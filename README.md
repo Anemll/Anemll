@@ -14,18 +14,27 @@ We aim to:
 See [Roadmap.md](./docs/Roadmap.md) for more details
 
 > [!Important]
-> This is Alpha Release 0.1.2 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
+> This is Alpha Release 0.2.0 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
 > - This release only supports LLAMA models including DeepSeek distilled models on LLaMA 3.1 architecture
 > - The future release will add support for more models and architectures
 > - Please visit https://huggingface.co/anemll where we uload the latest models and X: [@anemll](https://x.com/anemll) for updates
 > - Please star this repo to support the project!
 
-### New in 0.1.2 🚀
-- Dependency checks and troubleshooting guide [docs/troubleshooting.md](./docs/troubleshooting.md) added
-- Prefill batch size added to the conversion script
-- Chat_full interface updated for DeepHermes "think" token "/t" and both chat interfaces added --nw flag to skip warmup step ( [docs/chat.md](./docs/chat.md) )
-- XCode Tools dependency added to the README
+### New in 0.2.0 🚀
 
+> Refernce implementation for Swift inference:
+> ```bash
+> cd anemll-swift-cli
+> ```
+> # To Build
+> ```bash
+> swift build -c release
+> ```
+> # To Run:
+> ```bash
+> swift run -c release anemllcli --meta <path_to_anemall_model_folder>/meta.yaml
+> # optional parms: --prompt "Who are you?"
+> ```
 
 ## Basic Workflow
 

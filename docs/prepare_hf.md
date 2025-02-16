@@ -97,7 +97,7 @@ huggingface-cli login
 
 # Then upload using the command printed by the script
 # The repository name will include both the model name and version number
-# For example: anemll/anemll-Meta-Llama-3.2-1B-ctx512_0.1.2
+# For example: anemll/anemll-Meta-Llama-3.2-1B-ctx512_0.2.0
 huggingface-cli upload <org>/<model-name>_<version> output_directory
 
 # To update just the README file in an existing repository:

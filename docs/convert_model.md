@@ -204,7 +204,7 @@ The script generates a meta.yaml file containing all model configuration:
 ```yaml
 model_info:
   name: anemll-ModelName-ctx1024
-  version: 0.1.2
+  version: 0.2.0
   parameters:
     context_length: 1024
     batch_size: 64
