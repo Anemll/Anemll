@@ -15,6 +15,7 @@ See [Roadmap.md](./docs/Roadmap.md) for more details
 
 > [!Important]
 > This is Alpha Release 0.2.0 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
+> This is Alpha Release 0.2.0 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
 > - This release only supports LLAMA models including DeepSeek distilled models on LLaMA 3.1 architecture
 > - The future release will add support for more models and architectures
 > - Please visit https://huggingface.co/anemll where we uload the latest models and X: [@anemll](https://x.com/anemll) for updates
@@ -35,6 +36,8 @@ See [Roadmap.md](./docs/Roadmap.md) for more details
 > swift run -c release anemllcli --meta <path_to_anemall_model_folder>/meta.yaml
 > # optional parms: --prompt "Who are you?"
 > ```
+
+
 
 ## Basic Workflow
 
