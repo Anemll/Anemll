@@ -23,6 +23,9 @@ NUM_CHUNKS=2   # Default number of chunks
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
 
+# Initialize SKIP_CHECK before parsing arguments
+SKIP_CHECK=false
+
 # Function to print usage
 print_usage() {
     echo "Usage: $0 --model <path_to_model> --output <output_directory> [options]"
@@ -38,6 +41,7 @@ print_usage() {
     echo "  --only          Run only specified step and exit (1-8)"
     echo "  --prefix        Prefix for model names (default: llama)"
     echo "  --chunk         Number of chunks to split FFN/prefill (default: 2)"
+    echo "  --skip-check    Skip the dependency check step"
     echo "  --skip-check    Skip the dependency check step"
     exit 1
 }
@@ -93,6 +97,10 @@ while [[ $# -gt 0 ]]; do
             SKIP_CHECK=true
             shift
             ;;
+        --skip-check)
+            SKIP_CHECK=true
+            shift
+            ;;
         *)
             echo "Unknown parameter: $1"
             print_usage
@@ -128,6 +136,15 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)" || {
     # If output directory doesn't exist, get absolute path another way
     OUTPUT_DIR="$(cd "$(dirname "$OUTPUT_DIR")" && pwd)/$(basename "$OUTPUT_DIR")"
 }
+
+# Step 0: Check dependencies
+if [ "$SKIP_CHECK" = false ]; then
+    "$SCRIPT_DIR/check_dependencies.sh" --model "$MODEL_PATH" --output "$OUTPUT_DIR" "$@"
+    if [ $? -ne 0 ]; then
+        echo "Dependency check failed. Aborting."
+        exit 1
+    fi
+fi
 
 # Step 0: Check dependencies
 if [ "$SKIP_CHECK" = false ]; then
@@ -180,6 +197,8 @@ run_step 1 "Converting Embeddings" "python -m anemll.ane_converter.llama_convert
     $LUT1_PARAM \
     --context-length $CONTEXT_LENGTH \
     --batch-size $BATCH_SIZE \
+    --context-length $CONTEXT_LENGTH \
+    --batch-size $BATCH_SIZE \
     --prefix \"$PREFIX\" \
     --model \"$MODEL_PATH\" \
     --output \"$OUTPUT_DIR\""
@@ -193,6 +212,7 @@ fi
 run_step 2 "Converting LM Head" "python -m anemll.ane_converter.llama_converter \
     --part 3 \
     $LUT3_PARAM \
+    --context-length $CONTEXT_LENGTH \
     --context-length $CONTEXT_LENGTH \
     --prefix \"$PREFIX\" \
     --model \"$MODEL_PATH\" \
@@ -293,6 +313,7 @@ fi
 
 # Step 8: Test with chat.py
 run_step 8 "Testing with chat.py" "python \"$PROJECT_ROOT/tests/chat.py\" \
+    --meta \"$OUTPUT_DIR/meta.yaml\" \
     --meta \"$OUTPUT_DIR/meta.yaml\" \
     --prompt \"Who are you ?\""
 
