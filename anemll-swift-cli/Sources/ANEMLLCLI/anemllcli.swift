@@ -59,8 +59,8 @@ class TokenPrinter: @unchecked Sendable {
         }
         
         // Check for special tokens and thinking tags
-        let isEOSToken = withSpecial.contains("<|endoftext|>") || withSpecial.contains("</s>")
-        let isEOTToken = withSpecial.contains("<|eot_id|>")
+        //let isEOSToken = withSpecial.contains("<|endoftext|>") || withSpecial.contains("</s>")
+        //let isEOTToken = withSpecial.contains("<|eot_id|>")
         let isThinkStartToken = withSpecial == "<think>" || 
                                (withSpecial == "<th" && buffer.isEmpty) // Start of <think>
         let isThinkEndToken = withSpecial == "</think>" || 
@@ -130,7 +130,7 @@ struct AnemllCLI: AsyncParsableCommand {
     var meta: String
     
     @Option(name: .long, help: "Maximum number of tokens to generate")
-    var maxTokens: Int = 512
+    var maxTokens: Int? = nil  // Optional parameter
     
     @Option(name: .long, help: "Temperature for sampling (0 for deterministic)")
     var temperature: Float = 0.0
@@ -180,6 +180,17 @@ struct AnemllCLI: AsyncParsableCommand {
     mutating func run() async throws {
         // Load config
         let config = try YAMLConfig.load(from: meta)
+        
+        // Determine effective max tokens
+        let effectiveMaxTokens: Int
+        
+        if let specifiedMaxTokens = maxTokens {
+            effectiveMaxTokens = specifiedMaxTokens  // Use user-specified value
+        } else if config.contextLength > 0 {
+            effectiveMaxTokens = config.contextLength  // Use context length from config
+        } else {
+            effectiveMaxTokens = 512  // Default value if context length is unknown
+        }
         
         // Initialize tokenizer with debug level and template
         print("\nInitializing tokenizer...")
@@ -236,7 +247,7 @@ struct AnemllCLI: AsyncParsableCommand {
             let (generatedTokens, prefillTime, stopReason) = try await inferenceManager.generateResponse(
                 initialTokens: tokens,
                 temperature: temperature,
-                maxTokens: maxTokens,
+                maxTokens: effectiveMaxTokens,
                 eosToken: tokenizer.eosTokenId,
                 tokenizer: tokenizer,
                 onToken: { token in
@@ -264,6 +275,9 @@ struct AnemllCLI: AsyncParsableCommand {
                   " [Stop reason: \(stopReason)]\u{001B}[0m")
         } else {
             // Interactive chat mode
+            print("Context length: \(config.contextLength)")
+            print("Max tokens: \(effectiveMaxTokens)")
+            print("Prefill batch size: \(config.batchSize)")
             print("\nStarting interactive chat. Press Ctrl+D to exit.")
             print("Type your message and press Enter to chat. Use /t to toggle thinking mode.")
             print("Thinking mode is \(thinkingMode ? "ON" : "OFF")")
@@ -281,6 +295,8 @@ struct AnemllCLI: AsyncParsableCommand {
                 showSpecialTokens: showSpecialTokens
             )
             
+
+
             while true {
                 await tokenPrinter.drain()
                 
@@ -364,7 +380,7 @@ struct AnemllCLI: AsyncParsableCommand {
                 let (generatedTokens, prefillTime, stopReason) = try await inferenceManager.generateResponse(
                     initialTokens: tokens,
                     temperature: temperature,
-                    maxTokens: maxTokens,
+                    maxTokens: effectiveMaxTokens,
                     eosToken: tokenizer.eosTokenId,
                     tokenizer: tokenizer,
                     onToken: { token in

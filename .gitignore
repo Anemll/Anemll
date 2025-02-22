@@ -13,3 +13,4 @@ anemll-env/pyvenv.cfg
 .gitignore
 anemll/ane_converter/__pycache__/
 anemll/models/__pycache__/*
+anemll-swift-cli/.build/

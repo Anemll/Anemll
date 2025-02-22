@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:anemll}/anemll-swift-cli",
+            "name": "Debug anemllcli (anemll-swift-cli)",
+            "program": "${workspaceFolder:anemll}/anemll-swift-cli/.build/debug/anemllcli",
+            "preLaunchTask": "swift: Build Debug anemllcli (anemll-swift-cli)"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:anemll}/anemll-swift-cli",
+            "name": "Release anemllcli (anemll-swift-cli)",
+            "program": "${workspaceFolder:anemll}/anemll-swift-cli/.build/release/anemllcli",
+            "preLaunchTask": "swift: Build Release anemllcli (anemll-swift-cli)"
+        }
+    ]
+}

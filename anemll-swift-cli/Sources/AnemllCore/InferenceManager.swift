@@ -13,7 +13,7 @@ public class InferenceManager {
     private let batchSize: Int
     private let fullCausalMask: MLMultiArray  // We already have this
     private let debugLevel: Int
-    
+    private var v110: Bool = false // old conversio has batch x hidden_states for the last chunk
     // Change timing property to CFAbsoluteTime
     private var prefillEndTime: CFAbsoluteTime?
     
@@ -418,7 +418,7 @@ public class InferenceManager {
                 let ffnOptions = MLPredictionOptions()
                 
                 // Assign output backing BEFORE predict
-                if isLastChunk {
+                if isLastChunk && !v110 {
                     guard let lastBackingDict = hiddenStatesBackings_last else {
                         throw InferenceError.inferenceError("Missing last chunk output backing dictionary")
                     }
