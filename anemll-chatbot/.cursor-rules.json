@@ -1,0 +1,125 @@
+{
+  "rules": {
+    "minimal-changes": {
+      "description": "Do minimal changes to fix issues.",
+      "enforce": true
+    },
+    "no-unrequested-fixes": {
+      "description": "Do not fix issues you were not asked to fix.",
+      "enforce": true
+    },
+    "build-commands": {
+      "description": "Rules for building the project",
+      "commands": {
+        "default_build": {
+          "command": "cd ${PROJECT_ROOT} && xcodebuild -project anemll-chatbot.xcodeproj -scheme \"anemll-chatbot\" -configuration Debug -sdk iphonesimulator -destination \"platform=iOS Simulator,id=58236138-D5F1-467F-8D13-526F90BFA5A5\" build",
+          "description": "Default build command for development"
+        }
+      },
+      "troubleshooting": {
+        "empty_target_error": {
+          "error": "target 'anemll-chatbot.xcodeproj' referenced in product 'anemll-chatbot.xcodeproj' is empty",
+          "solution": "Open project in Xcode first",
+          "fix_command": "open ${PROJECT_ROOT}/anemll-chatbot.xcodeproj"
+        }
+      },
+      "environment": {
+        "PROJECT_ROOT": {
+          "description": "Root directory of the anemll-chatbot project",
+          "required": true
+        }
+      },
+      "enforce": true
+    },
+    "models-json-handling": {
+      "description": "Rules for handling Models.json configuration",
+      "rules": [
+        "Source URLs for custom models should use ${MODEL_ROOT} variable instead of absolute paths",
+        "Never expose full filesystem paths in Models.json",
+        "Use relative paths when possible",
+        "For local custom models, use format: ${MODEL_ROOT}/models/custom/<model_name>",
+        "For downloaded models, use format: ${MODEL_ROOT}/models/downloaded/<model_name>"
+      ],
+      "parameters": {
+        "MODEL_ROOT": {
+          "description": "Root directory for model storage",
+          "required": true,
+          "format": "environment variable"
+        },
+        "source_url": {
+          "description": "Source URL format for custom models",
+          "format": "${MODEL_ROOT}/models/<type>/<model_name>",
+          "required": true
+        }
+      },
+      "enforce": true
+    },
+    "meta-yaml-handling": {
+      "description": "Rules for handling meta.yaml configuration and model files",
+      "rules": [
+        "meta.yaml is the source of truth for model configuration (prefix, chunks, LUT values)",
+        "If LUT value is 0 or nil, file names should NOT include the '_lutX' suffix",
+        "If LUT value is > 0, file names MUST include the '_lutX' suffix with correct value",
+        "NEVER try multiple LUT values (1-16) when meta.yaml exists - use ONLY the specified values",
+        "For embeddings: if lut_embeddings=0/nil/none, check ONLY for prefix_embeddings.mlmodelc (no LUT suffix)",
+        "For LM head: if lut_lmhead=0/nil/none, check ONLY for prefix_lm_head.mlmodelc (no LUT suffix)",
+        "For FFN chunks: if lut_ffn=0/nil/none, check ONLY for prefix_FFN_PF_chunk_NNofMM.mlmodelc (no LUT suffix)",
+        "File naming pattern with LUT: prefix_FFN_PF_lutN_chunk_NNofMM.mlmodelc",
+        "File naming pattern without LUT: prefix_FFN_PF_chunk_NNofMM.mlmodelc"
+      ],
+      "enforce": true
+    },
+    "meta-yaml-parameters": {
+      "description": "Required and optional parameters in meta.yaml with their default values",
+      "parameters": {
+        "model_prefix": {
+          "description": "Prefix used in all model file names",
+          "default": "llama",
+          "required": false
+        },
+        "num_chunks": {
+          "description": "Number of model chunks",
+          "default": "2",
+          "required": false
+        },
+        "context_length": {
+          "description": "Maximum context length for the model",
+          "default": "512",
+          "required": false
+        },
+        "batch_size": {
+          "description": "Batch size for inference",
+          "default": "64",
+          "required": false
+        },
+        "lut_embeddings": {
+          "description": "LUT value for embeddings",
+          "default": "none/nil",
+          "required": false
+        },
+        "lut_ffn": {
+          "description": "LUT value for FFN",
+          "default": "none/nil",
+          "required": false
+        },
+        "lut_lmhead": {
+          "description": "LUT value for LM head",
+          "default": "none/nil",
+          "required": false
+        }
+      },
+      "enforce": true
+    },
+    "embeddings-handling": {
+      "description": "Specific rules for embeddings component to prevent random LUT checking",
+      "rules": [
+        "For embeddings, ONLY check files exactly matching the lut_embeddings value in meta.yaml",
+        "If lut_embeddings=0/nil/none, ONLY check for prefix_embeddings.mlmodelc (without suffix)",
+        "If lut_embeddings=N (where N>0), ONLY check for prefix_embeddings_lutN.mlmodelc",
+        "NEVER add alternative embedding directories with different LUT values when meta.yaml exists",
+        "NEVER try to verify embeddings files with LUT 1,2,3,4,8,16 when meta.yaml specifies a value"
+      ],
+      "enforce": true
+    }
+  }
+}
