@@ -30,14 +30,17 @@ public class InferenceManager {
         let index: Int
     }
     
-    public init(models: LoadedModels, contextLength: Int, batchSize: Int, debugLevel: Int = 0) throws {  // Make init throwing
+    public init(models: LoadedModels, contextLength: Int, batchSize: Int, debugLevel: Int = 0, v110: Bool = false) throws {  // Make init throwing
         self.embedModel = models.embedModel
         self.lmheadModel = models.lmheadModel
         // Assume models.ffnChunks is available (see note below)
         self.ffnChunks = models.ffnChunks
         self.contextLength = contextLength
         self.batchSize = batchSize
+        self.v110 = v110 // Set the v110 flag based on the parameter
         self.state = ffnChunks[0].prefillModel.makeState()
+        
+        print("InferenceManager initialized with v110=\(v110)")
         
         // Create full causal mask once with -inf and 0.0 (we already have this)
         self.fullCausalMask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: contextLength)], dataType: .float16)
@@ -582,20 +585,24 @@ public class InferenceManager {
                         throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
                     }
                     
-                    let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
-                    let count = localLogitsPart.count
-                    var localMaxValue: Float = -Float.infinity
-                    var localMaxIndex = 0
-                    
-                    for j in 0..<count {
-                        let value = Float(buffer[j])
-                        if value > localMaxValue {
-                            localMaxValue = value
-                            localMaxIndex = localOffset + j
+                    #if arch(arm64)
+                        let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
+                        let count = localLogitsPart.count
+                        var localMaxValue: Float = -Float.infinity
+                        var localMaxIndex = 0
+                        
+                        for j in 0..<count {
+                            let value = Float(buffer[j])
+                            if value > localMaxValue {
+                                localMaxValue = value
+                                localMaxIndex = localOffset + j
+                            }
                         }
-                    }
-                    
-                    return PartialMax(value: localMaxValue, index: localMaxIndex)
+                        return PartialMax(value: localMaxValue, index: localMaxIndex)
+                    #else
+                        fatalError("Unsupported architecture, only Apple Sylicon is supported")
+                    #endif
+                                        
                 }
             }
             
@@ -625,11 +632,28 @@ public class InferenceManager {
     }
     
     /// Shifts the context window if needed (similar to the Python code).
-    public func shiftWindow(currentPos: Int, contextTokens: inout [Int]) throws {
+    public func shiftWindow(
+        currentPos: Int,  
+        contextTokens: inout [Int],
+        onWindowShift: (() -> Void)? = nil
+    ) throws {
         if currentPos >= contextLength - 2 {
+            // Calculate shift to maintain full batches
             let maxBatches = contextLength / batchSize
-            let desiredBatches = max(1, maxBatches - 2)
-            let newSize = min(desiredBatches * batchSize, contextLength - batchSize)
+            let desiredBatches = max(1, maxBatches - 2)  // Leave room for new tokens
+            // Modified calculation to ensure we shift by no less than CONTEXT-PREFILL_BATCH
+            // This prevents overflow on the last prefill operation
+            let minSafeSize = max(1, contextLength - batchSize)
+            let newSize = min(desiredBatches * batchSize, minSafeSize)
+            
+            if debugLevel >= 2 {
+                print("\nShifting context window:")
+                print("Current position: \(currentPos)")
+                print("Context length: \(contextLength), Batch size: \(batchSize)")
+                print("Min safe size: \(minSafeSize)")
+                print("New size: \(newSize)")
+            }
+            
             // Shift window: keep only the last newSize tokens.
             let shiftedTokens = Array(contextTokens[(currentPos - newSize)..<currentPos])
             // Reset the context to all zeros, then write the shifted tokens at the beginning.
@@ -637,6 +661,9 @@ public class InferenceManager {
             for i in 0..<shiftedTokens.count {
                 contextTokens[i] = shiftedTokens[i]
             }
+            
+            // Call the window shift callback to notify listeners
+            onWindowShift?()
         }
     }
     
@@ -648,7 +675,8 @@ public class InferenceManager {
         maxTokens: Int,
         eosToken: Int,
         tokenizer: Tokenizer,
-        onToken: ((Int) -> Void)? = nil
+        onToken: ((Int) -> Void)? = nil,
+        onWindowShift: (() -> Void)? = nil
     ) async throws -> ([Int], TimeInterval, String) {
         var generatedTokens: [Int] = []
         let startTime = CFAbsoluteTimeGetCurrent()
@@ -677,11 +705,16 @@ public class InferenceManager {
                     // Calculate shift to maintain full batches
                     let maxBatches = contextLength / batchSize
                     let desiredBatches = max(1, maxBatches - 2)  // Leave room for new tokens
-                    let newSize = min(desiredBatches * batchSize, contextLength - batchSize)
+                    // Modified calculation to ensure we shift by no less than CONTEXT-PREFILL_BATCH
+                    // This prevents overflow on the last prefill operation
+                    let minSafeSize = max(1, contextLength - batchSize)
+                    let newSize = min(desiredBatches * batchSize, minSafeSize)
                     
                     if debugLevel >= 2 {
                         print("\nShifting context window:")
                         print("Current position: \(currentPos)")
+                        print("Context length: \(contextLength), Batch size: \(batchSize)")
+                        print("Min safe size: \(minSafeSize)")
                         print("New size: \(newSize)")
                     }
                     
@@ -691,6 +724,9 @@ public class InferenceManager {
                     for i in 0..<shiftedTokens.count {
                         contextTokens[i] = shiftedTokens[i]
                     }
+                    
+                    // Call the window shift callback to notify listeners
+                    onWindowShift?()
                     
                     // Reset state and run prefill on shifted content
                     state = ffnChunks[0].prefillModel.makeState()

@@ -3,6 +3,12 @@ import ArgumentParser
 import AnemllCore
 import CoreML
 import CoreFoundation
+import Dispatch
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 // Update TokenPrinter class to be Sendable-compliant
 @globalActor actor TokenPrinterActor {
@@ -159,6 +165,10 @@ struct AnemllCLI: AsyncParsableCommand {
     @Flag(name: .long, help: "Show special tokens in output")
     var showSpecialTokens = false
     
+    // Add flag for detailed loading progress
+    @Flag(name: .long, help: "Show detailed model loading progress")
+    var showLoadingProgress = false
+    
     // Update thinking prompt to use actual tokens
     private static let THINKING_PROMPT = """
     You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem.
@@ -176,6 +186,93 @@ struct AnemllCLI: AsyncParsableCommand {
     // ANSI color codes as static constants
     private static let DARK_BLUE = "\u{001B}[34m"
     private static let RESET_COLOR = "\u{001B}[0m"
+    
+    // MARK: - Progress Delegate Implementation
+    // ModelLoadingProgressDelegate implementation for the CLI
+    private class CLIProgressDelegate: ModelLoadingProgressDelegate, @unchecked Sendable {
+        private let showDetailedProgress: Bool
+        private var lastPercentageReported: Int = -1
+        private var loadingBar: String = ""
+        private var loadingStartTime: CFAbsoluteTime = 0
+        
+        init(showDetailedProgress: Bool) {
+            self.showDetailedProgress = showDetailedProgress
+            self.loadingStartTime = CFAbsoluteTimeGetCurrent()
+        }
+        
+        func loadingProgress(percentage: Double, stage: String, detail: String?) {
+            let percentInt = Int(percentage * 100)
+            
+            // Only update if percentage has changed
+            if percentInt != lastPercentageReported {
+                lastPercentageReported = percentInt
+                
+                // Basic progress bar (always shown)
+                let fullWidth = 30
+                let filledWidth = Int(Double(fullWidth) * percentage)
+                let emptyWidth = fullWidth - filledWidth
+                
+                loadingBar = "["
+                loadingBar += String(repeating: "■", count: filledWidth)
+                loadingBar += String(repeating: "□", count: emptyWidth)
+                loadingBar += "] \(percentInt)%"
+                
+                // Clear the line and reprint
+                print("\u{001B}[2K\r\(loadingBar)", terminator: "")
+                
+                // If detailed progress is enabled, print more info
+                if showDetailedProgress && detail != nil {
+                    print(" \(stage): \(detail!)")
+                } else {
+                    fflush(stdout)
+                }
+            }
+        }
+        
+        func loadingCompleted(models: LoadedModels) {
+            let elapsed = CFAbsoluteTimeGetCurrent() - loadingStartTime
+            print("\u{001B}[2K\r[" + String(repeating: "■", count: 30) + "] 100%")
+            print("✓ Models loaded successfully in \(String(format: "%.2f", elapsed))s")
+        }
+        
+        func loadingCancelled() {
+            print("\u{001B}[2K\r❌ Model loading cancelled")
+        }
+        
+        func loadingFailed(error: Error) {
+            print("\u{001B}[2K\r❌ Model loading failed: \(error)")
+        }
+    }
+    
+    // Signal handling for cancellation
+    private func setupSignalHandling(for modelLoader: ModelLoader) {
+        // Create a signal source that will be triggered on SIGINT (Ctrl+C)
+        let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        
+        // Store the signal source in a property that will live for the duration of the command
+        var signalSources: [DispatchSourceSignal] = []
+        signalSources.append(sigintSource)
+        
+        // Set up the handler
+        sigintSource.setEventHandler {
+            print("\nCancelling model loading...")
+            Task {
+                await modelLoader.cancelLoading()
+            }
+        }
+        
+        // Register for the signal
+        signal(SIGINT, SIG_IGN)
+        sigintSource.resume()
+        
+        // Store the signal sources in a way they won't be deallocated
+        objc_setAssociatedObject(
+            self, 
+            "signalSources", 
+            signalSources, 
+            .OBJC_ASSOCIATION_RETAIN
+        )
+    }
     
     mutating func run() async throws {
         // Load config
@@ -200,16 +297,40 @@ struct AnemllCLI: AsyncParsableCommand {
             debugLevel: debugLevel
         )
         
-        // Load models
+        // Create progress delegate
+        let progressDelegate = CLIProgressDelegate(showDetailedProgress: showLoadingProgress)
+        
+        // Load models with progress reporting
         print("\nLoading models...")
-        let models = try ModelLoader.loadModel(from: config)
+        let modelLoader = ModelLoader(progressDelegate: progressDelegate)
+        
+        // Set up signal handling for cancellation
+        setupSignalHandling(for: modelLoader)
+        
+        // Start model loading
+        let modelLoadingTask = Task {
+            try await modelLoader.loadModel(from: config)
+        }
+        
+        // Wait for model loading to complete
+        let models: LoadedModels
+        do {
+            models = try await modelLoadingTask.value
+        } catch is CancellationError {
+            print("Model loading was cancelled by user.")
+            throw ExitCode.failure
+        } catch {
+            print("Failed to load models: \(error)")
+            throw error
+        }
         
         // Create inference manager with debug level
         let inferenceManager = try InferenceManager(
             models: models,
             contextLength: config.contextLength,
             batchSize: config.batchSize,
-            debugLevel: debugLevel
+            debugLevel: debugLevel,
+            v110: config.configVersion == "0.1.1"  // Set v110 flag based on version
         )
         
         if let prompt = prompt {
@@ -295,8 +416,6 @@ struct AnemllCLI: AsyncParsableCommand {
                 showSpecialTokens: showSpecialTokens
             )
             
-
-
             while true {
                 await tokenPrinter.drain()
                 
