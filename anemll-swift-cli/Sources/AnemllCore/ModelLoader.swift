@@ -179,18 +179,124 @@ public actor ModelLoader {
             // Calculate per-chunk progress increment
             let chunkProgressIncrement = ProgressWeights.ffnChunks / Double(configCopy.numChunks * 2)
             
+            // Validate model files exist before attempting to load
+            let fileManager = FileManager.default
+            let modelDir = (configCopy.ffnPath as NSString).deletingLastPathComponent
+            print("Model directory: \(modelDir)")
+            
+            // Verify embeddings model
+            if !fileManager.fileExists(atPath: configCopy.embedPath) {
+                print("❌ ERROR: Embeddings model not found at path: \(configCopy.embedPath)")
+                throw ModelError.failedToLoadModel
+            }
+            
+            // Verify LM head model
+            if !fileManager.fileExists(atPath: configCopy.lmheadPath) {
+                print("❌ ERROR: LM head model not found at path: \(configCopy.lmheadPath)")
+                throw ModelError.failedToLoadModel
+            }
+            
+            // For multi-chunk models, verify at least one chunk exists
+            if configCopy.numChunks > 1 {
+                var foundAnyChunk = false
+                var availableChunks: [Int] = []
+                
+                // Check all possible chunks
+                for i in 1...configCopy.numChunks {
+                    // Construct expected chunk path
+                    let chunkPath: String
+                    if configCopy.ffnPath.contains("_chunk_") {
+                        // If base path contains chunk info, replace chunk number
+                        chunkPath = configCopy.ffnPath.replacingOccurrences(
+                            of: "_chunk_\\d+of",
+                            with: "_chunk_\(String(format: "%02d", i))of",
+                            options: .regularExpression
+                        )
+                    } else {
+                        // Construct from base model path
+                        let directory = (configCopy.ffnPath as NSString).deletingLastPathComponent
+                        let filename = (configCopy.ffnPath as NSString).lastPathComponent
+                        var baseName = filename
+                        if baseName.hasSuffix(".mlmodelc") {
+                            baseName = String(baseName.dropLast(9))
+                        }
+                        chunkPath = "\(directory)/\(baseName)_chunk_\(String(format: "%02d", i))of\(String(format: "%02d", configCopy.numChunks)).mlmodelc"
+                    }
+                    
+                    if fileManager.fileExists(atPath: chunkPath) {
+                        foundAnyChunk = true
+                        availableChunks.append(i)
+                    }
+                }
+                
+                if !foundAnyChunk {
+                    print("❌ ERROR: No FFN chunks found for model")
+                    if let files = try? fileManager.contentsOfDirectory(atPath: modelDir) {
+                        print("Available files in \(modelDir):")
+                        for file in files {
+                            print("  - \(file)")
+                        }
+                    }
+                    throw ModelError.failedToLoadModel
+                }
+                
+                print("✅ Found \(availableChunks.count) available chunks: \(availableChunks)")
+            } else {
+                // Single chunk model - verify the FFN file exists
+                if !fileManager.fileExists(atPath: configCopy.ffnPath) {
+                    print("❌ ERROR: FFN model not found at path: \(configCopy.ffnPath)")
+                    if let files = try? fileManager.contentsOfDirectory(atPath: modelDir) {
+                        print("Available files in \(modelDir):")
+                        for file in files {
+                            print("  - \(file)")
+                        }
+                    }
+                    throw ModelError.failedToLoadModel
+                }
+            }
+            
             // Load chunks sequentially to avoid memory pressure
             for i in 1...configCopy.numChunks {
                 if Task.isCancelled {
                     throw ModelError.loadingCancelled
                 }
                 
-                // Modify the FFN path to point to the correct chunk
-                let chunkPath = configCopy.ffnPath.replacingOccurrences(
-                    of: "01of\(String(format: "%02d", configCopy.numChunks))",
-                    with: "\(String(format: "%02d", i))of\(String(format: "%02d", configCopy.numChunks))"
-                )
+                // Construct the path for this chunk
+                var chunkPath: String
                 
+                // Check if the original path already contains chunk information
+                if configCopy.ffnPath.contains("_chunk_") {
+                    // If it's already a chunk path, modify the chunk number
+                    chunkPath = configCopy.ffnPath.replacingOccurrences(
+                        of: "_chunk_\\d+of",
+                        with: "_chunk_\(String(format: "%02d", i))of",
+                        options: .regularExpression
+                    )
+                } else if configCopy.numChunks > 1 {
+                    // Multi-chunk model with non-chunked path format
+                    let directory = (configCopy.ffnPath as NSString).deletingLastPathComponent
+                    let filename = (configCopy.ffnPath as NSString).lastPathComponent
+                    
+                    // Remove .mlmodelc if present
+                    var baseName = filename
+                    if baseName.hasSuffix(".mlmodelc") {
+                        baseName = String(baseName.dropLast(9))
+                    }
+                    
+                    // Add chunk suffix
+                    chunkPath = "\(directory)/\(baseName)_chunk_\(String(format: "%02d", i))of\(String(format: "%02d", configCopy.numChunks)).mlmodelc"
+                } else {
+                    // Single chunk model
+                    chunkPath = configCopy.ffnPath
+                }
+                
+                // Skip this chunk if it doesn't exist
+                if !fileManager.fileExists(atPath: chunkPath) {
+                    print("⚠️ Chunk \(i) not found at: \(chunkPath) - skipping")
+                    continue
+                }
+                
+                print("Loading chunk \(i): \(chunkPath)")
                 let ffnURL = URL(fileURLWithPath: chunkPath)
                 
                 // Load inference model for this chunk
@@ -202,8 +308,17 @@ public actor ModelLoader {
                 
                 print("Loading inference chunk \(i): \(chunkPath)")
                 modelConfig.functionName = "infer"
-                let inferModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
-                print("✓ Inference chunk \(i) loaded")
+                
+                // Try loading the model but continue if a specific chunk fails
+                var inferModel: MLModel
+                do {
+                    inferModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                    print("✅ Inference chunk \(i) loaded")
+                } catch {
+                    print("❌ Error loading inference chunk \(i): \(error)")
+                    print("Skipping this chunk and continuing...")
+                    continue
+                }
                 
                 try await progressTracker.updateProgress(
                     increment: chunkProgressIncrement,
@@ -220,8 +335,17 @@ public actor ModelLoader {
                 
                 print("Loading prefill chunk \(i): \(chunkPath)")
                 modelConfig.functionName = "prefill"
-                let prefillModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
-                print("✓ Prefill chunk \(i) loaded")
+                
+                // Try loading the prefill model
+                var prefillModel: MLModel
+                do {
+                    prefillModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                    print("✅ Prefill chunk \(i) loaded")
+                } catch {
+                    print("❌ Error loading prefill chunk \(i): \(error)")
+                    print("Skipping this chunk and continuing...")
+                    continue
+                }
                 
                 try await progressTracker.updateProgress(
                     increment: chunkProgressIncrement,
@@ -230,6 +354,14 @@ public actor ModelLoader {
                 )
                 
                 ffnChunks.append(FFNChunk(inferModel: inferModel, prefillModel: prefillModel))
+            }
+            
+            // Verify that we loaded at least one chunk
+            if ffnChunks.isEmpty {
+                print("❌ ERROR: No FFN chunks were loaded")
+                throw ModelError.inferenceError("Failed to load any FFN chunks")
+            } else {
+                print("✅ Successfully loaded \(ffnChunks.count) of \(configCopy.numChunks) FFN chunks")
             }
             
             // Final update to ensure we reach 100%

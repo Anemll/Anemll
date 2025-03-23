@@ -3,7 +3,7 @@ import CoreVideo
 import CoreFoundation
 
 /// Manages inference by wrapping a CoreML model and handling state.
-public class InferenceManager {
+@preconcurrency public final class InferenceManager: @unchecked Sendable {
     private var hidden_states: Int = -1
     private let embedModel: MLModel
     private let lmheadModel: MLModel

@@ -47,9 +47,29 @@ public struct YAMLConfig: Sendable {
         // Extract paths from yaml
         self.embedPath = yaml["embed_path"] as? String ?? ""
         self.lmheadPath = yaml["lmhead_path"] as? String ?? ""
-        self.ffnPath = yaml["ffn_path"] as? String ?? ""
         
-        self.configVersion = yaml["version"] as? String ?? "1.0"
+        // Get the ffn_path
+        let rawFFNPath = yaml["ffn_path"] as? String ?? ""
+        
+        // If multi-chunk model and path doesn't already have the proper format, adjust it
+        if self.numChunks > 1 && !rawFFNPath.contains("_chunk_01of") {
+            let directory = (rawFFNPath as NSString).deletingLastPathComponent
+            let filename = (rawFFNPath as NSString).lastPathComponent
+            
+            // Derive base name without .mlmodelc
+            var baseName = filename
+            if baseName.hasSuffix(".mlmodelc") {
+                baseName = String(baseName.dropLast(9)) // Remove .mlmodelc
+            }
+            
+            // Generate canonical first chunk path
+            self.ffnPath = "\(directory)/\(baseName)_chunk_01of\(String(format: "%02d", self.numChunks)).mlmodelc"
+            print("Generated canonical chunk path: \(self.ffnPath)")
+        } else {
+            self.ffnPath = rawFFNPath
+        }
+        
+        self.configVersion = yaml["version"] as? String ?? "0.2.0"
     }
     
     /// Load configuration from a file path
@@ -100,44 +120,60 @@ public struct YAMLConfig: Sendable {
             
             let lutFFN = String(params["lut_ffn"] as? Int ?? -1)
             let lutLMHead = String(params["lut_lmhead"] as? Int ?? -1)
+            let lutEmbeddings = String(params["lut_embeddings"] as? Int ?? -1)
             let numChunks = params["num_chunks"] as? Int ?? 1
             
-            // Build paths
-            let embedPath = "\(baseDir)/\(modelPrefix)_embeddings.mlmodelc"
-            let lmheadPath = "\(baseDir)/\(modelPrefix)_lm_head\(lutLMHead != "-1" ? "_lut\(lutLMHead)" : "").mlmodelc"
-            let ffnPath = "\(baseDir)/\(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "")_chunk_01of\(String(format: "%02d", numChunks)).mlmodelc"
+            // Check for predefined paths in parameters
+            let predefinedEmbedPath = params["embeddings"] as? String
+            let predefinedLMHeadPath = params["lm_head"] as? String
+            let predefinedFFNPath = params["ffn"] as? String
+            
+            print("Predefined paths from meta.yaml:")
+            print("  - embeddings: \(predefinedEmbedPath ?? "Not defined")")
+            print("  - lm_head: \(predefinedLMHeadPath ?? "Not defined")")
+            print("  - ffn: \(predefinedFFNPath ?? "Not defined")")
+            
+            // Build paths, preferring predefined paths if available
+            let embedPath: String
+            if let definedPath = predefinedEmbedPath {
+                embedPath = "\(baseDir)/\(definedPath)"
+            } else {
+                // Always include "_embeddings" suffix with optional LUT suffix
+                embedPath = "\(baseDir)/\(modelPrefix)_embeddings\(lutEmbeddings != "-1" ? "_lut\(lutEmbeddings)" : "").mlmodelc"
+            }
+            
+            let lmheadPath: String
+            if let definedPath = predefinedLMHeadPath {
+                lmheadPath = "\(baseDir)/\(definedPath)"
+            } else {
+                lmheadPath = "\(baseDir)/\(modelPrefix)_lm_head\(lutLMHead != "-1" ? "_lut\(lutLMHead)" : "").mlmodelc"
+            }
+            
+            let ffnPath: String
+            if let definedPath = predefinedFFNPath {
+                ffnPath = "\(baseDir)/\(definedPath)"
+            } else if numChunks > 1 {
+                // For multi-chunk models, use the canonical chunk path format
+                ffnPath = "\(baseDir)/\(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "")_chunk_01of\(String(format: "%02d", numChunks)).mlmodelc"
+                print("Generated canonical chunked FFN path: \(ffnPath)")
+            } else {
+                // For single-chunk models
+                ffnPath = "\(baseDir)/\(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "").mlmodelc"
+            }
             
             print("\nModel paths (Python style):")
             print("Raw paths before .mlmodelc:")
-            print("Embed: \(modelPrefix)_embeddings")
-            print("LMHead: \(modelPrefix)_lm_head\(lutLMHead != "none" ? "_lut\(lutLMHead)" : "")")
-            print("FFN: \(modelPrefix)_FFN_PF\(lutFFN != "none" ? "_lut\(lutFFN)" : "")_chunk_01of\(String(format: "%02d", numChunks))")
+            print("Embed: \(modelPrefix)_embeddings\(lutEmbeddings != "-1" ? "_lut\(lutEmbeddings)" : "")")
+            print("LMHead: \(modelPrefix)_lm_head\(lutLMHead != "-1" ? "_lut\(lutLMHead)" : "")")
+            if numChunks > 1 {
+                print("FFN: \(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "")_chunk_01of\(String(format: "%02d", numChunks))")
+            } else {
+                print("FFN: \(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "")")
+            }
             print("\nFull paths:")
             print("Embed: \(embedPath)")
             print("LMHead: \(lmheadPath)")
             print("FFN: \(ffnPath)")
-            
-            // Verify files exist
-            var missingFiles: [String] = []
-            for path in [embedPath, lmheadPath, ffnPath] {
-                if !fileManager.fileExists(atPath: path) {
-                    print("Error: Model file not found: \(path)")
-                    missingFiles.append(path)
-                    
-                    // Try to list similar files to help with debugging
-                    let directory = (path as NSString).deletingLastPathComponent
-                    if let files = try? fileManager.contentsOfDirectory(atPath: directory) {
-                        print("Files in directory \(directory):")
-                        for file in files {
-                            print("  - \(file)")
-                        }
-                    }
-                }
-            }
-            
-            if !missingFiles.isEmpty {
-                throw ConfigError.missingField("Model files not found: \(missingFiles.joined(separator: ", "))")
-            }
             
             // Create YAML string for init(from:)
             let configDict: [String: Any] = [
@@ -151,6 +187,7 @@ public struct YAMLConfig: Sendable {
                 "model_prefix": modelPrefix,
                 "lut_ffn": lutFFN,
                 "lut_lmhead": lutLMHead,
+                "lut_embeddings": lutEmbeddings,
                 "version": modelInfo["version"] as? String ?? "1.0",
                 "embed_path": embedPath,
                 "ffn_path": ffnPath,
@@ -166,6 +203,43 @@ public struct YAMLConfig: Sendable {
             print("Error parsing YAML: \(error.localizedDescription)")
             throw ConfigError.invalidFormat("Failed to parse YAML: \(error.localizedDescription)")
         }
+    }
+    
+    // Helper method to create YAMLConfig when an alternate chunk is found
+    private static func loadFromDetectedPaths(
+        baseDir: String, 
+        embedPath: String, 
+        lmheadPath: String, 
+        ffnPath: String, 
+        params: [String: Any], 
+        modelInfo: [String: Any], 
+        modelPrefix: String, 
+        numChunks: Int, 
+        lutFFN: String, 
+        lutLMHead: String, 
+        lutEmbeddings: String
+    ) throws -> YAMLConfig {
+        // Create YAML string for init(from:)
+        let configDict: [String: Any] = [
+            "model_path": ffnPath,
+            "tokenizer_model": baseDir,
+            "context_length": params["context_length"] as? Int ?? 2048,
+            "batch_size": params["batch_size"] as? Int ?? 32,
+            "state_length": params["context_length"] as? Int ?? 2048,
+            "lut_bits": params["lut_bits"] as? Int ?? 4,
+            "num_chunks": numChunks,
+            "model_prefix": modelPrefix,
+            "lut_ffn": lutFFN,
+            "lut_lmhead": lutLMHead,
+            "lut_embeddings": lutEmbeddings,
+            "version": modelInfo["version"] as? String ?? "1.0",
+            "embed_path": embedPath,
+            "ffn_path": ffnPath,
+            "lmhead_path": lmheadPath
+        ]
+        
+        let yamlString = try Yams.dump(object: configDict)
+        return try YAMLConfig(from: yamlString)
     }
 }
 

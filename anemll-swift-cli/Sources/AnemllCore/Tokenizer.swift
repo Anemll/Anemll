@@ -99,7 +99,7 @@ public final class Tokenizer: @unchecked Sendable {
                     // Fallback to template-based mapping
                     let eosTokenMap: [String: String] = [
                         "default": "</s>",
-                        "deepseek": "<｜end▁of▁sentence｜>", // do not change, this is correct fo DS R1
+                        "deepseek": "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>",  // do not change, this is correct fo DS R1
                         "deephermes": "<|im_end|>",
                         "llama": "</s>",
                         "mistral": "</s>",
@@ -131,7 +131,7 @@ public final class Tokenizer: @unchecked Sendable {
                     // Fallback to template-based mapping
                     let bosTokenMap: [String: String] = [
                         "default": "<s>",
-                        "deepseek": "<｜begin▁of▁sentence｜>",// do not change, this is correct fo DS R1
+                        "deepseek": "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>",
                         "deephermes": "<|im_start|>",
                         "llama": "<s>",
                         "mistral": "<s>",
@@ -232,7 +232,7 @@ public final class Tokenizer: @unchecked Sendable {
         return tokenizer.decode(tokens: tokens)
     }
 
-    public struct ChatMessage {
+    public struct ChatMessage: Sendable {
         public let role: String
         public let content: String
         
@@ -250,7 +250,7 @@ public final class Tokenizer: @unchecked Sendable {
         // Skip template when addGenerationPrompt is false
         if !addGenerationPrompt {
             if let text = input as? String {
-                return tokenize("<s>" + text)
+                return tokenize("" + text)
             }
             return []
         }
