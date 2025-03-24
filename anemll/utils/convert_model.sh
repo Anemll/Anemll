@@ -192,16 +192,20 @@ if [ ! -z "$LUT_PART1" ]; then
     LUT1_PARAM="--lut $LUT_PART1"
 fi
 
-run_step 1 "Converting Embeddings" "python -m anemll.ane_converter.llama_converter \
-    --part 1 \
-    $LUT1_PARAM \
-    --context-length $CONTEXT_LENGTH \
-    --batch-size $BATCH_SIZE \
-    --context-length $CONTEXT_LENGTH \
-    --batch-size $BATCH_SIZE \
-    --prefix \"$PREFIX\" \
-    --model \"$MODEL_PATH\" \
-    --output \"$OUTPUT_DIR\""
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "1" ]; then
+    run_step 1 "Converting Embeddings" "python -m anemll.ane_converter.llama_converter \
+        --part 1 \
+        $LUT1_PARAM \
+        --context-length $CONTEXT_LENGTH \
+        --batch-size $BATCH_SIZE \
+        --context-length $CONTEXT_LENGTH \
+        --batch-size $BATCH_SIZE \
+        --prefix \"$PREFIX\" \
+        --model \"$MODEL_PATH\" \
+        --output \"$OUTPUT_DIR\""
+else
+    echo "Skipping step 1: Converting Embeddings"
+fi
 
 # Step 2: Convert LM Head (Part 3)
 LUT3_PARAM=""
@@ -209,14 +213,18 @@ if [ ! -z "$LUT_PART3" ]; then
     LUT3_PARAM="--lut $LUT_PART3"
 fi
 
-run_step 2 "Converting LM Head" "python -m anemll.ane_converter.llama_converter \
-    --part 3 \
-    $LUT3_PARAM \
-    --context-length $CONTEXT_LENGTH \
-    --context-length $CONTEXT_LENGTH \
-    --prefix \"$PREFIX\" \
-    --model \"$MODEL_PATH\" \
-    --output \"$OUTPUT_DIR\""
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+    run_step 2 "Converting LM Head" "python -m anemll.ane_converter.llama_converter \
+        --part 3 \
+        $LUT3_PARAM \
+        --context-length $CONTEXT_LENGTH \
+        --context-length $CONTEXT_LENGTH \
+        --prefix \"$PREFIX\" \
+        --model \"$MODEL_PATH\" \
+        --output \"$OUTPUT_DIR\""
+else
+    echo "Skipping step 2: Converting LM Head"
+fi
 
 # Step 3: Convert FFN (Part 2)
 LUT2_PARAM=""
@@ -224,46 +232,60 @@ if [ ! -z "$LUT_PART2" ]; then
     LUT2_PARAM="--lut $LUT_PART2"
 fi
 
-run_step 3 "Converting FFN" "python -m anemll.ane_converter.llama_converter \
-    --part 2 \
-    $LUT2_PARAM \
-    --chunk $NUM_CHUNKS \
-    --context-length $CONTEXT_LENGTH \
-    --batch-size $BATCH_SIZE \
-    --prefix \"$PREFIX\" \
-    --model \"$MODEL_PATH\" \
-    --output \"$OUTPUT_DIR\""
-
-run_step 4 "Converting Prefill" "python -m anemll.ane_converter.llama_converter \
-    --part 2_prefill \
-    $LUT2_PARAM \
-    --chunk $NUM_CHUNKS \
-    --context-length $CONTEXT_LENGTH \
-    --batch-size $BATCH_SIZE \
-    --prefix \"$PREFIX\" \
-    --model \"$MODEL_PATH\" \
-    --output \"$OUTPUT_DIR\""
-
-# Step 5: Combine Models
-if [ ! -z "$LUT_PART2" ]; then
-    run_step 5 "Combining Models" "python \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
-        --chunk $NUM_CHUNKS \
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+    run_step 3 "Converting FFN" "python -m anemll.ane_converter.llama_converter \
+        --part 2 \
         $LUT2_PARAM \
+        --chunk $NUM_CHUNKS \
+        --context-length $CONTEXT_LENGTH \
+        --batch-size $BATCH_SIZE \
         --prefix \"$PREFIX\" \
-        --input \"$OUTPUT_DIR\" \
+        --model \"$MODEL_PATH\" \
         --output \"$OUTPUT_DIR\""
 else
-    run_step 5 "Combining Models" "python \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
-        --chunk $NUM_CHUNKS \
-        --prefix \"$PREFIX\" \
-        --input \"$OUTPUT_DIR\" \
-        --output \"$OUTPUT_DIR\""
+    echo "Skipping step 3: Converting FFN"
 fi
 
-# Step 6: Compile Models
-run_step 6 "Compiling Models Part 1" "python \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 1 $LUT1_PARAM --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
-run_step 6 "Compiling Models Part 3" "python \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 3 $LUT3_PARAM --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
-run_step 6 "Compiling Models Part 2" "python \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 2 $LUT2_PARAM --chunk $NUM_CHUNKS --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+    run_step 4 "Converting Prefill" "python -m anemll.ane_converter.llama_converter \
+        --part 2_prefill \
+        $LUT2_PARAM \
+        --chunk $NUM_CHUNKS \
+        --context-length $CONTEXT_LENGTH \
+        --batch-size $BATCH_SIZE \
+        --prefix \"$PREFIX\" \
+        --model \"$MODEL_PATH\" \
+        --output \"$OUTPUT_DIR\""
+else
+    echo "Skipping step 4: Converting Prefill"
+fi
+
+# Step 5: Combine Models
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+    if [ ! -z "$LUT_PART2" ]; then
+        run_step 5 "Combining Models" "python \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
+            --chunk $NUM_CHUNKS \
+            $LUT2_PARAM \
+            --prefix \"$PREFIX\" \
+            --input \"$OUTPUT_DIR\" \
+            --output \"$OUTPUT_DIR\""
+    else
+        run_step 5 "Combining Models" "python \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
+            --chunk $NUM_CHUNKS \
+            --prefix \"$PREFIX\" \
+            --input \"$OUTPUT_DIR\" \
+            --output \"$OUTPUT_DIR\""
+    fi
+else
+    echo "Skipping step 5: Combining Models"
+fi
+
+# Step 6: Compile Models - Always run compilation for all parts that have LUT specified
+run_step 6 "Compiling Models Part 1" "python \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 1 ${LUT_PART1:+--lut $LUT_PART1} --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+run_step 6 "Compiling Models Part 3" "python \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 3 ${LUT_PART3:+--lut $LUT_PART3} --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+    run_step 6 "Compiling Models Part 2" "python \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 2 ${LUT_PART2:+--lut $LUT_PART2} --chunk $NUM_CHUNKS --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+fi
 
 # Step 7: Copy tokenizer files and create meta.yaml
 if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
@@ -284,6 +306,17 @@ LUT_LMH = sys.argv[6]
 NUM_CHUNKS = sys.argv[7]
 PREFIX = sys.argv[8]
 OUTFILE = sys.argv[9]
+
+# Construct model names with LUT suffixes if specified
+embeddings_name = f'{PREFIX}_embeddings' + (f'_lut{LUT_EMB}' if LUT_EMB != 'none' else '')
+lmhead_name = f'{PREFIX}_lm_head' + (f'_lut{LUT_LMH}' if LUT_LMH != 'none' else '')
+ffn_base = f'{PREFIX}_FFN_PF' + (f'_lut{LUT_FFN}' if LUT_FFN != 'none' else '')
+
+# Add .mlmodelc extension to model paths
+embeddings_path = f'{embeddings_name}.mlmodelc'
+lmhead_path = f'{lmhead_name}.mlmodelc'
+ffn_path = f'{ffn_base}.mlmodelc'
+
 meta = f'''model_info:
   name: anemll-{MODEL_NAME}-ctx{CONTEXT}
   version: 0.2.0
@@ -304,6 +337,9 @@ meta = f'''model_info:
     lut_lmhead: {LUT_LMH}
     num_chunks: {NUM_CHUNKS}
     model_prefix: {PREFIX}
+    embeddings: {embeddings_path}
+    lm_head: {lmhead_path}
+    ffn: {ffn_path}
 '''
 with open(OUTFILE, 'w') as f:
     f.write(meta)
@@ -313,7 +349,6 @@ fi
 
 # Step 8: Test with chat.py
 run_step 8 "Testing with chat.py" "python \"$PROJECT_ROOT/tests/chat.py\" \
-    --meta \"$OUTPUT_DIR/meta.yaml\" \
     --meta \"$OUTPUT_DIR/meta.yaml\" \
     --prompt \"Who are you ?\""
 
@@ -327,10 +362,14 @@ echo "python $PROJECT_ROOT/tests/chat_full.py \\"
 echo "    --meta \"$OUTPUT_DIR/meta.yaml\""
 
 echo -e "\nOption 2 - Manual configuration:"
+EMBEDDINGS_NAME="${PREFIX}_embeddings${LUT_PART1:+_lut$LUT_PART1}"
+LMHEAD_NAME="${PREFIX}_lm_head${LUT_PART3:+_lut$LUT_PART3}"
+FFN_BASE="${PREFIX}_FFN_PF${LUT_PART2:+_lut$LUT_PART2}"
+
 echo "python $PROJECT_ROOT/tests/chat.py \\"
-echo "    --embed ${PREFIX}_embeddings \\"
-echo "    --lmhead ${PREFIX}_lm_head${LUT3_PARAM:+_lut$LUT_PART3} \\"
-echo "    --ffn ${PREFIX}_FFN_PF${LUT2_PARAM:+_lut$LUT_PART2}_chunk_01of$(printf "%02d" $NUM_CHUNKS) \\"
+echo "    --embed $EMBEDDINGS_NAME \\"
+echo "    --lmhead $LMHEAD_NAME \\"
+echo "    --ffn ${FFN_BASE}_chunk_01of$(printf "%02d" $NUM_CHUNKS) \\"
 echo "    --tokenizer \"$OUTPUT_DIR\" \\"
 echo "    --context-length $CONTEXT_LENGTH \\"
 echo "    --d \"$OUTPUT_DIR\""

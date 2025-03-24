@@ -144,7 +144,9 @@ def main():
     
     # Construct input filename based on part and parameters
     if args.part == '1':
-        input_name = f'{args.prefix}_embeddings.mlpackage'
+        # Add LUT suffix for embeddings if specified
+        lut_suffix = f'_lut{args.lut}' if args.lut else ''
+        input_name = f'{args.prefix}_embeddings{lut_suffix}.mlpackage'
     elif args.part == '3':
         # Make LUT optional for part 3
         lut_suffix = f'_lut{args.lut}' if args.lut else ''
