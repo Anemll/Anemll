@@ -14,13 +14,29 @@ public struct ModelConfiguration {
     let contextLength: Int
     let batchSize: Int
     let version: String
+    var modelPath: String?  // Add model path property
     
-    // Check if v110 should be true based on version
+    // Make shouldUseV110 settable while keeping the default behavior
     var shouldUseV110: Bool {
-        return version == "0.1.1"
+        get {
+            return version == "0.1.1" || version.hasPrefix("v0.1.1")
+        }
+        set {
+            // This is a trick to allow setting the property - we'll actually store it in _manualV110Flag
+            _manualV110Flag = newValue
+        }
     }
     
-    init(from yamlContent: String) throws {
+    // Private backing field for manual override
+    private var _manualV110Flag: Bool?
+    
+    // Allow manual override of v110 flag
+    var manuallySetV110: Bool? {
+        get { return _manualV110Flag }
+        set { _manualV110Flag = newValue }
+    }
+    
+    init(from yamlContent: String, modelPath: String? = nil) throws {
         // Default values
         var modelPrefix = "model"
         var numChunks = 1
@@ -168,8 +184,14 @@ public struct ModelConfiguration {
         self.contextLength = contextLength
         self.batchSize = batchSize
         self.version = version
+        self.modelPath = modelPath
         
         print("📊 ModelConfiguration initialized: modelPrefix='\(modelPrefix)', numChunks=\(numChunks), lutLMHead=\(String(describing: lutLMHead)), lutFFN=\(String(describing: lutFFN)), lutEmbeddings=\(String(describing: lutEmbeddings)), contextLength=\(contextLength), batchSize=\(batchSize), version=\(version)")
-        print("📊 v110 flag should be: \(self.shouldUseV110 ? "true" : "false") based on version \(version)")
+        
+        let v110Reason = self._manualV110Flag != nil ? "MANUALLY SET" : "version check"
+        print("📊 v110 flag is: \(self.shouldUseV110 ? "TRUE" : "FALSE") (\(v110Reason)) based on version \(version)")
+        if let path = self.modelPath {
+            print("📂 Model path: \(path)")
+        }
     }
 } 

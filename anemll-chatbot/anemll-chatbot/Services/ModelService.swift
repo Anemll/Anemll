@@ -1100,7 +1100,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             print("📝 Parsing meta.yaml content...")
             
             // Parse meta.yaml to get model configuration
-            let config = try ModelConfiguration(from: metaYamlContent)
+            let config = try ModelConfiguration(from: metaYamlContent, modelPath: modelDir.path)
             print("📋 Model configuration parsed successfully")
             
             // Initialize collections for blobs and trees information
@@ -1237,7 +1237,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                 self.currentDownloadingFiles[modelId] = "Starting model download..."
                 
                 // Step 2: Parse meta.yaml to create ModelConfiguration
-                let config = try ModelConfiguration(from: metaYamlContent)
+                let config = try ModelConfiguration(from: metaYamlContent, modelPath: modelDir.path)
                 
                 // Step 3: Get required files using the improved method
                 let requiredFiles = self.getRequiredFiles(from: config)
@@ -1791,11 +1791,9 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         // 1. Embeddings model directory structure
         let embedDirName: String
         if let lutEmbeddings = config.lutEmbeddings, lutEmbeddings > 0 {
-            // If LUT embeddings is explicitly specified and > 0
             embedDirName = "\(config.modelPrefix)_embeddings_lut\(lutEmbeddings).mlmodelc"
             print("Using specified LUT embeddings value: \(lutEmbeddings)")
         } else {
-            // If LUT embeddings is nil, "none", or 0, use version without LUT suffix
             embedDirName = "\(config.modelPrefix)_embeddings.mlmodelc"
             print("Using embeddings without LUT suffix (for lut_embeddings=none/nil/0)")
         }
@@ -2108,7 +2106,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
     }
     
     /// Verifies that all required files for a model exist
-    public func verifyModelFiles(modelId: String) -> Bool {
+    public func verifyModelFiles(modelId: String, verbose: Bool = true) -> Bool {
         let modelDir = getModelPath(for: modelId)
         
         guard fileManager.fileExists(atPath: modelDir.path) else {
@@ -2130,11 +2128,13 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         let configJsonExists = fileManager.fileExists(atPath: configJsonPath.path)
         let tokenizerJsonExists = fileManager.fileExists(atPath: tokenizerJsonPath.path)
         
-        print("📋 Verification for model: \(modelId)")
-        print("Basic files:")
-        print("  - meta.yaml: \(metaYamlExists ? "✅" : "❌")")
-        print("  - config.json: \(configJsonExists ? "✅" : "❌")")
-        print("  - tokenizer.json: \(tokenizerJsonExists ? "✅" : "❌")")
+        if verbose {
+            print("📋 Verification for model: \(modelId)")
+            print("Basic files:")
+            print("  - meta.yaml: \(metaYamlExists ? "✅" : "❌")")
+            print("  - config.json: \(configJsonExists ? "✅" : "❌")")
+            print("  - tokenizer.json: \(tokenizerJsonExists ? "✅" : "❌")")
+        }
         
         var allRequiredFilesExist = true
         var missingFiles: [String] = []
@@ -2169,7 +2169,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                 print("Successfully read meta.yaml")
                 
                 // Attempt to parse the ModelConfiguration to get precise values for verification
-                let modelConfig = try ModelConfiguration(from: yamlContent)
+                let modelConfig = try ModelConfiguration(from: yamlContent, modelPath: modelDir.path)
                 print("Using exact configuration from meta.yaml for verification:")
                 print("  - Model prefix: \(modelConfig.modelPrefix)")
                 print("  - Num chunks: \(modelConfig.numChunks)")
@@ -2227,15 +2227,19 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                 
                 // Size verification
                 let sizePercentage = expectedSize > 0 ? Double(actualTotalSize) / Double(expectedSize) * 100.0 : 0
-                print("\n📊 Size verification:")
-                print("  - Expected size: \(formatFileSize(Int64(expectedSize)))")
-                print("  - Actual size: \(formatFileSize(actualTotalSize))")
-                print("  - Completeness: \(String(format: "%.1f", sizePercentage))%")
-                
-                // Check if size is significantly different from expected
+                // Check if size is valid (>=95% of expected)
                 let hasValidSize = sizePercentage >= 95.0
-                let sizeStatusEmoji = hasValidSize ? "✅" : "⚠️"
-                print("  - Size validation: \(sizeStatusEmoji) \(hasValidSize ? "Valid" : "Incomplete")")
+                
+                if verbose {
+                    print("\n📊 Size verification:")
+                    print("  - Expected size: \(formatFileSize(Int64(expectedSize)))")
+                    print("  - Actual size: \(formatFileSize(actualTotalSize))")
+                    print("  - Completeness: \(String(format: "%.1f", sizePercentage))%")
+                    
+                    // Check if size is significantly different from expected
+                    let sizeStatusEmoji = hasValidSize ? "✅" : "⚠️"
+                    print("  - Size validation: \(sizeStatusEmoji) \(hasValidSize ? "Valid" : "Incomplete")")
+                }
                 
                 // Update model size if it's significantly different from expected
                 // (either too large or too small)
@@ -2308,8 +2312,10 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                     }
                     
                     // Print with size information
-                    let sizeInfo = weightBinExists ? " (\(formatFileSize(fileSize)))" : ""
-                    print("  \(weightBinExists ? "✅" : "❌") \(dirName)/weights/weight.bin\(sizeInfo)")
+                    if verbose {
+                        let sizeInfo = weightBinExists ? " (\(formatFileSize(fileSize)))" : ""
+                        print("  \(weightBinExists ? "✅" : "❌") \(dirName)/weights/weight.bin\(sizeInfo)")
+                    }
                     
                     if !weightBinExists {
                         hasAllWeightFiles = false
@@ -2320,41 +2326,57 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                 
                 // Size verification
                 let sizePercentage = expectedSize > 0 ? Double(actualTotalSize) / Double(expectedSize) * 100.0 : 0
-                print("\n📊 Size verification:")
-                print("  - Expected size: \(formatFileSize(Int64(expectedSize)))")
-                print("  - Actual size: \(formatFileSize(actualTotalSize))")
-                print("  - Completeness: \(String(format: "%.1f", sizePercentage))%")
-                
-                // Check if size is significantly different from expected
+                // Check if size is valid (>=95% of expected)
                 let hasValidSize = sizePercentage >= 95.0
-                let sizeStatusEmoji = hasValidSize ? "✅" : "⚠️"
-                print("  - Size validation: \(sizeStatusEmoji) \(hasValidSize ? "Valid" : "Incomplete")")
+                
+                if verbose {
+                    print("\n📊 Size verification:")
+                    print("  - Expected size: \(formatFileSize(Int64(expectedSize)))")
+                    print("  - Actual size: \(formatFileSize(actualTotalSize))")
+                    print("  - Completeness: \(String(format: "%.1f", sizePercentage))%")
+                    
+                    // Check if size is significantly different from expected
+                    let sizeStatusEmoji = hasValidSize ? "✅" : "⚠️"
+                    print("  - Size validation: \(sizeStatusEmoji) \(hasValidSize ? "Valid" : "Incomplete")")
+                }
                 
                 if hasAllWeightFiles && hasValidSize {
-                    print("\n✅ Model verification SUCCESSFUL: All weight files present and valid size.")
+                    if verbose {
+                        print("\n✅ Model verification SUCCESSFUL: All weight files present and valid size.")
+                    }
                     return true
                 } else if hasAllWeightFiles && !hasValidSize {
-                    print("\n⚠️ Model verification PARTIALLY SUCCESSFUL: All weight files present but total size (\(formatFileSize(actualTotalSize))) is less than expected (\(formatFileSize(Int64(expectedSize)))).")
+                    if verbose {
+                        print("\n⚠️ Model verification PARTIALLY SUCCESSFUL: All weight files present but total size (\(formatFileSize(actualTotalSize))) is less than expected (\(formatFileSize(Int64(expectedSize)))).")
+                    }
                     return true
                 } else {
-                    print("\n❌ Model verification FAILED: Missing weight files:")
-                    for file in weightFilesMissing {
-                        print("   - \(file)")
-                    }
-                    if !hasValidSize {
-                        print("   - Size mismatch: Expected \(formatFileSize(Int64(expectedSize))), got \(formatFileSize(actualTotalSize)) (\(String(format: "%.1f", sizePercentage))%)")
+                    if verbose {
+                        print("\n❌ Model verification FAILED: Missing weight files:")
+                        for file in weightFilesMissing {
+                            print("   - \(file)")
+                        }
+                        if !hasValidSize {
+                            print("   - Size mismatch: Expected \(formatFileSize(Int64(expectedSize))), got \(formatFileSize(actualTotalSize)) (\(String(format: "%.1f", sizePercentage))%)")
+                        }
                     }
                     return false
                 }
             } else {
-                print("❌ Model verification FAILED: No .mlmodelc directories found or missing essential files")
+                if verbose {
+                    print("❌ Model verification FAILED: No .mlmodelc directories found or missing essential files")
+                }
                 return false
             }
         } catch {
-            print("Error checking for .mlmodelc directories: \(error)")
+            if verbose {
+                print("Error checking for .mlmodelc directories: \(error)")
+            }
         }
         
-        print("❌ Model verification FAILED: Could not verify model files")
+        if verbose {
+            print("❌ Model verification FAILED: Could not verify model files")
+        }
         return allRequiredFilesExist
     }
 
@@ -2416,7 +2438,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                 
                 print("✅ Model loaded successfully: \(model.id) (100%)")
             } catch {
-                print("❌ Error loading model: \(error.localizedDescription)")
+                print("❌ MS.1 Error loading model: \(error.localizedDescription)")
                 
                 // Don't post failure notifications for cancellation errors
                 if error is CancellationError {
@@ -2754,7 +2776,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                 print(metaYamlContent)
                 
                 // Parse the model configuration to get the correct capitalization
-                modelConfig = try ModelConfiguration(from: metaYamlContent)
+                modelConfig = try ModelConfiguration(from: metaYamlContent, modelPath: modelDir.path)
                 if let config = modelConfig {
                     print("Model prefix with correct capitalization: \(config.modelPrefix)")
                 }

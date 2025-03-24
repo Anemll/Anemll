@@ -580,7 +580,8 @@ struct ModelManagementView: View {
                         isDownloading: $isDownloading,
                         downloadProgress: $downloadProgress,
                         currentDownloadingFile: $currentDownloadingFile,
-                        modelsWithIncompleteFiles: modelsWithIncompleteFiles
+                        modelsWithIncompleteFiles: modelsWithIncompleteFiles,
+                        modelErrors: modelErrors
                     )
                 }
                 
@@ -681,8 +682,8 @@ struct ModelManagementView: View {
             
             // Map each one to check if it has incomplete files
             for model in downloadedModels {
-                // Use the detailed verification
-                let verificationDetails = modelService.verifyModelWithDetails(modelId: model.id)
+                // Use the detailed verification with verbose off to reduce logging
+                let verificationDetails = modelService.verifyModelWithDetails(modelId: model.id, verbose: false)
                 let isValid = verificationDetails.isValid
                 let actualSize = verificationDetails.actualSize
                 let expectedSize = model.size
@@ -768,7 +769,7 @@ struct ModelManagementView: View {
             // Check each downloaded model for incomplete files
             for model in downloadedModels {
                 // Use the detailed verification method
-                let verificationDetails = modelService.verifyModelWithDetails(modelId: model.id)
+                let verificationDetails = modelService.verifyModelWithDetails(modelId: model.id, verbose: false)
                 let isValid = verificationDetails.isValid
                 let actualSize = verificationDetails.actualSize
                 let expectedSize = model.size
@@ -822,6 +823,17 @@ struct ModelManagementView: View {
         // Clear any selected model to prevent stale references
         selectedModel = nil
         
+        // Cancel the model check timer to prevent background verification
+        cancelModelCheckTimer()
+        
+        // Cancel any in-progress verification tasks
+        Task {
+            // Log that we're cleaning up
+            print("Cleaning up background tasks when ModelManagementView disappeared")
+            // No more need to update UI
+            isLoading = false
+        }
+        
         // Remove notification observers
         NotificationCenter.default.removeObserver(self, name: Notification.Name("DownloadDefaultModel"), object: nil)
         NotificationCenter.default.removeObserver(self, name: Notification.Name("DownloadSelectedModel"), object: nil)
@@ -842,7 +854,7 @@ struct ModelManagementView: View {
             let models = ModelService.shared.getAvailableModels()
             AppLogger.info("Loaded \(models.count) models from ModelService", category: .models)
             
-            // Verify model files in background
+            // Verify model files in background with reduced logging
             for model in models where model.isDownloaded {
                 let isValid = ModelService.shared.verifyModelFiles(modelId: model.id)
                 AppLogger.info("Model \(model.id) verification: \(isValid ? "✅" : "❌")", category: .models)
@@ -903,63 +915,99 @@ struct ModelManagementView: View {
     }
     
     // Optimized model refresh with performance tracking
-    private func refreshModels(fullRefresh: Bool = false) {
-        let state = signposter.beginInterval("ModelRefresh", id: signpostID)
-        
-        // Only perform a full refresh (with new UUID) when explicitly requested
-        if fullRefresh {
-            // print("🔄 Performing FULL refresh of model management view")
-            refreshID = UUID()
-                            } else {
-            // Otherwise, use a lighter approach to update model states
-            // print("🔄 Performing lightweight refresh of model management view")
+    private func refreshModels(fullRefresh: Bool = true) {
+        Task {
+            // Get models that are marked as downloaded
+            let downloadedModels = modelsList.filter { $0.isDownloaded }
             
-            #if os(iOS)
-            // Force a layout update without full view reconstruction
-            UIView.performWithoutAnimation {
-                if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                   let window = windowScene.windows.first(where: { $0.isKeyWindow }) {
-                    window.layoutIfNeeded()
+            // Create a temporary set to avoid UI flickering
+            var incompleteModels = Set<String>()
+            var completelyMissingModels = Set<String>()
+            var modelErrors: [String: String] = [:]  // Track specific errors for each model
+            
+            // Map each one to check if it has incomplete files
+            for model in downloadedModels {
+                // Use the detailed verification with verbose off to reduce logging
+                let verificationDetails = modelService.verifyModelWithDetails(modelId: model.id, verbose: false)
+                let isValid = verificationDetails.isValid
+                let actualSize = verificationDetails.actualSize
+                let expectedSize = model.size
+                let sizePercentage = Float(actualSize) / Float(expectedSize) * 100.0
+                
+                // Check for specific LUT-related errors
+                let missingFiles = verificationDetails.missingFiles
+                let lutErrors = missingFiles.filter { $0.contains("_lut") }
+                if !lutErrors.isEmpty {
+                    let errorMsg = "Missing LUT files: \(lutErrors.joined(separator: ", "))"
+                    modelErrors[model.id] = errorMsg
+                    print("🚨 \(errorMsg)")
+                    incompleteModels.insert(model.id)
+                }
+                
+                if actualSize == 0 || (!isValid && sizePercentage < 5.0) {
+                    // Model is completely missing
+                    print("🚨 Model \(model.id) is completely missing - valid: \(isValid), size: \(formatFileSize(actualSize))/\(formatFileSize(expectedSize)) (\(String(format: "%.1f", sizePercentage))%)")
+                    completelyMissingModels.insert(model.id)
+                    
+                    // Mark it as not downloaded
+                    await MainActor.run {
+                        model.isDownloaded = false
+                    }
+                } else if !isValid || sizePercentage < 95.0 {
+                    // If files are missing or size is significantly less than expected
+                    print("⚠️ Model \(model.id) is incomplete - valid: \(isValid), size: \(formatFileSize(actualSize))/\(formatFileSize(expectedSize)) (\(String(format: "%.1f", sizePercentage))%)")
+                    incompleteModels.insert(model.id)
+                    
+                    // Add size error if no LUT error already exists
+                    if modelErrors[model.id] == nil {
+                        modelErrors[model.id] = "Incomplete download: \(String(format: "%.1f", sizePercentage))% of expected size"
+                    }
                 }
             }
-            #endif
             
-            // Update ActiveModel section by forcing refresh
-            self.refreshID = UUID()
-            
-            // Update models without full view refresh
-            Task {
-                // Get updated model statuses without requiring a full view refresh
-                for model in modelService.getAvailableModels() {
-                    model.refreshDownloadStatus()
+            // Update UI status
+            await MainActor.run {
+                self.modelsWithIncompleteFiles = incompleteModels
+                // Store error messages for display
+                self.modelErrors = modelErrors
+                
+                // If this was a full refresh, update the refresh token
+                if fullRefresh {
+                    self.refreshID = UUID()
                 }
             }
         }
-        
-        signposter.endInterval("ModelRefresh", state)
     }
     
     // Timer management - use a state property instead of direct timer reference
     @State private var modelCheckTimer: Timer? = nil
     
+    
     private func startModelCheckTimer() {
         // Cancel any existing timer first
         cancelModelCheckTimer()
         
-        // Create a timer that updates less frequently (3 seconds) to reduce UI load
-        self.modelCheckTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { timer in
+        // Create a timer that updates less frequently (10 seconds) to reduce overhead
+        self.modelCheckTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { timer in
+            // Skip verification if the view is not visible anymore
+            if !self.hasAppeared {
+                print("Skipping model verification - view not visible")
+                timer.invalidate()
+                return
+            }
+            
             // Check models in background to avoid UI freezes
             Task {
                 let state = self.signposter.beginInterval("ModelCheck", id: self.signpostID)
                 
-                // MARK: SkipVerification - Check if any download is in progress before performing verification
+                // Check if any download is in progress before performing verification
                 let isAnyModelDownloading = await MainActor.run {
                     return self.isDownloading.values.contains(true)
                 }
                 
                 if isAnyModelDownloading {
                     // Skip verification if any model is being downloaded
-                    print("Skipping model verification due to active download in progress")
+                    print("Skipping model verification due to active download")
                     self.signposter.endInterval("ModelCheck", state)
                     return
                 }
@@ -1091,8 +1139,8 @@ struct ModelManagementView: View {
                         // Add verification after download completes
                         Task {
                             // Perform verification in background
-                            print("🔍 Verifying downloaded model: \(model.id)")
-                            let verificationDetails = self.modelService.verifyModelWithDetails(modelId: model.id)
+                            print("🔍 Verifying model: \(model.id)")
+                            let verificationDetails = self.modelService.verifyModelWithDetails(modelId: model.id, verbose: false)
                             let isValid = verificationDetails.isValid
                             let actualSize = verificationDetails.actualSize
                             let expectedSize = model.size
@@ -1449,7 +1497,7 @@ struct ModelManagementView: View {
             
             // Perform verification
             print("🔍 Verifying after downloading missing files for model: \(model.id)")
-            let verificationDetails = self.modelService.verifyModelWithDetails(modelId: model.id)
+            let verificationDetails = self.modelService.verifyModelWithDetails(modelId: model.id, verbose: false)
             let isValid = verificationDetails.isValid
             let actualSize = verificationDetails.actualSize
             let expectedSize = model.size
@@ -1519,7 +1567,7 @@ struct ModelManagementView: View {
             
             // Perform verification after full redownload
             print("🔍 Verifying after complete redownload of model: \(model.id)")
-            let verificationDetails = self.modelService.verifyModelWithDetails(modelId: model.id)
+            let verificationDetails = self.modelService.verifyModelWithDetails(modelId: model.id, verbose: false)
             let isValid = verificationDetails.isValid
             let actualSize = verificationDetails.actualSize
             let expectedSize = model.size
@@ -1558,7 +1606,7 @@ struct ModelManagementView: View {
         
         if model.isDownloaded {
             // Check if the model needs verification
-            let verificationDetails = modelService.verifyModelWithDetails(modelId: model.id)
+            let verificationDetails = modelService.verifyModelWithDetails(modelId: model.id, verbose: false)
             let hasIncompleteFiles = !verificationDetails.isValid
             let actualSize = verificationDetails.actualSize
             let expectedSize = model.size
@@ -1679,6 +1727,9 @@ struct ModelManagementView: View {
         // For web URLs, return as is
         return url
     }
+    
+    // Add property to store model errors
+    @State private var modelErrors: [String: String] = [:]
 }
 
 // MARK: - UI Components
@@ -1890,6 +1941,7 @@ struct AvailableModelsSection: View {
     @Binding var downloadProgress: [String: Double]
     @Binding var currentDownloadingFile: [String: String]
     let modelsWithIncompleteFiles: Set<String>
+    let modelErrors: [String: String]
     
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1944,7 +1996,8 @@ struct AvailableModelsSection: View {
                         onDownload: { onDownload(model) },
                         onCancelDownload: { onCancelDownload(model) },
                         onShowInfo: { onShowInfo(model) },
-                        hasIncompleteFiles: modelsWithIncompleteFiles.contains(model.id)
+                        hasIncompleteFiles: modelsWithIncompleteFiles.contains(model.id),
+                        errorMessage: modelErrors[model.id]
                     )
                 }
             }
@@ -2187,7 +2240,7 @@ extension ModelService {
     }
     
     // Verify the model and return detailed information
-    func verifyModelWithDetails(modelId: String) -> (isValid: Bool, actualSize: Int, missingFiles: [String], fileSizes: [String: Int]) {
+    func verifyModelWithDetails(modelId: String, verbose: Bool = true) -> (isValid: Bool, actualSize: Int, missingFiles: [String], fileSizes: [String: Int]) {
         let modelPath = getModelPath(for: modelId)
         var fileSizes: [String: Int] = [:]
         let missingFiles: [String] = []

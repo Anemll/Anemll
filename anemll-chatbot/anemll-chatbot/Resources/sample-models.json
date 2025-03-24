@@ -1,0 +1,12 @@
+[
+
+  {
+    "id": "llama-2-7b-chat",
+    "name": "LLaMA 2 7B Chat",
+    "description": "Meta's 7B parameter chat model optimized for dialogue use cases.",
+    "size": 7000000000,
+    "downloadURL": "https://huggingface.co/meta-llama/Llama-2-7b-chat",
+    "isDownloaded": false,
+    "sourceURL": "https://huggingface.co/meta-llama/Llama-2-7b-chat"
+  }
+] 

@@ -17,6 +17,8 @@ struct ModelListItemHorizontal: View {
     
     // Check if the model has incomplete files
     let hasIncompleteFiles: Bool
+    // Add error message property
+    let errorMessage: String?
     
     // Constants for uniform button sizing
     private let buttonWidth: CGFloat = 80
@@ -74,9 +76,15 @@ struct ModelListItemHorizontal: View {
                             .foregroundColor(.secondary)
                             
                         if isDownloaded && hasIncompleteFiles {
-                            Text("Files incomplete")
-                                .font(.caption)
-                                .foregroundColor(.orange)
+                            if let error = errorMessage {
+                                Text(error)
+                                    .font(.caption)
+                                    .foregroundColor(.orange)
+                            } else {
+                                Text("Files incomplete")
+                                    .font(.caption)
+                                    .foregroundColor(.orange)
+                            }
                         }
                     }
                 }
@@ -102,9 +110,11 @@ struct ModelListItemHorizontal: View {
                     if isDownloaded && !isDownloading {
                         ActionButton(
                             title: "Load",
-                            color: Color.purple,
+                            color: hasIncompleteFiles ? Color.gray : Color.purple,
                             action: onLoad
                         )
+                        .disabled(hasIncompleteFiles)
+                        .help(hasIncompleteFiles ? "Cannot load model with missing files" : "Load model")
                     }
                     
                     // Download button (for downloaded models to verify/update)
@@ -114,7 +124,7 @@ struct ModelListItemHorizontal: View {
                             color: hasIncompleteFiles ? Color.orange : Color.blue.opacity(0.8),
                             action: onDownload
                         )
-                        .help("Download missing files or verify completeness")
+                        .help(hasIncompleteFiles ? "Download missing files" : "Verify completeness")
                     }
                     
                     // Delete button (only for downloaded models)

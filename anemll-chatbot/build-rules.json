@@ -1,0 +1,39 @@
+{
+  "build": {
+    "command": "cd ${PROJECT_ROOT} && xcodebuild -project anemll-chatbot.xcodeproj -scheme \"anemll-chatbot\" -configuration Debug -sdk iphonesimulator -destination \"platform=iOS Simulator,id=58236138-D5F1-467F-8D13-526F90BFA5A5\" build",
+    "description": "Build command for anemll-chatbot project",
+    "troubleshooting": {
+      "empty_target_error": {
+        "error": "target 'anemll-chatbot.xcodeproj' referenced in product 'anemll-chatbot.xcodeproj' is empty",
+        "solution": "Open the project in Xcode first to properly initialize package dependencies:",
+        "fix_command": "open ${PROJECT_ROOT}/anemll-chatbot.xcodeproj"
+      }
+    },
+    "notes": [
+      "Uses Debug configuration for development builds",
+      "Targets iOS Simulator",
+      "Requires opening in Xcode first if package dependencies need initialization",
+      "PROJECT_ROOT should be set to the root directory of the anemll-chatbot project"
+    ]
+  },
+  "models": {
+    "json_handling": {
+      "description": "Rules for handling Models.json",
+      "source_url_format": {
+        "custom_models": "${MODEL_ROOT}/models/custom/<model_name>",
+        "downloaded_models": "${MODEL_ROOT}/models/downloaded/<model_name>"
+      },
+      "environment": {
+        "MODEL_ROOT": {
+          "description": "Root directory for model storage",
+          "required": true
+        }
+      },
+      "rules": [
+        "Never expose absolute filesystem paths in Models.json",
+        "Use ${MODEL_ROOT} variable for all model paths",
+        "Keep source URLs private by using environment variables"
+      ]
+    }
+  }
+} 

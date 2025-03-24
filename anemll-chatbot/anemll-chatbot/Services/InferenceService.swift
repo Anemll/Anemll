@@ -347,7 +347,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     }
     
     nonisolated func loadingFailed(error: Error) {
-        print("❌ Error loading model: \(error)")
+        print("❌ IS.1: Error loading model: \(error)")
         
         // Switch to the main actor for UI updates
         Task { @MainActor in
@@ -384,14 +384,17 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     ///   - modelPrefix: The prefix of the model (e.g., "llama")
     ///   - numChunks: The number of chunks in the model
     ///   - lutFFN: The LUT value for FFN
+    ///   - lutLMHead: The LUT value for LM Head
+    ///   - lutEmbeddings: The LUT value for Embeddings
     ///   - modelDir: The URL of the model directory
     /// - Returns: A tuple with a boolean indicating success and a string message
-    private func verifyModelFiles(modelPrefix: String, numChunks: Int, lutFFN: Int, lutLMHead: Int, modelDir: URL) -> (success: Bool, message: String) {
+    private func verifyModelFiles(modelPrefix: String, numChunks: Int, lutFFN: Int, lutLMHead: Int, lutEmbeddings: Int?, modelDir: URL) -> (success: Bool, message: String) {
         print("📋 Verifying model files using ONLY the configuration specified in meta.yaml:")
         print("  - Model prefix: \(modelPrefix)")
         print("  - Number of chunks: \(numChunks)")
         print("  - LUT FFN value: \(lutFFN)")
         print("  - LUT LM Head value: \(lutLMHead)")
+        print("  - LUT Embeddings value: \(lutEmbeddings != nil ? String(lutEmbeddings!) : "nil")")
         print("  - Model directory: \(modelDir.path)")
         
         let fileManager = FileManager.default
@@ -400,7 +403,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         // Create a list of all required files
         var requiredFiles: [String] = [
             // Main model components
-            "\(modelPrefix)_embeddings.mlmodelc",
+            lutEmbeddings != nil && lutEmbeddings! > 0 ? "\(modelPrefix)_embeddings_lut\(lutEmbeddings!).mlmodelc" : "\(modelPrefix)_embeddings.mlmodelc",
             "\(modelPrefix)_lm_head_lut\(lutLMHead).mlmodelc",
             "meta.yaml",
             "config.json",
@@ -408,7 +411,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
             "tokenizer_config.json"
         ]
         
-        // Add chunk files
+        // Add chunk files - this is the only correct format for FFN files
         for i in 1...numChunks {
             let chunkName = String(format: "\(modelPrefix)_FFN_PF_lut\(lutFFN)_chunk_%02dof%02d.mlmodelc", i, numChunks)
             requiredFiles.append(chunkName)
@@ -710,6 +713,11 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         do {
                             let yamlString = try String(contentsOf: metaYamlPath, encoding: .utf8)
                             
+                            // Debug: Show a preview of the yaml file
+                            print("\n📋 Meta.yaml preview (first 200 characters):")
+                            print(yamlString.prefix(200))
+                            print("...\n")
+                            
                             // Try to extract model prefix from meta.yaml model_info section
                             if let prefixRange = yamlString.range(of: "model_prefix:\\s*[a-zA-Z0-9_]+", options: .regularExpression) {
                                 let prefixString = String(yamlString[prefixRange])
@@ -721,10 +729,23 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             
                             // Try to extract LUT values from meta.yaml
                             // We ONLY use the exact values specified in meta.yaml and don't try random combinations
-                            if let lutEmbRange = yamlString.range(of: "lut_embeddings:\\s*[a-zA-Z0-9_]+", options: .regularExpression) {
+                            if let lutEmbRange = yamlString.range(of: "lut_embeddings:[\\s\\t]*(\\d+|none|None|NONE)", options: .regularExpression) {
                                 let lutString = String(yamlString[lutEmbRange])
-                                lutEmbeddings = lutString.components(separatedBy: ": ").last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "none"
-                                print("Found lut_embeddings in meta.yaml: \(lutEmbeddings)")
+                                let rawValue = lutString.components(separatedBy: ":").last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "none"
+                                
+                                // Check if the value is a number or "none"
+                                if rawValue.lowercased() == "none" {
+                                    lutEmbeddings = "none"
+                                } else if let intValue = Int(rawValue) {
+                                    // Store numeric value as string
+                                    lutEmbeddings = "\(intValue)"
+                                } else {
+                                    // Default to "none" for unrecognized values
+                                    lutEmbeddings = "none"
+                                }
+                                print("Found lut_embeddings in meta.yaml: \(lutEmbeddings) (raw value: \(rawValue))")
+                            } else {
+                                print("No lut_embeddings found in meta.yaml, using default: none")
                             }
                             
                             if let lutFFNRange = yamlString.range(of: "lut_ffn:\\s*\\d+", options: .regularExpression) {
@@ -801,6 +822,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         numChunks: numChunks,
                         lutFFN: lutFFN ?? 0,
                         lutLMHead: lutLMHead ?? 0,
+                        lutEmbeddings: lutEmbeddings == "none" ? nil : Int(lutEmbeddings),
                         modelDir: url
                     )
                     
@@ -839,15 +861,72 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     do {
                         let config = try YAMLConfig.load(from: configURL.path)
                         
-                        // Check if model files exist
-                        let embedPath = url.appendingPathComponent("\(modelPrefix)_embeddings.mlmodelc").path
-                        let lmHeadPath = url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path
-                        let ffnPath = url.appendingPathComponent("\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0)_chunk_01of\(String(format: "%02d", numChunks)).mlmodelc").path
+                        // Define embedDirName here so it's available in both scopes
+                        let embedDirName = lutEmbeddings == "none" ? 
+                            "\(modelPrefix)_embeddings.mlmodelc" :
+                            "\(modelPrefix)_embeddings_lut\(Int(lutEmbeddings) ?? 0).mlmodelc"
+                        let embedPath = url.appendingPathComponent(embedDirName).path
                         
-                        print("Checking model files:")
-                        print("Embed path: \(embedPath) - Exists: \(FileManager.default.fileExists(atPath: embedPath))")
-                        print("LM Head path: \(lmHeadPath) - Exists: \(FileManager.default.fileExists(atPath: lmHeadPath))")
-                        print("FFN path: \(ffnPath) - Exists: \(FileManager.default.fileExists(atPath: ffnPath))")
+                        // Sanity check: Log a warning if the embedDirName doesn't exist but an alternative does
+                        if !FileManager.default.fileExists(atPath: embedPath) {
+                            // Simply log that the expected path doesn't exist
+                            print("⚠️ WARNING: Configured embedDirName '\(embedDirName)' doesn't exist")
+                        }
+                        
+                        // Extra logging to debug path issues
+                        print("📁 EMBEDDINGS PATH DEBUG:")
+                        print("  - modelPrefix: \(modelPrefix)")
+                        print("  - lutEmbeddings: \(lutEmbeddings)")
+                        print("  - resultEmbedDirName: \(embedDirName)")
+                        print("  - fullEmbedPath: \(embedPath)")
+                        print("  - embedDirExists: \(FileManager.default.fileExists(atPath: embedPath))")
+                        
+                        if !FileManager.default.fileExists(atPath: embedPath) {
+                            // No alternative searching, just throw the error
+                            throw InferenceError.inferenceError("Embeddings model not found at: \(embedPath)")
+                        }
+                        if !FileManager.default.fileExists(atPath: url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path) {
+                            throw InferenceError.inferenceError("LM Head model not found at: \(url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path)")
+                        }
+                        
+                        // Check for any FFN chunk, not just chunk_01
+                        let ffnPath01 = url.appendingPathComponent("\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0)_chunk_01of\(String(format: "%02d", numChunks)).mlmodelc").path
+                        let chunkExistsAt01 = FileManager.default.fileExists(atPath: ffnPath01)
+                        
+                        var ffnPathToUse = ffnPath01
+                        
+                        // If first chunk missing, look for any other chunk
+                        if !chunkExistsAt01 {
+                            var foundAnyChunk = false
+                            
+                            // Check all possible chunks
+                            for i in 1...numChunks {
+                                let chunkPath = url.appendingPathComponent("\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0)_chunk_\(String(format: "%02d", i))of\(String(format: "%02d", numChunks)).mlmodelc").path
+                                if FileManager.default.fileExists(atPath: chunkPath) {
+                                    foundAnyChunk = true
+                                    ffnPathToUse = chunkPath
+                                    print("Found alternative chunk: \(chunkPath)")
+                                    break
+                                }
+                            }
+                            
+                            // Also check non-chunked version
+                            let nonChunkedPath = url.appendingPathComponent("\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0).mlmodelc").path
+                            if !foundAnyChunk && FileManager.default.fileExists(atPath: nonChunkedPath) {
+                                foundAnyChunk = true
+                                ffnPathToUse = nonChunkedPath
+                                print("Found non-chunked model: \(nonChunkedPath)")
+                            }
+                            
+                            if !foundAnyChunk {
+                                throw InferenceError.inferenceError("No FFN chunk models found at: \(url.path)")
+                            }
+                        }
+                        
+                        print("Using model paths:")
+                        print("Embed path: \(embedPath)")
+                        print("LM Head path: \(url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path)")
+                        print("FFN path: \(ffnPathToUse)")
                         
                         // List all files in the model directory for debugging
                         if let files = try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) {
@@ -919,8 +998,8 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         // Build the model directories list based on the number of chunks
                         var modelDirs = [URL]()
                         
-                        // Add embeddings
-                        modelDirs.append(url.appendingPathComponent("\(modelPrefix)_embeddings.mlmodelc"))
+                        // Use embedDirName from outer scope
+                        modelDirs.append(url.appendingPathComponent(embedDirName))
                         
                         // Add all chunks
                         for i in 1...numChunks {
@@ -932,204 +1011,63 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         modelDirs.append(url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc"))
                         
                         try checkCancellation()
- 
-                        print("Loading model with \(numChunks) chunks: \(modelDirs.map { $0.lastPathComponent }.joined(separator: ", "))")
-                        
-                        // Calculate the expected total number of model components based on the architecture
-                        // For each chunk, we load both inference and prefill models (2 models per chunk)
-                        // Plus embeddings (1) + lm_head (1)
-                        // We exclude the tokenizer as requested
-                        let expectedTotalComponents = (numChunks * 2) + 2
-                        
-                        print("📊 COMPONENT COUNT BREAKDOWN:")
-                        print("  - Embeddings model: 1 component")
-                        print("  - LM Head model: 1 component")
-                        print("  - FFN Chunks: \(numChunks) chunks × 2 models each (inference + prefill) = \(numChunks * 2) components")
-                        print("  - Total: \(expectedTotalComponents) components")
-                        
-                        // Setup progress tracking for component loading
-                        print("📊 DEBUG: Setting up loading progress tracking - Total components: \(expectedTotalComponents)")
-                        self.totalComponents = expectedTotalComponents
-                        self.loadedComponents = 0
-                        
-                        print("📊 DEBUG: Initial component count - \(self.loadedComponents)/\(self.totalComponents) (Progress: \(self.loadingProgress))")
-                        
-                        // Reset loading progress to ensure it starts from 0%
-                        self.loadingProgress = 0.0
-                        print("📊 DEBUG: Reset loading progress to 0.0")
-                        
-                        // MODIFY: Use a more gradual approach to progress updates
-                        
-                        // Helper function to calculate progress percentage with appropriate scaling
-                        // This ensures a more gradual progression from 0% to 100%
-                        func calculateProgress(phase: String, current: Int, total: Int) -> Double {
-                            print("📊 DEBUG: Calculating progress for phase: \(phase), current: \(current), total: \(total)")
-                            
-                            // Components loading phase: 0% - 70%
-                            if phase == "components" {
-                                // Scale component loading to use only 0-70% of the progress bar
-                                return min(0.7 * (Double(current) / Double(total)), 0.7)
-                            }
-                            // Model loading phase: 70% - 90%
-                            else if phase == "model" {
-                                return 0.7 + 0.2 * (Double(current) / Double(total))
-                            }
-                            // Initialization phase: 90% - 100%
-                            else if phase == "initialization" {
-                                return 0.9 + 0.1 * (Double(current) / Double(total))
-                            }
-                            // Unknown phase or initialization finished
-                            else {
-                                return current >= total ? 1.0 : Double(current) / Double(total)
-                            }
-                        }
-                        
-                        // Initialize tokenizer
-                        self.loadingStatus = "Initializing tokenizer..."
-                        self.loadingProgress = 0.1 // Start at 10% for tokenizer (down from 20%)
-                        print("📊 DEBUG: Starting tokenizer loading - Progress set to: \(self.loadingProgress)")
-                        
-                        try checkCancellation()
-                        
-                        // Check if the tokenizer model is a relative path or an absolute path
-                        let tokenizerFilename = config.tokenizerModel
-                        let tokenizerPath: URL
-                        
-                        if tokenizerFilename.hasPrefix("/") {
-                            // It's an absolute path
-                            tokenizerPath = URL(fileURLWithPath: tokenizerFilename)
-                        } else {
-                            // It's a relative path, append to the model directory
-                            tokenizerPath = url.appendingPathComponent(tokenizerFilename)
-                        }
-                        
-                        print("Looking for tokenizer at: \(tokenizerPath.path)")
-                        
-                        if !FileManager.default.fileExists(atPath: tokenizerPath.path) {
-                            print("Tokenizer file not found: \(tokenizerPath.path)")
-                            
-                            // Try to find a tokenizer file in the model directory
-                            if let files = try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) {
-                                print("Searching for tokenizer files in model directory:")
-                                let tokenizerFiles = files.filter { $0.lastPathComponent.contains("tokenizer") }
-                                for file in tokenizerFiles {
-                                    print("- Found potential tokenizer: \(file.path)")
-                                }
-                            }
-                            
-                            throw InferenceError.tokenizationFailed
-                        }
-                        
-                        print("\nTokenizer Debug:")
-                        print("Input modelPath: \(tokenizerPath.path)")
-                        
-                        // Load tokenizer configuration to get the chat template
-                        let tokenizerConfigPath = url.appendingPathComponent("tokenizer_config.json")
-                        var chatTemplate = "default"  // Default template string
-                        
-                        if FileManager.default.fileExists(atPath: tokenizerConfigPath.path) {
-                            print("Loading tokenizer_config.json")
-                            let configData = try Data(contentsOf: tokenizerConfigPath)
-                            if let config = try JSONSerialization.jsonObject(with: configData) as? [String: Any],
-                               let template = config["chat_template"] as? String {
-                                print("Found chat_template in tokenizer_config.json")
-                                chatTemplate = template
-                            } else {
-                                print("No chat_template found in tokenizer_config.json, using default")
-                            }
-                        }
-                        
-                        print("Using modelURL: \(tokenizerPath.path)")
-                        
-                        // Initialize tokenizer with the template from config
-                        tokenizer = try await Tokenizer(
-                            modelPath: tokenizerPath.path,
-                            template: chatTemplate,  // Now passing a non-optional String
-                            debugLevel: 0
-                        )
-                        
-                        // Tokenizer loaded but not counted in component loading progress
-                        print("✓ Tokenizer loaded successfully!")
-                        
-                        // Add detailed tokenizer configuration debugging
-                        if let tokenizer = tokenizer {
-                            print("\n=============== TOKENIZER CONFIGURATION ===============")
-                            print("Template used: \(chatTemplate)")
-                            print("EOS Token ID: \(tokenizer.eosTokenId)")
-                            
-                            // Check for common EOS tokens for different models
-                            let commonEosIds = [tokenizer.eosTokenId, 2, 100257, 100276, 50256, 0]
-                            print("\nSampling common special tokens:")
-                            
-                            // Try each token to see what it decodes to
-                            for tokenId in commonEosIds {
-                                let tokenStr = tokenizer.decode(tokens: [tokenId], skipSpecialTokens: false)
-                                print("Token ID \(tokenId) decodes to: \"\(tokenStr)\"")
-                                
-                                // Special note for token ID 2 which is commonly used as EOS in DeepSeek models
-                                if tokenId == 2 {
-                                    print("  → Token ID 2 is commonly used as EOS in DeepSeek models")
-                                }
-                                
-                                // Special note for token ID 100257 which is used in some DeepSeek model variants
-                                if tokenId == 100257 {
-                                    print("  → Token ID 100257 is used in some DeepSeek model variants")
-                                }
-                            }
-                            
-                            // Try to find the " " token if used by the model
-                            let eosText = " " // Simple space character
-                            // Create a ChatMessage with the EOS text
-                            let eosMessage = Tokenizer.ChatMessage.user(eosText)
-                            let eosTokens = tokenizer.applyChatTemplate(
-                                input: [eosMessage],
-                                addGenerationPrompt: false
-                            )
-                            print("\nTokens when applying \"\(eosText)\" to template: \(eosTokens)")
-                            print("  → Decodes back to: \"\(tokenizer.decode(tokens: eosTokens, skipSpecialTokens: false))\"")
-                            
-                            print("================ TOKENIZER CONFIG END ================\n")
-                        }
-                        
-                        print("📊 DEBUG: After tokenizer loading - Progress: \(self.loadingProgress), isModelLoaded: \(self.isModelLoaded)")
-                        
-                        try checkCancellation()
-                        
-                        // Load models using ModelLoader
-                        self.loadingStatus = "Loading model components..."
-                        self.loadingProgress = 0.3 // Move to loading actual model components
-                        print("📊 DEBUG: Updated progress to 0.3 for model components loading")
-                        
-                        try checkCancellation()
                         
                         do {
-                            // Check if we need to modify the config paths
+                            // Use embedDirName from above scope
+                            let embedPath = url.appendingPathComponent(embedDirName).path
+                            
                             if !FileManager.default.fileExists(atPath: embedPath) {
+                                // No alternative searching, just throw the error
                                 throw InferenceError.inferenceError("Embeddings model not found at: \(embedPath)")
                             }
-                            if !FileManager.default.fileExists(atPath: lmHeadPath) {
-                                throw InferenceError.inferenceError("LM Head model not found at: \(lmHeadPath)")
+                            if !FileManager.default.fileExists(atPath: url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path) {
+                                throw InferenceError.inferenceError("LM Head model not found at: \(url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path)")
                             }
-                            if !FileManager.default.fileExists(atPath: ffnPath) {
-                                throw InferenceError.inferenceError("FFN model not found at: \(ffnPath)")
+                            if !FileManager.default.fileExists(atPath: ffnPathToUse) {
+                                throw InferenceError.inferenceError("FFN model not found at: \(ffnPathToUse)")
                             }
                             
                             print("Using model paths:")
                             print("Embed path: \(embedPath)")
-                            print("LM Head path: \(lmHeadPath)")
-                            print("FFN path: \(ffnPath)")
+                            print("LM Head path: \(url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path)")
+                            print("FFN path: \(ffnPathToUse)")
                             
                             // Create a modified config with the correct paths
                             let yamlDict: [String: Any] = [
-                                "model_path": ffnPath,
+                                "model_path": ffnPathToUse,
                                 "tokenizer_model": config.tokenizerModel,
                                 "context_length": config.contextLength,
                                 "batch_size": config.batchSize,
                                 "embed_path": embedPath,
-                                "lmhead_path": lmHeadPath,
-                                "ffn_path": ffnPath,
-                                "num_chunks": config.numChunks
+                                "lmhead_path": url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path,
+                                "ffn_path": ffnPathToUse,  // Use the detected path directly, YAMLConfig will handle canonicalization
+                                "num_chunks": config.numChunks,
+                                // Additional metadata to ensure proper path generation in YAMLConfig
+                                "model_prefix": modelPrefix,
+                                "lut_ffn": lutFFN ?? 0,
+                                "lut_lmhead": lutLMHead ?? 0,
+                                "lut_embeddings": lutEmbeddings == "none" ? 0 : Int(lutEmbeddings) ?? 0
                             ]
+                            
+                            // Enhanced debug logging for the model paths
+                            print("🔍 YAML CONFIG PATHS:")
+                            print("  - model_path: \(yamlDict["model_path"] as? String ?? "nil")")
+                            print("  - embed_path: \(yamlDict["embed_path"] as? String ?? "nil")")
+                            print("  - lmhead_path: \(yamlDict["lmhead_path"] as? String ?? "nil")")
+                            print("  - ffn_path: \(yamlDict["ffn_path"] as? String ?? "nil")")
+                            print("  - num_chunks: \(yamlDict["num_chunks"] as? Int ?? 0)")
+                            
+                            // Verify these paths exist
+                            if let ffnPath = yamlDict["ffn_path"] as? String {
+                                print("  - ffn_path exists: \(FileManager.default.fileExists(atPath: ffnPath))")
+                                
+                                // Check if the FFN path follows the expected chunk pattern
+                                if ffnPath.contains("_chunk_01of") {
+                                    print("  - ffn_path format: ✅ Contains proper chunk format")
+                                } else {
+                                    print("  - ffn_path format: ⚠️ Does NOT contain proper chunk format")
+                                }
+                            }
                             
                             let yamlString = try Yams.dump(object: yamlDict)
                             let modifiedConfig = try YAMLConfig(from: yamlString)
@@ -1162,17 +1100,31 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             // Check for meta.yaml to determine if v110 flag should be set
                             var shouldUseV110 = false
                             let metaYamlPath = url.appendingPathComponent("meta.yaml")
+                            
+                            // Print the model path for debugging
+                            print("📂 Model directory path: \(url.path)")
+                            print("📄 Meta YAML path: \(metaYamlPath.path)")
+                            
                             if FileManager.default.fileExists(atPath: metaYamlPath.path) {
                                 do {
                                     let yamlContent = try String(contentsOf: metaYamlPath, encoding: .utf8)
-                                    let modelConfig = try ModelConfiguration(from: yamlContent)
+                                    
+                                    // Pass the model path to the ModelConfiguration initializer
+                                    let modelConfig = try ModelConfiguration(from: yamlContent, modelPath: url.path)
+                                    
+                                    // You can manually override the v110 flag here if needed
+                                    // Uncomment the next line and set to true/false to manually control v110
+                                    // modelConfig.shouldUseV110 = true
+                                    
                                     shouldUseV110 = modelConfig.shouldUseV110
                                     print("📊 Setting v110 flag to \(shouldUseV110) based on model version \(modelConfig.version)")
                                 } catch {
                                     print("⚠️ Error reading meta.yaml for v110 check: \(error). Using default v110=false")
+                                    print("📂 Model directory path: \(url.path)")
                                 }
                             } else {
                                 print("⚠️ meta.yaml not found at \(metaYamlPath.path). Using default v110=false")
+                                print("📂 Model directory path: \(url.path)")
                             }
                             
                             do {
@@ -1186,15 +1138,80 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                 print("📊 DEBUG: ModelLoader.loadModel completed")
                                 
                                 // Set up our inference manager with the loaded models
-                                self.inferenceManager = try InferenceManager(
-                                    models: models,
-                                    contextLength: localConfig.contextLength,
-                                    batchSize: localConfig.batchSize,
-                                    debugLevel: 0,  // No debug output
-                                    v110: shouldUseV110  // Pass the v110 flag based on model version
-                                )
+                                do {
+                                    print("📊 DEBUG: Setting up InferenceManager")
+                                    print("📊 DEBUG: Context length: \(localConfig.contextLength)")
+                                    print("📊 DEBUG: Batch size: \(localConfig.batchSize)")
+                                    print("📊 DEBUG: v110 flag: \(shouldUseV110)")
+                                    
+                                    self.inferenceManager = try InferenceManager(
+                                        models: models,
+                                        contextLength: localConfig.contextLength,
+                                        batchSize: localConfig.batchSize,
+                                        debugLevel: 0,  // Set back to 0 for production
+                                        v110: shouldUseV110  // Pass the v110 flag based on model version
+                                    )
+                                    
+                                    print("✅ InferenceManager successfully initialized with v110=\(shouldUseV110)")
+                                } catch {
+                                    print("❌ ERROR initializing InferenceManager: \(error.localizedDescription)")
+                                    print("❌ Error type: \(type(of: error))")
+                                    throw InferenceError.inferenceError("Failed to initialize InferenceManager: \(error.localizedDescription)")
+                                }
                                 
-                                print("📊 InferenceManager initialized with v110=\(shouldUseV110)")
+                                // Initialize tokenizer
+                                do {
+                                    print("Initializing tokenizer from: \(localConfig.tokenizerModel)")
+                                    let tokenizerPath = URL(fileURLWithPath: localConfig.tokenizerModel)
+                                    
+                                    // Check if tokenizer model file exists
+                                    if !FileManager.default.fileExists(atPath: tokenizerPath.path) {
+                                        print("❌ ERROR: Tokenizer model file not found at path: \(tokenizerPath.path)")
+                                        throw InferenceError.tokenizationFailed
+                                    }
+                                    
+                                    // Add retry logic for tokenizer initialization
+                                    var tokenizerRetryCount = 0
+                                    let maxRetries = 3
+                                    
+                                    while tokenizerRetryCount < maxRetries {
+                                        do {
+                                            if tokenizerRetryCount > 0 {
+                                                print("Retrying tokenizer initialization (attempt \(tokenizerRetryCount + 1)/\(maxRetries))")
+                                            }
+                                            self.tokenizer = try await Tokenizer(modelPath: tokenizerPath.path, debugLevel: 0)
+                                            
+                                            if self.tokenizer != nil {
+                                                print("✅ Tokenizer successfully initialized")
+                                                break
+                                            } else {
+                                                print("⚠️ WARNING: Tokenizer initialization returned nil on attempt \(tokenizerRetryCount + 1)")
+                                                tokenizerRetryCount += 1
+                                                if tokenizerRetryCount >= maxRetries {
+                                                    throw InferenceError.tokenizationFailed
+                                                }
+                                                try await Task.sleep(nanoseconds: 500_000_000) // 500ms delay between retries
+                                            }
+                                        } catch {
+                                            print("⚠️ WARNING: Tokenizer initialization error on attempt \(tokenizerRetryCount + 1): \(error.localizedDescription)")
+                                            tokenizerRetryCount += 1
+                                            if tokenizerRetryCount >= maxRetries {
+                                                throw error
+                                            }
+                                            try await Task.sleep(nanoseconds: 500_000_000) // 500ms delay between retries
+                                        }
+                                    }
+                                    
+                                    // Verify tokenizer is initialized
+                                    if self.tokenizer == nil {
+                                        print("❌ ERROR: Failed to initialize tokenizer after \(maxRetries) attempts")
+                                        throw InferenceError.tokenizationFailed
+                                    }
+                                } catch {
+                                    print("❌ ERROR initializing Tokenizer: \(error.localizedDescription)")
+                                    print("❌ Error type: \(type(of: error))")
+                                    throw InferenceError.tokenizationFailed
+                                }
                                 
                                 // Set the current model ID now that loading is complete
                                 self.currentModelId = modelId
@@ -1240,7 +1257,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                 print("🔕 Suppressed ModelLoadingInterrupted notification - starting new model")
                             }
                         } else {
-                            print("❌ Error loading model: \(error)")
+                            print("IS.2: ❌ Error loading model: \(error)")
                             self.loadingStatus = "Error: \(error.localizedDescription)"
                             self.loadingProgress = 0
                             self.isLoadingModel = false
@@ -1290,7 +1307,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             print("🔕 Suppressed ModelLoadingInterrupted notification - starting new model")
                         }
                     } else {
-                        print("❌ Error loading model: \(error)")
+                        print("❌ IS.3 Error loading model: \(error)")
                         self.loadingStatus = "Error: \(error.localizedDescription)"
                         self.loadingProgress = 0
                         self.isLoadingModel = false
@@ -1374,7 +1391,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                 }
                 
                 // For all other errors, update UI and post notification
-                print("❌ Error loading model: \(error)")
+                print("IS.4 ❌ Error loading model: \(error)")
                 self.loadingStatus = "Error: \(error.localizedDescription)"
                 self.loadingProgress = 0
                 self.isLoadingModel = false
@@ -1657,7 +1674,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     print("================ INFERENCE RESULT END ================\n")
                     
                     // Finalize the stream - use appropriate source for final text
-                    let finalResponse = allowLongGeneration ? tokenBuffer.getText() : await tokenPrinter.stop()
+                    let finalResponse = await self.shouldUseTokenBuffer(allowLongGeneration: allowLongGeneration, windowShifts: tokenBuffer.getWindowShifts()) ? 
+                        tokenBuffer.getText() : 
+                        await tokenPrinter.stop()
                     print("DEBUG - Final response with thinking content: \"\(finalResponse)\"")
                     
                     // IMPORTANT: Yield the final response as is, with thinking content preserved
@@ -1694,7 +1713,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             isComplete: true,
                             wasCancelled: true
                         ))
-                        continuation.finish()
+                        try continuation.finish() // Add try here to make the catch block reachable
                         
                         // Reset the task
                         await MainActor.run {
@@ -1734,7 +1753,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         windowShifts: 0,
                         isComplete: true
                     ))
-                    continuation.finish()
+                    try continuation.finish() // Add try here to make the catch block reachable
                 }
             }
         }
@@ -1749,10 +1768,18 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         chatId: String? = nil, // Add optional chat ID parameter
         allowLongGeneration: Bool = true // New parameter to enable long generation
     ) async throws -> AsyncStream<InferenceResult> {
+        print("🔍 DEBUG: Starting inferWithSystemPrompt")
+        print("🔍 DEBUG: Model ID: \(modelId)")
+        print("🔍 DEBUG: Current model ID: \(currentModelId ?? "nil")")
+        print("🔍 DEBUG: Tokenizer available: \(tokenizer != nil)")
+        print("🔍 DEBUG: Inference manager available: \(inferenceManager != nil)")
+        
         guard let inferenceManager = inferenceManager, let tokenizer = tokenizer else {
+            print("❌ ERROR: Model not loaded - inferenceManager or tokenizer is nil")
             throw InferenceError.modelNotLoaded
         }
         guard modelId == currentModelId else {
+            print("❌ ERROR: Model ID mismatch - requested: \(modelId), current: \(currentModelId ?? "nil")")
             throw InferenceError.modelNotLoaded
         }
         
@@ -1889,149 +1916,221 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     
                     print("\n💡 INFERENCE STARTING - Prefill phase beginning with \(currentPrompt.count) tokens")
                     
-                    // Start inference using generateResponse with correct parameters
-                    let (prefillTokenCount, prefillTime, stopReason) = try await inferenceManager.generateResponse(
-                        initialTokens: currentPrompt,
-                        temperature: defaultTemperature,
-                        maxTokens: maxGenerationTokens, // Now using potential longer limit based on allowLongGeneration
-                        eosToken: tokenizer.eosTokenId,
-                        tokenizer: tokenizer,
-                        onToken: { token in
-                            // Check cancellation flag
-                            if self.inferenceIsCancelled {
-                                print("🛑 TOKEN GENERATION CANCELLED - Stopping token callbacks")
-                                return
-                            }
-                            
-                            // Increment token count
-                            generatedTokenCount += 1
-                            
-                            // Add to buffer for complete storage
-                            tokenBuffer.addToken(token)
-                            
-                            // If this is the first token after a window shift, log it
-                            if isFirstTokenAfterShift {
-                                print("🔍 FIRST TOKEN AFTER WINDOW SHIFT #\(totalWindowShifts): ID \(token) = \"\(tokenizer.decode(tokens: [token], skipSpecialTokens: false))\"")
-                                isFirstTokenAfterShift = false
-                                
-                                // Calculate time since last shift
-                                if let lastTime = lastShiftTime {
-                                    let timeSinceShift = Date().timeIntervalSince(lastTime)
-                                    print("⏱️ Time elapsed for re-prefill: \(String(format: "%.3f", timeSinceShift))s")
-                                }
-                            }
-                            
-                            // Create a detached task to avoid blocking token generation
-                            Task.detached {
-                                // Check cancellation flag again in the detached task
+                    // Add more debug information before inference
+                    print("🔍 DEBUG: Current model ID: \(currentModelId ?? "nil")")
+                    print("🔍 DEBUG: inferenceManager type: \(type(of: inferenceManager))")
+                    print("🔍 DEBUG: Prompt tokens: \(currentPrompt.count)")
+                    print("🔍 DEBUG: Max tokens: \(maxGenerationTokens)")
+                    print("🔍 DEBUG: Temperature: \(defaultTemperature)")
+                    
+                    do {
+                        // Start inference using generateResponse with correct parameters
+                        let (prefillTokenCount, prefillTime, stopReason) = try await inferenceManager.generateResponse(
+                            initialTokens: currentPrompt,
+                            temperature: defaultTemperature,
+                            maxTokens: maxGenerationTokens, // Now using potential longer limit based on allowLongGeneration
+                            eosToken: tokenizer.eosTokenId,
+                            tokenizer: tokenizer,
+                            onToken: { token in
+                                // Check cancellation flag
                                 if self.inferenceIsCancelled {
+                                    print("🛑 TOKEN GENERATION CANCELLED - Stopping token callbacks")
                                     return
                                 }
                                 
-                                // Add token to the printer and get current text
-                                await tokenPrinter.addToken(token)
+                                // Increment token count
+                                generatedTokenCount += 1
                                 
-                                // Get text - use token buffer for long generations to ensure full context retention
-                                let currentText = allowLongGeneration ? 
-                                    tokenBuffer.getText() : 
-                                    await tokenPrinter.getBuffer()
+                                // Add to buffer for complete storage
+                                tokenBuffer.addToken(token)
                                 
-                                // Calculate performance metrics
-                                let currentTime = Date().timeIntervalSince(startTime)
-                                let tokensPerSecond = currentTime > 0 ? Double(generatedTokenCount) / currentTime : 0
-                                
-                                // Debug token info occasionally
-                                if generatedTokenCount % 20 == 0 || generatedTokenCount < 5 {
-                                    print("DEBUG - Token #\(generatedTokenCount): ID \(token) = \"\(tokenizer.decode(tokens: [token], skipSpecialTokens: false))\"")
-                                    if generatedTokenCount % 200 == 0 && tokenBuffer.getWindowShifts() > 0 {
-                                        print("DEBUG - Window shifts so far: \(tokenBuffer.getWindowShifts())")
+                                // If this is the first token after a window shift, log it
+                                if isFirstTokenAfterShift {
+                                    print("🔍 FIRST TOKEN AFTER WINDOW SHIFT #\(totalWindowShifts): ID \(token) = \"\(tokenizer.decode(tokens: [token], skipSpecialTokens: false))\"")
+                                    isFirstTokenAfterShift = false
+                                    
+                                    // Calculate time since last shift
+                                    if let lastTime = lastShiftTime {
+                                        let timeSinceShift = Date().timeIntervalSince(lastTime)
+                                        print("⏱️ Time elapsed for re-prefill: \(String(format: "%.3f", timeSinceShift))s")
                                     }
                                 }
                                 
-                                // Final check for cancellation before yielding
-                                if self.inferenceIsCancelled {
-                                    return
+                                // Create a detached task to avoid blocking token generation
+                                Task.detached {
+                                    // Check cancellation flag again in the detached task
+                                    if self.inferenceIsCancelled {
+                                        return
+                                    }
+                                    
+                                    // Add token to the printer and get current text
+                                    await tokenPrinter.addToken(token)
+                                    
+                                    // Get text - use token buffer for long generations to ensure full context retention
+                                    let currentText = await self.shouldUseTokenBuffer(allowLongGeneration: allowLongGeneration, windowShifts: tokenBuffer.getWindowShifts()) ? 
+                                        tokenBuffer.getText() : 
+                                        await tokenPrinter.getBuffer()
+                                    
+                                    // Calculate performance metrics
+                                    let currentTime = Date().timeIntervalSince(startTime)
+                                    let tokensPerSecond = currentTime > 0 ? Double(generatedTokenCount) / currentTime : 0
+                                    
+                                    // Store tokenizer reference before entering closure
+                                    let currentTokenizer = await self.tokenizer
+                                    
+                                    // Debug token info occasionally
+                                    if generatedTokenCount % 20 == 0 || generatedTokenCount < 5 {
+                                        if let safeTokenizer = currentTokenizer {
+                                            print("DEBUG - Token #\(generatedTokenCount): ID \(token) = \"\(safeTokenizer.decode(tokens: [token], skipSpecialTokens: false))\"")
+                                        } else {
+                                            print("DEBUG - Token #\(generatedTokenCount): ID \(token) (tokenizer unavailable)")
+                                        }
+                                        if generatedTokenCount % 200 == 0 && tokenBuffer.getWindowShifts() > 0 {
+                                            print("DEBUG - Window shifts so far: \(tokenBuffer.getWindowShifts())")
+                                        }
+                                    }
+                                    
+                                    // Final check for cancellation before yielding
+                                    if self.inferenceIsCancelled {
+                                        return
+                                    }
+                                    
+                                    // Yield result to the stream with window shift information
+                                    continuation.yield(InferenceResult(
+                                        text: currentText,
+                                        tokensPerSecond: tokensPerSecond,
+                                        tokenCount: generatedTokenCount,
+                                        windowShifts: tokenBuffer.getWindowShifts(),
+                                        isComplete: false // Not the final result
+                                    ))
                                 }
+                            },
+                            onWindowShift: {
+                                // Record window shifts for tracking
+                                tokenBuffer.recordWindowShift()
+                                totalWindowShifts += 1
+                                isFirstTokenAfterShift = true
+                                lastShiftTime = Date()
                                 
-                                // Yield result to the stream with window shift information
-                                continuation.yield(InferenceResult(
-                                    text: currentText,
-                                    tokensPerSecond: tokensPerSecond,
-                                    tokenCount: generatedTokenCount,
-                                    windowShifts: tokenBuffer.getWindowShifts(),
-                                    isComplete: false // Not the final result
-                                ))
+                                // Enhanced window shift logging
+                                print("\n🔄 WINDOW SHIFT #\(totalWindowShifts) OCCURRED at \(Date().timeIntervalSince(startTime))s")
+                                print("💨 Generated \(generatedTokenCount) tokens before this shift")
+                                print("🧠 Current context will be truncated and re-prefilled")
                             }
-                        },
-                        onWindowShift: {
-                            // Record window shifts for tracking
-                            tokenBuffer.recordWindowShift()
-                            totalWindowShifts += 1
-                            isFirstTokenAfterShift = true
-                            lastShiftTime = Date()
-                            
-                            // Enhanced window shift logging
-                            print("\n🔄 WINDOW SHIFT #\(totalWindowShifts) OCCURRED at \(Date().timeIntervalSince(startTime))s")
-                            print("💨 Generated \(generatedTokenCount) tokens before this shift")
-                            print("🧠 Current context will be truncated and re-prefilled")
+                        )
+                        
+                        // Log completion info with enhanced details
+                        print("\n✅ GENERATION COMPLETE:")
+                        print("📊 Prefill token count: \(prefillTokenCount.count)")
+                        // Fix to use the count of the array, not the array itself
+                        let prefillTPS = prefillTime > 0 ? Double(prefillTokenCount.count) / prefillTime : 0
+                        print("⏱️ Prefill time: \(String(format: "%.3f", prefillTime))s (\(String(format: "%.1f", prefillTPS)) tokens/second)")
+                        print("🏁 Generation tokens: \(generatedTokenCount)")
+                        print("🔀 Window shifts: \(totalWindowShifts)")
+                        print("❓ Stop reason: \(stopReason)")
+                        
+                        // Update conversation state with the generated tokens
+                        if let chatId = chatId {
+                            // Update token count with both prompt and generated tokens
+                            // This is a simplification - in a real implementation we'd track KV cache state too
+                            await MainActor.run {
+                                self.updateConversationState(tokenCount: generatedTokenCount, chatId: chatId)
+                            }
                         }
-                    )
-                    
-                    // Log completion info with enhanced details
-                    print("\n✅ GENERATION COMPLETE:")
-                    print("📊 Prefill token count: \(prefillTokenCount.count)")
-                    // Fix to use the count of the array, not the array itself
-                    let prefillTPS = prefillTime > 0 ? Double(prefillTokenCount.count) / prefillTime : 0
-                    print("⏱️ Prefill time: \(String(format: "%.3f", prefillTime))s (\(String(format: "%.1f", prefillTPS)) tokens/second)")
-                    print("🏁 Generation tokens: \(generatedTokenCount)")
-                    print("🔀 Window shifts: \(totalWindowShifts)")
-                    print("❓ Stop reason: \(stopReason)")
-                    
-                    // Update conversation state with the generated tokens
-                    if let chatId = chatId {
-                        // Update token count with both prompt and generated tokens
-                        // This is a simplification - in a real implementation we'd track KV cache state too
+                        
+                        // Calculate final tokens per second
+                        let totalTime = Date().timeIntervalSince(startTime)
+                        let tokensPerSecond = totalTime > 0 ? Double(generatedTokenCount) / totalTime : 0
+                        
+                        // Print performance metrics
+                        print("\n📝 PERFORMANCE SUMMARY:")
+                        print("⏱️ Total time: \(String(format: "%.2f", totalTime))s")
+                        print("🔢 Total tokens: \(generatedTokenCount)")
+                        print("⚡ Speed: \(String(format: "%.1f", tokensPerSecond)) tokens/second")
+                        print("🧮 Total window shifts: \(totalWindowShifts)")
+                        
+                        // Final yield with completed text - use token buffer for long generations
+                        let finalText = await self.shouldUseTokenBuffer(allowLongGeneration: allowLongGeneration, windowShifts: tokenBuffer.getWindowShifts()) ? 
+                            tokenBuffer.getText() : 
+                            await tokenPrinter.stop()
+                        continuation.yield(InferenceResult(
+                            text: finalText,
+                            tokensPerSecond: tokensPerSecond,
+                            tokenCount: generatedTokenCount,
+                            windowShifts: tokenBuffer.getWindowShifts(),
+                            isComplete: true // This is the final result
+                        ))
+                        try continuation.finish() // Add try here to make the catch block reachable
+                        
+                        // Clear the active task reference since we're done
                         await MainActor.run {
-                            self.updateConversationState(tokenCount: generatedTokenCount, chatId: chatId)
+                            // Store cancellation state before resetting
+                            let wasCancelled = self.inferenceIsCancelled
+                            
+                            // Reset internal state
+                            self.activeInferenceTask = nil
+                            self.inferenceIsCancelled = false
+                            
+                            if wasCancelled {
+                                print("🛑 TOKEN GENERATION COMPLETED AFTER CANCELLATION")
+                            } else {
+                                print("✅ TOKEN GENERATION COMPLETED NORMALLY")
+                            }
                         }
-                    }
-                    
-                    // Calculate final tokens per second
-                    let totalTime = Date().timeIntervalSince(startTime)
-                    let tokensPerSecond = totalTime > 0 ? Double(generatedTokenCount) / totalTime : 0
-                    
-                    // Print performance metrics
-                    print("\n📝 PERFORMANCE SUMMARY:")
-                    print("⏱️ Total time: \(String(format: "%.2f", totalTime))s")
-                    print("🔢 Total tokens: \(generatedTokenCount)")
-                    print("⚡ Speed: \(String(format: "%.1f", tokensPerSecond)) tokens/second")
-                    print("🧮 Total window shifts: \(totalWindowShifts)")
-                    
-                    // Final yield with completed text - use token buffer for long generations
-                    let finalText = allowLongGeneration ? tokenBuffer.getText() : await tokenPrinter.stop()
-                    continuation.yield(InferenceResult(
-                        text: finalText,
-                        tokensPerSecond: tokensPerSecond,
-                        tokenCount: generatedTokenCount,
-                        windowShifts: tokenBuffer.getWindowShifts(),
-                        isComplete: true // This is the final result
-                    ))
-                    continuation.finish()
-                    
-                    // Clear the active task reference since we're done
-                    await MainActor.run {
-                        // Store cancellation state before resetting
-                        let wasCancelled = self.inferenceIsCancelled
-                        
-                        // Reset internal state
-                        self.activeInferenceTask = nil
-                        self.inferenceIsCancelled = false
-                        
-                        if wasCancelled {
-                            print("🛑 TOKEN GENERATION COMPLETED AFTER CANCELLATION")
-                        } else {
-                            print("✅ TOKEN GENERATION COMPLETED NORMALLY")
+                    } catch {
+                        // Check if the error is due to cancellation
+                        if Task.isCancelled || self.inferenceIsCancelled {
+                            print("🛑 TOKEN GENERATION TASK CANCELLED")
+                            // End the stream with a cancelled result
+                            continuation.yield(InferenceResult(
+                                text: tokenBuffer.getText(),
+                                tokensPerSecond: 0,
+                                tokenCount: 0,
+                                windowShifts: 0,
+                                isComplete: true,
+                                wasCancelled: true
+                            ))
+                            try continuation.finish() // Add try here to make the catch block reachable
+                            
+                            // Reset the task
+                            await MainActor.run {
+                                self.activeInferenceTask = nil
+                                self.inferenceIsCancelled = false
+                            }
+                            
+                            return
                         }
+                        
+                        print("\n❌ ERROR DURING INFERENCE:")
+                        print("📍 Error location: inferWithSystemPrompt → generateResponse")
+                        print("🔴 Error type: \(String(describing: type(of: error)))")
+                        print("📄 Description: \(error.localizedDescription)")
+                        
+                        // Try to determine more specific error location
+                        if let inferenceError = error as? InferenceError {
+                            switch inferenceError {
+                            case .modelNotLoaded:
+                                print("📍 Error detail: Model not loaded or not found")
+                            case .contextTooLong:
+                                print("📍 Error detail: Context exceeds maximum length")
+                            case .tokenizationFailed:
+                                print("📍 Error detail: Failed to tokenize input")
+                            case .inferenceError(let message):
+                                print("📍 Error detail: \(message)")
+                            default:
+                                print("📍 Error detail: Other inference error")
+                            }
+                        }
+                        
+                        // Yield an error result instead of trying to throw from the continuation
+                        continuation.yield(InferenceResult(
+                            text: "Error: \(error.localizedDescription)",
+                            tokensPerSecond: 0,
+                            tokenCount: 0,
+                            windowShifts: 0,
+                            isComplete: true
+                        ))
+                        try continuation.finish() // Add try here to make the catch block reachable
                     }
                 } catch {
                     // Check if the error is due to cancellation
@@ -2046,7 +2145,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             isComplete: true,
                             wasCancelled: true
                         ))
-                        continuation.finish()
+                        try continuation.finish() // Add try here to make the catch block reachable
                         
                         // Reset the task
                         await MainActor.run {
@@ -2086,7 +2185,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         windowShifts: 0,
                         isComplete: true
                     ))
-                    continuation.finish()
+                    try continuation.finish() // Add try here to make the catch block reachable
                 }
             }
         }
@@ -2623,5 +2722,12 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
             // For other messages, return as is
             return message
         }
+    }
+    
+    // Add a helper method to determine if we should use the token buffer for full text
+    private func shouldUseTokenBuffer(allowLongGeneration: Bool, windowShifts: Int) async -> Bool {
+        // Always use token buffer when we've had window shifts to ensure full text retention
+        // Also use it when long generation is enabled for consistency
+        return windowShifts > 0 || allowLongGeneration
     }
 }

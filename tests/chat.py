@@ -112,34 +112,21 @@ class TokenPrinter:
                 print(RESET_COLOR)  # Reset color at the end
         return self.buffer
 
-def parse_model_path(path):
-    """Parse model path and return full path with .mlmodelc or .mlpackage extension."""
-    path = Path(path)
-    
-    # If path exists exactly as specified, return it
-    if path.exists():
-        return str(path)
+def parse_model_path(model_path):
+    """Parse model path and return full path with extension."""
+    # If path already has .mlmodelc extension, use it as is
+    if model_path.endswith('.mlmodelc'):
+        return model_path
         
-    # Try with both extensions
-    candidates = [
-        path,  # Original path
-        path.with_suffix('.mlmodelc'),  # With .mlmodelc
-        path.with_suffix('.mlpackage'),  # With .mlpackage
-        Path(str(path) + '.mlmodelc'),  # Handle case where extension is included
-        Path(str(path) + '.mlpackage')
-    ]
-    
-    # Try all possible paths
-    for candidate in candidates:
-        if candidate.exists():
-            print(f"Found model at: {candidate}")
-            return str(candidate)
+    # Try different extensions
+    extensions = ['.mlmodelc']
+    for ext in extensions:
+        full_path = model_path + ext
+        if os.path.exists(full_path):
+            return full_path
             
-    # If we get here, no valid path was found
-    print("\nError: Model not found. Tried following paths:")
-    for candidate in candidates:
-        print(f"  {candidate}")
-    raise FileNotFoundError(f"Model not found: {path}")
+    # If no extension works, return original path
+    return model_path
 
 def parse_ffn_filename(path):
     """Parse FFN model filename to extract chunk information."""
@@ -267,70 +254,83 @@ def load_metadata(model,args):
     
     return metadata
     
-def load_models(args,metadata):
-    """Load all required models and extract metadata."""
+def load_models(args, metadata):
+    """Load all model components."""
     print("\nLoading models...")
     
-    try:
-        # Load embeddings model
-        print("\nLoading embeddings model...")
-        embed_path = parse_model_path(args.embed)
-        print(f"Loading from: {embed_path}")
-        embed_model = load_model(embed_path)
-        print("Embeddings model loaded successfully")
-        metadata = load_metadata(embed_model,args)
-        
+    # Get model directory
+    model_dir = args.d if args.d else os.path.dirname(args.meta) if args.meta else '.'
+    print(f"\nUsing model directory: {model_dir}")
+    
+    # Initialize metadata if empty
+    if not metadata:
+        metadata = {}
+    
+    # If using meta.yaml, get model names and parameters from there
+    if args.meta:
+        with open(args.meta) as f:
+            meta = yaml.safe_load(f)
+            params = meta['model_info']['parameters']
+            
+            # Use the model paths from meta.yaml
+            args.embed = params.get('embeddings', args.embed)
+            args.lmhead = params.get('lm_head', args.lmhead)
+            args.ffn = params.get('ffn', args.ffn)
+            
+            # Update metadata with values from meta.yaml
+            metadata['context_length'] = int(params.get('context_length', args.context_length or 512))
+            metadata['batch_size'] = int(params.get('batch_size', args.batch_size or 64))
+            metadata['num_chunks'] = int(params.get('num_chunks', 1))
+    else:
+        # Set default values if not using meta.yaml
+        metadata['context_length'] = args.context_length or 512
+        metadata['batch_size'] = args.batch_size or 64
+        metadata['num_chunks'] = getattr(args, 'num_chunks', 1)
 
-        
-        # Load LM head model
-        print("\nLoading LM head model...")
-        lmhead_path = parse_model_path(args.lmhead)
-        print(f"Loading from: {lmhead_path}")
-        lmhead_model = load_model(lmhead_path)
-        print("LM head model loaded successfully")
-        
-        # Parse FFN path and find chunks if needed
-        print("\nLoading FFN+PREFILL model(s)...")
-        ffn_path = parse_model_path(args.ffn)
-        chunk_no, total_chunks = parse_ffn_filename(ffn_path)
-        
-        ffn_models = []
-        if chunk_no and total_chunks:
-            print(f"\nDetected chunked FFN+PREFILL model ({total_chunks} chunks)")
-            # Find and load all chunks
-            chunk_paths = find_all_chunks(ffn_path)
-            if len(chunk_paths) != total_chunks:
-                raise ValueError(f"Found {len(chunk_paths)} chunks but filename indicates {total_chunks} chunks")
-                
-            for chunk_path in chunk_paths:
-                print(f"\nLoading FFN+PREFILL chunk: {Path(chunk_path).name}")
-                try:
-                    # For chunked models, we need both infer and prefill functions
-                    ffn_models.append({
-                        'infer': load_model(chunk_path, function_name='infer'),
-                        'prefill': load_model(chunk_path, function_name='prefill')
-                    })
-                    print("Chunk loaded successfully")
-                except Exception as e:
-                    print(f"Error loading chunk {chunk_path}: {str(e)}")
-                    raise
-            metadata = load_metadata(ffn_models[0],args)
-
-        else:
-            print("\nLoading single FFN model...")
-            ffn_models.append(load_model(ffn_path))
-            print("FFN model loaded successfully")
-        
-        return embed_model, ffn_models, lmhead_model, metadata
-        
-    except Exception as e:
-        print(f"\nError loading models: {str(e)}")
-        print("\nPlease ensure all model files exist and are accessible.")
-        print("Expected files:")
-        print(f"  Embeddings: {args.embed}")
-        print(f"  LM Head: {args.lmhead}")
-        print(f"  FFN: {args.ffn}")
-        raise
+    print(f"Context length: {metadata['context_length']}")
+    
+    # Get tokenizer path
+    tokenizer_path = args.tokenizer if args.tokenizer else model_dir
+    print(f"Using tokenizer path: {tokenizer_path}")
+    
+    # Ensure we have all required model names
+    if not all([args.embed, args.lmhead, args.ffn]):
+        print("\nError: Missing model names. Please provide either:")
+        print("1. A meta.yaml file with model names")
+        print("2. Individual model names via --embed, --lmhead, and --ffn arguments")
+        sys.exit(1)
+    
+    # Load embeddings model
+    print("\nLoading embeddings model...")
+    embed_path = os.path.join(model_dir, args.embed)
+    embed_model = load_model(parse_model_path(embed_path))
+    
+    # Load LM head model
+    print("\nLoading LM head model...")
+    lmhead_path = os.path.join(model_dir, args.lmhead)
+    lmhead_model = load_model(parse_model_path(lmhead_path))
+    
+    # Load FFN models
+    print("\nLoading FFN models...")
+    ffn_path = os.path.join(model_dir, args.ffn)
+    ffn_models = []
+    
+    # Check if this is a chunked model
+    chunk_info = parse_ffn_filename(ffn_path)
+    if chunk_info[0] is not None:
+        # Find all chunk files
+        chunk_files = find_all_chunks(ffn_path)
+        if not chunk_files:
+            raise FileNotFoundError(f"No FFN chunk files found matching pattern: {ffn_path}")
+            
+        print(f"Found {len(chunk_files)} FFN chunks")
+        for chunk_file in chunk_files:
+            ffn_models.append(load_model(chunk_file))
+    else:
+        # Single FFN model
+        ffn_models = [load_model(parse_model_path(ffn_path))]
+    
+    return embed_model, ffn_models, lmhead_model, metadata
 
 # At the top of the file, make this a default path
 
@@ -713,17 +713,26 @@ def parse_args():
             
             # Build model paths based on parameters
             prefix = params.get('model_prefix', 'llama')  # Default to 'llama' if not specified
-            lut_ffn = f"_lut{params['lut_ffn']}" if params['lut_ffn'] != 'none' else ''
-            lut_lmhead = f"_lut{params['lut_lmhead']}" if params['lut_lmhead'] != 'none' else ''
+            
+            # Get LUT values, defaulting to 'none' if not specified
+            lut_embeddings = params.get('lut_embeddings', 'none')
+            lut_ffn = params.get('lut_ffn', 'none')
+            lut_lmhead = params.get('lut_lmhead', 'none')
+            
+            # Construct LUT suffixes
+            lut_emb_suffix = f"_lut{lut_embeddings}" if lut_embeddings != 'none' else ''
+            lut_ffn_suffix = f"_lut{lut_ffn}" if lut_ffn != 'none' else ''
+            lut_lmhead_suffix = f"_lut{lut_lmhead}" if lut_lmhead != 'none' else ''
+            
             num_chunks = int(params['num_chunks'])
             
             # Set model paths if not specified
             if not args.embed:
-                args.embed = f'{prefix}_embeddings'
+                args.embed = f'{prefix}_embeddings{lut_emb_suffix}'
             if not args.lmhead:
-                args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
+                args.lmhead = f'{prefix}_lm_head{lut_lmhead_suffix}'
             if not args.ffn:
-                args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
+                args.ffn = f'{prefix}_FFN_PF{lut_ffn_suffix}_chunk_01of{num_chunks:02d}'
             if not args.tokenizer:
                 args.tokenizer = args.d
             

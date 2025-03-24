@@ -72,9 +72,9 @@ class ChatService: ObservableObject {
         ) { [weak self] notification in
             self?.isModelLoaded = false
             if let error = notification.userInfo?["error"] as? String {
-                self?.modelLoadingStatus = "Error loading model: \(error)"
+                self?.modelLoadingStatus = "CS.1 Error loading model: \(error)"
             } else {
-                self?.modelLoadingStatus = "Error loading model"
+                self?.modelLoadingStatus = "CS.2 Error loading model"
             }
         }
         

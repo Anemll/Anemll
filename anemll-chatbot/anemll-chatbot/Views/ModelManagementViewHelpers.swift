@@ -343,7 +343,7 @@ extension ModelManagementView {
                     
                     // Also try to parse the files based on the model configuration (for CoreML models)
                     do {
-                        let modelConfig = try ModelConfiguration(from: metaContents)
+                        let modelConfig = try ModelConfiguration(from: metaContents, modelPath: modelDir.path)
                         let modelService = ModelService.shared
                         let inferredFiles = modelService.getRequiredFiles(from: modelConfig)
                         

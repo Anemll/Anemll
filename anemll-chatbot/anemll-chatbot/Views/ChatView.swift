@@ -330,7 +330,7 @@ struct ChatView: View {
                         Divider()
                         
                         VStack(alignment: .leading) {
-                            Toggle("Advanced Mode", isOn: $isAdvancedMode)
+                            Toggle("Show advanced commands", isOn: $isAdvancedMode)
                                 .toggleStyle(SwitchToggleStyle(tint: .blue))
                                 .padding(.horizontal)
                                 .onAppear {
@@ -349,32 +349,11 @@ struct ChatView: View {
                                 .onChange(of: allowLongGeneration) { oldValue, newValue in
                                     print("DEBUG: Long Generation toggle changed to: \(newValue)")
                                 }
-                                
-                            Divider()
                             
-                            Text("Hardware Compatibility")
-                                .font(.headline)
+                            Text("Enables responses up to 4x longer with extended token limits")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                                 .padding(.horizontal)
-                                .padding(.top, 4)
-                            
-                            Button("Disable ANE (CPU Mode)") {
-                                // Turn off long generation temporarily if getting ANE errors
-                                allowLongGeneration = false
-                                showSettingsPopover = false
-                                
-                                // Show a brief message explaining what happened
-                                let originalText = inputText
-                                inputText = "Switched to CPU mode with shorter responses to prevent neural engine errors"
-                                
-                                // Restore original text after a short delay
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                                    if inputText == "Switched to CPU mode with shorter responses to prevent neural engine errors" {
-                                        inputText = originalText
-                                    }
-                                }
-                            }
-                            .foregroundColor(.orange)
-                            .padding(.horizontal)
                         }
                         
                         if isAdvancedMode {
@@ -520,7 +499,7 @@ struct ChatView: View {
                         do {
                             try await modelService.loadModelForInference(selectedModel)
                         } catch {
-                            print("Error loading model: \(error)")
+                            print("CV.1 Error loading model: \(error)")
                         }
                     }
                     
