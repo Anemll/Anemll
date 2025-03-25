@@ -420,9 +420,12 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
         position_ids = torch.arange(batch_size, dtype=torch.int32)  # Changed: Always use full batch size
         batch_causal_mask = causal_mask[:, :, :batch_size, :]  # Changed: Use full batch size
         
-        # Run embeddings
+        # Run embeddings with proper batch size
         hidden_states = torch.from_numpy(
-            embed_model.predict({'input_ids': batch_input.numpy()})['hidden_states']
+            embed_model.predict({
+                'input_ids': batch_input.numpy(),
+                'batch_size': np.array([batch_size], dtype=np.int32)  # Add batch_size parameter
+            })['hidden_states']
         )
         
         # Run through FFN chunks with state
@@ -730,13 +733,14 @@ def parse_args():
             prefix = params.get('model_prefix', 'llama')  # Default to 'llama' if not specified
             lut_ffn = f"_lut{params['lut_ffn']}" if params['lut_ffn'] != 'none' else ''
             lut_lmhead = f"_lut{params['lut_lmhead']}" if params['lut_lmhead'] != 'none' else ''
+            lut_embeddings = f"_lut{params['lut_embeddings']}" if params['lut_embeddings'] != 'none' else ''
             num_chunks = int(params['num_chunks'])
             
             # Set model paths if not specified
-            if not args.embed:
-                args.embed = f'{prefix}_embeddings'
             if not args.lmhead:
                 args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
+            if not args.embed:
+                args.embed = f'{prefix}_embeddings{lut_embeddings}'  # Changed from lm_head to embeddings
             if not args.ffn:
                 args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
             if not args.tokenizer:

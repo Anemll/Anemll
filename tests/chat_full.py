@@ -242,13 +242,14 @@ def parse_args():
             prefix = params.get('model_prefix', 'llama')  # Default to 'llama' if not specified
             lut_ffn = f"_lut{params['lut_ffn']}" if params['lut_ffn'] != 'none' else ''
             lut_lmhead = f"_lut{params['lut_lmhead']}" if params['lut_lmhead'] != 'none' else ''
+            lut_embeddings = f"_lut{params['lut_embeddings']}" if params['lut_embeddings'] != 'none' else ''
             num_chunks = int(params['num_chunks'])
             
             # Set model paths if not specified
-            if not args.embed:
-                args.embed = f'{prefix}_embeddings'
             if not args.lmhead:
                 args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
+            if not args.embed:
+                args.embed = f'{prefix}_embeddings{lut_embeddings}'  # Changed from lm_head to embeddings
             if not args.ffn:
                 args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
             if not args.tokenizer:
@@ -476,7 +477,10 @@ def make_causal_mask(length, start):
 
 def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length, batch_size, state, causal_mask):
     """Run prefill on the input sequence."""
-    #print(f"[DEBUG] Running prefill from 0 to {current_pos}")
+    # Use provided causal mask or create one if not provided
+    if causal_mask is None:
+        causal_mask = make_causal_mask(context_length, 0)
+        causal_mask = torch.tensor(causal_mask, dtype=torch.float16)
     
     # Process in batches
     batch_pos = 0
@@ -484,37 +488,36 @@ def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length,
         batch_end = min(batch_pos + batch_size, current_pos)
         current_batch_size = batch_end - batch_pos
         
-        #print(f"[DEBUG] Prefill batch {batch_pos}-{batch_end} (size={current_batch_size})")
-        
         # Get current batch
         batch_input = input_ids[:, batch_pos:batch_end]
         
-        # Pad to full batch size
+        # Always pad to full batch size for prefill
         batch_input = F.pad(
             batch_input,
             (0, batch_size - current_batch_size),
             value=0
         )
         
-        # Generate position IDs for this batch
-        position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+        # Generate position IDs for full batch size
+        position_ids = torch.arange(batch_size, dtype=torch.int32)  # Changed: Always use full batch size
+        batch_causal_mask = causal_mask[:, :, :batch_size, :]  # Changed: Use full batch size
         
-        # Use the pre-initialized causal mask and extract the batch portion
-        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
-        
-        # Run embeddings
+        # Run embeddings with proper batch size
         hidden_states = torch.from_numpy(
-            embed_model.predict({'input_ids': batch_input.numpy()})['hidden_states']
+            embed_model.predict({
+                'input_ids': batch_input.numpy(),
+                'batch_size': np.array([batch_size], dtype=np.int32)  # Add batch_size parameter
+            })['hidden_states']
         )
         
-        # Run through FFN chunks
+        # Run through FFN chunks with state
         for ffn_model in ffn_models:
             if isinstance(ffn_model, dict):
                 inputs = {
-                    'hidden_states': hidden_states.numpy(),
-                    'position_ids': position_ids.numpy(),
-                    'causal_mask': batch_causal_mask.numpy(),
-                    'current_pos': np.array([batch_pos], dtype=np.int32)
+                    'hidden_states': hidden_states.numpy(),  # [1, 64, hidden_size]
+                    'position_ids': position_ids.numpy(),    # [64]
+                    'causal_mask': batch_causal_mask.numpy(), # [1, 1, 64, context_length]
+                    'current_pos': np.array([batch_pos], dtype=np.int32)  # [1]
                 }
                 output = ffn_model['prefill'].predict(inputs, state)
                 hidden_states = torch.from_numpy(output['output_hidden_states'])
