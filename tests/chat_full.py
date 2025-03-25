@@ -194,7 +194,7 @@ def load_model(path, function_name=None):
         raise
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Full Chat with CoreML LLaMA with context window shifting (c) 2025 Anemll')
+    parser = argparse.ArgumentParser(description='Full Chat with CoreML LLaMA with context window shifting, gil resolved (c) 2025 Anemll')
     
     # Add meta.yaml option
     parser.add_argument('--meta', type=str, help='Path to meta.yaml to load all parameters')
@@ -240,26 +240,17 @@ def parse_args():
             
             # Build model paths based on parameters
             prefix = params.get('model_prefix', 'llama')  # Default to 'llama' if not specified
-            
-            # Get LUT values, defaulting to 'none' if not specified
-            lut_embeddings = params.get('lut_embeddings', 'none')
-            lut_ffn = params.get('lut_ffn', 'none')
-            lut_lmhead = params.get('lut_lmhead', 'none')
-            
-            # Construct LUT suffixes
-            lut_emb_suffix = f"_lut{lut_embeddings}" if lut_embeddings != 'none' else ''
-            lut_ffn_suffix = f"_lut{lut_ffn}" if lut_ffn != 'none' else ''
-            lut_lmhead_suffix = f"_lut{lut_lmhead}" if lut_lmhead != 'none' else ''
-            
+            lut_ffn = f"_lut{params['lut_ffn']}" if params['lut_ffn'] != 'none' else ''
+            lut_lmhead = f"_lut{params['lut_lmhead']}" if params['lut_lmhead'] != 'none' else ''
             num_chunks = int(params['num_chunks'])
             
             # Set model paths if not specified
             if not args.embed:
-                args.embed = f'{prefix}_embeddings{lut_emb_suffix}'
+                args.embed = f'{prefix}_embeddings'
             if not args.lmhead:
-                args.lmhead = f'{prefix}_lm_head{lut_lmhead_suffix}'
+                args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
             if not args.ffn:
-                args.ffn = f'{prefix}_FFN_PF{lut_ffn_suffix}_chunk_01of{num_chunks:02d}'
+                args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
             if not args.tokenizer:
                 args.tokenizer = args.d
             
@@ -368,47 +359,12 @@ def load_models(args,metadata):
     """Load all required models and extract metadata."""
     print("\nLoading models...")
     
-    # Get model directory
-    model_dir = args.d if args.d else os.path.dirname(args.meta) if args.meta else '.'
-    print(f"\nUsing model directory: {model_dir}")
-    
-    # Initialize metadata if empty
-    if not metadata:
-        metadata = {}
-    
-    # If using meta.yaml, get model names and parameters from there
-    if args.meta:
-        with open(args.meta) as f:
-            meta = yaml.safe_load(f)
-            params = meta['model_info']['parameters']
-            
-            # Use the model paths from meta.yaml
-            args.embed = params.get('embeddings', args.embed)
-            args.lmhead = params.get('lm_head', args.lmhead)
-            args.ffn = params.get('ffn', args.ffn)
-            
-            # Update metadata with values from meta.yaml
-            metadata['context_length'] = int(params.get('context_length', args.context_length or 512))
-            metadata['batch_size'] = int(params.get('batch_size', args.batch_size or 64))
-            metadata['num_chunks'] = int(params.get('num_chunks', 1))
-    else:
-        # Set default values if not using meta.yaml
-        metadata['context_length'] = args.context_length or 512
-        metadata['batch_size'] = args.batch_size or 64
-        metadata['num_chunks'] = getattr(args, 'num_chunks', 1)
-
-    print(f"Context length: {metadata['context_length']}")
-    
-    # Get tokenizer path
-    tokenizer_path = args.tokenizer if args.tokenizer else model_dir
-    print(f"Using tokenizer path: {tokenizer_path}")
-    
     try:
         # Load embeddings model
         print("\nLoading embeddings model...")
-        embed_path = os.path.join(model_dir, args.embed)
+        embed_path = parse_model_path(args.embed)
         print(f"Loading from: {embed_path}")
-        embed_model = load_model(parse_model_path(embed_path))
+        embed_model = load_model(embed_path)
         print("Embeddings model loaded successfully")
         metadata = load_metadata(embed_model,args)
         
@@ -416,14 +372,14 @@ def load_models(args,metadata):
         
         # Load LM head model
         print("\nLoading LM head model...")
-        lmhead_path = os.path.join(model_dir, args.lmhead)
+        lmhead_path = parse_model_path(args.lmhead)
         print(f"Loading from: {lmhead_path}")
-        lmhead_model = load_model(parse_model_path(lmhead_path))
+        lmhead_model = load_model(lmhead_path)
         print("LM head model loaded successfully")
         
         # Parse FFN path and find chunks if needed
         print("\nLoading FFN+PREFILL model(s)...")
-        ffn_path = os.path.join(model_dir, args.ffn)
+        ffn_path = parse_model_path(args.ffn)
         chunk_no, total_chunks = parse_ffn_filename(ffn_path)
         
         ffn_models = []
@@ -450,7 +406,7 @@ def load_models(args,metadata):
 
         else:
             print("\nLoading single FFN model...")
-            ffn_models.append(load_model(parse_model_path(ffn_path)))
+            ffn_models.append(load_model(ffn_path))
             print("FFN model loaded successfully")
         
         return embed_model, ffn_models, lmhead_model, metadata
@@ -518,7 +474,7 @@ def make_causal_mask(length, start):
     mask[:, :, col_indices <= (row_indices + start)] = 0
     return mask
 
-def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length, batch_size, state):
+def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length, batch_size, state, causal_mask):
     """Run prefill on the input sequence."""
     #print(f"[DEBUG] Running prefill from 0 to {current_pos}")
     
@@ -543,9 +499,7 @@ def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length,
         # Generate position IDs for this batch
         position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
         
-        # Create causal mask for this batch
-        causal_mask = make_causal_mask(context_length, 0)  # Always start from 0 for prefill
-        causal_mask = torch.tensor(causal_mask, dtype=torch.float16)
+        # Use the pre-initialized causal mask and extract the batch portion
         batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
         
         # Run embeddings
@@ -569,7 +523,7 @@ def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length,
     
     return torch.tensor([current_pos], dtype=torch.int32)
 
-def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state=None, temperature=0.0):
+def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state, causal_mask, temperature=0.0):
     """Generate the next token."""
     # Get current token
     current_token = input_ids[:, pos-1:pos]
@@ -584,9 +538,8 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     update_mask[0, 0, pos-1, 0] = 1.0
     position_ids = torch.tensor([pos-1], dtype=torch.int32)
     
-    # Create causal mask for current position
-    causal_mask = make_causal_mask(context_length, 0)  # Always start from 0 for generation
-    single_causal_mask = torch.tensor(causal_mask[:, :, pos-1:pos, :], dtype=torch.float16)
+    # Use the pre-initialized causal mask and extract the single position portion
+    single_causal_mask = causal_mask[:, :, pos-1:pos, :]
     
     # Run through FFN chunks
     for ffn_model in ffn_models:
@@ -634,6 +587,13 @@ def create_unified_state(ffn_models, context_length):
         state = ffn_models[0].make_state()
         print("\nCreated unified transformer state")
         return state
+
+def initialize_causal_mask(context_length):
+    """Initialize causal mask for transformer attention."""
+    causal_mask = make_causal_mask(context_length, 0)
+    causal_mask = torch.tensor(causal_mask, dtype=torch.float16)
+    print(f"\nInitialized causal mask for context length {context_length}")
+    return causal_mask
 
 def get_user_input():
     """Get input from user, handling special key combinations."""
@@ -695,7 +655,7 @@ def get_user_input():
         # Fallback for systems without termios
         return input("> ")
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, auto_prompt=None, warmup=False):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask, auto_prompt=None, warmup=False):
     """Interactive chat loop."""
     global THINKING_MODE
     context_length = metadata.get('context_length')
@@ -787,10 +747,6 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
             generation_start_time = time.time()
             
             try:
-                # Create initial causal mask
-                causal_mask = make_causal_mask(context_length, 0)
-                causal_mask = torch.tensor(causal_mask, dtype=torch.float16)
-                
                 # Run prefill on entire context
                 current_pos = run_prefill(
                     embed_model,
@@ -799,7 +755,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     context_pos,
                     context_length,
                     batch_size,
-                    state
+                    state,
+                    causal_mask
                 )
                 #print(f"\n[DEBUG] After initial prefill - current_pos: {current_pos}")
                 
@@ -833,7 +790,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                             new_size,  # Prefill the entire shifted content
                             context_length,
                             batch_size,
-                            state
+                            state,
+                            causal_mask
                         )
                         
                         # Start generating from the next position
@@ -852,7 +810,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                         input_ids,
                         pos,
                         context_length,
-                        state
+                        state,
+                        causal_mask
                     )
                     
                     # Add token
@@ -955,6 +914,9 @@ def main():
         # Create unified state once
         state = create_unified_state(ffn_models, metadata['context_length'])
         
+        # Initialize causal mask once
+        causal_mask = initialize_causal_mask(metadata['context_length'])
+        
         # Warmup runs to prevent Python GIL issues with CoreML !
         if not args.nw:
             for i in range(2):
@@ -965,6 +927,7 @@ def main():
                     tokenizer=tokenizer,
                     metadata=metadata,
                     state=state,  # Pass the state
+                    causal_mask=causal_mask,  # Pass the causal mask
                     warmup=True,
                     auto_prompt="who are you?"
                 )
@@ -977,6 +940,7 @@ def main():
             tokenizer=tokenizer,
             metadata=metadata,
             state=state,  # Pass the state
+            causal_mask=causal_mask,  # Pass the causal mask
             warmup=False,
             auto_prompt=args.prompt
         )
