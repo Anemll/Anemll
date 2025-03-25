@@ -3812,7 +3812,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                 let ownerLower = repoInfo.ownerLowercase
                 
                 // Check if the model ID has a duplicated owner prefix
-                // Example: "anemll-anemll-deepseekr1-8b-ctx1024_0.2.0"
+                // Example: "anemll-anemll-deepseekr1-8b-ctx1024_0.3.0"
                 let expectedPrefix = "\(ownerLower)-\(ownerLower)-"
                 if model.id.lowercased().hasPrefix(expectedPrefix) {
                     // Found a model with duplicated owner prefix
