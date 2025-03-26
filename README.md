@@ -11,17 +11,51 @@ We aim to:
 - Provide flexible and easy to use library/framework to port LLMs to ANE directly from Hugging Face models
 - Provide on-device examples for iOS and macOS swift or C/C++ Applications
 
-See [Roadmap.md](./docs/Roadmap.md) for more details
+See update [Roadmap.md](./docs/Roadmap.md) for more details
+
+## Main Components in 0.3.0 Release
+
+ANEMLL provides four main components for Apple Neural Engine inference development:
+
+1. [LLM Conversion Tools](./docs/convert.md) - Scripts and code to convert models directly from Hugging Face weights
+   - [Single-shot Conversion Script](./docs/convert_model.md)
+   - [DeepSeek Model Conversion Guide](./docs/ConvertingDeepSeek.md)
+
+2. [Swift Reference Implementation](./docs/swift_inference.md) - Optimized inference code for Swift applications
+   - Sample CLI application in `anemll-swift-cli`
+   - Core inference engine implementation
+
+3. [Python Sample Code](./docs/chat.md) - Reference implementation and testing tools
+   - Basic chat interface (`chat.py`)
+   - Advanced conversation management (`chat_full.py`)
+
+4. [iOS/macOS Sample Applications](./docs/sample_apps.md) - Ready-to-use example applications
+   - SwiftUI Chat interface
+   - Conversation management
+   - Model integration examples
+
+### Pre-converted Models
+
+We provide sample converted models ready for use:
+- LLAMA 3.1 (1B and 8B variants) including iOS "friendly builds"
+- DeepSeek Coder distilled models
+- DeepHermes distilled models
+
+Visit our [Hugging Face repository](https://huggingface.co/anemll) for the latest converted models.
 
 > [!Important]
 > This is Alpha Release 0.3.0 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
 > This is Alpha Release 0.3.0 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
-> - This release only supports LLAMA models including DeepSeek distilled models on LLaMA 3.1 architecture
+> - This release only supports LLAMA models including DeepSeek and DeepHermes distilled models on LLaMA 3.1 architecture
 > - The future release will add support for more models and architectures
-> - Please visit https://huggingface.co/anemll where we uload the latest models and X: [@anemll](https://x.com/anemll) for updates
+> - Please visit https://huggingface.co/anemll where we upload the latest models and X: [@anemll](https://x.com/anemll) for updates
 > - Please star this repo to support the project!
 
 ### New in 0.3.0 🚀
+
+####Swift UI sample Code:
+Sample iOS/macOS inference Chat-Bot App
+Updates to Model conversion scripts 
 
 > Refernce implementation for Swift inference:
 > ```bash
@@ -37,7 +71,10 @@ See [Roadmap.md](./docs/Roadmap.md) for more details
 > # optional parms: --prompt "Who are you?"
 > ```
 
-
+####Sample iOSiOS/macOS Sample Applications
+- Downloads reference or custom models from HuggingFace
+- Inference / chat implementation use Swift Library
+- Sample TestFlight App for a quick test
 
 ## Basic Workflow
 
