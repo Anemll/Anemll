@@ -6,10 +6,10 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 > The goal is to provide a fully open-source pipeline from model conversion to inference for common LLM architectures running on ANE.
 > This enables seamless integration and on-device inference for low-power applications on edge devices, ensuring maximum privacy and security.
 > This is critical for autonomous applications, where models run directly on the device without requiring an internet connection.
-
-We aim to:
-- Provide flexible and easy to use library/framework to port LLMs to ANE directly from Hugging Face models
-- Provide on-device examples for iOS and macOS swift or C/C++ Applications
+>
+> We aim to:
+> - Provide flexible and easy to use library/framework to port LLMs to ANE directly from Hugging Face models
+> - Provide on-device examples for iOS and macOS swift or C/C++ Applications
 
 See update [Roadmap.md](./docs/Roadmap.md) for more details
 
@@ -57,11 +57,11 @@ Visit our [Hugging Face repository](https://huggingface.co/anemll) for the lates
 
 ### New in 0.3.0 🚀
 
-####Swift UI sample Code:
-Sample iOS/macOS inference Chat-Bot App
-Updates to Model conversion scripts 
+Swift UI Sample Code
+- Sample iOS/macOS inference Chat-Bot App
+- Updates to Model conversion scripts 
 
-> Refernce implementation for Swift inference:
+> Reference implementation for Swift inference:
 > ```bash
 > cd anemll-swift-cli
 > ```
@@ -75,10 +75,14 @@ Updates to Model conversion scripts
 > # optional parms: --prompt "Who are you?"
 > ```
 
-####Sample iOSiOS/macOS Sample Applications
+### Sample iOS/macOS Applications
 - Downloads reference or custom models from HuggingFace
 - Inference / chat implementation use Swift Library
 - Sample TestFlight App for a quick test
+- See [iOS/macOS Sample Applications Guide](./docs/sample_apps.md) for details
+
+> [!Tip]
+> Try our TestFlight app: [Join Beta](https://testflight.apple.com/join/jrQq1D1C)
 
 ## Basic Workflow
 
@@ -208,10 +212,23 @@ Currently optimized for:
 
 Feel free to submit issues and pull requests to improve **ANEMLL**!
 
-## License
+> [!Note]
+> If you're using ANEMLL in your project, please submit a PR to add it to this list.
+> We love to showcase how the community is using ANEMLL!
+### Third-Party Applications Using ANEMLL
 
-ANEMLL is licensed under the MIT License.
-https://opensource.org/license/mit 
+### Open Source Projects
+- [anemll-server](https://github.com/alexgusevski/anemll-server) - Server implementation of ANEMLL inference
+
+> [!Note]
+> If you're using ANEMLL in your project, please submit a PR to add it to this list.
+> We love to showcase how the community is using ANEMLL!
+
+### Integration Examples
+For examples of how to integrate ANEMLL into your projects, see:
+- [iOS Integration Guide](./docs/sample_apps.md)
+- [Swift CLI Reference](./docs/swift_cli.md)
+- [Python Sample Code](./docs/chat.md)
 
 ## Links & Resources
 
@@ -222,8 +239,13 @@ https://opensource.org/license/mit
 
 ## Contact
 
+For any questions or support, reach out to us at [realanemll@gmail.com](mailto:realanemll@gmail.com)
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=Anemll/Anemll&type=Date)](https://star-history.com/#Anemll/Anemll&Date)
 
-For any questions or support, reach out to us at [realanemll@gmail.com](mailto:realanemll@gmail.com)
+## License
+
+ANEMLL is licensed under the MIT License.
+https://opensource.org/license/mit
