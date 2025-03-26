@@ -6,6 +6,7 @@ tags:
 - DeepSeek
 - Apple
 - Apple Neural Engine
+- DeepHermes
 ---
 # ANEMLL
 
@@ -17,6 +18,9 @@ This enables seamless integration and on-device inference for low-power applicat
 
 This is critical for autonomous applications, where models run directly on the device without requiring an internet connection.
 
+For more information, visit the [ANEMLL GitHub repository](https://github.com/anemll/anemll).
+
+
 ---
 
 ## License
@@ -24,13 +28,13 @@ This is critical for autonomous applications, where models run directly on the d
 ANEMLL is licensed under the [MIT License](https://opensource.org/license/mit).  
 The model is based on Meta's LLaMA 3.2 and may require a separate license.
 
-This test model is exclusively for the Meta's LLaMA 3.2 1B (1024 context) model converted for CoreML, released before the official launch of the ANEMLL repository and minimal documentation. It is intended for early adopters only who requested an early release.
+This test model is exclusively for the Meta's LLaMA architecture  converted for CoreML, released before the official launch of the ANEMLL repository and minimal documentation. It is intended for early adopters only who requested an early release.
 
 ---
 
 ## Requirements
 
-- **macOS Sequoia** with Apple Neural Engine and 16GB RAM
+- **macOS Sequoia** with Apple Neural Engine and 8GB RAM or more
 - **CoreML Tools** and **HuggingFace Transformers** libraries 
 - **Python 3.9**
 
@@ -104,3 +108,40 @@ Please check following links for later updates:
 
 
 realanemll@gmail.com
+
+# %NAME_OF_THE_FOLDER_WE_UPLOAD%
+
+This is a CoreML model converted using ANEMLL for Apple Neural Engine inference.
+
+## Available Distributions
+
+### Standard Distribution
+- Contains zipped MLMODELC files
+- Suitable for macOS and development
+
+### iOS Distribution
+- Contains unzipped MLMODELC files
+- Ready for iOS deployment
+- Includes offline tokenizer support
+
+## Model Information
+- Context Length: %CONTEXT_LENGTH%
+- Batch Size: %BATCH_SIZE%
+- Number of Chunks: %NUM_CHUNKS%
+
+## Quick Start
+
+### Test in iOS/macOS App
+Try our sample Chat-Bot app on TestFlight:
+1. Install TestFlight from App Store
+2. Join beta test: [TestFlight Link](https://testflight.apple.com/join/jrQq1D1C)
+3. App includes a small demo model pre-installed
+4. You can add custom models via HuggingFace URLs
+
+> [!Note]
+> - The TestFlight app works on both iOS and macOS
+> - Demonstrates proper model integration and provides a reference implementation
+> - iOS requires unzipped MLMODELC files and config.json for offline tokenizer
+> - macOS supports both zipped and unzipped model formats
+
+```

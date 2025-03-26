@@ -1,6 +1,8 @@
-# ANEMLL Swift CLI Reference
+# ANEMLL Swift CLI Reference implementation 
 
 A Swift-based CLI tool for running LLM inference with CoreML models. This package provides high-performance inference capabilities for transformer models on Apple Silicon devices.
+
+Swift pakage is located in ./anemll-swift-cli folder
 
 ## Requirements
 
@@ -12,14 +14,14 @@ A Swift-based CLI tool for running LLM inference with CoreML models. This packag
 
 ## Features
 
-- High-performance CoreML inference
+- High-performance Apple Neural Engine (ANE) acceleration
+- CoreML Models
 - Support for chunked model execution
-- Batch processing capabilities
+- Batch Prefill and KV-cache support
 - Interactive chat mode
 - Progress reporting during model loading
 - Detailed debugging options
 - Support for various model versions (including 0.1.1)
-- Native Apple Neural Engine (ANE) acceleration
 
 ## Quick Start
 
@@ -79,7 +81,7 @@ Currently, the package should be added as a local package in Xcode:
 
 ### Sample Chat Bot Application
 For a complete example of integrating ANEMLL in a SwiftUI application, see our sample chat bot:
-[iOS/macOS Sample Applications](./sample_apps.md)
+[iOS/macOS Sample Applications](../docs/sample_apps.md)
 
 > [!Important]
 > Make sure to select the Package.swift from the CLI folder (`anemll-swift-cli`), not the root ANEMLL directory.

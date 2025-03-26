@@ -24,7 +24,7 @@ The `prepare_hf.sh` script automates the preparation of converted ANEMLL models 
 ## Usage
 
 ```bash
-./anemll/utils/prepare_hf.sh --input <converted_model_dir> [--output <output_dir>] [--org <org>]
+./anemll/utils/prepare_hf.sh --input <converted_model_dir> [--output <output_dir>] [--org <org>] [--ios]
 ```
 
 ### Parameters
@@ -34,22 +34,23 @@ The `prepare_hf.sh` script automates the preparation of converted ANEMLL models 
 | `--input` | Directory containing converted model files (with meta.yaml) | Yes |
 | `--output` | Output directory for HF distribution (defaults to input_dir/hf_dist) | No |
 | `--org` | Hugging Face organization/account (defaults to anemll) | No |
+| `--ios` | Also prepare iOS-ready version with unzipped MLMODELC files | No |
 
 ### Example
 
 ```bash
-# Prepare model for upload with default organization (anemll)
+# Prepare standard distribution
 ./anemll/utils/prepare_hf.sh --input /path/to/converted/model
 
-# Specify custom output directory
-./anemll/utils/prepare_hf.sh \
-    --input /path/to/converted/model \
-    --output /path/to/hf/dist
+# Prepare both standard and iOS distributions
+./anemll/utils/prepare_hf.sh --input /path/to/converted/model --ios
 
-# Use custom Hugging Face organization
+# Custom output and organization
 ./anemll/utils/prepare_hf.sh \
     --input /path/to/converted/model \
-    --org myorganization
+    --output /path/to/hf/dist \
+    --org myorganization \
+    --ios
 ```
 
 ## What the Script Does
@@ -58,21 +59,29 @@ The `prepare_hf.sh` script automates the preparation of converted ANEMLL models 
    - Extracts model information from meta.yaml
    - Gets model name, context length, batch size, etc.
 
-2. **Compresses Model Files**
-   - Compresses all .mlmodelc directories into zip files
+2. **Prepares Model Files**
+   - Standard distribution: Compresses .mlmodelc directories into zip files
+   - iOS distribution (optional): Copies uncompressed .mlmodelc directories
    - Handles embeddings, LM head, and FFN/prefill chunks
 
 3. **Copies Required Files**
    - meta.yaml
+   - config.json (required for offline iOS tokenizer)
    - tokenizer.json
    - tokenizer_config.json
    - chat.py and chat_full.py
+
+> [!Important]
+> The `config.json` file is required for iOS tokenizer to work offline without internet connection. 
+> Make sure this file is present in your converted model directory before preparing for distribution.
 
 4. **Generates README.md**
    - Uses readme.template
    - Replaces placeholders with actual values
 
 ## Output Structure
+
+### Standard Distribution
 
 ```
 output_directory/

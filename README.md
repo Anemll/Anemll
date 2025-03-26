@@ -15,13 +15,12 @@ See update [Roadmap.md](./docs/Roadmap.md) for more details
 
 ## Main Components in 0.3.0 Release
 
-ANEMLL provides four main components for Apple Neural Engine inference development:
+ANEMLL provides five main components for Apple Neural Engine inference development:
 
 1. [LLM Conversion Tools](./docs/convert.md) - Scripts and code to convert models directly from Hugging Face weights
    - [Single-shot Conversion Script](./docs/convert_model.md)
-   - [DeepSeek Model Conversion Guide](./docs/ConvertingDeepSeek.md)
 
-2. [Swift Reference Implementation](./docs/swift_inference.md) - Optimized inference code for Swift applications
+2. [Swift Reference Implementation](./docs/swift_cli.md) - Optimized inference code for Swift applications
    - Sample CLI application in `anemll-swift-cli`
    - Core inference engine implementation
 
@@ -33,6 +32,11 @@ ANEMLL provides four main components for Apple Neural Engine inference developme
    - SwiftUI Chat interface
    - Conversation management
    - Model integration examples
+
+5. [ANEMLL-BENCH](https://github.com/anemll/anemll-bench) - Apple Neural Engine Benchmarking
+   - Performance testing and comparison
+   - Model optimization metrics
+   - Hardware-specific benchmarks
 
 ### Pre-converted Models
 
