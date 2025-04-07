@@ -244,6 +244,7 @@ struct ChatView: View {
     private var inputArea: some View {
         HStack {
             messageTextField
+            
             actionButton
         }
         .padding()
@@ -291,6 +292,35 @@ struct ChatView: View {
     
     private var toolbarContent: some ToolbarContent {
         Group {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                // Thinking mode toggle button
+                Button(action: {
+                    let currentThinking = inferenceService.isThinkingModeEnabled()
+                    inferenceService.setThinkingMode(!currentThinking)
+                    
+                    // Add a system message to inform the user about the toggle
+                    let statusMessage = Message(
+                        text: "Thinking mode \(!currentThinking ? "enabled" : "disabled")",
+                        isUser: false,
+                        isSystemMessage: true
+                    )
+                    chat.addMessage(statusMessage)
+                    chatService.saveChat(chat)
+                    
+                    // Scroll to bottom to show the status message
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        Task { @MainActor in
+                            self.scrollToBottom()
+                        }
+                    }
+                }) {
+                    Image(systemName: "brain")
+                        .foregroundColor(inferenceService.isThinkingModeEnabled() ? .blue : .gray)
+                        .fontWeight(inferenceService.isThinkingModeEnabled() ? .bold : .regular)
+                }
+                .disabled(isTyping)
+            }
+            
             ToolbarItem(placement: .navigationBarTrailing) {
                 Button {
                     // Use a dedicated method to handle showing the model management view
@@ -462,6 +492,29 @@ struct ChatView: View {
         
         let userMessage = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         inputText = ""
+        
+        // Check if the input is the "/t" command to toggle thinking mode
+        if userMessage == "/t" {
+            let currentThinking = inferenceService.isThinkingModeEnabled()
+            inferenceService.setThinkingMode(!currentThinking)
+            
+            // Add a system message to inform the user about the toggle
+            let statusMessage = Message(
+                text: "Thinking mode \(!currentThinking ? "enabled" : "disabled")",
+                isUser: false,
+                isSystemMessage: true
+            )
+            chat.addMessage(statusMessage)
+            chatService.saveChat(chat)
+            
+            // Scroll to bottom to show the status message
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                Task { @MainActor in
+                    self.scrollToBottom()
+                }
+            }
+            return
+        }
         
         // Check if model is loaded and ready
         if isModelLoading {

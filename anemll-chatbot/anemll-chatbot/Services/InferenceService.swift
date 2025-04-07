@@ -118,6 +118,38 @@ class TokenBuffer {
     }
 }
 
+// Add the RepetitionDetector class before InferenceService
+class RepetitionDetector {
+    private let windowSize: Int
+    private let ngramSize: Int
+    private let threshold: Int
+    private var tokenWindow: [Int] = []
+
+    init(windowSize: Int = 50, ngramSize: Int = 5, threshold: Int = 3) {
+        self.windowSize = windowSize
+        self.ngramSize = ngramSize
+        self.threshold = threshold
+    }
+
+    func addToken(_ token: Int) -> Bool {
+        tokenWindow.append(token)
+        if tokenWindow.count > windowSize {
+            tokenWindow.removeFirst()
+        }
+        if tokenWindow.count >= ngramSize {
+            var counts: [[Int]: Int] = [:]
+            for i in 0..<(tokenWindow.count - ngramSize + 1) {
+                let ngram = Array(tokenWindow[i..<(i + ngramSize)])
+                counts[ngram, default: 0] += 1
+                if counts[ngram]! > threshold {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+}
+
 @MainActor
 class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     // Use a properly isolated shared instance that is created on the main actor
@@ -133,6 +165,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     
     // Add a property to store the context length from config
     private var modelContextLength: Int = 2048
+    
+    // Update debug level property to default to 2 for detailed hidden states debugging
+    private var debugLevel: Int = 0
     
     // Add conversation state tracking
     private var currentState: ConversationState?
@@ -524,19 +559,19 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     /// Cancels the current model loading process
     func cancelModelLoading(reason: CancellationReason = .userInitiated) {
         print("🛑 CANCEL: Cancelling model loading with reason: \(reason)")
-        isCancelled = true
+            isCancelled = true
         
         // Since lastCancellationReason is @MainActor isolated, we can safely set it
         // from this method which is also on the main actor
-        lastCancellationReason = reason
+            lastCancellationReason = reason
         print("🛑 CANCEL: Set lastCancellationReason to \(reason)")
         
         // Update the cancellation reason for delegate methods (accessible from nonisolated contexts)
-        _cancellationReasonForDelegate = reason
-        
+            _cancellationReasonForDelegate = reason
+            
         // Cancel our task wrapper
         print("🛑 CANCEL: Cancelling modelLoadingTask: \(modelLoadingTask != nil ? "task exists" : "no task")")
-        modelLoadingTask?.cancel()
+            modelLoadingTask?.cancel()
         
         // Call AnemllCore's cancellation method if we have a model loader
         if let modelLoader = currentModelLoader {
@@ -559,22 +594,25 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         
         // Use the updateUI method for consistent UI updates
         print("🛑 CANCEL: Updating UI to show cancellation")
-        updateUI(
-            progress: 0.0,
+            updateUI(
+                progress: 0.0,
             status: "Model loading cancelled",
-            isLoading: false,
-            isLoaded: false
-        )
-        
-        // Reset resources
+                isLoading: false,
+                isLoaded: false
+            )
+            
+            // Reset resources
         print("🛑 CANCEL: Resetting resources")
-        self.currentModelId = nil
-        self.inferenceManager = nil
-        self.tokenizer = nil
+        
+        unloadInferenceManager()
+        
+            self.currentModelId = nil
+            self.inferenceManager = nil
+            self.tokenizer = nil
         
         // Reset component tracking
-        self.totalComponents = 0
-        self.loadedComponents = 0
+            self.totalComponents = 0
+            self.loadedComponents = 0
         
         // Ensure hasLoadingError is set appropriately
         if reason == .userInitiated {
@@ -625,11 +663,32 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     
     /// Loads a model from a given URL with its YAML configuration
     func loadModel(modelId: String, from url: URL) async throws {
-        // New internal flag to track if this is a retry attempt
-        var isMLConfigRetryAttempted = false
+        // First, unload any existing model to free up memory
+        print("🧹 Unloading previous model before loading new one")
+                unloadModel()
+        
+        // Continue with the existing implementation...
+        // Create a class with an isolated property for thread safety
+        actor RetryStateManager {
+            var isRetryAttempted = false
+            
+            func markRetryAttempted() {
+                isRetryAttempted = true
+            }
+            
+            func isRetryAttemptedValue() -> Bool {
+                return isRetryAttempted
+            }
+        }
+        
+        // Create an actor-isolated state manager
+        let retryManager = RetryStateManager()
         
         // Use a simple while loop without labels
         while true {
+            // Get the current retry state
+            let isMLConfigRetryAttempted = await retryManager.isRetryAttemptedValue()
+            
             // Cancel any existing loading task with the appropriate reason
             cancelModelLoading(reason: .startingNewModel)
             
@@ -657,10 +716,15 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
             
             // Create a new task for loading the model
             // Store the task so it can be cancelled if needed
-            modelLoadingTask = Task {
+            modelLoadingTask = Task { [weak self] in
+                guard let self = self else { return }
+                
                 do {
+                    // Get retry state - use Task for async call
+                    let isRetryAttempted = await retryManager.isRetryAttemptedValue()
+                    
                     // Publish loading started notification - only for the first attempt
-                    if !isMLConfigRetryAttempted {
+                    if !isRetryAttempted {
                         NotificationCenter.default.post(
                             name: Notification.Name("ModelLoadingStarted"),
                             object: modelId
@@ -670,7 +734,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     }
                     
                     // If this is a retry attempt, clean up any CoreML cache directories
-                    if isMLConfigRetryAttempted {
+                    if await retryManager.isRetryAttemptedValue() {
                         print("🧹 Cleaning CoreML cache directories before retry...")
                         
                         // Clean caches directory first
@@ -1143,12 +1207,13 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                     print("📊 DEBUG: Context length: \(localConfig.contextLength)")
                                     print("📊 DEBUG: Batch size: \(localConfig.batchSize)")
                                     print("📊 DEBUG: v110 flag: \(shouldUseV110)")
+                                    print("📊 DEBUG: Debug level: \(self.debugLevel)")
                                     
                                     self.inferenceManager = try InferenceManager(
                                         models: models,
                                         contextLength: localConfig.contextLength,
                                         batchSize: localConfig.batchSize,
-                                        debugLevel: 0,  // Set back to 0 for production
+                                        debugLevel: self.debugLevel,  // Pass debug level to show hidden states
                                         v110: shouldUseV110  // Pass the v110 flag based on model version
                                     )
                                     
@@ -1356,7 +1421,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     self.loadingStatus = "Encountered MLModelConfiguration error, will retry..."
                     
                     // Set the retry flag to true - this ensures we only retry once
-                    isMLConfigRetryAttempted = true
+                    await retryManager.markRetryAttempted()
                     
                     // Sleep for a second before retry
                     try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
@@ -1418,20 +1483,41 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     }
     
     /// Unloads the current model to free memory
-    func unloadModel() {
-        // Cancel any ongoing model loading
-        cancelModelLoading()
-        
-        inferenceManager = nil
-        tokenizer = nil
-        currentModelId = nil
-        
-        // Update published property
-        DispatchQueue.main.async {
-            self.isModelLoaded = false
-            self.loadingProgress = 0.0
-            self.loadingStatus = ""
+    func unloadInferenceManager () {
+            guard let InferenceManager = inferenceManager else {
+                print("No inferenceManager to unload")
+            return // or break/continue, depending on the context
+            }
+            InferenceManager.unload()
         }
+    func unloadModel() {
+    
+            // Cancel any ongoing model loading
+        cancelModelLoading()
+
+            print("🛑 unloadModel - Resetting resources")
+        unloadInferenceManager()
+            self.currentModelId = nil
+            self.inferenceManager = nil
+            self.tokenizer = nil
+            
+            // Reset component tracking
+            self.totalComponents = 0
+            self.loadedComponents = 0
+        
+            
+            // Update published property
+            DispatchQueue.main.async {
+                self.isModelLoaded = false
+                self.loadingProgress = 0.0
+                self.loadingStatus = ""
+            }
+            
+            // Ensure hasLoadingError is set appropriately
+            // Reset cancellation flag for future loads
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.isCancelled = false
+            }
     }
     
     /// Gets the maximum number of tokens for generation based on the model's context length
@@ -1516,7 +1602,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
             Task {
                 do {
                     // Track start time and token count for performance metrics
-                    let startTime = Date()
+            let startTime = Date()
                     var generatedTokenCount = 0
                     
                     print("DEBUG - Starting token generation")
@@ -1680,9 +1766,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     print("DEBUG - Final response with thinking content: \"\(finalResponse)\"")
                     
                     // IMPORTANT: Yield the final response as is, with thinking content preserved
-                    continuation.yield(InferenceResult(
+                                continuation.yield(InferenceResult(
                         text: finalResponse,
-                        tokensPerSecond: tokensPerSecond,
+                                    tokensPerSecond: tokensPerSecond,
                         tokenCount: generatedTokenCount,
                         windowShifts: tokenBuffer.getWindowShifts(),
                         isComplete: true
@@ -1713,7 +1799,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             isComplete: true,
                             wasCancelled: true
                         ))
-                        try continuation.finish() // Add try here to make the catch block reachable
+                        continuation.finish() // Removed unnecessary try
                         
                         // Reset the task
                         await MainActor.run {
@@ -1753,7 +1839,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         windowShifts: 0,
                         isComplete: true
                     ))
-                    try continuation.finish() // Add try here to make the catch block reachable
+                    continuation.finish() // Removed unnecessary try
                 }
             }
         }
@@ -1807,56 +1893,97 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         // Create a conversation context from chat history and current input
         var allMessages = chatHistory
         
+        //allMessages.debugPrintConversationStructure(prefix:"X1: ")
+
+        
+        
         // Ensure we've added the latest user message if it's not already in the history
         let userMessage = Tokenizer.ChatMessage.user(userInput)
         if !allMessages.contains(where: { $0.isUser && $0.content == userInput }) {
             allMessages.append(userMessage)
         }
         
+        //allMessages.debugPrintConversationStructure(prefix:"X2:")
+
+        
         // Determine max tokens based on model's context length and whether long generation is allowed
         let maxContextTokens = getMaxTokensForGeneration()
         let maxGenerationTokens = allowLongGeneration ? 
             getMaxTokensForGeneration(multiplier: 4) : maxContextTokens
         
-        // Check if the context is too large and needs trimming
-        let contextLimit = Int(Double(maxContextTokens) * 0.8) // Use 80% of max for context
+        // Define a buffer for tokens added by the final template (BOS, roles, gen prompt)
+        let bufferForTemplateTokens = 50
+        // Calculate the maximum tokens the message history itself should occupy *before* templating
+        let messageTokenLimit = maxContextTokens - bufferForTemplateTokens
         
-        // Trim the conversation context if needed using our PAD token strategy
-        var conversationMessages = trimConversationContext(messages: allMessages, maxTokens: contextLimit)
+        print("DEBUG - Context Limits: maxContext=\(maxContextTokens), messageLimit=\(messageTokenLimit), generationLimit=\(maxGenerationTokens)")
         
-        // Add system prompt if present - always keep this at the beginning
+        // Prepare conversation messages from history
+        var conversationMessages = allMessages
+        
+        // Add system prompt if present or needed
+        let hasSystemPrompt: Bool
         if !systemPrompt.isEmpty {
             print("Adding system prompt to conversation")
-            // System prompts should be modeled as the first message (system role)
-            // For now, use assistant role since ChatMessage only supports user/assistant
-            conversationMessages.insert(.assistant(systemPrompt), at: 0)
+            conversationMessages.insert(.system(systemPrompt), at: 0)
+            hasSystemPrompt = true
             print("System prompt: \"\(systemPrompt)\"")
         }
-        
-        // If thinking mode is enabled and system prompt is empty, add the thinking system prompt
-        if thinkingModeEnabled && systemPrompt.isEmpty {
+        else if thinkingModeEnabled && systemPrompt.isEmpty {
             print("Adding thinking mode system prompt")
-            conversationMessages.insert(.assistant(thinkingSystemPrompt), at: 0)
+            conversationMessages.insert(.system(thinkingSystemPrompt), at: 0)
+            hasSystemPrompt = true
+                    } else {
+            conversationMessages.insert(.system(" "), at: 0)
+            hasSystemPrompt = true // Treat empty system prompt as still present for trimming logic
         }
         
-        // Debug print the simplified conversation structure
-        print("\nDEBUGGING CONVERSATION STRUCTURE:")
-        for (index, message) in conversationMessages.enumerated() {
-            let contentPreview = message.content.isEmpty ? "(empty)" : 
-                "\(message.content.prefix(min(30, message.content.count)))\(message.content.count > 30 ? "..." : "")"
-            print("Message #\(index): Role: \(message.role), Content: \(contentPreview)")
+        conversationMessages.debugPrintConversationStructure(prefix: "Initial Messages (before trim): ")
+        
+        // Pre-template Token Estimation and Trimming Loop
+        // Estimate tokens WITHOUT the final generation prompt structure
+        var estimatedTokens = tokenizer.applyChatTemplate(input: conversationMessages, addGenerationPrompt: false).count
+        print("DEBUG - Initial estimated token count (no gen prompt): \(estimatedTokens) / Limit: \(messageTokenLimit)")
+        
+        // Determine minimum messages to keep (system prompt + last user message)
+        let minMessagesToKeep = hasSystemPrompt ? 2 : 1
+        
+        while estimatedTokens > messageTokenLimit && conversationMessages.count > minMessagesToKeep {
+            // Determine which message to remove: the oldest one *after* the system prompt
+            let removeIndex = hasSystemPrompt ? 1 : 0
+            
+            // Ensure the index is valid before attempting removal
+            if conversationMessages.indices.contains(removeIndex) {
+                let removedMessage = conversationMessages.remove(at: removeIndex)
+                print("DEBUG - Trimming: Removed message at index \(removeIndex) (Role: \(removedMessage.role)). \(conversationMessages.count) messages left.")
+                
+                // Re-estimate token count after removal (still without gen prompt)
+                estimatedTokens = tokenizer.applyChatTemplate(input: conversationMessages, addGenerationPrompt: false).count
+                print("DEBUG - Estimated token count after trimming: \(estimatedTokens)")
+            } else {
+                // This shouldn't happen with the count check, but added as safety
+                print("DEBUG - Trimming Error: Attempted to remove message at invalid index \(removeIndex). Stopping trim.")
+                break
+            }
         }
+        
+        if estimatedTokens > messageTokenLimit {
+            print("⚠️ WARNING: Estimated tokens (\(estimatedTokens)) still exceed limit (\(messageTokenLimit)) after trimming. Proceeding, but safety net might be needed.")
+        } else {
+            print("DEBUG - Pre-template trimming complete. Final estimated count: \(estimatedTokens)")
+        }
+        
+        conversationMessages.debugPrintConversationStructure(prefix: "Trimmed Messages (before sanitize): ")
         
         // 2. Apply template to the simplified conversation
         print("\nApplying chat template to simplified conversation...")
         
         // Sanitize messages to handle thinking tags before applying chat template
-        let sanitizedMessages = sanitizeMessagesForChatTemplate(messages: conversationMessages)
         
         // Ensure we're using the proper encoding method from the tokenizer that understands
         // chat formats and special tokens like BOS/EOS
         var currentPrompt = tokenizer.applyChatTemplate(
-            input: sanitizedMessages,
+            input: sanitizeMessagesForChatTemplate(messages: conversationMessages),
             addGenerationPrompt: true  // This will add the assistant prompt for us
         )
         
@@ -1865,6 +1992,22 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
             print("⚠️ Warning: Template application returned empty token list, using fallback")
             // Use a fallback approach - manually tokenize without template
             currentPrompt = createFallbackPrompt(messages: conversationMessages, tokenizer: tokenizer)
+        } else {
+            // Log info about the final prompt that will be sent to the model
+            let decodedText = tokenizer.decode(tokens: currentPrompt, skipSpecialTokens: false)
+            print("\nDecoded prompt preview:")
+            print("\"\(decodedText.prefix(100))...\"")
+            print("Final prompt token count: \(currentPrompt.count) / Max Allowed: \(maxContextTokens)")
+        }
+        
+        // Safety Net: Hard Truncation
+        // This handles cases where the estimation + buffer wasn't perfect or template added unexpected tokens
+        if currentPrompt.count > maxContextTokens {
+            print("🚨 SAFETY NET: Final prompt (\(currentPrompt.count) tokens) exceeds max context (\(maxContextTokens)). Applying hard truncation.")
+            // Truncate from the *beginning* to preserve the end, which contains the crucial generation prompt structure
+            let excessTokens = currentPrompt.count - maxContextTokens
+            currentPrompt.removeFirst(excessTokens) 
+            print("🚨 SAFETY NET: Truncated prompt to \(currentPrompt.count) tokens.")
         }
         
         // 3. Check token count against context length
@@ -1891,17 +2034,19 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         }
         
         // Decode a preview
-        let previewTokens = Array(currentPrompt.prefix(min(100, currentPrompt.count)))
-        let decodedText = tokenizer.decode(tokens: previewTokens)
+        let previewTokens = Array(currentPrompt.prefix(min(500, currentPrompt.count)))
+        let decodedText = tokenizer.decode(tokens: previewTokens, skipSpecialTokens: false)
         print("\nDecoded prompt preview (first \(previewTokens.count) tokens):")
         print("\"\(decodedText)\"")
+        print("\n---ENC of Decoded prompt preview (first \(previewTokens.count) tokens):")
+
         
         print("=============== SIMPLIFIED APPROACH END ===============\n")
         
         // 4. Handle token generation through AsyncStream
         return AsyncStream<InferenceResult> { (continuation: AsyncStream<InferenceResult>.Continuation) in
             // Create and store the inference task so it can be cancelled later
-            self.activeInferenceTask = Task {
+            self.activeInferenceTask = Task { @Sendable in
                 do {
                     // Track metrics
                     let startTime = Date()
@@ -1909,6 +2054,10 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     var totalWindowShifts = 0
                     var isFirstTokenAfterShift = false
                     var lastShiftTime: Date? = nil
+                    
+                    // Initialize repetition detector and cancellation flag
+                    var repetitionDetector = RepetitionDetector(windowSize: 150, ngramSize: 15, threshold: 3)
+                    var isCancellationInProgress = false
                     
                     // Create a token printer for accurate decoding
                     let tokenPrinter = await TokenPrinter(tokenizer: tokenizer)
@@ -1923,214 +2072,196 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     print("🔍 DEBUG: Max tokens: \(maxGenerationTokens)")
                     print("🔍 DEBUG: Temperature: \(defaultTemperature)")
                     
-                    do {
-                        // Start inference using generateResponse with correct parameters
-                        let (prefillTokenCount, prefillTime, stopReason) = try await inferenceManager.generateResponse(
-                            initialTokens: currentPrompt,
-                            temperature: defaultTemperature,
-                            maxTokens: maxGenerationTokens, // Now using potential longer limit based on allowLongGeneration
-                            eosToken: tokenizer.eosTokenId,
-                            tokenizer: tokenizer,
-                            onToken: { token in
-                                // Check cancellation flag
-                                if self.inferenceIsCancelled {
-                                    print("🛑 TOKEN GENERATION CANCELLED - Stopping token callbacks")
-                                    return
-                                }
+                    // Validate the tokenizer before proceeding - this can throw
+                    try await tokenPrinter.validateTokenizer()
+                    
+                    // Start inference using generateResponse with correct parameters
+                    let (prefillTokenCount, prefillTime, stopReason) = try await inferenceManager.generateResponse(
+                        initialTokens: currentPrompt,
+                        temperature: defaultTemperature,
+                        maxTokens: maxGenerationTokens,
+                        eosToken: tokenizer.eosTokenId,
+                        tokenizer: tokenizer,
+                        onToken: { [tokenizer, tokenBuffer] token in
+                            // Check if cancellation is already in progress
+                            if isCancellationInProgress {
+                                return
+                            }
+                            
+                            // Check cancellation flag
+                            if self.inferenceIsCancelled {
+                                print("🛑 TOKEN GENERATION CANCELLED - Stopping token callbacks")
+                                return
+                            }
+                            
+                            // Check for repetition
+                            if repetitionDetector.addToken(token) {
+                                // Set flag to prevent re-entry
+                                isCancellationInProgress = true
+                                print("🔄 Repetition detected - stopping generation")
                                 
-                                // Increment token count
-                                generatedTokenCount += 1
-                                
-                                // Add to buffer for complete storage
-                                tokenBuffer.addToken(token)
-                                
-                                // If this is the first token after a window shift, log it
-                                if isFirstTokenAfterShift {
-                                    print("🔍 FIRST TOKEN AFTER WINDOW SHIFT #\(totalWindowShifts): ID \(token) = \"\(tokenizer.decode(tokens: [token], skipSpecialTokens: false))\"")
-                                    isFirstTokenAfterShift = false
+                                Task { @MainActor in
+                                    self.inferenceIsCancelled = true
                                     
-                                    // Calculate time since last shift
-                                    if let lastTime = lastShiftTime {
-                                        let timeSinceShift = Date().timeIntervalSince(lastTime)
-                                        print("⏱️ Time elapsed for re-prefill: \(String(format: "%.3f", timeSinceShift))s")
-                                    }
-                                }
-                                
-                                // Create a detached task to avoid blocking token generation
-                                Task.detached {
-                                    // Check cancellation flag again in the detached task
-                                    if self.inferenceIsCancelled {
-                                        return
-                                    }
-                                    
-                                    // Add token to the printer and get current text
-                                    await tokenPrinter.addToken(token)
-                                    
-                                    // Get text - use token buffer for long generations to ensure full context retention
-                                    let currentText = await self.shouldUseTokenBuffer(allowLongGeneration: allowLongGeneration, windowShifts: tokenBuffer.getWindowShifts()) ? 
+                                    // Get the current text before stopping
+                                    let finalText = await self.shouldUseTokenBuffer(allowLongGeneration: allowLongGeneration, windowShifts: tokenBuffer.getWindowShifts()) ? 
                                         tokenBuffer.getText() : 
                                         await tokenPrinter.getBuffer()
                                     
-                                    // Calculate performance metrics
-                                    let currentTime = Date().timeIntervalSince(startTime)
-                                    let tokensPerSecond = currentTime > 0 ? Double(generatedTokenCount) / currentTime : 0
-                                    
-                                    // Store tokenizer reference before entering closure
-                                    let currentTokenizer = await self.tokenizer
-                                    
-                                    // Debug token info occasionally
-                                    if generatedTokenCount % 20 == 0 || generatedTokenCount < 5 {
-                                        if let safeTokenizer = currentTokenizer {
-                                            print("DEBUG - Token #\(generatedTokenCount): ID \(token) = \"\(safeTokenizer.decode(tokens: [token], skipSpecialTokens: false))\"")
-                                        } else {
-                                            print("DEBUG - Token #\(generatedTokenCount): ID \(token) (tokenizer unavailable)")
-                                        }
-                                        if generatedTokenCount % 200 == 0 && tokenBuffer.getWindowShifts() > 0 {
-                                            print("DEBUG - Window shifts so far: \(tokenBuffer.getWindowShifts())")
-                                        }
-                                    }
-                                    
-                                    // Final check for cancellation before yielding
-                                    if self.inferenceIsCancelled {
-                                        return
-                                    }
-                                    
-                                    // Yield result to the stream with window shift information
+                                    // Yield final result and finish the stream
                                     continuation.yield(InferenceResult(
-                                        text: currentText,
-                                        tokensPerSecond: tokensPerSecond,
+                                        text: finalText,
+                                        tokensPerSecond: generatedTokenCount > 0 ? Double(generatedTokenCount) / Date().timeIntervalSince(startTime) : 0,
                                         tokenCount: generatedTokenCount,
                                         windowShifts: tokenBuffer.getWindowShifts(),
-                                        isComplete: false // Not the final result
+                                        isComplete: true
                                     ))
-                                }
-                            },
-                            onWindowShift: {
-                                // Record window shifts for tracking
-                                tokenBuffer.recordWindowShift()
-                                totalWindowShifts += 1
-                                isFirstTokenAfterShift = true
-                                lastShiftTime = Date()
+                    continuation.finish()
+                }
+                                return
+                            }
+                            
+                            // Increment token count
+                            generatedTokenCount += 1
+                            
+                            // Add to buffer for complete storage
+                            tokenBuffer.addToken(token)
+                            
+                            // If this is the first token after a window shift, log it and check for repetition
+                            if isFirstTokenAfterShift {
+                                print("🔍 FIRST TOKEN AFTER WINDOW SHIFT #\(totalWindowShifts): ID \(token) = \"\(tokenizer.decode(tokens: [token], skipSpecialTokens: false))\"")
+                                isFirstTokenAfterShift = false
                                 
-                                // Enhanced window shift logging
-                                print("\n🔄 WINDOW SHIFT #\(totalWindowShifts) OCCURRED at \(Date().timeIntervalSince(startTime))s")
-                                print("💨 Generated \(generatedTokenCount) tokens before this shift")
-                                print("🧠 Current context will be truncated and re-prefilled")
+                                // Calculate time since last shift
+                                if let lastTime = lastShiftTime {
+                                    let timeSinceShift = Date().timeIntervalSince(lastTime)
+                                    print("⏱️ Time elapsed for re-prefill: \(String(format: "%.3f", timeSinceShift))s")
+                                }
+                                
+                                // Reset repetition detector after window shift
+                                repetitionDetector = RepetitionDetector(windowSize: 150, ngramSize: 15, threshold: 3)
                             }
-                        )
-                        
-                        // Log completion info with enhanced details
-                        print("\n✅ GENERATION COMPLETE:")
-                        print("📊 Prefill token count: \(prefillTokenCount.count)")
-                        // Fix to use the count of the array, not the array itself
-                        let prefillTPS = prefillTime > 0 ? Double(prefillTokenCount.count) / prefillTime : 0
-                        print("⏱️ Prefill time: \(String(format: "%.3f", prefillTime))s (\(String(format: "%.1f", prefillTPS)) tokens/second)")
-                        print("🏁 Generation tokens: \(generatedTokenCount)")
-                        print("🔀 Window shifts: \(totalWindowShifts)")
-                        print("❓ Stop reason: \(stopReason)")
-                        
-                        // Update conversation state with the generated tokens
-                        if let chatId = chatId {
-                            // Update token count with both prompt and generated tokens
-                            // This is a simplification - in a real implementation we'd track KV cache state too
-                            await MainActor.run {
-                                self.updateConversationState(tokenCount: generatedTokenCount, chatId: chatId)
+                            
+                            // Create a detached task to avoid blocking token generation
+                            Task.detached {
+                                // Check cancellation flag again in the detached task
+                                if self.inferenceIsCancelled {
+                                    return
+                                }
+                                
+                                // Add token to the printer and get current text
+                                await tokenPrinter.addToken(token)
+                                
+                                // Get text - use token buffer for long generations to ensure full context retention
+                                let currentText = await self.shouldUseTokenBuffer(allowLongGeneration: allowLongGeneration, windowShifts: tokenBuffer.getWindowShifts()) ? 
+                                    tokenBuffer.getText() : 
+                                    await tokenPrinter.getBuffer()
+                                
+                                // Calculate performance metrics
+                                let currentTime = Date().timeIntervalSince(startTime)
+                                let tokensPerSecond = currentTime > 0 ? Double(generatedTokenCount) / currentTime : 0
+                                
+                                // Store tokenizer reference before entering closure
+                                let currentTokenizer = await self.tokenizer
+                                
+                                // Debug token info occasionally
+                                if generatedTokenCount % 20 == 0 || generatedTokenCount < 5 {
+                                    if let safeTokenizer = currentTokenizer {
+                                        print("DEBUG - Token #\(generatedTokenCount): ID \(token) = \"\(safeTokenizer.decode(tokens: [token], skipSpecialTokens: false))\"")
+        } else {
+                                        print("DEBUG - Token #\(generatedTokenCount): ID \(token) (tokenizer unavailable)")
+                                    }
+                                    if generatedTokenCount % 200 == 0 && tokenBuffer.getWindowShifts() > 0 {
+                                        print("DEBUG - Window shifts so far: \(tokenBuffer.getWindowShifts())")
+                                    }
+                                }
+                                
+                                // Final check for cancellation before yielding
+                                if self.inferenceIsCancelled {
+                                    return
+                                }
+                                
+                                // Yield result to the stream with window shift information
+                                continuation.yield(InferenceResult(
+                                    text: currentText,
+                                    tokensPerSecond: tokensPerSecond,
+                                    tokenCount: generatedTokenCount,
+                                    windowShifts: tokenBuffer.getWindowShifts(),
+                                    isComplete: false // Not the final result
+                                ))
                             }
+                        },
+                        onWindowShift: {
+                            // Record window shifts for tracking
+                            tokenBuffer.recordWindowShift()
+                            totalWindowShifts += 1
+                            isFirstTokenAfterShift = true
+                            lastShiftTime = Date()
+                            
+                            // Enhanced window shift logging
+                            print("\n🔄 WINDOW SHIFT #\(totalWindowShifts) OCCURRED at \(Date().timeIntervalSince(startTime))s")
+                            print("💨 Generated \(generatedTokenCount) tokens before this shift")
+                            print("🧠 Current context will be truncated and re-prefilled")
                         }
-                        
-                        // Calculate final tokens per second
-                        let totalTime = Date().timeIntervalSince(startTime)
-                        let tokensPerSecond = totalTime > 0 ? Double(generatedTokenCount) / totalTime : 0
-                        
-                        // Print performance metrics
-                        print("\n📝 PERFORMANCE SUMMARY:")
-                        print("⏱️ Total time: \(String(format: "%.2f", totalTime))s")
-                        print("🔢 Total tokens: \(generatedTokenCount)")
-                        print("⚡ Speed: \(String(format: "%.1f", tokensPerSecond)) tokens/second")
-                        print("🧮 Total window shifts: \(totalWindowShifts)")
-                        
-                        // Final yield with completed text - use token buffer for long generations
-                        let finalText = await self.shouldUseTokenBuffer(allowLongGeneration: allowLongGeneration, windowShifts: tokenBuffer.getWindowShifts()) ? 
-                            tokenBuffer.getText() : 
-                            await tokenPrinter.stop()
-                        continuation.yield(InferenceResult(
-                            text: finalText,
-                            tokensPerSecond: tokensPerSecond,
-                            tokenCount: generatedTokenCount,
-                            windowShifts: tokenBuffer.getWindowShifts(),
-                            isComplete: true // This is the final result
-                        ))
-                        try continuation.finish() // Add try here to make the catch block reachable
-                        
-                        // Clear the active task reference since we're done
+                    )
+                    
+                    // Log completion info with enhanced details
+                    print("\n✅ GENERATION COMPLETE:")
+                    print("📊 Prefill token count: \(prefillTokenCount.count)")
+                    // Fix to use the count of the array, not the array itself
+                    let prefillTPS = prefillTime > 0 ? Double(prefillTokenCount.count) / prefillTime : 0
+                    print("⏱️ Prefill time: \(String(format: "%.3f", prefillTime))s (\(String(format: "%.1f", prefillTPS)) tokens/second)")
+                    print("🏁 Generation tokens: \(generatedTokenCount)")
+                    print("🔀 Window shifts: \(totalWindowShifts)")
+                    print("❓ Stop reason: \(stopReason)")
+                    
+                    // Update conversation state with the generated tokens
+                    if let chatId = chatId {
+                        // Update token count with both prompt and generated tokens
+                        // This is a simplification - in a real implementation we'd track KV cache state too
                         await MainActor.run {
-                            // Store cancellation state before resetting
-                            let wasCancelled = self.inferenceIsCancelled
-                            
-                            // Reset internal state
-                            self.activeInferenceTask = nil
-                            self.inferenceIsCancelled = false
-                            
-                            if wasCancelled {
-                                print("🛑 TOKEN GENERATION COMPLETED AFTER CANCELLATION")
-                            } else {
-                                print("✅ TOKEN GENERATION COMPLETED NORMALLY")
-                            }
+                            self.updateConversationState(tokenCount: generatedTokenCount, chatId: chatId)
                         }
-                    } catch {
-                        // Check if the error is due to cancellation
-                        if Task.isCancelled || self.inferenceIsCancelled {
-                            print("🛑 TOKEN GENERATION TASK CANCELLED")
-                            // End the stream with a cancelled result
-                            continuation.yield(InferenceResult(
-                                text: tokenBuffer.getText(),
-                                tokensPerSecond: 0,
-                                tokenCount: 0,
-                                windowShifts: 0,
-                                isComplete: true,
-                                wasCancelled: true
-                            ))
-                            try continuation.finish() // Add try here to make the catch block reachable
-                            
-                            // Reset the task
-                            await MainActor.run {
-                                self.activeInferenceTask = nil
-                                self.inferenceIsCancelled = false
-                            }
-                            
-                            return
+                    }
+                    
+                    // Calculate final tokens per second
+                    let totalTime = Date().timeIntervalSince(startTime)
+                    let tokensPerSecond = totalTime > 0 ? Double(generatedTokenCount) / totalTime : 0
+                    
+                    // Print performance metrics
+                    print("\n📝 PERFORMANCE SUMMARY:")
+                    print("⏱️ Total time: \(String(format: "%.2f", totalTime))s")
+                    print("🔢 Total tokens: \(generatedTokenCount)")
+                    print("⚡ Speed: \(String(format: "%.1f", tokensPerSecond)) tokens/second")
+                    print("🧮 Total window shifts: \(totalWindowShifts)")
+                    
+                    // Final yield with completed text - use token buffer for long generations
+                    let finalText = await self.shouldUseTokenBuffer(allowLongGeneration: allowLongGeneration, windowShifts: tokenBuffer.getWindowShifts()) ? 
+                        tokenBuffer.getText() : 
+                        await tokenPrinter.stop()
+                    continuation.yield(InferenceResult(
+                        text: finalText,
+                        tokensPerSecond: tokensPerSecond,
+                        tokenCount: generatedTokenCount,
+                        windowShifts: tokenBuffer.getWindowShifts(),
+                        isComplete: true // This is the final result
+                    ))
+                    continuation.finish() // Removed unnecessary try
+                    
+                    // Clear the active task reference since we're done
+                    await MainActor.run {
+                        // Store cancellation state before resetting
+                        let wasCancelled = self.inferenceIsCancelled
+                        
+                        // Reset internal state
+                        self.activeInferenceTask = nil
+                        self.inferenceIsCancelled = false
+                        
+                        if wasCancelled {
+                            print("🛑 TOKEN GENERATION COMPLETED AFTER CANCELLATION")
+                        } else {
+                            print("✅ TOKEN GENERATION COMPLETED NORMALLY")
                         }
-                        
-                        print("\n❌ ERROR DURING INFERENCE:")
-                        print("📍 Error location: inferWithSystemPrompt → generateResponse")
-                        print("🔴 Error type: \(String(describing: type(of: error)))")
-                        print("📄 Description: \(error.localizedDescription)")
-                        
-                        // Try to determine more specific error location
-                        if let inferenceError = error as? InferenceError {
-                            switch inferenceError {
-                            case .modelNotLoaded:
-                                print("📍 Error detail: Model not loaded or not found")
-                            case .contextTooLong:
-                                print("📍 Error detail: Context exceeds maximum length")
-                            case .tokenizationFailed:
-                                print("📍 Error detail: Failed to tokenize input")
-                            case .inferenceError(let message):
-                                print("📍 Error detail: \(message)")
-                            default:
-                                print("📍 Error detail: Other inference error")
-                            }
-                        }
-                        
-                        // Yield an error result instead of trying to throw from the continuation
-                        continuation.yield(InferenceResult(
-                            text: "Error: \(error.localizedDescription)",
-                            tokensPerSecond: 0,
-                            tokenCount: 0,
-                            windowShifts: 0,
-                            isComplete: true
-                        ))
-                        try continuation.finish() // Add try here to make the catch block reachable
                     }
                 } catch {
                     // Check if the error is due to cancellation
@@ -2145,7 +2276,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             isComplete: true,
                             wasCancelled: true
                         ))
-                        try continuation.finish() // Add try here to make the catch block reachable
+                        continuation.finish() // Removed unnecessary try
                         
                         // Reset the task
                         await MainActor.run {
@@ -2185,7 +2316,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         windowShifts: 0,
                         isComplete: true
                     ))
-                    try continuation.finish() // Add try here to make the catch block reachable
+                    continuation.finish() // Removed unnecessary try
                 }
             }
         }
@@ -2366,6 +2497,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         
         // Reset resources
         print("⚠️ FORCE CANCEL: Resetting all resources")
+        unloadInferenceManager()
         self.currentModelId = nil
         self.inferenceManager = nil
         self.tokenizer = nil
@@ -2402,17 +2534,17 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     
     /// Initialize a new conversation state
     func initializeConversationState(for chatId: String) {
-        print("🔄 Initializing new conversation state for chat: \(chatId)")
-        currentState = ConversationState(chatId: chatId, isNewChat: true)
+            print("🔄 Initializing new conversation state for chat: \(chatId)")
+            currentState = ConversationState(chatId: chatId, isNewChat: true)
     }
     
     /// Reset the conversation state for a chat
     func resetConversationState(for chatId: String) {
-        print("🔄 Resetting conversation state for chat: \(chatId)")
-        if let existingState = currentState, existingState.chatId == chatId {
-            currentState = ConversationState(chatId: chatId, isNewChat: false)
-        } else {
-            initializeConversationState(for: chatId)
+            print("🔄 Resetting conversation state for chat: \(chatId)")
+            if let existingState = currentState, existingState.chatId == chatId {
+                currentState = ConversationState(chatId: chatId, isNewChat: false)
+            } else {
+                initializeConversationState(for: chatId)
         }
     }
     
@@ -2422,9 +2554,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
             print("⚠️ Cannot update state - no active state for chat: \(chatId)")
             initializeConversationState(for: chatId)
             currentState?.tokenCount = tokenCount
-            return
-        }
-        
+                return
+            }
+            
         state.tokenCount += tokenCount
         state.lastMessageTimestamp = Date()
         state.isNewChat = false
@@ -2435,15 +2567,15 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     
     /// Check if the conversation needs token trimming
     func needsTokenTrimming(chatId: String) -> Bool {
-        guard let state = currentState, state.chatId == chatId else {
-            return false
-        }
-        
-        // Get model context length (or use default)
-        let maxTokens = modelContextLength
-        let tokenLimit = maxTokens - 100 // Leave room for generation
-        
-        return state.tokenCount > tokenLimit
+            guard let state = currentState, state.chatId == chatId else {
+                return false
+            }
+            
+            // Get model context length (or use default)
+            let maxTokens = modelContextLength
+            let tokenLimit = maxTokens - 100 // Leave room for generation
+            
+            return state.tokenCount > tokenLimit
     }
     
     /// Trims a conversation to fit within context window by replacing older messages with PAD tokens
@@ -2678,6 +2810,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     }
     
     /// Sanitize messages with thinking tags to ensure chat template works properly
+    // This function is used to clean up the messages before they're passed to the chat template, ensuring that any 
+    // intermediate "thinking" content is properly handled and only the final responses are included in the conversation.
+    
     private func sanitizeMessagesForChatTemplate(messages: [Tokenizer.ChatMessage]) -> [Tokenizer.ChatMessage] {
         return messages.map { message in
             // Only need to process assistant messages
@@ -2730,4 +2865,104 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         // Also use it when long generation is enabled for consistency
         return windowShifts > 0 || allowLongGeneration
     }
+    
+    // Add this debug method for hidden states
+    private func debugHiddenStates(_ hiddenStates: MLMultiArray, label: String, debugLevel: Int = 1) {
+        if debugLevel > 0 {
+            let shape = hiddenStates.shape.map { $0.intValue }
+            print("\n🔍 DEBUG HIDDEN STATES: \(label)")
+            print("  Shape: \(shape)")
+            
+            // Print first 8 values
+            print("  First 8 values:")
+            var firstValues = "  "
+            for i in 0..<min(8, hiddenStates.count) {
+                let value = Float(truncating: hiddenStates[i])
+                firstValues += String(format: "%.6f ", value)
+            }
+            print(firstValues)
+            
+            // Print last 8 values
+            print("  Last 8 values:")
+            var lastValues = "  "
+            for i in max(0, hiddenStates.count-8)..<hiddenStates.count {
+                let value = Float(truncating: hiddenStates[i])
+                lastValues += String(format: "%.6f ", value)
+            }
+            print(lastValues)
+        }
+    }
+    
+    // Add a method to set debug level
+    func setDebugLevel(_ level: Int) {
+        self.debugLevel = level
+        print("Debug level set to \(level) - restart model to apply changes")
+    }
+    
+    @MainActor
+    private func startModelLoading(model: Model, modelPath: URL) {
+        // Ensure any existing model is unloaded before starting to load a new one
+        InferenceService.shared.unloadModel()
+        
+        // Start the loading process with high priority
+        Task(priority: .userInitiated) {
+            do {
+                print("🚀 Starting model loading for: \(model.id) (0%)")
+                
+                // Set loading state in InferenceService
+                InferenceService.shared.loadingStatus = "Starting model loading..."
+                InferenceService.shared.isLoadingModel = true
+                InferenceService.shared.loadingProgress = 0.05
+                
+                // Post notification that model loading has started
+                NotificationCenter.default.post(
+                    name: Notification.Name("ModelLoadingStarted"),
+                    object: model.id
+                )
+                
+                // Start loading the model
+                try await InferenceService.shared.loadModel(modelId: model.id, from: modelPath)
+                
+                print("✅ Model loaded successfully: \(model.id) (100%)")
+            } catch {
+                print("❌ MS.1 Error loading model: \(error.localizedDescription)")
+                
+                // Don't post failure notifications for cancellation errors
+                if error is CancellationError {
+                    print("🔄 Model loading was cancelled - not posting error notification")
+                    
+                    // Just reset loading state without posting error
+                    InferenceService.shared.isLoadingModel = false
+                    InferenceService.shared.loadingProgress = 0
+                    InferenceService.shared.loadingStatus = ""
+                    return
+                }
+                
+                // Reset loading state
+                InferenceService.shared.isLoadingModel = false
+                InferenceService.shared.loadingProgress = 0
+                InferenceService.shared.loadingStatus = "Error: \(error.localizedDescription)"
+                
+                // Post notification that model loading failed (only for non-cancellation errors)
+                NotificationCenter.default.post(
+                    name: Notification.Name("ModelLoadingFailed"),
+                    object: model.id,
+                    userInfo: ["error": error.localizedDescription]
+                )
+            }
+        }
+    }
 }
+
+// Add the extension before the InferenceService class
+extension Array where Element == Tokenizer.ChatMessage {
+    func debugPrintConversationStructure(prefix: String = "") {
+        print("\n\(prefix)DEBUGGING CONVERSATION STRUCTURE:")
+        for (index, message) in self.enumerated() {
+            let contentPreview = message.content.isEmpty ? "(empty)" : 
+            "\(message.content.prefix(Swift.min(100, message.content.count)))\(message.content.count > 30 ? "..." : "")"
+            print("\(prefix)Message #\(index): Role: \(message.role), Content: \(contentPreview)")
+        }
+    }
+}
+    

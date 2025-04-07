@@ -251,6 +251,7 @@ class ChatService: ObservableObject {
         
         // Add all previous messages from the chat history
         for message in chat.messages {
+            if message.text.isEmpty { continue } // skip empty messages!
             if message.isUser {
                 chatMessages.append(.user(message.text))
             } else {

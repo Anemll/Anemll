@@ -1887,9 +1887,9 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             // We'll still select it but log a warning
         }
         
-        // Special handling for the default model
+        // Use exact ID check for the default model
         let modelIdToStore: String
-        if model.id == "llama-3.2-1b" || model.id.contains("llama-3.2") || model.id.contains("llama_3_2") {
+        if model.id == "llama-3.2-1b" {
             // For the default model, always use the consistent ID
             modelIdToStore = "llama-3.2-1b"
             print("🔄 Using standardized ID for default model: \(modelIdToStore)")
@@ -2417,6 +2417,9 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
     // Helper method to start the actual model loading
     @MainActor
     private func startModelLoading(model: Model, modelPath: URL) {
+        // Ensure any existing model is unloaded before starting to load a new one
+        InferenceService.shared.unloadModel()
+        
         // Start the loading process with high priority
         Task(priority: .userInitiated) {
             do {

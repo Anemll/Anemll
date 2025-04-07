@@ -632,16 +632,38 @@ struct ModelManagementView: View {
     // Confirmation buttons for model loading
     private var modelLoadConfirmationButtons: some View {
         Group {
-                Button("Cancel", role: .cancel) { 
+            Button("No", role: .cancel) { 
+                // Just keep the selection but don't load
+                if let model = selectedModel {
+                    // Make sure the model is still selected, but not marked as loaded
+                    modelService.selectModel(model)
+                    
+                    // Reset any existing loading state to ensure UI is consistent
+                    if inferenceService.isModelLoaded {
+                        // Only unload if a different model was loaded
+                        if inferenceService.currentModel != model.id {
+                            inferenceService.unloadModel()
+                        }
+                    }
+                    
+                    // Refresh models to update UI state
+                    refreshModels(fullRefresh: true)
+                    
+                    // Show success message
+                    successMessage = "Model '\(model.name)' selected. Use the 'Load' button to load it into memory."
+                    showSuccess = true
+                }
                 selectedModel = nil
+                
                 // Dismiss keyboard if not in custom model sheet
                 if !isCustomModelSheetActive {
                     UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                 }
-                }
-                Button("Load Now", role: .none) {
+            }
+            
+            Button("Yes", role: .none) {
                 if let model = selectedModel {
-                        loadSelectedModel(model)
+                    loadSelectedModel(model)
                     selectedModel = nil
                 }
             }
@@ -652,11 +674,11 @@ struct ModelManagementView: View {
     private var modelLoadConfirmationMessage: some View {
         Group {
             if let model = selectedModel {
-                    Text("Do you want to load \(model.name) into memory now? This may take a moment.")
-                } else {
-                    Text("Do you want to load this model into memory now?")
-                }
+                Text("Model \"\(model.name)\" is selected. Do you want to load it into memory now?")
+            } else {
+                Text("Do you want to load this model into memory now?")
             }
+        }
     }
     
     // Helper function to handle view appearing
@@ -744,10 +766,6 @@ struct ModelManagementView: View {
                         self.refreshModels(fullRefresh: true)
                     }
                     
-                    // Start the model check timer
-                    await MainActor.run {
-                        self.startModelCheckTimer()
-                    }
                     
                     self.signposter.endInterval("LoadModels", state)
                 }
@@ -822,9 +840,6 @@ struct ModelManagementView: View {
         // print("ModelManagementView disappeared")
         // Clear any selected model to prevent stale references
         selectedModel = nil
-        
-        // Cancel the model check timer to prevent background verification
-        cancelModelCheckTimer()
         
         // Cancel any in-progress verification tasks
         Task {
@@ -980,51 +995,6 @@ struct ModelManagementView: View {
     }
     
     // Timer management - use a state property instead of direct timer reference
-    @State private var modelCheckTimer: Timer? = nil
-    
-    
-    private func startModelCheckTimer() {
-        // Cancel any existing timer first
-        cancelModelCheckTimer()
-        
-        // Create a timer that updates less frequently (10 seconds) to reduce overhead
-        self.modelCheckTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { timer in
-            // Skip verification if the view is not visible anymore
-            if !self.hasAppeared {
-                print("Skipping model verification - view not visible")
-                timer.invalidate()
-                return
-            }
-            
-            // Check models in background to avoid UI freezes
-            Task {
-                let state = self.signposter.beginInterval("ModelCheck", id: self.signpostID)
-                
-                // Check if any download is in progress before performing verification
-                let isAnyModelDownloading = await MainActor.run {
-                    return self.isDownloading.values.contains(true)
-                }
-                
-                if isAnyModelDownloading {
-                    // Skip verification if any model is being downloaded
-                    print("Skipping model verification due to active download")
-                    self.signposter.endInterval("ModelCheck", state)
-                    return
-                }
-                
-                // No active downloads, proceed with normal verification
-                await self.refreshModels(fullRefresh: false)
-                self.signposter.endInterval("ModelCheck", state)
-            }
-        }
-    }
-    
-    private func cancelModelCheckTimer() {
-        self.modelCheckTimer?.invalidate()
-        self.modelCheckTimer = nil
-        // print("⏱️ Model check timer cancelled")
-    }
-    
     // Helper function to dismiss keyboard in multiple ways
     private func dismissKeyboard() {
         let state = signposter.beginInterval("KeyboardDismiss", id: signpostID)
@@ -1225,14 +1195,16 @@ struct ModelManagementView: View {
             Task {
                 try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds delay
                 
-                // Now handle the model selection after cancellation
-                await selectModelAfterCancellation(model)
+                // Show confirmation dialog
+                await MainActor.run {
+                    selectedModel = model
+                    showModelLoadConfirmation = true
+                }
             }
         } else {
-            // No active loading, proceed normally
-            Task {
-                await selectModelAfterCancellation(model)
-            }
+            // No active loading, proceed with selection and show confirmation dialog
+            selectedModel = model
+            showModelLoadConfirmation = true
         }
     }
     
@@ -1302,6 +1274,9 @@ struct ModelManagementView: View {
     private func loadSelectedModel(_ model: Model) {
         // print("Loading selected model: \(model.id)")
         
+        // First make sure the model is selected
+        modelService.selectModel(model)
+        
         // Check if there's already a model loading in progress
         if inferenceService.isLoadingModel {
             // Cancel the current loading process
@@ -1313,10 +1288,20 @@ struct ModelManagementView: View {
                 
                 // Now load the selected model
                 loadActiveModel(model)
+                
+                // Dismiss the model management view
+                await MainActor.run {
+                    dismiss()
+                }
             }
         } else {
             // No loading in progress, proceed normally
             loadActiveModel(model)
+            
+            // Dismiss the model management view
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                self.dismiss()
+            }
         }
     }
     
@@ -1664,12 +1649,18 @@ struct ModelManagementView: View {
         
         // Add observer for model loading progress changes
         NotificationCenter.default.addObserver(
-            forName: Notification.Name("ModelLoadingProgress"),
+            forName: Notification.Name("ModelLoadingProgressUpdated"),
             object: nil,
             queue: .main
         ) { [self] _ in
-            // Update the UI when loading progress changes
-            refreshModels(fullRefresh: false)
+            // Only update the UI without verification during active model loading
+            if inferenceService.isLoadingModel {
+                // Just trigger UI refresh without running verification
+                self.refreshID = UUID()
+            } else {
+                // Regular update with verification when not loading a model
+                refreshModels(fullRefresh: false)
+            }
         }
         
         // Add observer for model loading state changes
@@ -1882,41 +1873,13 @@ struct ActiveModelSection: View {
         }
         .onAppear {
             // Start a timer to refresh the view when it appears
-            startRefreshTimer()
         }
         .onDisappear {
             // Cancel the timer when the view disappears
-            cancelRefreshTimer()
         }
     }
     
-    // Add a timer property
-    @State private var refreshTimer: Timer? = nil
     
-    // Start a timer to refresh the view
-    private func startRefreshTimer() {
-        // Cancel any existing timer
-        cancelRefreshTimer()
-        
-        // Create a timer that updates frequently to show loading progress
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [self] _ in
-            // Instead of directly accessing isLoadingModel, dispatch to main actor
-                    Task { @MainActor in
-                // This now runs on the MainActor, which is safe for accessing isLoadingModel
-                let isLoading = inferenceService.isLoadingModel
-                if isLoading {
-                    // Update the refresh token to force the view to refresh
-                    refreshToken = UUID()
-                }
-            }
-        }
-    }
-    
-    // Cancel the refresh timer
-    private func cancelRefreshTimer() {
-        refreshTimer?.invalidate()
-        refreshTimer = nil
-    }
     
     private func formatFileSize(_ size: Int) -> String {
         let formatter = ByteCountFormatter()

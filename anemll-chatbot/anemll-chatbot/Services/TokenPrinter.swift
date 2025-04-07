@@ -23,6 +23,15 @@ class TokenPrinter {
         self.tokenizer = tokenizer
     }
     
+    /// Validates that the tokenizer is properly initialized
+    /// - Throws: An error if the tokenizer is not valid
+    func validateTokenizer() throws {
+        // This method is used to make a potential throwing point in the call chain
+        if tokenizer.eosTokenId < 0 {
+            throw InferenceError.inferenceError("Tokenizer has invalid EOS token ID")
+        }
+    }
+    
     /// Add a token to the buffer
     /// - Parameter token: The token ID to decode and add
     func addToken(_ token: Int) async {
