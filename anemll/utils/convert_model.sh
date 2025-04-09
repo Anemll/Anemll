@@ -291,8 +291,17 @@ fi
 if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
     MODEL_NAME=$(basename "$MODEL_PATH")
     run_step 7 "Copying tokenizer files and creating meta.yaml" "
+        # Copy tokenizer files if they exist
         (cp \"$MODEL_PATH/tokenizer.json\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/tokenizer_config.json\" \"$OUTPUT_DIR/\" || true) && \
+        
+        # Create config.json if it doesn't exist
+        if [ ! -f \"$OUTPUT_DIR/config.json\" ]; then
+            echo \"Creating config.json for iOS tokenizer...\" && \
+            python -m anemll.ane_converter.create_config_json --output \"$OUTPUT_DIR/config.json\"
+        fi && \
+        
+        # Create meta.yaml
         python3 - \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
             $NUM_CHUNKS \"$PREFIX\" \"$OUTPUT_DIR/meta.yaml\" <<'EOF_PY'
@@ -346,6 +355,7 @@ with open(OUTFILE, 'w') as f:
 EOF_PY
     "
 fi
+
 
 # Step 8: Test with chat.py
 run_step 8 "Testing with chat.py" "python \"$PROJECT_ROOT/tests/chat.py\" \

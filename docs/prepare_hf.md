@@ -91,10 +91,27 @@ output_directory/
 ├── chat.py
 ├── chat_full.py
 ├── README.md
-├── llama_embeddings.mlmodelc.zip
+├── llama_embeddings_lutX.mlmodelc.zip
 ├── llama_lm_head_lutX.mlmodelc.zip
 └── llama_FFN_PF_lutX_chunk_NNofMM.mlmodelc.zip
 ```
+
+### iOS Distribution
+
+```
+output_directory/ios/
+├── meta.yaml
+├── tokenizer.json
+├── tokenizer_config.json
+├── config.json           # Required for iOS offline tokenizer
+├── chat.py               # Optional, for debug/testing in macOS
+├── chat_full.py          # Optional, for debug/testing in macOS
+├── llama_embeddings_lutX.mlmodelc/  # Uncompressed directory
+├── llama_lm_head_lutX.mlmodelc/  # Uncompressed directory
+└── llama_FFN_PF_lutX_chunk_NNofMM.mlmodelc/  # Uncompressed directory
+```
+
+Note that the iOS distribution contains **uncompressed** `.mlmodelc` directories, which are required for iOS apps to load the models directly. The `chat.py` and `chat_full.py` files are optional and included only for debugging and testing in macOS environments.
 
 ## Uploading to Hugging Face
 
@@ -104,13 +121,19 @@ After running the script, you can upload the model using:
 # First, ensure you're logged in
 huggingface-cli login
 
-# Then upload using the command printed by the script
-# The repository name will include both the model name and version number
-# For example: anemll/anemll-Meta-Llama-3.2-1B-ctx512_0.3.0
-huggingface-cli upload <org>/<model-name>_<version> output_directory
+# For standard distribution:
+huggingface-cli upload <org>/<model-name>_<version> <output_directory>/standard
+
+# For iOS distribution:
+huggingface-cli upload <org>/<model-name>_<version> <output_directory>/ios
+
+# Example with real paths:
+# Standard: huggingface-cli upload anemll/anemll-Meta-Llama-3.2-1B-ctx512_0.3.0 /path/to/hf_dist/standard
+# iOS: huggingface-cli upload anemll/anemll-Meta-Llama-3.2-1B-ctx512_0.3.0 /path/to/hf_dist/ios
 
 # To update just the README file in an existing repository:
-huggingface-cli upload <org>/<model-name>_<version> output_directory/README.md
+huggingface-cli upload <org>/<model-name>_<version> <output_directory>/standard/README.md  # For standard distribution
+huggingface-cli upload <org>/<model-name>_<version> <output_directory>/ios/README.md      # For iOS distribution
 ```
 
 ### Creating a New Model Repository

@@ -15,6 +15,11 @@ class BaseConverter(ABC):
         """Each model must implement its own conversion logic."""
         pass
 
-    def postprocess(self):
-        """Common postprocessing steps (e.g., optimizations)."""
+    def postprocess(self, num_workers=None):
+        """Common postprocessing steps (e.g., optimizations).
+        
+        Args:
+            num_workers: Optional number of workers for parallel processing.
+                        If None, uses default single worker.
+        """
         pass

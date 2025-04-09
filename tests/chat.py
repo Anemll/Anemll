@@ -66,6 +66,10 @@ class TokenPrinter:
         # Decode all tokens at once in the main thread
         token_str = self.tokenizer.decode(self.decoding_buffer)
         self.decoding_buffer.clear()
+        
+        # Store the text in buffer for later saving to file
+        with self.lock:
+            self.buffer += token_str
 
         # Color-handling logic
         if self.thinking and "</think>" in token_str:
@@ -98,6 +102,8 @@ class TokenPrinter:
     def stop(self):
         """Stop the printer thread."""
         if self.thread and self.thread.is_alive():
+            # Ensure any remaining tokens are processed
+            self.drain_buffer()
             self.stop_event.set()
             try:
                 self.thread.join(timeout=1.0)
@@ -519,7 +525,7 @@ def create_unified_state(ffn_models, context_length):
         print("\nCreated unified transformer state")
         return state
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None):
     """Interactive chat loop."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
@@ -667,6 +673,26 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     print(f"Inference: {inference_tokens_per_sec:.1f} t/s")
                     print(f"Total: Generated {tokens_generated} tokens in {prefill_time + inference_time:.2f}s")
                     conversation.append({"role": "assistant", "content": response})
+                    
+                    # Save response to file if requested
+                    if save_file:
+                        try:
+                            # Add small delay to ensure all tokens are processed
+                            time.sleep(0.5)
+                            
+                            # Make sure response ends with EOS token if it's supposed to
+                            if response and not response.endswith("<|eot_id|>") and not response.endswith("</s>"):
+                                if tokenizer.eos_token:
+                                    eos_text = tokenizer.decode([tokenizer.eos_token_id])
+                                    if not response.endswith(eos_text):
+                                        print(f"\n{DARK_BLUE}Adding missing EOS token for consistency{RESET_COLOR}")
+                                        response += eos_text
+                            
+                            with open(save_file, 'w') as f:
+                                f.write(response)
+                            print(f"\n{DARK_BLUE}Response saved to file: {save_file}{RESET_COLOR}")
+                        except Exception as e:
+                            print(f"\n{DARK_BLUE}Error saving to file: {str(e)}{RESET_COLOR}")
                 else:
                     token_printer.stop()  # Clean up without printing stats
                 
@@ -705,6 +731,10 @@ def parse_args():
     # Add new argument for auto-generation
     parser.add_argument('--prompt', type=str,
                        help='If specified, run once with this prompt and exit')
+    
+    # Add save option
+    parser.add_argument('--save', type=str,
+                       help='Save assistant\'s response to specified file')
     
     # Add no-warmup flag
     parser.add_argument('--nw', action='store_true',
@@ -847,7 +877,8 @@ def main():
             state=state,
             causal_mask=causal_mask,  # Pass the causal mask
             warmup=False,
-            auto_prompt=args.prompt
+            auto_prompt=args.prompt,
+            save_file=args.save
         )
         
     except Exception as e:
