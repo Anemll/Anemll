@@ -1653,13 +1653,15 @@ struct ModelManagementView: View {
             object: nil,
             queue: .main
         ) { [self] _ in
-            // Only update the UI without verification during active model loading
-            if inferenceService.isLoadingModel {
-                // Just trigger UI refresh without running verification
-                self.refreshID = UUID()
-            } else {
-                // Regular update with verification when not loading a model
-                refreshModels(fullRefresh: false)
+            Task { @MainActor in
+                // Only update the UI without verification during active model loading
+                if self.inferenceService.isLoadingModel {
+                    // Just trigger UI refresh without running verification
+                    self.refreshID = UUID()
+                } else {
+                    // Regular update with verification when not loading a model
+                    self.refreshModels(fullRefresh: false)
+                }
             }
         }
         
@@ -2155,94 +2157,6 @@ extension ModelService {
             // Completion handled by caller
         })
     }
-    
-    // Calculate the actual size of a model on disk
-    func calculateActualModelSize(modelId: String) -> Int {
-        let modelPath = getModelPath(for: modelId)
-        
-        // Make sure the directory exists
-        guard FileManager.default.fileExists(atPath: modelPath.path) else {
-            return 0
-        }
-        
-        var totalSize = 0
-        
-        // Helper function to recursively calculate directory size
-        func calculateSize(for url: URL) -> Int {
-            var dirSize = 0
-            
-            do {
-                // Get all files in directory
-                let contents = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.fileSizeKey])
-                
-                // Sum up the size of all files
-                for fileURL in contents {
-                    if let fileAttributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-                       let fileSize = fileAttributes[.size] as? Int {
-                        dirSize += fileSize
-                    }
-                    
-                    // If it's a directory, recursively calculate its size
-                    var isDir: ObjCBool = false
-                    if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir), isDir.boolValue {
-                        dirSize += calculateSize(for: fileURL)
-                    }
-                }
-            } catch {
-                // This catch block is now reachable because contents could throw
-                print("Error calculating size for \(url.path): \(error)")
-            }
-            
-            return dirSize
-        }
-        
-        // Calculate size of the entire model directory
-        totalSize = calculateSize(for: modelPath)
-        
-        return totalSize
-    }
-    
-    // Verify the model and return detailed information
-    func verifyModelWithDetails(modelId: String, verbose: Bool = true) -> (isValid: Bool, actualSize: Int, missingFiles: [String], fileSizes: [String: Int]) {
-        let modelPath = getModelPath(for: modelId)
-        var fileSizes: [String: Int] = [:]
-        let missingFiles: [String] = []
-        
-        // Use existing verification to check if files exist
-        let isValid = verifyModelFiles(modelId: modelId)
-        
-        // Calculate actual size on disk
-        let actualSize = calculateActualModelSize(modelId: modelId)
-        
-        // Helper function to recursively get file sizes
-        func getFileSizes(for url: URL, basePath: String = "") {
-            do {
-                let contents = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.fileSizeKey])
-                
-                for fileURL in contents {
-                    let relativePath = basePath.isEmpty ? fileURL.lastPathComponent : "\(basePath)/\(fileURL.lastPathComponent)"
-                    
-                    if let fileAttributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-                       let fileSize = fileAttributes[.size] as? Int {
-                        fileSizes[relativePath] = fileSize
-                    }
-                    
-                    // If it's a directory, recursively get sizes
-                    var isDir: ObjCBool = false
-                    if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir), isDir.boolValue {
-                        getFileSizes(for: fileURL, basePath: relativePath)
-                    }
-                }
-            } catch {
-                print("Error getting file sizes for \(url.path): \(error)")
-            }
-        }
-        
-        // Get sizes of all files
-        getFileSizes(for: modelPath)
-        
-        return (isValid, actualSize, missingFiles, fileSizes)
-    }
 }
 
 // Add this new view after the other custom views
@@ -2318,8 +2232,8 @@ struct ModelRedownloadSheet: View {
                                 Text("Missing weight files were detected. The model needs to be fixed before it can be used.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
-                                                            }
-                                                        } else {
+                            }
+                        } else {
                             HStack {
                                 Image(systemName: "checkmark.circle.fill")
                                     .foregroundColor(.green)
@@ -2333,25 +2247,6 @@ struct ModelRedownloadSheet: View {
                 }
                 
                 Section(header: Text("Download Options")) {
-                    if hasIncompleteDownload {
-                        Button(action: {
-                            isPresented = false
-                            onDownloadMissing()
-                        }) {
-                            HStack {
-                                Image(systemName: "bandage")
-                                    .foregroundColor(.blue)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Download Missing Files Only")
-                                        .foregroundColor(.primary)
-                                    Text("Attempt to fix by downloading only missing components")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                        }
-                    }
-                    
                     Button(action: {
                         isPresented = false
                         onDownloadAll()

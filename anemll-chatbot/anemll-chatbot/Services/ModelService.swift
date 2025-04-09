@@ -2123,10 +2123,12 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         let metaYamlPath = modelDir.appendingPathComponent("meta.yaml")
         let configJsonPath = modelDir.appendingPathComponent("config.json")
         let tokenizerJsonPath = modelDir.appendingPathComponent("tokenizer.json")
+        let tokenizerConfigJsonPath = modelDir.appendingPathComponent("tokenizer_config.json")
         
         let metaYamlExists = fileManager.fileExists(atPath: metaYamlPath.path)
         let configJsonExists = fileManager.fileExists(atPath: configJsonPath.path)
         let tokenizerJsonExists = fileManager.fileExists(atPath: tokenizerJsonPath.path)
+        let tokenizerConfigJsonExists = fileManager.fileExists(atPath: tokenizerConfigJsonPath.path)
         
         if verbose {
             print("📋 Verification for model: \(modelId)")
@@ -2134,11 +2136,59 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             print("  - meta.yaml: \(metaYamlExists ? "✅" : "❌")")
             print("  - config.json: \(configJsonExists ? "✅" : "❌")")
             print("  - tokenizer.json: \(tokenizerJsonExists ? "✅" : "❌")")
+            print("  - tokenizer_config.json: \(tokenizerConfigJsonExists ? "✅" : "❌")")
         }
         
         var allRequiredFilesExist = true
         var missingFiles: [String] = []
         var missingWeightFiles: [String] = []
+        var hasMissingCriticalFiles = false
+        
+        // Check for critical files first
+        if !metaYamlExists {
+            missingFiles.append("meta.yaml")
+            hasMissingCriticalFiles = true
+        }
+        if !configJsonExists {
+            missingFiles.append("config.json")
+            hasMissingCriticalFiles = true
+        }
+        if !tokenizerJsonExists {
+            missingFiles.append("tokenizer.json")
+            hasMissingCriticalFiles = true
+        }
+        if !tokenizerConfigJsonExists {
+            missingFiles.append("tokenizer_config.json")
+            hasMissingCriticalFiles = true
+        }
+        
+        // Update model's hasPlaceholders status based on critical files
+        if let model = model {
+            if hasMissingCriticalFiles {
+                print("⚠️ Model \(modelId) has missing critical files - setting hasPlaceholders to true")
+                DispatchQueue.main.async {
+                    model.hasPlaceholders = true
+                }
+            } else {
+                DispatchQueue.main.async {
+                    model.hasPlaceholders = false
+                }
+            }
+        }
+        
+        // If any critical files are missing, return false immediately
+        if hasMissingCriticalFiles {
+            if verbose {
+                print("❌ Critical files missing:")
+                for file in missingFiles {
+                    print("   - \(file)")
+                }
+            }
+            return false
+        }
+        
+        // Continue with weight file verification
+        // ... rest of the existing verification code ...
         
         // Helper function to get file size
         func getFileSize(at path: String) -> Int64 {
@@ -2206,6 +2256,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                     let isCriticalFile = file == "meta.yaml" || 
                                          file == "config.json" || 
                                          file == "tokenizer.json" ||
+                                         file == "tokenizer_config.json" ||  // Add tokenizer_config.json as critical
                                          file.contains("/weights/weight.bin")
                     
                     if !exists {
@@ -2216,6 +2267,9 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                         
                         if isCriticalFile {
                             allRequiredFilesExist = false
+                            if verbose {
+                                print("❌ Critical file missing: \(file)")
+                            }
                         }
                     }
                     
@@ -4409,57 +4463,113 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         return (isValidSize, totalSize, output)
     }
 
-    // Forward to the implementation in ModelManagementView to avoid duplication
-//     func calculateActualModelSize(modelId: String) -> Int {
-//         // Implement directly instead of forwarding to ModelManagementView
-//         let modelPath = getModelPath(for: modelId)
-//         
-//         // Make sure the directory exists
-//         guard FileManager.default.fileExists(atPath: modelPath.path) else {
-//             return 0
-//         }
-//         
-//         var totalSize = 0
-//         
-//         // Helper function to recursively calculate directory size
-//         func calculateSize(for url: URL) -> Int {
-//             var dirSize = 0
-//             
-//             do {
-//                 // Get all files in directory
-//                 let contents = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.fileSizeKey])
-//                 
-//                 // Sum up the size of all files
-//                 for fileURL in contents {
-//                     if let fileAttributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-//                        let fileSize = fileAttributes[.size] as? Int {
-//                         dirSize += fileSize
-//                     }
-//                     
-//                     // If it's a directory, recursively calculate its size
-//                     var isDir: ObjCBool = false
-//                     if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir), isDir.boolValue {
-//                         dirSize += calculateSize(for: fileURL)
-//                     }
-//                 }
-//             } catch {
-//                 print("Error calculating size for \(url.path): \(error)")
-//             }
-//             
-//             return dirSize
-//         }
-//         
-//         // Calculate size of the entire model directory
-//         totalSize = calculateSize(for: modelPath)
-//         
-//         return totalSize
-//     }
+    // Calculate the actual size of a model on disk
+    func calculateActualModelSize(modelId: String) -> Int {
+        let modelPath = getModelPath(for: modelId)
+        
+        // Make sure the directory exists
+        guard FileManager.default.fileExists(atPath: modelPath.path) else {
+            return 0
+        }
+        
+        var totalSize = 0
+        
+        // Helper function to recursively calculate directory size
+        func calculateSize(for url: URL) -> Int {
+            var dirSize = 0
+            
+            do {
+                // Get all files in directory
+                let contents = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.fileSizeKey])
+                
+                // Sum up the size of all files
+                for fileURL in contents {
+                    if let fileAttributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+                       let fileSize = fileAttributes[.size] as? Int {
+                        dirSize += fileSize
+                    }
+                    
+                    // If it's a directory, recursively calculate its size
+                    var isDir: ObjCBool = false
+                    if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir), isDir.boolValue {
+                        dirSize += calculateSize(for: fileURL)
+                    }
+                }
+            } catch {
+                print("Error calculating size for \(url.path): \(error)")
+            }
+            
+            return dirSize
+        }
+        
+        // Calculate size of the entire model directory
+        totalSize = calculateSize(for: modelPath)
+        
+        return totalSize
+    }
+
+    func verifyModelWithDetails(modelId: String, verbose: Bool = true) -> (isValid: Bool, actualSize: Int, missingFiles: [String], fileSizes: [String: Int]) {
+        let modelPath = self.getModelPath(for: modelId)
+        var fileSizes: [String: Int] = [:]
+        var missingFiles: [String] = []
+        var hasCriticalFilesMissing = false
+        
+        // Get the model to check for hasPlaceholders
+        if let model = self.getModel(for: modelId) {
+            // Check for critical files
+            let tokenizerConfigPath = modelPath.appendingPathComponent("tokenizer_config.json")
+            let tokenizerConfigExists = FileManager.default.fileExists(atPath: tokenizerConfigPath.path)
+            
+            if !tokenizerConfigExists {
+                missingFiles.append("tokenizer_config.json")
+                hasCriticalFilesMissing = true
+                print("⚠️ Critical file missing: tokenizer_config.json")
+                
+                // Update model's hasPlaceholders status on main thread
+                DispatchQueue.main.async {
+                    model.hasPlaceholders = true
+                }
+            } else {
+                // If tokenizer_config.json exists, check its size
+                if let attributes = try? FileManager.default.attributesOfItem(atPath: tokenizerConfigPath.path),
+                   let fileSize = attributes[.size] as? Int {
+                    fileSizes["tokenizer_config.json"] = fileSize
+                    if fileSize == 0 {
+                        print("⚠️ tokenizer_config.json exists but is empty")
+                        missingFiles.append("tokenizer_config.json (empty)")
+                        hasCriticalFilesMissing = true
+                        
+                        // Update model's hasPlaceholders status on main thread
+                        DispatchQueue.main.async {
+                            model.hasPlaceholders = true
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Use existing verification to check if files exist
+        let isValid = !hasCriticalFilesMissing && self.verifyModelFiles(modelId: modelId)
+        
+        // Calculate actual size on disk
+        let actualSize = self.calculateActualModelSize(modelId: modelId)
+        
+        if verbose {
+            print("📋 Model verification details for \(modelId):")
+            print("  - Valid: \(isValid)")
+            print("  - Actual size: \(formatFileSize(actualSize))")
+            print("  - Missing files: \(missingFiles.joined(separator: ", "))")
+            print("  - Has critical files missing: \(hasCriticalFilesMissing)")
+        }
+        
+        return (isValid: isValid, actualSize: actualSize, missingFiles: missingFiles, fileSizes: fileSizes)
+    }
 }
 
 extension ModelService {
-public func checkModelConfiguration(at yamlPath: URL) throws -> ModelConfiguration {
-    let yamlContent = try String(contentsOf: yamlPath, encoding: .utf8)
-    return try ModelConfiguration(from: yamlContent)
+    public func checkModelConfiguration(at yamlPath: URL) throws -> ModelConfiguration {
+        let yamlContent = try String(contentsOf: yamlPath, encoding: .utf8)
+        return try ModelConfiguration(from: yamlContent)
     }
 }
 

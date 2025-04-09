@@ -40,6 +40,7 @@ struct ChatView: View {
     @State private var showingClearAlert = false
     @State private var showSettingsPopover = false // New state for custom popover
     @State private var settingsAnchor: CGPoint = .zero // Anchor point for popover
+    @State private var useRepetitionDetector = InferenceService.shared.isRepetitionDetectorEnabled
     @ObservedObject private var modelService = ModelService.shared
     @ObservedObject private var inferenceService = InferenceService.shared
     @ObservedObject private var chatService = ChatService.shared
@@ -291,117 +292,170 @@ struct ChatView: View {
     }
     
     private var toolbarContent: some ToolbarContent {
-        Group {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                // Thinking mode toggle button
-                Button(action: {
-                    let currentThinking = inferenceService.isThinkingModeEnabled()
-                    inferenceService.setThinkingMode(!currentThinking)
-                    
-                    // Add a system message to inform the user about the toggle
-                    let statusMessage = Message(
-                        text: "Thinking mode \(!currentThinking ? "enabled" : "disabled")",
-                        isUser: false,
-                        isSystemMessage: true
-                    )
-                    chat.addMessage(statusMessage)
-                    chatService.saveChat(chat)
-                    
-                    // Scroll to bottom to show the status message
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        Task { @MainActor in
-                            self.scrollToBottom()
-                        }
-                    }
-                }) {
-                    Image(systemName: "brain")
-                        .foregroundColor(inferenceService.isThinkingModeEnabled() ? .blue : .gray)
-                        .fontWeight(inferenceService.isThinkingModeEnabled() ? .bold : .regular)
-                }
-                .disabled(isTyping)
-            }
-            
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Button {
-                    // Use a dedicated method to handle showing the model management view
-                    showModelManagementView()
-                } label: {
-                    Image(systemName: "cube")
-                        .foregroundColor(.blue)
-                }
-            }
-            
-            ToolbarItem(placement: .navigationBarTrailing) {
-                // Replace Menu with a Button that shows custom popover
-                Button {
-                    // Show settings popover
-                    showSettingsPopover = true
-                    print("DEBUG: Settings button tapped, showing popover")
-                } label: {
-                    Label("Settings", systemImage: "gear")
-                }
-                .background(
-                    GeometryReader { geo in
-                        Color.clear
-                            .onAppear {
-                                // Get the position for the popover
-                                let frame = geo.frame(in: .global)
-                                settingsAnchor = CGPoint(x: frame.midX, y: frame.midY)
-                            }
-                    }
+        ToolbarItemGroup(placement: .navigationBarTrailing) {
+            // Thinking mode toggle button
+            Button(action: {
+                let currentThinking = inferenceService.isThinkingModeEnabled()
+                inferenceService.setThinkingMode(!currentThinking)
+                
+                // Add a system message to inform the user about the toggle
+                let statusMessage = Message(
+                    text: "Thinking mode \(!currentThinking ? "enabled" : "disabled")",
+                    isUser: false,
+                    isSystemMessage: true
                 )
-                .popover(isPresented: $showSettingsPopover, arrowEdge: .top) {
-                    // Custom popover content
-                    VStack(spacing: 16) {
-                        Text("Settings")
-                            .font(.headline)
-                            .padding(.top)
+                chat.addMessage(statusMessage)
+                chatService.saveChat(chat)
+                
+                // Scroll to bottom to show the status message
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    Task { @MainActor in
+                        self.scrollToBottom()
+                    }
+                }
+            }) {
+                Image(systemName: "brain")
+                    .foregroundColor(inferenceService.isThinkingModeEnabled() ? .blue : .gray)
+                    .fontWeight(inferenceService.isThinkingModeEnabled() ? .bold : .regular)
+            }
+            .disabled(isTyping)
+            
+            Button {
+                // Use a dedicated method to handle showing the model management view
+                showModelManagementView()
+            } label: {
+                Image(systemName: "cube")
+                    .foregroundColor(.blue)
+            }
+            
+            // Replace Menu with a Button that shows custom popover
+            Button {
+                // Show settings popover
+                showSettingsPopover = true
+                print("DEBUG: Settings button tapped, showing popover")
+            } label: {
+                Label("Settings", systemImage: "gear")
+            }
+            .background(
+                GeometryReader { geo in
+                    Color.clear
+                        .onAppear {
+                            // Get the position for the popover
+                            let frame = geo.frame(in: .global)
+                            settingsAnchor = CGPoint(x: frame.midX, y: frame.midY)
+                        }
+                }
+            )
+            .popover(isPresented: $showSettingsPopover, arrowEdge: .top) {
+                // Custom popover content
+                VStack(spacing: 16) {
+                    Text("Settings")
+                        .font(.headline)
+                        .padding(.top)
+                    
+                    Divider()
+                    
+                    VStack(alignment: .leading) {
+                        Toggle("Show advanced commands", isOn: $isAdvancedMode)
+                            .toggleStyle(SwitchToggleStyle(tint: .blue))
+                            .padding(.horizontal)
+                            .onAppear {
+                                print("DEBUG: Advanced Mode toggle value: \(isAdvancedMode)")
+                            }
+                            .onChange(of: isAdvancedMode) { oldValue, newValue in
+                                print("DEBUG: Advanced Mode toggle changed to: \(newValue)")
+                            }
+                        
+                        Toggle("Long Generation", isOn: $allowLongGeneration)
+                            .toggleStyle(SwitchToggleStyle(tint: .green))
+                            .padding(.horizontal)
+                            .onAppear {
+                                print("DEBUG: Long Generation toggle value: \(allowLongGeneration)")
+                            }
+                            .onChange(of: allowLongGeneration) { oldValue, newValue in
+                                print("DEBUG: Long Generation toggle changed to: \(newValue)")
+                            }
+                        
+                        Text("Enables responses up to 4x longer with extended token limits")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal)
+                            
+                        Toggle("Repetition Detection", isOn: $useRepetitionDetector)
+                            .toggleStyle(SwitchToggleStyle(tint: .purple))
+                            .padding(.horizontal)
+                            .onAppear {
+                                print("DEBUG: Repetition Detection toggle value: \(useRepetitionDetector)")
+                            }
+                            .onChange(of: useRepetitionDetector) { oldValue, newValue in
+                                print("DEBUG: Repetition Detection toggle changed to: \(newValue)")
+                                InferenceService.shared.configureRepetitionDetector(enabled: newValue)
+                            }
+                        
+                        Text("Automatically stops generation if text becomes repetitive")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal)
+                    }
+                    
+                    if isAdvancedMode {
+                        Divider()
+                        
+                        // InferenceManager Debug Controls
+                        VStack(spacing: 8) {
+                            Text("Debug Controls")
+                                .font(.headline)
+                                .padding(.vertical, 4)
+                            
+                            Button("Reset Backings") {
+                                if let inferenceManager = inferenceService.debugInferenceManager {
+                                    Task {
+                                        do {
+                                            try await inferenceManager.initializeBackings()
+                                        } catch {
+                                            print("Error resetting backings: \(error)")
+                                        }
+                                    }
+                                }
+                            }
+                            .disabled(inferenceService.debugInferenceManager == nil)
+                            
+                            Button("Reset Causal Mask") {
+                                if let inferenceManager = inferenceService.debugInferenceManager {
+                                    inferenceManager.initFullCausalMask()
+                                }
+                            }
+                            .disabled(inferenceService.debugInferenceManager == nil)
+                            
+                            Button("Reset KV-Cache") {
+                                if let inferenceManager = inferenceService.debugInferenceManager {
+                                    inferenceManager.initState()
+                                }
+                            }
+                            .disabled(inferenceService.debugInferenceManager == nil)
+                            
+                            Button("Toggle Debug Level") {
+                                if let inferenceManager = inferenceService.debugInferenceManager {
+                                    inferenceManager.ToggeDebugLevel()
+                                }
+                            }
+                            .disabled(inferenceService.debugInferenceManager == nil)
+                        }
                         
                         Divider()
                         
-                        VStack(alignment: .leading) {
-                            Toggle("Show advanced commands", isOn: $isAdvancedMode)
-                                .toggleStyle(SwitchToggleStyle(tint: .blue))
-                                .padding(.horizontal)
-                                .onAppear {
-                                    print("DEBUG: Advanced Mode toggle value: \(isAdvancedMode)")
-                                }
-                                .onChange(of: isAdvancedMode) { oldValue, newValue in
-                                    print("DEBUG: Advanced Mode toggle changed to: \(newValue)")
-                                }
-                            
-                            Toggle("Long Generation", isOn: $allowLongGeneration)
-                                .toggleStyle(SwitchToggleStyle(tint: .green))
-                                .padding(.horizontal)
-                                .onAppear {
-                                    print("DEBUG: Long Generation toggle value: \(allowLongGeneration)")
-                                }
-                                .onChange(of: allowLongGeneration) { oldValue, newValue in
-                                    print("DEBUG: Long Generation toggle changed to: \(newValue)")
-                                }
-                            
-                            Text("Enables responses up to 4x longer with extended token limits")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .padding(.horizontal)
-                        }
-                        
-                        if isAdvancedMode {
-                            Divider()
-                            
-                            Button("Clear Conversation") {
-                                showSettingsPopover = false
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                    showingClearAlert = true
-                                }
+                        Button("Clear Conversation") {
+                            showSettingsPopover = false
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                                showingClearAlert = true
                             }
-                            .foregroundColor(.red)
-                            .padding(.bottom)
                         }
+                        .foregroundColor(.red)
+                        .padding(.bottom)
                     }
-                    .frame(width: 250)
-                    .padding(.vertical, 10)
                 }
+                .frame(width: 250)
+                .padding(.vertical, 10)
             }
         }
     }
@@ -487,39 +541,17 @@ struct ChatView: View {
         // Don't send empty messages
         if inputText.isEmpty { return }
         
-        // Add the user message to the chat
-        print("Sending message: \(inputText)")
-        
-        let userMessage = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        inputText = ""
-        
-        // Check if the input is the "/t" command to toggle thinking mode
-        if userMessage == "/t" {
-            let currentThinking = inferenceService.isThinkingModeEnabled()
-            inferenceService.setThinkingMode(!currentThinking)
-            
-            // Add a system message to inform the user about the toggle
-            let statusMessage = Message(
-                text: "Thinking mode \(!currentThinking ? "enabled" : "disabled")",
-                isUser: false,
-                isSystemMessage: true
-            )
-            chat.addMessage(statusMessage)
-            chatService.saveChat(chat)
-            
-            // Scroll to bottom to show the status message
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                Task { @MainActor in
-                    self.scrollToBottom()
-                }
-            }
-            return
-        }
-        
         // Check if model is loaded and ready
         if isModelLoading {
             showModelLoadingError = true
             errorMessage = "Please wait for the model to finish loading."
+            return
+        }
+        
+        // Check if inference is busy
+        if let inferenceManager = inferenceService.debugInferenceManager, inferenceManager.isBusy() {
+            showModelLoadingError = true
+            errorMessage = "Please wait for the current generation to complete."
             return
         }
         
@@ -571,6 +603,35 @@ struct ChatView: View {
         
         // If we're already generating, don't start another
         if isTyping || inferenceTask != nil {
+            return
+        }
+        
+        // Add the user message to the chat
+        print("Sending message: \(inputText)")
+        
+        let userMessage = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        inputText = ""
+        
+        // Check if the input is the "/t" command to toggle thinking mode
+        if userMessage == "/t" {
+            let currentThinking = inferenceService.isThinkingModeEnabled()
+            inferenceService.setThinkingMode(!currentThinking)
+            
+            // Add a system message to inform the user about the toggle
+            let statusMessage = Message(
+                text: "Thinking mode \(!currentThinking ? "enabled" : "disabled")",
+                isUser: false,
+                isSystemMessage: true
+            )
+            chat.addMessage(statusMessage)
+            chatService.saveChat(chat)
+            
+            // Scroll to bottom to show the status message
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                Task { @MainActor in
+                    self.scrollToBottom()
+                }
+            }
             return
         }
         
@@ -942,6 +1003,7 @@ struct ModelIndicatorView: View {
     @Binding var showModelManagement: Bool
     var isCancellingModel: Bool
     var onReloadModel: () -> Void
+    @State private var showErrorDetails = false
     
     var isModelLoading: Bool {
         guard let selectedModel = modelService.getSelectedModel() else { return false }
@@ -993,14 +1055,68 @@ struct ModelIndicatorView: View {
                     }
                 } else if inferenceService.hasLoadingError {
                     // Display error indicator when loading fails
-                    HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.circle")
-                            .foregroundColor(.red)
+                    Button(action: { showErrorDetails = true }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.circle")
+                                .foregroundColor(.red)
+                                .font(.caption)
+                            
+                            Text("Load Error")
+                                .font(.system(size: 9))
+                                .foregroundColor(.red)
+                        }
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .popover(isPresented: $showErrorDetails) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Model Loading Error")
+                                .font(.headline)
+                                .padding(.bottom, 4)
+                            
+                            // Show all errors from the current loading attempt
+                            if !inferenceService.currentLoadingErrors.isEmpty {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    ForEach(inferenceService.currentLoadingErrors, id: \.self) { error in
+                                        Text(error)
+                                            .font(.subheadline)
+                                            .foregroundColor(.red)
+                                    }
+                                }
+                            } else if let errorMessage = inferenceService.lastLoadingError {
+                                Text(errorMessage)
+                                    .font(.subheadline)
+                                    .foregroundColor(.red)
+                            } else {
+                                Text("An unknown error occurred while loading the model.")
+                                    .font(.subheadline)
+                                    .foregroundColor(.red)
+                            }
+                            
+                            Divider()
+                            
+                            Text("Suggested Actions:")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("• Verify model files are complete")
+                                Text("• Try reloading the model")
+                                Text("• Check available storage space")
+                                Text("• Reinstall the model if issues persist")
+                            }
                             .font(.caption)
-                        
-                        Text("Load Error")
-                            .font(.system(size: 9))
-                            .foregroundColor(.red)
+                            .foregroundColor(.secondary)
+                            
+                            HStack {
+                                Spacer()
+                                Button("Close") {
+                                    showErrorDetails = false
+                                }
+                                .padding(.top, 8)
+                            }
+                        }
+                        .padding()
+                        .frame(width: 300)
                     }
                 } else if isModelLoading {
                     // Use our updated ModelLoadingView

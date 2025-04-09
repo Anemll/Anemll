@@ -8,6 +8,12 @@ import Combine
 import Yams
 import AnemllCore  // Import AnemllCore for InferenceManager, Tokenizer, etc.
 
+// Add constants for abort reasons
+private enum AbortReason {
+    static let userCancelled = 1
+    static let repetitionDetected = 2
+}
+
 // StandardOutputObserver to intercept standard output if needed
 final class StandardOutputObserver {
     private var pipe = Pipe()
@@ -161,7 +167,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     private var inferenceManager: InferenceManager?
     private var tokenizer: Tokenizer?
     private var currentModelId: String?
-    private let defaultTemperature: Float = 0.0
+    private let defaultTemperature: Float = 0.6
     
     // Add a property to store the context length from config
     private var modelContextLength: Int = 2048
@@ -213,6 +219,38 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     
     // Add a property to safely access the cancellation reason from nonisolated contexts
     nonisolated(unsafe) private var _cancellationReasonForDelegate: CancellationReason = .userInitiated
+    
+    // Add warmup configuration
+    private var warmupOnLoad: Bool = false
+    private var testOnLoad: Bool = true
+
+    // Add published property for last loading error
+    @Published var lastLoadingError: String?
+    
+    // Add array to track all loading errors in current attempt
+    @Published private var loadingErrors: [String] = []
+    
+    // Add property to track if we're in a loading attempt
+    private var isInLoadingAttempt: Bool = false
+    
+    /// Get all errors from the current/last loading attempt
+    var currentLoadingErrors: [String] {
+        return loadingErrors
+    }
+    
+    // Add repetition detector configuration
+    private var useRepetitionDetector: Bool = true
+    
+    /// Configure whether to use repetition detection during inference
+    func configureRepetitionDetector(enabled: Bool) {
+        print("🔧 Configuring repetition detector: \(enabled ? "enabled" : "disabled")")
+        useRepetitionDetector = enabled
+    }
+    
+    /// Get the current state of the repetition detector
+    var isRepetitionDetectorEnabled: Bool {
+        useRepetitionDetector
+    }
     
     // MARK: - Published Properties with Observers
     
@@ -288,6 +326,10 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         
         Task { @MainActor in
             print("⛔️ DELEGATE: Inside Task in loadingCancelled(), updating UI")
+            
+            // Add cancellation message to loading errors
+            self.loadingErrors.append("Model loading cancelled")
+            
             // Use our helper to update the UI
             self.updateUI(
                 progress: 0,
@@ -326,6 +368,99 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                 print("⛔️ DELEGATE: Resetting isCancelled flag to false")
                 self?.isCancelled = false
             }
+        }
+    }
+    
+        
+    // Add warmup inference method
+    private func performTestInference() async throws {
+        print("🔥 Performing performTestInference inference...")
+        guard let inferenceManager = inferenceManager, let tokenizer = tokenizer else {
+            print("⚠️ Cannot perform warmup: inferenceManager or tokenizer is nil")
+            return
+        }
+        
+        let maxTokens = 5
+        let TestText = """
+        <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+        Cutting Knowledge Date: December 2023
+        Today Date: 26 Jul 2024
+
+        <|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+        Thinking mode disabled<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+        Who are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+        I'm an artificial intelligence model that provides general information and discussion on a variety of topics, including but not limited to history, science, technology, culture, and many other subjects.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+        Who made you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+        """
+        
+        do {
+            // Tokenize the warmup text
+            let tokens = tokenizer.tokenize(TestText)
+            
+            // Perform inference using generateResponse
+            for _ in 1...2 {
+                let (_, _, _) = try await inferenceManager.generateResponse(
+                    initialTokens: tokens,
+                    temperature: defaultTemperature,
+                    maxTokens: maxTokens,
+                    eosToken: tokenizer.eosTokenId,
+                    tokenizer: tokenizer,
+                    onToken: { token in
+                        print("🔥 TEST: Generated token \(token)")
+                    }
+                )
+            }
+            print("✅ test inference completed successfully")
+            //print("   Prefill time: \(String(format: "%.3f", prefillTime))s")
+            //print("   Stop reason: \(stopReason)")
+        } catch {
+            print("⚠️ Warmup inference failed: \(error)")
+            // Don't throw the error as warmup failure shouldn't block model loading
+        }
+    }
+
+    
+    
+    // Add warmup inference method
+    private func performWarmupInference() async throws {
+        print("🔥 Performing warmup inference...")
+        guard let inferenceManager = inferenceManager, let tokenizer = tokenizer else {
+            print("⚠️ Cannot perform warmup: inferenceManager or tokenizer is nil")
+            return
+        }
+        
+        let warmupText = "who are you"
+        let maxTokens = 12
+        
+        do {
+            // Tokenize the warmup text
+            let tokens = tokenizer.tokenize(warmupText)
+            
+            // Perform inference using generateResponse
+            let (_, prefillTime, stopReason) = try await inferenceManager.generateResponse(
+                initialTokens: tokens,
+                temperature: defaultTemperature,
+                maxTokens: maxTokens,
+                eosToken: tokenizer.eosTokenId,
+                tokenizer: tokenizer,
+                onToken: { token in
+                    // Just log every 5 tokens for monitoring
+                    if token % 5 == 0 {
+                        print("🔥 WARMUP: Generated token \(token)")
+                    }
+                }
+            )
+            print("✅ Warmup inference completed successfully")
+            print("   Prefill time: \(String(format: "%.3f", prefillTime))s")
+            print("   Stop reason: \(stopReason)")
+        } catch {
+            print("⚠️ Warmup inference failed: \(error)")
+            // Don't throw the error as warmup failure shouldn't block model loading
         }
     }
     
@@ -386,10 +521,16 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         
         // Switch to the main actor for UI updates
         Task { @MainActor in
+            // Format the error message
+            let errorMessage = formatErrorMessage(error)
+            
+            // Add the error to our list of loading errors
+            self.loadingErrors.append(errorMessage)
+            
             // Use our helper to update the UI
             self.updateUI(
                 progress: 0,
-                status: "Error: \(error.localizedDescription)",
+                status: "Error: \(errorMessage)",
                 isLoading: false,
                 isLoaded: false
             )
@@ -402,9 +543,12 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                 NotificationCenter.default.post(
                     name: Notification.Name("ModelLoadingFailed"),
                     object: modelId,
-                    userInfo: ["error": error.localizedDescription]
+                    userInfo: ["error": errorMessage]
                 )
                 print("📣 Posted ModelLoadingFailed notification")
+                
+                // Store the error message
+                self.lastLoadingError = errorMessage
             } else {
                 print("🔕 Suppressed ModelLoadingFailed notification due to interruption flag")
             }
@@ -1218,6 +1362,8 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                     )
                                     
                                     print("✅ InferenceManager successfully initialized with v110=\(shouldUseV110)")
+                                    
+                                    
                                 } catch {
                                     print("❌ ERROR initializing InferenceManager: \(error.localizedDescription)")
                                     print("❌ Error type: \(type(of: error))")
@@ -1284,6 +1430,26 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                 // Clear the model loader reference
                                 self.currentModelLoader = nil
                                 
+                                
+                                // Perform warmup inference if enabled
+                                if self.warmupOnLoad {
+                                        do {
+                                            try await self.performWarmupInference()
+                                        } catch {
+                                            print("⚠️ Warmup inference failed but continuing: \(error)")
+                                        }
+                                }
+                                
+                                // Perform warmup inference if enabled
+                                if self.testOnLoad {
+                                        do {
+                                            try await self.performTestInference()
+                                        } catch {
+                                            print("⚠️ Warmup inference failed but continuing: \(error)")
+                                        }
+                                }
+                                
+                                
                                 // Note: Model loading completion is handled in the loadingCompleted delegate method,
                                 // which will update isModelLoaded, isLoadingModel, etc.
                             } catch {
@@ -1338,6 +1504,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                     userInfo: ["error": error.localizedDescription]
                                 )
                                 print("📣 Posted ModelLoadingFailed notification")
+                                
+                                // Store the error message
+                                self.lastLoadingError = error.localizedDescription
                             } else {
                                 print("🔕 Suppressed ModelLoadingFailed notification due to interruption flag")
                             }
@@ -1388,6 +1557,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                 userInfo: ["error": error.localizedDescription]
                             )
                             print("📣 Posted ModelLoadingFailed notification")
+                            
+                            // Store the error message
+                            self.lastLoadingError = error.localizedDescription
                         } else {
                             print("🔕 Suppressed ModelLoadingFailed notification due to interruption flag")
                         }
@@ -1472,6 +1644,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         userInfo: ["error": error.localizedDescription]
                     )
                     print("📣 Posted ModelLoadingFailed notification")
+                    
+                    // Store the error message
+                    self.lastLoadingError = error.localizedDescription
                 } else {
                     print("🔕 Suppressed ModelLoadingFailed notification due to interruption flag")
                 }
@@ -1813,33 +1988,17 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     print("\n❌ ERROR DURING INFERENCE:")
                     print("📍 Error location: inferStream → generateResponse")
                     print("🔴 Error type: \(String(describing: type(of: error)))")
-                    print("📄 Description: \(error.localizedDescription)")
-                    
-                    // Try to determine more specific error location
-                    if let inferenceError = error as? InferenceError {
-                        switch inferenceError {
-                        case .modelNotLoaded:
-                            print("📍 Error detail: Model not loaded or not found")
-                        case .contextTooLong:
-                            print("📍 Error detail: Context exceeds maximum length")
-                        case .tokenizationFailed:
-                            print("📍 Error detail: Failed to tokenize input")
-                        case .inferenceError(let message):
-                            print("📍 Error detail: \(message)")
-                        default:
-                            print("📍 Error detail: Other inference error")
-                        }
-                    }
+                    print("📄 Description: \(formatErrorMessage(error))")
                     
                     // Yield an error result instead of trying to throw from the continuation
                     continuation.yield(InferenceResult(
-                        text: "Error: \(error.localizedDescription)",
+                        text: "Error: \(formatErrorMessage(error))",
                         tokensPerSecond: 0,
                         tokenCount: 0,
                         windowShifts: 0,
                         isComplete: true
                     ))
-                    continuation.finish() // Removed unnecessary try
+                    continuation.finish()
                 }
             }
         }
@@ -2095,14 +2254,14 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             }
                             
                             // Check for repetition
-                            if repetitionDetector.addToken(token) {
+                            if self.useRepetitionDetector && repetitionDetector.addToken(token) {
                                 // Set flag to prevent re-entry
                                 isCancellationInProgress = true
+                                inferenceManager.AbortGeneration(Code: AbortReason.repetitionDetected) // Use repetitionDetected value
                                 print("🔄 Repetition detected - stopping generation")
                                 
                                 Task { @MainActor in
                                     self.inferenceIsCancelled = true
-                                    
                                     // Get the current text before stopping
                                     let finalText = await self.shouldUseTokenBuffer(allowLongGeneration: allowLongGeneration, windowShifts: tokenBuffer.getWindowShifts()) ? 
                                         tokenBuffer.getText() : 
@@ -2116,8 +2275,8 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                         windowShifts: tokenBuffer.getWindowShifts(),
                                         isComplete: true
                                     ))
-                    continuation.finish()
-                }
+                                    continuation.finish()
+                                }
                                 return
                             }
                             
@@ -2290,33 +2449,17 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     print("\n❌ ERROR DURING INFERENCE:")
                     print("📍 Error location: inferWithSystemPrompt → generateResponse")
                     print("🔴 Error type: \(String(describing: type(of: error)))")
-                    print("📄 Description: \(error.localizedDescription)")
-                    
-                    // Try to determine more specific error location
-                    if let inferenceError = error as? InferenceError {
-                        switch inferenceError {
-                        case .modelNotLoaded:
-                            print("📍 Error detail: Model not loaded or not found")
-                        case .contextTooLong:
-                            print("📍 Error detail: Context exceeds maximum length")
-                        case .tokenizationFailed:
-                            print("📍 Error detail: Failed to tokenize input")
-                        case .inferenceError(let message):
-                            print("📍 Error detail: \(message)")
-                        default:
-                            print("📍 Error detail: Other inference error")
-                        }
-                    }
+                    print("📄 Description: \(formatErrorMessage(error))")
                     
                     // Yield an error result instead of trying to throw from the continuation
                     continuation.yield(InferenceResult(
-                        text: "Error: \(error.localizedDescription)",
+                        text: "Error: \(formatErrorMessage(error))",
                         tokensPerSecond: 0,
                         tokenCount: 0,
                         windowShifts: 0,
                         isComplete: true
                     ))
-                    continuation.finish() // Removed unnecessary try
+                    continuation.finish()
                 }
             }
         }
@@ -2465,6 +2608,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         // Set cancellation flag
         isCancelled = true
         inferenceIsCancelled = true  // Set inference cancellation flag
+        if let inferenceManager = inferenceManager {
+            inferenceManager.AbortGeneration(Code: AbortReason.userCancelled) // Use userCancelled value
+        }
         lastCancellationReason = .userInitiated
         _cancellationReasonForDelegate = .userInitiated
         
@@ -2518,16 +2664,35 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         // Set the inference cancellation flag
         inferenceIsCancelled = true
         
-        // Cancel the active inference task
-        if let task = activeInferenceTask {
-            print("🛑 TOKEN GENERATION: Found active task to cancel")
-            task.cancel()
-            activeInferenceTask = nil
-        } else {
-            print("🛑 TOKEN GENERATION: No active task found")
+        // Start the cancellation task in background
+        Task {
+            // Try to cancel the task with retries
+            let maxRetries = 20
+            var currentRetry = 0
+            
+            while currentRetry < maxRetries {
+                if let task = activeInferenceTask {
+                    print("🛑 TOKEN GENERATION: Found active task to cancel")
+                    task.cancel()
+                    activeInferenceTask = nil
+                    print("🛑 TOKEN GENERATION: Cancellation complete")
+                    return
+                }
+                
+                // Wait for 100ms before next retry
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms in nanoseconds
+                currentRetry += 1
+                print("🛑 TOKEN GENERATION: Waiting for task to become available (attempt \(currentRetry)/\(maxRetries))")
+            }
+            
+            // If we get here, we've exhausted all retries
+            if activeInferenceTask != nil {
+                print("⚠️ TOKEN GENERATION: Force killing task after \(maxRetries) retries")
+                activeInferenceTask = nil
+            } else {
+                print("🛑 TOKEN GENERATION: No active task found after \(maxRetries) retries")
+            }
         }
-        
-        print("🛑 TOKEN GENERATION: Cancellation complete")
     }
     
     // MARK: - Conversation State Management
@@ -2904,6 +3069,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         // Ensure any existing model is unloaded before starting to load a new one
         InferenceService.shared.unloadModel()
         
+        // Clear any previous error
+        self.lastLoadingError = nil
+        
         // Start the loading process with high priority
         Task(priority: .userInitiated) {
             do {
@@ -2924,8 +3092,12 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                 try await InferenceService.shared.loadModel(modelId: model.id, from: modelPath)
                 
                 print("✅ Model loaded successfully: \(model.id) (100%)")
+                
+                // Clear any previous error on successful load
+                self.lastLoadingError = nil
+                
             } catch {
-                print("❌ MS.1 Error loading model: \(error.localizedDescription)")
+                print("❌ MS.1 Error loading model: \(formatErrorMessage(error))")
                 
                 // Don't post failure notifications for cancellation errors
                 if error is CancellationError {
@@ -2941,17 +3113,78 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                 // Reset loading state
                 InferenceService.shared.isLoadingModel = false
                 InferenceService.shared.loadingProgress = 0
-                InferenceService.shared.loadingStatus = "Error: \(error.localizedDescription)"
+                InferenceService.shared.loadingStatus = "Error: \(formatErrorMessage(error))"
+                
+                // Store the error message
+                self.lastLoadingError = formatErrorMessage(error)
                 
                 // Post notification that model loading failed (only for non-cancellation errors)
                 NotificationCenter.default.post(
                     name: Notification.Name("ModelLoadingFailed"),
                     object: model.id,
-                    userInfo: ["error": error.localizedDescription]
+                    userInfo: ["error": formatErrorMessage(error)]
                 )
             }
         }
     }
+
+    /// Configure whether to perform warmup inference after model loading
+    func configureWarmup(enabled: Bool) {
+        print("🔧 Configuring warmup inference: \(enabled ? "enabled" : "disabled")")
+        warmupOnLoad = enabled
+    }
+    
+    // Add public accessor for inferenceManager
+    var debugInferenceManager: InferenceManager? {
+        return inferenceManager
+    }
+    
+    // Add a method to format error messages
+    private func formatErrorMessage(_ error: Error) -> String {
+        if let modelError = error as? AnemllCore.ModelError {
+            // Check if the error description contains the error code
+            let description = modelError.localizedDescription
+            if description.contains("error 3") {
+                return "Model loading cancelled"
+            } else if description.contains("error 1") {
+                return "Model loading cancelled"
+            } else if description.contains("error 2") {
+                return "Invalid model path"
+            } else if description.contains("error 4") {
+                return "Invalid model configuration"
+            } else if description.contains("cancelled") || description.contains("cancel") {
+                return "Model loading cancelled"
+            } else if description.contains("path") {
+                return "Invalid model path"
+            } else if description.contains("not found") {
+                return "Model not found"
+            } else if description.contains("configuration") {
+                return "Invalid model configuration"
+            } else {
+                return "Model loading error: \(description)"
+            }
+        } else if let inferenceError = error as? InferenceError {
+            switch inferenceError {
+            case .modelNotLoaded:
+                return "Model not loaded or not found"
+            case .contextTooLong:
+                return "Context exceeds maximum length"
+            case .tokenizationFailed:
+                return "Failed to tokenize input"
+            case .inferenceError(let message):
+                return message
+            case .modelPathNotFound:
+                return "Model path not found"
+            case .invalidConfig:
+                return "Invalid model configuration"
+            }
+        } else if error is CancellationError {
+            return "Model loading cancelled"
+        } else {
+            return error.localizedDescription
+        }
+    }
+    
 }
 
 // Add the extension before the InferenceService class

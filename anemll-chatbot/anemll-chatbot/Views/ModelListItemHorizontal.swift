@@ -61,6 +61,7 @@ struct ModelListItemHorizontal: View {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .foregroundColor(.orange)
                                 .font(.caption)
+                                .help("Model has missing or incomplete files")
                         }
                     }
                     
@@ -76,14 +77,19 @@ struct ModelListItemHorizontal: View {
                             .foregroundColor(.secondary)
                             
                         if isDownloaded && hasIncompleteFiles {
-                            if let error = errorMessage {
-                                Text(error)
-                                    .font(.caption)
+                            HStack(spacing: 4) {
+                                Image(systemName: "exclamationmark.triangle.fill")
                                     .foregroundColor(.orange)
-                            } else {
-                                Text("Files incomplete")
                                     .font(.caption)
-                                    .foregroundColor(.orange)
+                                if let error = errorMessage {
+                                    Text(error)
+                                        .font(.caption)
+                                        .foregroundColor(.orange)
+                                } else {
+                                    Text("Missing required files")
+                                        .font(.caption)
+                                        .foregroundColor(.orange)
+                                }
                             }
                         }
                     }
@@ -97,105 +103,74 @@ struct ModelListItemHorizontal: View {
             }
             
             // Horizontal button row with uniform buttons
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    // Select button (always shown)
+            HStack(spacing: 8) {
+                // Select button (always shown)
+                ActionButton(
+                    title: isSelected ? "Selected" : "Select",
+                    color: isSelected ? .green : .blue,
+                    action: onSelect
+                )
+                
+                // Load button (only for downloaded models)
+                if isDownloaded && !isDownloading {
                     ActionButton(
-                        title: isSelected ? "Selected" : "Select",
-                        color: isSelected ? Color.green : Color.blue,
-                        action: onSelect
+                        title: "Load",
+                        color: .purple,
+                        action: onLoad
                     )
-                    
-                    // Load button (only for downloaded models)
-                    if isDownloaded && !isDownloading {
-                        ActionButton(
-                            title: "Load",
-                            color: hasIncompleteFiles ? Color.gray : Color.purple,
-                            action: onLoad
-                        )
-                        .disabled(hasIncompleteFiles)
-                        .help(hasIncompleteFiles ? "Cannot load model with missing files" : "Load model")
-                    }
-                    
-                    // Download button (for downloaded models to verify/update)
-                    if isDownloaded && !isDownloading {
-                        ActionButton(
-                            title: "Download",
-                            color: hasIncompleteFiles ? Color.orange : Color.blue.opacity(0.8),
-                            action: onDownload
-                        )
-                        .help(hasIncompleteFiles ? "Download missing files" : "Verify completeness")
-                    }
-                    
-                    // Delete button (only for downloaded models)
-                    if isDownloaded && !isDownloading {
-                        ActionButton(
-                            title: "Delete",
-                            color: Color.red,
-                            action: onDelete
-                        )
-                    }
-                    
-                    // Download button (for non-downloaded models)
-                    if !isDownloaded && !isDownloading {
-                        ActionButton(
-                            title: "Download",
-                            color: Color.blue,
-                            action: onDownload
-                        )
-                    }
-                    
-                    // Cancel button (only for downloading models)
-                    if isDownloading {
-                        ActionButton(
-                            title: "Cancel",
-                            color: Color.red,
-                            action: onCancelDownload
-                        )
-                    }
                 }
-                .padding(.vertical, 4)
+                
+                // Download/Verify button (for downloaded models)
+                if isDownloaded && !isDownloading {
+                    ActionButton(
+                        title: "Download",
+                        color: hasIncompleteFiles ? .orange : .blue.opacity(0.8),
+                        action: onDownload
+                    )
+                    .help(hasIncompleteFiles ? "Download missing files" : "Verify model files")
+                }
+                
+                // Delete button (only for downloaded models)
+                if isDownloaded && !isDownloading {
+                    ActionButton(
+                        title: "Delete",
+                        color: .red,
+                        action: onDelete
+                    )
+                }
+                
+                // Download button (for non-downloaded models)
+                if !isDownloaded && !isDownloading {
+                    ActionButton(
+                        title: "Download",
+                        color: .blue,
+                        action: onDownload
+                    )
+                }
+                
+                // Cancel button (only for downloading models)
+                if isDownloading {
+                    ActionButton(
+                        title: "Cancel",
+                        color: .red,
+                        action: onCancelDownload
+                    )
+                }
             }
             
-            // Download progress indicator (only shown when downloading)
+            // Download progress (only shown when downloading)
             if isDownloading {
                 VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Downloading...")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        
-                        Spacer()
-                        
-                        Text("\(Int(downloadProgress * 100))%")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    
-                    // Always use a non-zero progress value to ensure visibility
-                    ProgressView(value: max(0.01, downloadProgress))
+                    ProgressView(value: downloadProgress)
                         .progressViewStyle(LinearProgressViewStyle())
-                        .animation(.easeInOut, value: downloadProgress)
-                    
-                    if !currentFile.isEmpty {
-                        Text("Current file: \(currentFile)")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
+                    Text(currentFile)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
-                .padding(.vertical, 4)
             }
         }
         .padding()
-        .background(isDownloaded && hasIncompleteFiles ? 
-                    Color(.systemOrange).opacity(0.1) : 
-                    Color(.secondarySystemBackground))
+        .background(Color(.secondarySystemBackground))
         .cornerRadius(10)
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(isDownloaded && hasIncompleteFiles ? Color.orange.opacity(0.5) : Color.clear, lineWidth: 1)
-        )
     }
 }
