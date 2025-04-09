@@ -5,7 +5,7 @@ The sample applications demonstrate how to integrate ANEMLL models into iOS and 
 
 ## Project Location
 ```bash
-./apps/anemll-chat/
+./anemll-chatbot/
 ```
 
 ## Target Audience
@@ -41,14 +41,15 @@ The sample applications demonstrate how to integrate ANEMLL models into iOS and 
 
 ### 1. Project Setup
 ```bash
-cd apps/anemll-chat
-open ANEMLL-Chat.xcodeproj
+cd ./anemll-chatbot/
+open anemll-chatbot.xcodeproj 
 ```
 
 > [!Important]
 > Remember to change the Xcode Team and Bundle ID if you're building the project yourself.
 > Selecf iOS or My Mac target device and compile
-> for macOS we use Mac Catalyst target
+> for macOS we use MacCatalyst build target
+> target : anemll-chatbot
 
 ### 2. Model Management
 The app supports several ways to use models:
@@ -65,12 +66,12 @@ To switch between models:
 
 #### For iOS:
 1. Select your target iOS device or simulator
-2. Choose the "ANEMLL-Chat iOS" scheme
+2. Choose the "anemll-chatbot" scheme
 3. Build and run (⌘R)
 
 #### For macOS:
 1. Select "My Mac" as the target
-2. Choose the "ANEMLL-Chat macOS" scheme
+2. Choose the "anemll-chatbot" scheme and My Mac (MacCatalys)
 3. Build and run (⌘R)
 
 ## Testing
@@ -92,6 +93,8 @@ To switch between models:
 You can use your own models in two ways:
 1. Upload unzipped MLModels to HuggingFace then add Custom Model in the App useing repo's URL
 2. Copy models directly to your device using the Files app (iOS)
+3. Follow the instructions in [prepare_hf.md](prepare_hf.md) to prepare your model for inference. For iOS deployment, make sure to use the `--ios` flag when converting the model.
+
 
 ## Customization
 - Modify `ChatView.swift` to customize the chat interface
