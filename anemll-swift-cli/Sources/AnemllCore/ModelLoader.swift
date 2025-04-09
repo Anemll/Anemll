@@ -39,6 +39,7 @@ public actor ModelLoader {
         
         public init(
             computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
+            //computeUnits: MLComputeUnits = .cpuOnly,
             allowLowPrecision: Bool = false,
             memoryLimit: UInt64? = nil,
             functionName: String? = nil

@@ -148,6 +148,9 @@ struct AnemllCLI: AsyncParsableCommand {
     @Option(name: .long, help: "System prompt to use")
     var system: String?
     
+    @Option(name: .long, help: "Save assistant's response to file")
+    var save: String?
+    
     @Option(name: .long, help: "Template style (default, deephermes)")
     var template: String = "deephermes"
     
@@ -379,8 +382,18 @@ struct AnemllCLI: AsyncParsableCommand {
             )
             
             // Wait for printer to finish and get response
-            let _ = await tokenPrinter.stop()  // Explicitly ignore return value
+            let response = await tokenPrinter.stop()  // Get the response text
             await tokenPrinter.drain()  // Make sure everything is printed
+            
+            // Save response to file if requested
+            if let saveFile = save {
+                do {
+                    try response.write(toFile: saveFile, atomically: true, encoding: .utf8)
+                    print("\n\u{001B}[34mResponse saved to file: \(saveFile)\u{001B}[0m")
+                } catch {
+                    print("\n\u{001B}[31mError saving to file: \(error.localizedDescription)\u{001B}[0m")
+                }
+            }
             
             let inferenceEndTime = CFAbsoluteTimeGetCurrent()
             let inferenceTime = (inferenceEndTime - generationStartTime) - prefillTime
@@ -394,6 +407,22 @@ struct AnemllCLI: AsyncParsableCommand {
                   "(\(String(format: "%.1f", prefillTokensPerSec)) t/s), " +
                   "\(generatedTokens.count) tokens" +
                   " [Stop reason: \(stopReason)]\u{001B}[0m")
+            
+            // Add token ID output for debug level > 0 and prompt mode
+            if debugLevel > 0 {
+                print("\n=== TOKEN IDS ===")
+                print("INPUT_TOKENS:", tokens.map(String.init).joined(separator: ","))
+                print("OUTPUT_TOKENS:", generatedTokens.map(String.init).joined(separator: ","))
+                print("STOP_REASON:", stopReason)
+                
+                // Try to include the stop token if it was EOS
+                if stopReason == "eos" {
+                    print("STOP_TOKEN:", tokenizer.eosTokenId)
+                    // Also try to get the text representation of the stop token
+                    let stopTokenText = tokenizer.decode(tokens: [tokenizer.eosTokenId], skipSpecialTokens: false)
+                    print("STOP_TOKEN_TEXT:", stopTokenText)
+                }
+            }
         } else {
             // Interactive chat mode
             print("Context length: \(config.contextLength)")
@@ -513,6 +542,16 @@ struct AnemllCLI: AsyncParsableCommand {
                 let response = await tokenPrinter.stop()  // Keep the response for conversation
                 conversation.append(.assistant(response))
                 await tokenPrinter.drain()
+                
+                // Save response to file if requested (in chat mode)
+                if let saveFile = save {
+                    do {
+                        try response.write(toFile: saveFile, atomically: true, encoding: .utf8)
+                        print("\n\u{001B}[34mResponse saved to file: \(saveFile)\u{001B}[0m")
+                    } catch {
+                        print("\n\u{001B}[31mError saving to file: \(error.localizedDescription)\u{001B}[0m")
+                    }
+                }
                 
                 // Now print stats with stop reason
                 let inferenceEndTime = CFAbsoluteTimeGetCurrent()
