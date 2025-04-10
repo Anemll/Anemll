@@ -30,6 +30,7 @@ RESET_COLOR = "\033[0m"
 WARMUP_TOKEN_LIMIT = 10  # Maximum tokens to generate during warmup
 THINKING_MODE = False
 THINKING_PROMPT = """You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem."""
+DEBUG_LEVEL = 0  # Default debug level
 
 class TokenPrinter:
     """Handles background printing of generated tokens."""
@@ -218,6 +219,10 @@ def parse_args():
     # Add no-warmup flag
     parser.add_argument('--nw', action='store_true',
                        help='Skip warmup phase')
+    
+    # Add debug level
+    parser.add_argument('--debug-level', type=int, default=0,
+                       help='Debug level (0=none, 1=print prompts, 2=more verbose)')
     
     # Model configuration
     parser.add_argument('--context-length', type=int,
@@ -477,10 +482,7 @@ def make_causal_mask(length, start):
 
 def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length, batch_size, state, causal_mask):
     """Run prefill on the input sequence."""
-    # Use provided causal mask or create one if not provided
-    if causal_mask is None:
-        causal_mask = make_causal_mask(context_length, 0)
-        causal_mask = torch.tensor(causal_mask, dtype=torch.float16)
+    #print(f"[DEBUG] Running prefill from 0 to {current_pos}")
     
     # Process in batches
     batch_pos = 0
@@ -488,36 +490,37 @@ def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length,
         batch_end = min(batch_pos + batch_size, current_pos)
         current_batch_size = batch_end - batch_pos
         
+        #print(f"[DEBUG] Prefill batch {batch_pos}-{batch_end} (size={current_batch_size})")
+        
         # Get current batch
         batch_input = input_ids[:, batch_pos:batch_end]
         
-        # Always pad to full batch size for prefill
+        # Pad to full batch size
         batch_input = F.pad(
             batch_input,
             (0, batch_size - current_batch_size),
             value=0
         )
         
-        # Generate position IDs for full batch size
-        position_ids = torch.arange(batch_size, dtype=torch.int32)  # Changed: Always use full batch size
-        batch_causal_mask = causal_mask[:, :, :batch_size, :]  # Changed: Use full batch size
+        # Generate position IDs for this batch
+        position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
         
-        # Run embeddings with proper batch size
+        # Use the pre-initialized causal mask and extract the batch portion
+        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
+        
+        # Run embeddings
         hidden_states = torch.from_numpy(
-            embed_model.predict({
-                'input_ids': batch_input.numpy(),
-                'batch_size': np.array([batch_size], dtype=np.int32)  # Add batch_size parameter
-            })['hidden_states']
+            embed_model.predict({'input_ids': batch_input.numpy()})['hidden_states']
         )
         
-        # Run through FFN chunks with state
+        # Run through FFN chunks
         for ffn_model in ffn_models:
             if isinstance(ffn_model, dict):
                 inputs = {
-                    'hidden_states': hidden_states.numpy(),  # [1, 64, hidden_size]
-                    'position_ids': position_ids.numpy(),    # [64]
-                    'causal_mask': batch_causal_mask.numpy(), # [1, 1, 64, context_length]
-                    'current_pos': np.array([batch_pos], dtype=np.int32)  # [1]
+                    'hidden_states': hidden_states.numpy(),
+                    'position_ids': position_ids.numpy(),
+                    'causal_mask': batch_causal_mask.numpy(),
+                    'current_pos': np.array([batch_pos], dtype=np.int32)
                 }
                 output = ffn_model['prefill'].predict(inputs, state)
                 hidden_states = torch.from_numpy(output['output_hidden_states'])
@@ -661,6 +664,7 @@ def get_user_input():
 def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask, auto_prompt=None, warmup=False):
     """Interactive chat loop."""
     global THINKING_MODE
+    global DEBUG_LEVEL
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
     
@@ -710,12 +714,22 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     return_tensors="pt",
                     add_generation_prompt=True
                 ).to(torch.int32)
+                
+                # Print full prompt if debug level >= 1
+                if DEBUG_LEVEL >= 1 and not warmup:
+                    print(f"\n{DARK_BLUE}Debug: Full prompt with thinking:{RESET_COLOR}")
+                    print(tokenizer.decode(base_input_ids[0]))
             else:
                 base_input_ids = tokenizer.apply_chat_template(
                     conversation,
                     return_tensors="pt",
                     add_generation_prompt=True
                 ).to(torch.int32)
+                
+                # Print full prompt if debug level >= 1
+                if DEBUG_LEVEL >= 1 and not warmup:
+                    print(f"\n{DARK_BLUE}Debug: Full prompt:{RESET_COLOR}")
+                    print(tokenizer.decode(base_input_ids[0]))
             
             # Check if we need to trim history
             while base_input_ids.size(1) > context_length - 100:  # Leave room for response
@@ -868,6 +882,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
 
 def main():
     args = parse_args()
+    global DEBUG_LEVEL
+    DEBUG_LEVEL = args.debug_level
     
     # Convert directory to absolute path
     model_dir = Path(args.d).resolve()

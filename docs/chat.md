@@ -44,6 +44,10 @@ python ./tests/chat_full.py \
   - Total tokens generated
 - **Thinking Mode**: Toggle thinking mode with `/t` command to enable deep reasoning processes for DeepHermes
 - **No Warmup Option**: Use `--nw` flag to skip the warmup phase for faster startup
+- **Debug Mode**: Use `--debug-level` to control debug output:
+  - Level 0: Normal operation (default)
+  - Level 1: Print full prompts before generation
+  - Level 2: Reserved for more verbose debugging
 We use warm up models to prevent CoreML/Python GIL race conditions. You can skip the warmup phase for bigger models.
 
 ## Using meta.yaml
@@ -71,6 +75,7 @@ python ./tests/chat_full.py --meta ./converted_models/meta.yaml
 | `--meta` | Path to meta.yaml for automatic configuration | none |
 | `--prompt` | Run once with this prompt and exit | none |
 | `--nw` | Skip warmup phase | false |
+| `--debug-level` | Debug output level (0=none, 1=print prompts, 2=more verbose) | 0 |
 
 ## Model Paths
 
