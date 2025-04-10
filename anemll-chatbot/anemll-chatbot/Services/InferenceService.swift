@@ -583,7 +583,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         var requiredFiles: [String] = [
             // Main model components
             lutEmbeddings != nil && lutEmbeddings! > 0 ? "\(modelPrefix)_embeddings_lut\(lutEmbeddings!).mlmodelc" : "\(modelPrefix)_embeddings.mlmodelc",
-            "\(modelPrefix)_lm_head_lut\(lutLMHead).mlmodelc",
+            lutLMHead > 0 ? "\(modelPrefix)_lm_head_lut\(lutLMHead).mlmodelc" : "\(modelPrefix)_lm_head.mlmodelc",
             "meta.yaml",
             "config.json",
             "tokenizer.json",
@@ -592,7 +592,12 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         
         // Add chunk files - this is the only correct format for FFN files
         for i in 1...numChunks {
-            let chunkName = String(format: "\(modelPrefix)_FFN_PF_lut\(lutFFN)_chunk_%02dof%02d.mlmodelc", i, numChunks)
+            let chunkName: String
+            if lutFFN > 0 {
+                chunkName = String(format: "\(modelPrefix)_FFN_PF_lut\(lutFFN)_chunk_%02dof%02d.mlmodelc", i, numChunks)
+            } else {
+                chunkName = String(format: "\(modelPrefix)_FFN_PF_chunk_%02dof%02d.mlmodelc", i, numChunks)
+            }
             requiredFiles.append(chunkName)
         }
         
@@ -1093,12 +1098,14 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             // No alternative searching, just throw the error
                             throw InferenceError.inferenceError("Embeddings model not found at: \(embedPath)")
                         }
-                        if !FileManager.default.fileExists(atPath: url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path) {
-                            throw InferenceError.inferenceError("LM Head model not found at: \(url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path)")
+                        if !FileManager.default.fileExists(atPath: url.appendingPathComponent((lutLMHead ?? 0) > 0 ? "\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc" : "\(modelPrefix)_lm_head.mlmodelc").path) {
+                            throw InferenceError.inferenceError("LM Head model not found at: \(url.appendingPathComponent((lutLMHead ?? 0) > 0 ? "\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc" : "\(modelPrefix)_lm_head.mlmodelc").path)")
                         }
                         
                         // Check for any FFN chunk, not just chunk_01
-                        let ffnPath01 = url.appendingPathComponent("\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0)_chunk_01of\(String(format: "%02d", numChunks)).mlmodelc").path
+                        let ffnPath01 = url.appendingPathComponent((lutFFN ?? 0) > 0 ? 
+                            "\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0)_chunk_01of\(String(format: "%02d", numChunks)).mlmodelc" :
+                            "\(modelPrefix)_FFN_PF_chunk_01of\(String(format: "%02d", numChunks)).mlmodelc").path
                         let chunkExistsAt01 = FileManager.default.fileExists(atPath: ffnPath01)
                         
                         var ffnPathToUse = ffnPath01
@@ -1109,7 +1116,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             
                             // Check all possible chunks
                             for i in 1...numChunks {
-                                let chunkPath = url.appendingPathComponent("\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0)_chunk_\(String(format: "%02d", i))of\(String(format: "%02d", numChunks)).mlmodelc").path
+                                let chunkPath = url.appendingPathComponent((lutFFN ?? 0) > 0 ? 
+                                    "\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0)_chunk_\(String(format: "%02d", i))of\(String(format: "%02d", numChunks)).mlmodelc" :
+                                    "\(modelPrefix)_FFN_PF_chunk_\(String(format: "%02d", i))of\(String(format: "%02d", numChunks)).mlmodelc").path
                                 if FileManager.default.fileExists(atPath: chunkPath) {
                                     foundAnyChunk = true
                                     ffnPathToUse = chunkPath
@@ -1119,7 +1128,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             }
                             
                             // Also check non-chunked version
-                            let nonChunkedPath = url.appendingPathComponent("\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0).mlmodelc").path
+                            let nonChunkedPath = url.appendingPathComponent((lutFFN ?? 0) > 0 ? 
+                                "\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0).mlmodelc" :
+                                "\(modelPrefix)_FFN_PF.mlmodelc").path
                             if !foundAnyChunk && FileManager.default.fileExists(atPath: nonChunkedPath) {
                                 foundAnyChunk = true
                                 ffnPathToUse = nonChunkedPath
@@ -1133,7 +1144,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         
                         print("Using model paths:")
                         print("Embed path: \(embedPath)")
-                        print("LM Head path: \(url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path)")
+                        print("LM Head path: \(url.appendingPathComponent((lutLMHead ?? 0) > 0 ? "\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc" : "\(modelPrefix)_lm_head.mlmodelc").path)")
                         print("FFN path: \(ffnPathToUse)")
                         
                         // List all files in the model directory for debugging
@@ -1181,7 +1192,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                 let contents = try fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
                                 
                                 let chunkDirs = contents.filter { 
-                                    $0.lastPathComponent.contains("\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0)_chunk_") && 
+                                    $0.lastPathComponent.contains((lutFFN ?? 0) > 0 ? 
+                                        "\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0)_chunk_" :
+                                        "\(modelPrefix)_FFN_PF_chunk_") && 
                                     $0.lastPathComponent.hasSuffix(".mlmodelc") 
                                 }
                                 
@@ -1211,12 +1224,14 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         
                         // Add all chunks
                         for i in 1...numChunks {
-                            let chunkName = String(format: "\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0)_chunk_%02dof%02d.mlmodelc", i, numChunks)
+                            let chunkName = (lutFFN ?? 0) > 0 ?
+                                String(format: "\(modelPrefix)_FFN_PF_lut\(lutFFN ?? 0)_chunk_%02dof%02d.mlmodelc", i, numChunks) :
+                                String(format: "\(modelPrefix)_FFN_PF_chunk_%02dof%02d.mlmodelc", i, numChunks)
                             modelDirs.append(url.appendingPathComponent(chunkName))
                         }
                         
                         // Add lm_head
-                        modelDirs.append(url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc"))
+                        modelDirs.append(url.appendingPathComponent((lutLMHead ?? 0) > 0 ? "\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc" : "\(modelPrefix)_lm_head.mlmodelc"))
                         
                         try checkCancellation()
                         
@@ -1228,8 +1243,8 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                 // No alternative searching, just throw the error
                                 throw InferenceError.inferenceError("Embeddings model not found at: \(embedPath)")
                             }
-                            if !FileManager.default.fileExists(atPath: url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path) {
-                                throw InferenceError.inferenceError("LM Head model not found at: \(url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path)")
+                            if !FileManager.default.fileExists(atPath: url.appendingPathComponent((lutLMHead ?? 0) > 0 ? "\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc" : "\(modelPrefix)_lm_head.mlmodelc").path) {
+                                throw InferenceError.inferenceError("LM Head model not found at: \(url.appendingPathComponent((lutLMHead ?? 0) > 0 ? "\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc" : "\(modelPrefix)_lm_head.mlmodelc").path)")
                             }
                             if !FileManager.default.fileExists(atPath: ffnPathToUse) {
                                 throw InferenceError.inferenceError("FFN model not found at: \(ffnPathToUse)")
@@ -1237,7 +1252,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             
                             print("Using model paths:")
                             print("Embed path: \(embedPath)")
-                            print("LM Head path: \(url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path)")
+                            print("LM Head path: \(url.appendingPathComponent((lutLMHead ?? 0) > 0 ? "\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc" : "\(modelPrefix)_lm_head.mlmodelc").path)")
                             print("FFN path: \(ffnPathToUse)")
                             
                             // Create a modified config with the correct paths
@@ -1247,7 +1262,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                 "context_length": config.contextLength,
                                 "batch_size": config.batchSize,
                                 "embed_path": embedPath,
-                                "lmhead_path": url.appendingPathComponent("\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc").path,
+                                "lmhead_path": url.appendingPathComponent((lutLMHead ?? 0) > 0 ? "\(modelPrefix)_lm_head_lut\(lutLMHead ?? 0).mlmodelc" : "\(modelPrefix)_lm_head.mlmodelc").path,
                                 "ffn_path": ffnPathToUse,  // Use the detected path directly, YAMLConfig will handle canonicalization
                                 "num_chunks": config.numChunks,
                                 // Additional metadata to ensure proper path generation in YAMLConfig
@@ -3144,7 +3159,10 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         if let modelError = error as? AnemllCore.ModelError {
             // Check if the error description contains the error code
             let description = modelError.localizedDescription
-            if description.contains("error 3") {
+            
+            if description.contains("`.functionName` property must be `nil`") {
+                return "Model loading Error: OS CoreML cache is full. Recommend to reboot your device and retry!"
+            }else if description.contains("error 3") {
                 return "Model loading cancelled"
             } else if description.contains("error 1") {
                 return "Model loading cancelled"
