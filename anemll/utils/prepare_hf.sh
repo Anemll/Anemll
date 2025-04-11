@@ -67,20 +67,19 @@ validate_lut_values() {
     if [ -z "$LUT_FFN" ]; then
         echo "Warning: LUT value for FFN not found in meta.yaml, using default value of 8"
         LUT_FFN=8
+    elif [ "$LUT_FFN" = "none" ]; then
+        LUT_FFN="none"
+    elif ! [[ "$LUT_FFN" =~ ^[0-9]+$ ]]; then
+        echo "Warning: Invalid LUT value for FFN: $LUT_FFN, using default value of 8"
+        LUT_FFN=8
     fi
     
     if [ -z "$LUT_LMHEAD" ]; then
         echo "Warning: LUT value for LM head not found in meta.yaml, using default value of 8"
         LUT_LMHEAD=8
-    fi
-    
-    # Ensure values are numeric
-    if ! [[ "$LUT_FFN" =~ ^[0-9]+$ ]]; then
-        echo "Warning: Invalid LUT value for FFN: $LUT_FFN, using default value of 8"
-        LUT_FFN=8
-    fi
-    
-    if ! [[ "$LUT_LMHEAD" =~ ^[0-9]+$ ]]; then
+    elif [ "$LUT_LMHEAD" = "none" ]; then
+        LUT_LMHEAD="none"
+    elif ! [[ "$LUT_LMHEAD" =~ ^[0-9]+$ ]]; then
         echo "Warning: Invalid LUT value for LM head: $LUT_LMHEAD, using default value of 8"
         LUT_LMHEAD=8
     fi
@@ -192,6 +191,20 @@ copy_mlmodelc() {
     fi
 }
 
+# Function to get model filename with optional LUT
+get_model_filename() {
+    local prefix=$1
+    local type=$2
+    local lut=$3
+    local chunk_info=$4
+    
+    if [ "$lut" = "none" ] || [ -z "$lut" ]; then
+        echo "${prefix}_${type}${chunk_info}"
+    else
+        echo "${prefix}_${type}_lut${lut}${chunk_info}"
+    fi
+}
+
 # Determine which distribution to prepare based on flags
 if [ "$PREPARE_IOS" = true ]; then
     # Prepare iOS version only
@@ -202,15 +215,17 @@ if [ "$PREPARE_IOS" = true ]; then
     prepare_common_files "$OUTPUT_DIR/ios"
     
     # Copy all mlmodelc files uncompressed for iOS
-    if [ -n "$LUT_EMBEDDINGS" ]; then
-        copy_mlmodelc "${MODEL_PREFIX}_embeddings_lut${LUT_EMBEDDINGS}" "$OUTPUT_DIR/ios"
-    else
-        copy_mlmodelc "${MODEL_PREFIX}_embeddings" "$OUTPUT_DIR/ios"
-    fi
-    copy_mlmodelc "${MODEL_PREFIX}_lm_head_lut${LUT_LMHEAD}" "$OUTPUT_DIR/ios"
+    embeddings_file=$(get_model_filename "$MODEL_PREFIX" "embeddings" "$LUT_EMBEDDINGS")
+    copy_mlmodelc "$embeddings_file" "$OUTPUT_DIR/ios"
+    
+    lmhead_file=$(get_model_filename "$MODEL_PREFIX" "lm_head" "$LUT_LMHEAD")
+    copy_mlmodelc "$lmhead_file" "$OUTPUT_DIR/ios"
+    
     for ((i=1; i<=NUM_CHUNKS; i++)); do
         chunk_num=$(printf "%02d" $i)
-        copy_mlmodelc "${MODEL_PREFIX}_FFN_PF_lut${LUT_FFN}_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)" "$OUTPUT_DIR/ios"
+        chunk_info="_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)"
+        ffn_file=$(get_model_filename "$MODEL_PREFIX" "FFN_PF" "$LUT_FFN" "$chunk_info")
+        copy_mlmodelc "$ffn_file" "$OUTPUT_DIR/ios"
     done
     
     # No need to zip iOS distribution - it should be used directly
@@ -224,15 +239,17 @@ else
     prepare_common_files "$OUTPUT_DIR/standard"
     
     # Compress all mlmodelc files for standard distribution
-    if [ -n "$LUT_EMBEDDINGS" ]; then
-        compress_mlmodelc "${MODEL_PREFIX}_embeddings_lut${LUT_EMBEDDINGS}" "$OUTPUT_DIR/standard"
-    else
-        compress_mlmodelc "${MODEL_PREFIX}_embeddings" "$OUTPUT_DIR/standard"
-    fi
-    compress_mlmodelc "${MODEL_PREFIX}_lm_head_lut${LUT_LMHEAD}" "$OUTPUT_DIR/standard"
+    embeddings_file=$(get_model_filename "$MODEL_PREFIX" "embeddings" "$LUT_EMBEDDINGS")
+    compress_mlmodelc "$embeddings_file" "$OUTPUT_DIR/standard"
+    
+    lmhead_file=$(get_model_filename "$MODEL_PREFIX" "lm_head" "$LUT_LMHEAD")
+    compress_mlmodelc "$lmhead_file" "$OUTPUT_DIR/standard"
+    
     for ((i=1; i<=NUM_CHUNKS; i++)); do
         chunk_num=$(printf "%02d" $i)
-        compress_mlmodelc "${MODEL_PREFIX}_FFN_PF_lut${LUT_FFN}_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)" "$OUTPUT_DIR/standard"
+        chunk_info="_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)"
+        ffn_file=$(get_model_filename "$MODEL_PREFIX" "FFN_PF" "$LUT_FFN" "$chunk_info")
+        compress_mlmodelc "$ffn_file" "$OUTPUT_DIR/standard"
     done
     
     # Create standard distribution zip

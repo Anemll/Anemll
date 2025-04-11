@@ -34,7 +34,7 @@ The `prepare_hf.sh` script automates the preparation of converted ANEMLL models 
 | `--input` | Directory containing converted model files (with meta.yaml) | Yes |
 | `--output` | Output directory for HF distribution (defaults to input_dir/hf_dist) | No |
 | `--org` | Hugging Face organization/account (defaults to anemll) | No |
-| `--ios` | Also prepare iOS-ready version with unzipped MLMODELC files | No |
+| `--ios` | prepare iOS-ready version with unzipped MLMODELC files in {output}/ios folder | No |
 
 ### Example
 
@@ -85,15 +85,17 @@ The `prepare_hf.sh` script automates the preparation of converted ANEMLL models 
 
 ```
 output_directory/
-├── meta.yaml
-├── tokenizer.json
-├── tokenizer_config.json
-├── chat.py
-├── chat_full.py
-├── README.md
-├── llama_embeddings_lutX.mlmodelc.zip
-├── llama_lm_head_lutX.mlmodelc.zip
-└── llama_FFN_PF_lutX_chunk_NNofMM.mlmodelc.zip
+├── standard/
+│   ├── meta.yaml
+│   ├── tokenizer.json
+│   ├── tokenizer_config.json
+│   ├── chat.py
+│   ├── chat_full.py
+│   ├── README.md
+│   ├── llama_embeddings_lutX.mlmodelc.zip
+│   ├── llama_lm_head_lutX.mlmodelc.zip
+│   └── llama_FFN_PF_lutX_chunk_XXofYY.mlmodelc.zip
+└── ${FULL_MODEL_NAME}.zip
 ```
 
 ### iOS Distribution
