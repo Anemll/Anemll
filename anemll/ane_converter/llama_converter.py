@@ -77,7 +77,7 @@ class LlamaConverter(BaseConverter):
             lm_head_model = self.convert_lm_head(self.model, lut_bits=self.lut_bits)
             return [embeddings_model, transformer_model, lm_head_model]
         
-        self.postprocess()
+        self.postprocess(num_workers=None)
 
     def GetTransformerStates(model, part=None, prefix="model.model."):
         """Get the transformer states for CoreML conversion"""
@@ -386,10 +386,15 @@ class LlamaConverter(BaseConverter):
         
         print("Model preprocessing completed")
 
-    def postprocess(self):
-        """Postprocessing steps after conversion."""
+    def postprocess(self, num_workers=None):
+        """Postprocessing steps after conversion.
+        
+        Args:
+            num_workers: Optional number of workers for parallel processing.
+                        If None, uses default single worker.
+        """
         if self.converted_model is not None and self.lut_bits is not None:
-            print(f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group...")
+            print(f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)...")
             try:
                 # Set up quantization config
                 config = cto.coreml.OptimizationConfig(
@@ -398,7 +403,7 @@ class LlamaConverter(BaseConverter):
                         nbits=self.lut_bits,
                         granularity="per_grouped_channel",
                         group_size=self.per_channel,
-                        num_kmeans_workers=1  # Reduce to single worker to avoid pool issues
+                        num_kmeans_workers=num_workers if num_workers is not None else 1  # Use provided workers or default to 1
                     ),
                 )
                 
@@ -480,7 +485,7 @@ class LlamaConverter(BaseConverter):
         # Apply LUT quantization if specified
         if self.lut_bits:
             self.converted_model = mlmodel  # Set for postprocess
-            self.postprocess()
+            self.postprocess(num_workers=8)  # Allow passing num_workers if needed
             mlmodel = self.converted_model
         
         return mlmodel
@@ -580,7 +585,7 @@ class LlamaConverter(BaseConverter):
                         nbits=lut_bits,
                         granularity="per_grouped_channel",
                         group_size=self.per_channel,
-                        num_kmeans_workers=1
+                        num_kmeans_workers=8
                     ),
                 )
                 
@@ -693,7 +698,7 @@ class LlamaConverter(BaseConverter):
             # Apply LUT quantization if specified
             if self.lut_bits:
                 self.converted_model = mlmodel
-                self.postprocess()
+                self.postprocess(num_workers=None)  # Allow passing num_workers if needed
                 mlmodel = self.converted_model
             
             return mlmodel
@@ -797,7 +802,7 @@ class LlamaConverter(BaseConverter):
             # Apply LUT quantization if specified
             if self.lut_bits:
                 self.converted_model = mlmodel
-                self.postprocess()
+                self.postprocess(num_workers=None)  # Allow passing num_workers if needed
                 mlmodel = self.converted_model
             
             return mlmodel

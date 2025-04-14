@@ -4,11 +4,11 @@
 - [x] Initial Release - Basic conversion/test
 - [x] Automated single script workflow
 - [x] Documentation and guides
+- [x] Swift Sample Code
+- [x] iOS/SwiftUI Sample Application
 
 ## Upcoming Milestones 🚧
 
-- [ ] Swift Sample Code
-- [ ] iOS/SwiftUI Sample Application
 - [ ] Qwen Architecture Support
 - [ ] Conversion/Quantization Pipeline Re-factoring
 - [ ] SpinQuant Implementation

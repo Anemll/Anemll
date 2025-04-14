@@ -5,17 +5,18 @@ import CoreFoundation
 /// Manages inference by wrapping a CoreML model and handling state.
 @preconcurrency public final class InferenceManager: @unchecked Sendable {
     private var hidden_states: Int = -1
-    private let embedModel: MLModel
-    private let lmheadModel: MLModel
-    private let ffnChunks: [FFNChunk]  // Use the FFNChunk defined in FFNChunk.swift
+    private var embedModel: MLModel!
+    private var lmheadModel: MLModel!
+    private var ffnChunks: [FFNChunk]!  // Use the FFNChunk defined in FFNChunk.swift
     private var state: MLState!
     private let contextLength: Int
     private let batchSize: Int
     private let fullCausalMask: MLMultiArray  // We already have this
-    private let debugLevel: Int
+    private var debugLevel: Int
     private var v110: Bool = false // old conversio has batch x hidden_states for the last chunk
     // Change timing property to CFAbsoluteTime
     private var prefillEndTime: CFAbsoluteTime?
+    private var FilterLLAMA01: Bool = false
     
     private var lmheadOutputBackings: [String: MLMultiArray]?
     private var hiddenStatesBackings_emb: [String: MLMultiArray]?  // For embed output
@@ -23,6 +24,13 @@ import CoreFoundation
     private var hiddenStatesBackings_last: [String: MLMultiArray]?  // Prefill the last chunk
     private var hiddenStatesBackings_emb_prefill: [String: MLMultiArray]?  // For embed output in prefill
     private var hiddenStatesBackings_ffn_prefill: [String: MLMultiArray]?  // For FFN output in prefill
+    private var GreedySearch = true
+    nonisolated(unsafe) private var abort_generation = Int(0)
+    private var _busy = false
+    private var busy: Bool {
+        get { _busy }
+        set { _busy = newValue }
+    }
     
     // Move struct definition to class scope, before the methods
     private struct PartialMax {
@@ -30,7 +38,19 @@ import CoreFoundation
         let index: Int
     }
     
+    public func AbortGeneration( Code : Int)
+    {
+        abort_generation = Code
+    }
+    
+    public func set_FilterLLAMA01(value: Bool)
+    {
+        FilterLLAMA01 = value
+    }
+
+
     public init(models: LoadedModels, contextLength: Int, batchSize: Int, debugLevel: Int = 0, v110: Bool = false) throws {  // Make init throwing
+        self.debugLevel = debugLevel
         self.embedModel = models.embedModel
         self.lmheadModel = models.lmheadModel
         // Assume models.ffnChunks is available (see note below)
@@ -38,12 +58,43 @@ import CoreFoundation
         self.contextLength = contextLength
         self.batchSize = batchSize
         self.v110 = v110 // Set the v110 flag based on the parameter
-        self.state = ffnChunks[0].prefillModel.makeState()
+
         
         print("InferenceManager initialized with v110=\(v110)")
-        
-        // Create full causal mask once with -inf and 0.0 (we already have this)
         self.fullCausalMask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: contextLength)], dataType: .float16)
+
+        self.initState()
+
+        initFullCausalMask()
+        
+        try initializeBackings()
+        
+        // Debug model descriptions
+        if debugLevel >= 1 {
+            print("\nLM Head Model Output Description:")
+            for (name, desc) in lmheadModel.modelDescription.outputDescriptionsByName {
+                print("Output \(name):")
+                print("- Type: \(type(of: desc.type))")
+                print("- Description: \(desc.type)")
+            }
+        }
+        
+    }
+    
+    public func initializeBackings() throws {
+        // Initialize output backings for lmhead
+        try initializeLMHeadOutputBackings()
+        
+        // Initialize hidden states backings
+        try initializeHiddenStatesBackings()
+
+        try initializePrefillBackings()
+        try initializeLastChunkBacking()
+    }
+    
+    
+    public func initFullCausalMask()  {
+        // Create full causal mask once with -inf and 0.0 (we already have this)
         
         // Initialize all values to -inf first
         for i in 0..<fullCausalMask.count {
@@ -58,27 +109,19 @@ import CoreFoundation
                 }
             }
         }
-        self.debugLevel = debugLevel
-        
-        // Initialize output backings for lmhead
-        try initializeLMHeadOutputBackings()
-        
-        // Initialize hidden states backings
-        try initializeHiddenStatesBackings()
-
-        try initializePrefillBackings()
-        try initializeLastChunkBacking()
-        
-        // Debug model descriptions
-        if debugLevel >= 1 {
-            print("\nLM Head Model Output Description:")
-            for (name, desc) in lmheadModel.modelDescription.outputDescriptionsByName {
-                print("Output \(name):")
-                print("- Type: \(type(of: desc.type))")
-                print("- Description: \(desc.type)")
-            }
+    }
+    
+    public func initState()  {
+        self.state = ffnChunks[0].prefillModel.makeState()
+    }
+    
+    public func ToggeDebugLevel()  {
+        if (debugLevel == 0 ) {
+            debugLevel = 2
+        }else{
+            debugLevel = 0
         }
-        
+        print("Debug level set to \(debugLevel)")
     }
     
     private func initializeLMHeadOutputBackings() throws {
@@ -343,7 +386,8 @@ import CoreFoundation
             let _ = try await generateNextToken(
                 for: contextTokens[i],
                 currentPos: i+1,
-                temperature: 0
+                temperature: 0,
+                tokenizer: tokenizer
             )
             if debugLevel >= 1 {
                 print("runStPrefill predicted token:  \(i) \(contextTokens[i])")
@@ -362,7 +406,9 @@ import CoreFoundation
             print("Input context length:", contextPos)
             debugTokens(Array(contextTokens.prefix(contextPos)), prefix: "Input")
         }
-
+        guard let ffnChunks = ffnChunks else {
+            throw InferenceError.inferenceError("ffnChunks was nil in runPrefill()")
+        }
         var batchPos = 0
         while batchPos < contextPos {
             let batchEnd = min(batchPos + batchSize, contextPos)
@@ -471,6 +517,44 @@ import CoreFoundation
         return contextPos
     }
 
+    func topPSample(logits: [Float], temperature: Float = 1.0, topP: Float = 0.9) -> Int {
+        // Apply temperature scaling
+        let scaledLogits = logits.map { $0 / temperature }
+        
+        // Compute softmax probabilities (with numerical stability)
+        let maxLogit = scaledLogits.max() ?? 0
+        let expLogits = scaledLogits.map { exp($0 - maxLogit) }
+        let sumExp = expLogits.reduce(0, +)
+        let probs = expLogits.map { $0 / sumExp }
+        
+        // Sort indices by descending probability
+        let sorted = probs.enumerated().sorted { $0.element > $1.element }
+        var cumulative: Float = 0.0
+        var filtered: [(Int, Float)] = []
+        for (index, prob) in sorted {
+            cumulative += prob
+            filtered.append((index, prob))
+            if cumulative >= topP {
+                break
+            }
+        }
+        
+        // Normalize the filtered probability subset
+        let filteredSum = filtered.map { $0.1 }.reduce(0, +)
+        let normalized = filtered.map { ($0.0, $0.1 / filteredSum) }
+        
+        // Sample from the normalized set
+        let r = Float.random(in: 0..<1)
+        var cumulativeSample: Float = 0.0
+        for (index, prob) in normalized {
+            cumulativeSample += prob
+            if r <= cumulativeSample {
+                return index
+            }
+        }
+        
+        return normalized.last!.0  // fallback (should not usually happen)
+    }
 
     /// Generates the next token given the current token. This method calls the embedding model,
     /// passes the output through each FFN chunk's infer function, and then runs the LM head.
@@ -480,6 +564,9 @@ import CoreFoundation
         temperature: Float,
         tokenizer: Tokenizer? = nil
     ) async throws -> Int {
+        guard let ffnChunks = ffnChunks else {
+            throw InferenceError.inferenceError("ffnChunks is nil before generateNextToken")
+        }
         if debugLevel >= 1 {
             print("\nGenerating token at position \(currentPos-1)")
             print("Input token: \(lastToken)", terminator: "")
@@ -489,6 +576,10 @@ import CoreFoundation
                 print()
             }
         }
+        
+        let _padTokenId = tokenizer?.padTokenId ?? 0 // Default to 0 if nil
+
+        
         
         // Run embeddings with output backing
         let tokenArray = try MLMultiArray(shape: [1, 1], dataType: .int32)
@@ -520,6 +611,7 @@ import CoreFoundation
 
         // Run through FFN chunks using FFN backing
         var currentHiddenStates = hiddenStates
+
         for chunk in ffnChunks {
             let ffnOptions = MLPredictionOptions()
             if let backings = hiddenStatesBackings_ffn {
@@ -556,42 +648,49 @@ import CoreFoundation
             throw InferenceError.inferenceError("Output backings not initialized")
         }
 
-        // Process each logits part in parallel
-        let partialResults = try await withThrowingTaskGroup(of: PartialMax.self) { group -> [PartialMax] in
-            for i in 1...8 {
-                let partIndex = i
-                let logitsKey = "logits\(partIndex)"
-                
-                guard let logitsPart = outputBackings[logitsKey] else {
-                    throw InferenceError.inferenceError("Missing feature \(logitsKey)")
-                }
-                
-                // Create a task with @Sendable closure
-                group.addTask { @Sendable in
-                    // Capture values by copying them into the task
-                    let localLogitsPart = logitsPart
-                    let localOffset = (partIndex - 1) * logitsPart.count
+    
+        // Decide between greedy (argmax) vs. top-p sampling:
+        if GreedySearch {
+            // --- Argmax branch: process each logits part in parallel ---
+            let partialResults = try await withThrowingTaskGroup(of: PartialMax.self) { group -> [PartialMax] in
+                for i in 1...8 {
+                    let partIndex = i
+                    let logitsKey = "logits\(partIndex)"
                     
-                    guard let pixelBuffer = localLogitsPart.pixelBuffer else {
-                        throw InferenceError.inferenceError("Missing or invalid \(logitsKey) in output backings")
+                    guard let logitsPart = outputBackings[logitsKey] else {
+                        throw InferenceError.inferenceError("Missing feature \(logitsKey)")
                     }
                     
-                    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-                    defer {
-                        CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-                    }
-                    
-                    guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                        throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
-                    }
-                    
-                    #if arch(arm64)
+                    group.addTask { @Sendable in
+                        let localLogitsPart = logitsPart
+                        let localOffset = (partIndex - 1) * logitsPart.count
+                        
+                        guard let pixelBuffer = localLogitsPart.pixelBuffer else {
+                            throw InferenceError.inferenceError("Missing or invalid \(logitsKey) in output backings")
+                        }
+                        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+                        defer {
+                            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+                        }
+                        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                            throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
+                        }
+                        
+                        #if arch(arm64)
                         let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
                         let count = localLogitsPart.count
                         var localMaxValue: Float = -Float.infinity
                         var localMaxIndex = 0
                         
-                        for j in 0..<count {
+                        var start = 0
+                        if localOffset == 0 && self.FilterLLAMA01 {
+                            start = 2  // filtering special tokens
+                            if self.debugLevel >= 2 {
+                                print("Filtering special tokens: start=\(_padTokenId)")
+                            }
+                        }
+                        
+                        for j in start..<count {
                             let value = Float(buffer[j])
                             if value > localMaxValue {
                                 localMaxValue = value
@@ -599,37 +698,101 @@ import CoreFoundation
                             }
                         }
                         return PartialMax(value: localMaxValue, index: localMaxIndex)
-                    #else
-                        fatalError("Unsupported architecture, only Apple Sylicon is supported")
-                    #endif
-                                        
+                        #else
+                        fatalError("Unsupported architecture, only Apple Silicon is supported")
+                        #endif
+                    }
                 }
+                
+                var results: [PartialMax] = []
+                for try await result in group {
+                    results.append(result)
+                }
+                return results
             }
             
-            var results: [PartialMax] = []
-            for try await result in group {
-                results.append(result)
+            let globalMax = partialResults.reduce(PartialMax(value: -Float.infinity, index: 0)) { current, next in
+                next.value > current.value ? next : current
             }
-            return results
-        }
-        // Find global maximum from partial results
-        let globalMax = partialResults.reduce(PartialMax(value: -Float.infinity, index: 0)) { current, next in
-            next.value > current.value ? next : current
-        }
-
-        if debugLevel >= 1 {
-            print("\nArgmax token:", globalMax.index)
-            print("Argmax value:", globalMax.value)
-        }
-
-        // Example of level 2 debug output
-        if debugLevel >= 2 {
-            print("\nDetailed hidden states:")
-            debugTensor(currentHiddenStates, prefix: "Hidden states", level: 2)
-        }
-
-        return globalMax.index
-    }
+            
+            if debugLevel >= 1 {
+                print("\nArgmax token:", globalMax.index)
+                print("Argmax value:", globalMax.value)
+            }
+            return globalMax.index
+        } else {
+            // --- Top-p sampling branch: collect logits parts in parallel ---
+            let logitsResults = try await withThrowingTaskGroup(of: [(Int, Float)].self) { group -> [[(Int, Float)]] in
+                for i in 1...8 {
+                    let partIndex = i
+                    let logitsKey = "logits\(partIndex)"
+                    guard let logitsPart = outputBackings[logitsKey] else {
+                        throw InferenceError.inferenceError("Missing feature \(logitsKey)")
+                    }
+                    group.addTask { @Sendable in
+                        let localLogitsPart = logitsPart
+                        let localOffset = (partIndex - 1) * logitsPart.count
+                        
+                        guard let pixelBuffer = localLogitsPart.pixelBuffer else {
+                            throw InferenceError.inferenceError("Missing or invalid \(logitsKey) in output backings")
+                        }
+                        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+                        defer {
+                            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+                        }
+                        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                            throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
+                        }
+                        
+                        #if arch(arm64)
+                        let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
+                        let count = localLogitsPart.count
+                        var output: [(Int, Float)] = []
+                        var start = 0
+                        if localOffset == 0 && self.FilterLLAMA01 {
+                            start = 2  // filtering special tokens
+                            if self.debugLevel >= 2 {
+                                print("Filtering special tokens: start=\(_padTokenId)")
+                            }
+                        }
+                        
+                        for j in start..<count {
+                            let value = Float(buffer[j])
+                            let globalIndex = localOffset + j
+                            output.append((globalIndex, value))
+                        }
+                        return output
+                        #else
+                        fatalError("Unsupported architecture, only Apple Silicon is supported")
+                        #endif
+                    }
+                }
+                
+                var allLogits: [[(Int, Float)]] = []
+                for try await logits in group {
+                    allLogits.append(logits)
+                }
+                return allLogits
+            }
+            
+            // Flatten results into a single array of (index, logit) pairs.
+            let flatLogits = logitsResults.flatMap { $0 }
+            
+            // Determine the vocabulary size: assume it equals the max index observed + 1.
+            let vocabSize = (flatLogits.map { $0.0 }.max() ?? 0) + 1
+            var logitsVector = Array(repeating: -Float.infinity, count: vocabSize)
+            for (index, value) in flatLogits {
+                logitsVector[index] = value
+            }
+            
+            // Use top-p sampling to pick a token. You can hardcode or pass in your topP (here 0.9).
+            let sampledIndex = topPSample(logits: logitsVector, temperature: temperature, topP: 0.9)
+            if debugLevel >= 1 {
+                print("\nTop-p sampled token:", sampledIndex)
+            }
+            return sampledIndex
+        }   
+     }
     
     /// Shifts the context window if needed (similar to the Python code).
     public func shiftWindow(
@@ -669,6 +832,11 @@ import CoreFoundation
     
     /// Main generation loop. Given an initial (padded) token sequence, run prefill once,
     /// then generate tokens one-by-one until maxTokens are produced or an EOS token is reached.
+    ///
+    public func isBusy() ->Bool {
+        return busy;
+    }
+    
     public func generateResponse(
         initialTokens: [Int],
         temperature: Float,
@@ -678,13 +846,24 @@ import CoreFoundation
         onToken: ((Int) -> Void)? = nil,
         onWindowShift: (() -> Void)? = nil
     ) async throws -> ([Int], TimeInterval, String) {
+        
         var generatedTokens: [Int] = []
         let startTime = CFAbsoluteTimeGetCurrent()
         var stopReason = "max_tokens"
+        // Use known EOT token ID
+        let eotToken = 128009  // Hardcode the token ID we observed
+
+        if (busy) {
+            print("Should not happen!!!!!")
+            generatedTokens.append(eotToken)
+            return  (generatedTokens, 0, "Inference is Busy")
+        }
+
+        let _padTokenId = tokenizer.padTokenId
+        abort_generation = 0;
+        busy = true
         
         do {
-            // Use known EOT token ID
-            let eotToken = 128009  // Hardcode the token ID we observed
 
             if debugLevel >= 1 {
                 print("\n=== EOT Token Setup ===")
@@ -739,17 +918,26 @@ import CoreFoundation
                 
                 // Append new token to contextTokens if needed
                 if currentPos >= contextTokens.count {
-                    contextTokens.append(0)  // Placeholder value
+                    contextTokens.append(_padTokenId)  // Placeholder value
                 }
                 
                 guard currentPos > 0 && currentPos < contextTokens.count else {
                     throw InferenceError.inferenceError("Invalid position \(currentPos) for context length \(contextTokens.count)")
                 }
                 
+                if (abort_generation != 0 ) {
+                    stopReason = "abort_generation"+String(abort_generation)
+                    if debugLevel >= 1 {
+                        print("\nStopping: abort_generation (\(abort_generation))")
+                    }
+                    break
+                }
+                
                 let nextToken = try await generateNextToken(
                     for: contextTokens[currentPos - 1],
                     currentPos: currentPos,
-                    temperature: temperature
+                    temperature: temperature,
+                    tokenizer: tokenizer
                 )
                 
                 // Debug token comparison
@@ -762,7 +950,9 @@ import CoreFoundation
                 }
                 
                 // Check for stop tokens before adding to generated tokens
-                if nextToken == eosToken || nextToken == 0 {
+                //if nextToken == eosToken || nextToken == 0 {
+                if nextToken == eosToken  { // cannot be zero ?
+
                     stopReason = "eos_token"
                     if debugLevel >= 1 {
                         print("\nStopping: EOS token detected (\(nextToken))")
@@ -784,10 +974,11 @@ import CoreFoundation
                 onToken?(nextToken)
                 currentPos += 1
             }
-            
+            busy = false;
             return (generatedTokens, prefillTime, stopReason)
         } catch {
             print("\nError during generation: \(error)")
+            busy = false;
             throw error
         }
     }
@@ -823,7 +1014,8 @@ import CoreFoundation
         }
     }
 
-    deinit {
+    public func unload()
+    {
         // Just clear our local reference - no need to set model's outputBackings
         lmheadOutputBackings = nil
         hiddenStatesBackings_emb = nil
@@ -831,6 +1023,14 @@ import CoreFoundation
         hiddenStatesBackings_last = nil
         hiddenStatesBackings_emb_prefill = nil
         hiddenStatesBackings_ffn_prefill = nil
+        state = nil
+        embedModel = nil
+        lmheadModel = nil
+        ffnChunks = nil
+
+    }
+    deinit {
+        unload()
     }
 }
 

@@ -6,24 +6,62 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 > The goal is to provide a fully open-source pipeline from model conversion to inference for common LLM architectures running on ANE.
 > This enables seamless integration and on-device inference for low-power applications on edge devices, ensuring maximum privacy and security.
 > This is critical for autonomous applications, where models run directly on the device without requiring an internet connection.
+>
+> We aim to:
+> - Provide flexible and easy to use library/framework to port LLMs to ANE directly from Hugging Face models
+> - Provide on-device examples for iOS and macOS swift or C/C++ Applications
 
-We aim to:
-- Provide flexible and easy to use library/framework to port LLMs to ANE directly from Hugging Face models
-- Provide on-device examples for iOS and macOS swift or C/C++ Applications
+See update [Roadmap.md](./docs/Roadmap.md) for more details
 
-See [Roadmap.md](./docs/Roadmap.md) for more details
+## Main Components in 0.3.0 Release
+
+ANEMLL provides five main components for Apple Neural Engine inference development:
+
+1. [LLM Conversion Tools](./docs/convert.md) - Scripts and code to convert models directly from Hugging Face weights
+   - [Single-shot Conversion Script](./docs/convert_model.md)
+
+2. [Swift Reference Implementation](./docs/swift_cli.md) - Optimized inference code for Swift applications
+   - Sample CLI application in `anemll-swift-cli`
+   - Core inference engine implementation
+
+3. [Python Sample Code](./docs/chat.md) - Reference implementation and testing tools
+   - Basic chat interface (`chat.py`)
+   - Advanced conversation management (`chat_full.py`)
+
+4. [iOS/macOS Sample Applications](./docs/sample_apps.md) - Ready-to-use example applications
+   - SwiftUI Chat interface
+   - Conversation management
+   - Model integration examples
+
+5. [ANEMLL-BENCH](https://github.com/anemll/anemll-bench) - Apple Neural Engine Benchmarking
+   - Performance testing and comparison
+   - Model optimization metrics
+   - Hardware-specific benchmarks
+
+### Pre-converted Models
+
+We provide sample converted models ready for use:
+- LLAMA 3.1 (1B and 8B variants) including iOS "friendly builds"
+- DeepSeek Coder distilled models
+- DeepHermes distilled models
+
+Visit our [Hugging Face repository](https://huggingface.co/anemll) for the latest converted models.
 
 > [!Important]
-> This is Alpha Release 0.2.0 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
-> This is Alpha Release 0.2.0 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
-> - This release only supports LLAMA models including DeepSeek distilled models on LLaMA 3.1 architecture
+> This is Alpha Release 0.3.0 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
+> This is Alpha Release 0.3.0 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
+> - This release only supports LLAMA models including DeepSeek and DeepHermes distilled models on LLaMA 3.1 architecture
 > - The future release will add support for more models and architectures
-> - Please visit https://huggingface.co/anemll where we uload the latest models and X: [@anemll](https://x.com/anemll) for updates
+> - Please visit https://huggingface.co/anemll where we upload the latest models and X: [@anemll](https://x.com/anemll) for updates
 > - Please star this repo to support the project!
 
-### New in 0.2.0 🚀
+### New in 0.3.0 🚀
 
-> Refernce implementation for Swift inference:
+Swift UI Sample Code
+- Sample iOS/macOS inference Chat-Bot App
+- Updates to Model conversion scripts 
+
+> Reference implementation for Swift inference:
 > ```bash
 > cd anemll-swift-cli
 > ```
@@ -37,7 +75,14 @@ See [Roadmap.md](./docs/Roadmap.md) for more details
 > # optional parms: --prompt "Who are you?"
 > ```
 
+### Sample iOS/macOS Applications
+- Downloads reference or custom models from HuggingFace
+- Inference / chat implementation use Swift Library
+- Sample TestFlight App for a quick test
+- See [iOS/macOS Sample Applications Guide](./docs/sample_apps.md) for details
 
+> [!Tip]
+> Try our TestFlight app: [Join Beta](https://testflight.apple.com/join/jrQq1D1C)
 
 ## Basic Workflow
 
@@ -167,10 +212,23 @@ Currently optimized for:
 
 Feel free to submit issues and pull requests to improve **ANEMLL**!
 
-## License
+> [!Note]
+> If you're using ANEMLL in your project, please submit a PR to add it to this list.
+> We love to showcase how the community is using ANEMLL!
+### Third-Party Applications Using ANEMLL
 
-ANEMLL is licensed under the MIT License.
-https://opensource.org/license/mit 
+### Open Source Projects
+- [anemll-server](https://github.com/alexgusevski/anemll-server) - Server implementation of ANEMLL inference
+
+> [!Note]
+> If you're using ANEMLL in your project, please submit a PR to add it to this list.
+> We love to showcase how the community is using ANEMLL!
+
+### Integration Examples
+For examples of how to integrate ANEMLL into your projects, see:
+- [iOS Integration Guide](./docs/sample_apps.md)
+- [Swift CLI Reference](./docs/swift_cli.md)
+- [Python Sample Code](./docs/chat.md)
 
 ## Links & Resources
 
@@ -181,8 +239,13 @@ https://opensource.org/license/mit
 
 ## Contact
 
+For any questions or support, reach out to us at [realanemll@gmail.com](mailto:realanemll@gmail.com)
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=Anemll/Anemll&type=Date)](https://star-history.com/#Anemll/Anemll&Date)
 
-For any questions or support, reach out to us at [realanemll@gmail.com](mailto:realanemll@gmail.com)
+## License
+
+ANEMLL is licensed under the MIT License.
+https://opensource.org/license/mit

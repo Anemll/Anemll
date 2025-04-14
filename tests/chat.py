@@ -66,6 +66,10 @@ class TokenPrinter:
         # Decode all tokens at once in the main thread
         token_str = self.tokenizer.decode(self.decoding_buffer)
         self.decoding_buffer.clear()
+        
+        # Store the text in buffer for later saving to file
+        with self.lock:
+            self.buffer += token_str
 
         # Color-handling logic
         if self.thinking and "</think>" in token_str:
@@ -98,6 +102,8 @@ class TokenPrinter:
     def stop(self):
         """Stop the printer thread."""
         if self.thread and self.thread.is_alive():
+            # Ensure any remaining tokens are processed
+            self.drain_buffer()
             self.stop_event.set()
             try:
                 self.thread.join(timeout=1.0)
@@ -112,21 +118,34 @@ class TokenPrinter:
                 print(RESET_COLOR)  # Reset color at the end
         return self.buffer
 
-def parse_model_path(model_path):
-    """Parse model path and return full path with extension."""
-    # If path already has .mlmodelc extension, use it as is
-    if model_path.endswith('.mlmodelc'):
-        return model_path
+def parse_model_path(path):
+    """Parse model path and return full path with .mlmodelc or .mlpackage extension."""
+    path = Path(path)
+    
+    # If path exists exactly as specified, return it
+    if path.exists():
+        return str(path)
         
-    # Try different extensions
-    extensions = ['.mlmodelc']
-    for ext in extensions:
-        full_path = model_path + ext
-        if os.path.exists(full_path):
-            return full_path
+    # Try with both extensions
+    candidates = [
+        path,  # Original path
+        path.with_suffix('.mlmodelc'),  # With .mlmodelc
+        path.with_suffix('.mlpackage'),  # With .mlpackage
+        Path(str(path) + '.mlmodelc'),  # Handle case where extension is included
+        Path(str(path) + '.mlpackage')
+    ]
+    
+    # Try all possible paths
+    for candidate in candidates:
+        if candidate.exists():
+            print(f"Found model at: {candidate}")
+            return str(candidate)
             
-    # If no extension works, return original path
-    return model_path
+    # If we get here, no valid path was found
+    print("\nError: Model not found. Tried following paths:")
+    for candidate in candidates:
+        print(f"  {candidate}")
+    raise FileNotFoundError(f"Model not found: {path}")
 
 def parse_ffn_filename(path):
     """Parse FFN model filename to extract chunk information."""
@@ -254,83 +273,70 @@ def load_metadata(model,args):
     
     return metadata
     
-def load_models(args, metadata):
-    """Load all model components."""
+def load_models(args,metadata):
+    """Load all required models and extract metadata."""
     print("\nLoading models...")
     
-    # Get model directory
-    model_dir = args.d if args.d else os.path.dirname(args.meta) if args.meta else '.'
-    print(f"\nUsing model directory: {model_dir}")
-    
-    # Initialize metadata if empty
-    if not metadata:
-        metadata = {}
-    
-    # If using meta.yaml, get model names and parameters from there
-    if args.meta:
-        with open(args.meta) as f:
-            meta = yaml.safe_load(f)
-            params = meta['model_info']['parameters']
-            
-            # Use the model paths from meta.yaml
-            args.embed = params.get('embeddings', args.embed)
-            args.lmhead = params.get('lm_head', args.lmhead)
-            args.ffn = params.get('ffn', args.ffn)
-            
-            # Update metadata with values from meta.yaml
-            metadata['context_length'] = int(params.get('context_length', args.context_length or 512))
-            metadata['batch_size'] = int(params.get('batch_size', args.batch_size or 64))
-            metadata['num_chunks'] = int(params.get('num_chunks', 1))
-    else:
-        # Set default values if not using meta.yaml
-        metadata['context_length'] = args.context_length or 512
-        metadata['batch_size'] = args.batch_size or 64
-        metadata['num_chunks'] = getattr(args, 'num_chunks', 1)
+    try:
+        # Load embeddings model
+        print("\nLoading embeddings model...")
+        embed_path = parse_model_path(args.embed)
+        print(f"Loading from: {embed_path}")
+        embed_model = load_model(embed_path)
+        print("Embeddings model loaded successfully")
+        metadata = load_metadata(embed_model,args)
+        
 
-    print(f"Context length: {metadata['context_length']}")
-    
-    # Get tokenizer path
-    tokenizer_path = args.tokenizer if args.tokenizer else model_dir
-    print(f"Using tokenizer path: {tokenizer_path}")
-    
-    # Ensure we have all required model names
-    if not all([args.embed, args.lmhead, args.ffn]):
-        print("\nError: Missing model names. Please provide either:")
-        print("1. A meta.yaml file with model names")
-        print("2. Individual model names via --embed, --lmhead, and --ffn arguments")
-        sys.exit(1)
-    
-    # Load embeddings model
-    print("\nLoading embeddings model...")
-    embed_path = os.path.join(model_dir, args.embed)
-    embed_model = load_model(parse_model_path(embed_path))
-    
-    # Load LM head model
-    print("\nLoading LM head model...")
-    lmhead_path = os.path.join(model_dir, args.lmhead)
-    lmhead_model = load_model(parse_model_path(lmhead_path))
-    
-    # Load FFN models
-    print("\nLoading FFN models...")
-    ffn_path = os.path.join(model_dir, args.ffn)
-    ffn_models = []
-    
-    # Check if this is a chunked model
-    chunk_info = parse_ffn_filename(ffn_path)
-    if chunk_info[0] is not None:
-        # Find all chunk files
-        chunk_files = find_all_chunks(ffn_path)
-        if not chunk_files:
-            raise FileNotFoundError(f"No FFN chunk files found matching pattern: {ffn_path}")
-            
-        print(f"Found {len(chunk_files)} FFN chunks")
-        for chunk_file in chunk_files:
-            ffn_models.append(load_model(chunk_file))
-    else:
-        # Single FFN model
-        ffn_models = [load_model(parse_model_path(ffn_path))]
-    
-    return embed_model, ffn_models, lmhead_model, metadata
+        
+        # Load LM head model
+        print("\nLoading LM head model...")
+        lmhead_path = parse_model_path(args.lmhead)
+        print(f"Loading from: {lmhead_path}")
+        lmhead_model = load_model(lmhead_path)
+        print("LM head model loaded successfully")
+        
+        # Parse FFN path and find chunks if needed
+        print("\nLoading FFN+PREFILL model(s)...")
+        ffn_path = parse_model_path(args.ffn)
+        chunk_no, total_chunks = parse_ffn_filename(ffn_path)
+        
+        ffn_models = []
+        if chunk_no and total_chunks:
+            print(f"\nDetected chunked FFN+PREFILL model ({total_chunks} chunks)")
+            # Find and load all chunks
+            chunk_paths = find_all_chunks(ffn_path)
+            if len(chunk_paths) != total_chunks:
+                raise ValueError(f"Found {len(chunk_paths)} chunks but filename indicates {total_chunks} chunks")
+                
+            for chunk_path in chunk_paths:
+                print(f"\nLoading FFN+PREFILL chunk: {Path(chunk_path).name}")
+                try:
+                    # For chunked models, we need both infer and prefill functions
+                    ffn_models.append({
+                        'infer': load_model(chunk_path, function_name='infer'),
+                        'prefill': load_model(chunk_path, function_name='prefill')
+                    })
+                    print("Chunk loaded successfully")
+                except Exception as e:
+                    print(f"Error loading chunk {chunk_path}: {str(e)}")
+                    raise
+            metadata = load_metadata(ffn_models[0],args)
+
+        else:
+            print("\nLoading single FFN model...")
+            ffn_models.append(load_model(ffn_path))
+            print("FFN model loaded successfully")
+        
+        return embed_model, ffn_models, lmhead_model, metadata
+        
+    except Exception as e:
+        print(f"\nError loading models: {str(e)}")
+        print("\nPlease ensure all model files exist and are accessible.")
+        print("Expected files:")
+        print(f"  Embeddings: {args.embed}")
+        print(f"  LM Head: {args.lmhead}")
+        print(f"  FFN: {args.ffn}")
+        raise
 
 # At the top of the file, make this a default path
 
@@ -386,11 +392,19 @@ def make_causal_mask(length, start):
     mask[:, :, col_indices <= (row_indices + start)] = 0
     return mask
 
-def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None):
-    """Run prefill on the input sequence."""
-    # Create causal mask
+def initialize_causal_mask(context_length):
+    """Initialize causal mask for transformer attention."""
     causal_mask = make_causal_mask(context_length, 0)
     causal_mask = torch.tensor(causal_mask, dtype=torch.float16)
+    print(f"\nInitialized causal mask for context length {context_length}")
+    return causal_mask
+
+def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None, causal_mask=None):
+    """Run prefill on the input sequence."""
+    # Use provided causal mask or create one if not provided
+    if causal_mask is None:
+        causal_mask = make_causal_mask(context_length, 0)
+        causal_mask = torch.tensor(causal_mask, dtype=torch.float16)
     
     # Process in batches
     batch_pos = 0
@@ -412,9 +426,12 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
         position_ids = torch.arange(batch_size, dtype=torch.int32)  # Changed: Always use full batch size
         batch_causal_mask = causal_mask[:, :, :batch_size, :]  # Changed: Use full batch size
         
-        # Run embeddings
+        # Run embeddings with proper batch size
         hidden_states = torch.from_numpy(
-            embed_model.predict({'input_ids': batch_input.numpy()})['hidden_states']
+            embed_model.predict({
+                'input_ids': batch_input.numpy(),
+                'batch_size': np.array([batch_size], dtype=np.int32)  # Add batch_size parameter
+            })['hidden_states']
         )
         
         # Run through FFN chunks with state
@@ -433,7 +450,7 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
     
     return torch.tensor([context_pos], dtype=torch.int32)
 
-def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state=None, temperature=0.0):
+def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state=None, causal_mask=None, temperature=0.0):
     """Generate the next token."""
     # Get current token
     current_token = input_ids[:, pos-1:pos]  # [1, 1]
@@ -447,8 +464,13 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
     update_mask[0, 0, pos-1, 0] = 1.0
     position_ids = torch.tensor([pos-1], dtype=torch.int32)  # [1]
-    causal_mask = make_causal_mask(context_length, 0)
-    causal_mask = torch.tensor(causal_mask[:, :, pos-1:pos, :], dtype=torch.float16)  # [1, 1, 1, context_length]
+    
+    # Use provided causal mask or create one if not provided
+    if causal_mask is None:
+        causal_mask_data = make_causal_mask(context_length, 0)
+        single_causal_mask = torch.tensor(causal_mask_data[:, :, pos-1:pos, :], dtype=torch.float16)  # [1, 1, 1, context_length]
+    else:
+        single_causal_mask = causal_mask[:, :, pos-1:pos, :]
     
     # Run through FFN chunks with state
     for ffn_model in ffn_models:
@@ -457,7 +479,7 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
                 'hidden_states': hidden_states.numpy(),
                 'update_mask': update_mask.numpy(),
                 'position_ids': position_ids.numpy(),
-                'causal_mask': causal_mask.numpy(),
+                'causal_mask': single_causal_mask.numpy(),
                 'current_pos': position_ids.numpy()
             }
             output = ffn_model['infer'].predict(inputs, state)
@@ -503,7 +525,7 @@ def create_unified_state(ffn_models, context_length):
         print("\nCreated unified transformer state")
         return state
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, auto_prompt=None, warmup=False):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None):
     """Interactive chat loop."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
@@ -577,7 +599,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 # Start prefill timing
                 prefill_start = time.time()
                 
-                # Run prefill with state
+                # Run prefill with state and causal mask
                 current_pos = run_prefill(
                     embed_model,
                     ffn_models,
@@ -585,7 +607,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     context_pos,
                     context_length,
                     batch_size,
-                    state
+                    state,
+                    causal_mask
                 )
                 
                 # Calculate prefill timing
@@ -600,7 +623,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 inference_tokens = 0
                 
                 while pos < context_length - 1:
-                    # Generate next token
+                    # Generate next token with causal mask
                     next_token = generate_next_token(
                         embed_model,
                         ffn_models,
@@ -608,7 +631,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                         input_ids,
                         pos,
                         context_length,
-                        state
+                        state,
+                        causal_mask
                     )
                     
                     # Add token to sequence
@@ -649,6 +673,26 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     print(f"Inference: {inference_tokens_per_sec:.1f} t/s")
                     print(f"Total: Generated {tokens_generated} tokens in {prefill_time + inference_time:.2f}s")
                     conversation.append({"role": "assistant", "content": response})
+                    
+                    # Save response to file if requested
+                    if save_file:
+                        try:
+                            # Add small delay to ensure all tokens are processed
+                            time.sleep(0.5)
+                            
+                            # Make sure response ends with EOS token if it's supposed to
+                            if response and not response.endswith("<|eot_id|>") and not response.endswith("</s>"):
+                                if tokenizer.eos_token:
+                                    eos_text = tokenizer.decode([tokenizer.eos_token_id])
+                                    if not response.endswith(eos_text):
+                                        print(f"\n{DARK_BLUE}Adding missing EOS token for consistency{RESET_COLOR}")
+                                        response += eos_text
+                            
+                            with open(save_file, 'w') as f:
+                                f.write(response)
+                            print(f"\n{DARK_BLUE}Response saved to file: {save_file}{RESET_COLOR}")
+                        except Exception as e:
+                            print(f"\n{DARK_BLUE}Error saving to file: {str(e)}{RESET_COLOR}")
                 else:
                     token_printer.stop()  # Clean up without printing stats
                 
@@ -667,7 +711,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
         traceback.print_exc()
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Chat with CoreML LLaMA (c) 2025 Anemll')
+    parser = argparse.ArgumentParser(description='Chat with CoreML LLaMA, gil resolved  (c) 2025 Anemll')
     
     # Add meta.yaml option
     parser.add_argument('--meta', type=str, help='Path to meta.yaml to load all parameters')
@@ -687,6 +731,10 @@ def parse_args():
     # Add new argument for auto-generation
     parser.add_argument('--prompt', type=str,
                        help='If specified, run once with this prompt and exit')
+    
+    # Add save option
+    parser.add_argument('--save', type=str,
+                       help='Save assistant\'s response to specified file')
     
     # Add no-warmup flag
     parser.add_argument('--nw', action='store_true',
@@ -713,26 +761,18 @@ def parse_args():
             
             # Build model paths based on parameters
             prefix = params.get('model_prefix', 'llama')  # Default to 'llama' if not specified
-            
-            # Get LUT values, defaulting to 'none' if not specified
-            lut_embeddings = params.get('lut_embeddings', 'none')
-            lut_ffn = params.get('lut_ffn', 'none')
-            lut_lmhead = params.get('lut_lmhead', 'none')
-            
-            # Construct LUT suffixes
-            lut_emb_suffix = f"_lut{lut_embeddings}" if lut_embeddings != 'none' else ''
-            lut_ffn_suffix = f"_lut{lut_ffn}" if lut_ffn != 'none' else ''
-            lut_lmhead_suffix = f"_lut{lut_lmhead}" if lut_lmhead != 'none' else ''
-            
+            lut_ffn = f"_lut{params['lut_ffn']}" if params['lut_ffn'] != 'none' else ''
+            lut_lmhead = f"_lut{params['lut_lmhead']}" if params['lut_lmhead'] != 'none' else ''
+            lut_embeddings = f"_lut{params['lut_embeddings']}" if params['lut_embeddings'] != 'none' else ''
             num_chunks = int(params['num_chunks'])
             
             # Set model paths if not specified
-            if not args.embed:
-                args.embed = f'{prefix}_embeddings{lut_emb_suffix}'
             if not args.lmhead:
-                args.lmhead = f'{prefix}_lm_head{lut_lmhead_suffix}'
+                args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
+            if not args.embed:
+                args.embed = f'{prefix}_embeddings{lut_embeddings}'  # Changed from lm_head to embeddings
             if not args.ffn:
-                args.ffn = f'{prefix}_FFN_PF{lut_ffn_suffix}_chunk_01of{num_chunks:02d}'
+                args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
             if not args.tokenizer:
                 args.tokenizer = args.d
             
@@ -809,6 +849,9 @@ def main():
         # Create unified state once
         state = create_unified_state(ffn_models, metadata['context_length'])
         
+        # Initialize causal mask once
+        causal_mask = initialize_causal_mask(metadata['context_length'])
+        
         # Warmup runs to prevent Python GIL issues with CoreML !
         if not args.nw:
             for i in range(2):
@@ -819,6 +862,7 @@ def main():
                     tokenizer=tokenizer,
                     metadata=metadata,
                     state=state,
+                    causal_mask=causal_mask,  # Pass the causal mask
                     warmup=True,
                     auto_prompt="who are you?"
                 )
@@ -831,8 +875,10 @@ def main():
             tokenizer=tokenizer,
             metadata=metadata,
             state=state,
+            causal_mask=causal_mask,  # Pass the causal mask
             warmup=False,
-            auto_prompt=args.prompt
+            auto_prompt=args.prompt,
+            save_file=args.save
         )
         
     except Exception as e:

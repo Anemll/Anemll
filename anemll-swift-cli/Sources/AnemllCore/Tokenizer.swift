@@ -243,6 +243,9 @@ public final class Tokenizer: @unchecked Sendable {
         public static func assistant(_ content: String) -> ChatMessage {
             ChatMessage(role: "assistant", content: content)
         }
+        public static func system(_ content: String) -> ChatMessage {
+            ChatMessage(role: "system", content: content)
+        }
     }
 
     // Consolidated applyChatTemplate method

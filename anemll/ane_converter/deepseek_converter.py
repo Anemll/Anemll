@@ -16,7 +16,11 @@ class DeepSeekConverter(BaseConverter):
         self.preprocess()
         # DeepSeek model needs special transformations before ANE conversion
         ane_model = self.convert_to_ane(self.model)
-        self.postprocess()
+        # Apply LUT quantization if specified
+        if self.lut_bits:
+            self.converted_model = ane_model  # Set for postprocess
+            self.postprocess(num_workers=None)  # Allow passing num_workers if needed
+            ane_model = self.converted_model
         return ane_model
 
     def convert_to_ane(self, model):

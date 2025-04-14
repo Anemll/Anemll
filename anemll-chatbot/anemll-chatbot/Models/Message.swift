@@ -13,14 +13,16 @@ class Message: Identifiable, Codable, ObservableObject, Equatable {
     var timestamp: Date
     var tokensPerSecond: Double?
     @Published var windowShifts: Int = 0 // Track window shifts during generation
+    var isSystemMessage: Bool = false // Flag for system messages
     
-    init(text: String, isUser: Bool) {
+    init(text: String, isUser: Bool, isSystemMessage: Bool = false) {
         self.id = UUID()
         self.text = text
         self.isUser = isUser
         self.timestamp = Date()
         self.tokensPerSecond = nil
         self.windowShifts = 0
+        self.isSystemMessage = isSystemMessage
     }
     
     // Add a method to update the text
@@ -30,7 +32,7 @@ class Message: Identifiable, Codable, ObservableObject, Equatable {
             self.text = newText
             self.objectWillChange.send()
         } else {
-            DispatchQueue.main.async { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now()) { [weak self] in
                 guard let self = self else { return }
                 self.text = newText
                 self.objectWillChange.send()
@@ -43,12 +45,13 @@ class Message: Identifiable, Codable, ObservableObject, Equatable {
         let isIdEqual = lhs.id == rhs.id
         let isTextEqual = lhs.text == rhs.text
         let isUserEqual = lhs.isUser == rhs.isUser
-        return isIdEqual && isTextEqual && isUserEqual
+        let isSystemEqual = lhs.isSystemMessage == rhs.isSystemMessage
+        return isIdEqual && isTextEqual && isUserEqual && isSystemEqual
     }
     
     // Required for Codable when using @Published
     enum CodingKeys: String, CodingKey {
-        case id, text, isUser, timestamp, tokensPerSecond, windowShifts
+        case id, text, isUser, timestamp, tokensPerSecond, windowShifts, isSystemMessage
     }
     
     required init(from decoder: Decoder) throws {
@@ -59,6 +62,7 @@ class Message: Identifiable, Codable, ObservableObject, Equatable {
         timestamp = try container.decode(Date.self, forKey: .timestamp)
         tokensPerSecond = try container.decodeIfPresent(Double.self, forKey: .tokensPerSecond)
         windowShifts = try container.decodeIfPresent(Int.self, forKey: .windowShifts) ?? 0
+        isSystemMessage = try container.decodeIfPresent(Bool.self, forKey: .isSystemMessage) ?? false
     }
     
     func encode(to encoder: Encoder) throws {
@@ -69,5 +73,6 @@ class Message: Identifiable, Codable, ObservableObject, Equatable {
         try container.encode(timestamp, forKey: .timestamp)
         try container.encodeIfPresent(tokensPerSecond, forKey: .tokensPerSecond)
         try container.encode(windowShifts, forKey: .windowShifts)
+        try container.encode(isSystemMessage, forKey: .isSystemMessage)
     }
 }

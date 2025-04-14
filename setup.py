@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="anemll",
-    version="0.2.0",
+    version="0.3.0",
     packages=find_packages(),
     install_requires=[
         "coremltools>=8.2",    # Required for Apple Neural Engine conversion

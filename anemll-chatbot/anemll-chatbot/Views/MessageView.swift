@@ -47,7 +47,19 @@ struct MessageBubble: View {
     
     var body: some View {
         HStack {
-            if message.isUser {
+            if message.isSystemMessage {
+                // System message styling
+                HStack {
+                    Image(systemName: "info.circle.fill")
+                        .foregroundColor(.blue)
+                    Text(message.text)
+                        .foregroundColor(.primary)
+                }
+                .padding()
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(12)
+                .frame(maxWidth: .infinity, alignment: .center)
+            } else if message.isUser {
                 Spacer()
                 Text(message.text)
                     .padding()

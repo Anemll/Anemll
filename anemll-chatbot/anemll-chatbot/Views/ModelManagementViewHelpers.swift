@@ -43,14 +43,14 @@ extension ModelManagementView {
         var modelPrefix: String?
         if filePath != "meta.yaml" {
             // Perform file operations on background thread
-            let metaExists = await Task.detached(priority: .background) {
+            let metaExists = await Task.detached(priority: .background) { @MainActor in
                 return FileManager.default.fileExists(atPath: metaYamlPath.path)
             }.value
             
             if metaExists {
                 do {
                     // Read file on background thread
-                    let metaYamlContent = try await Task.detached(priority: .background) {
+                    let metaYamlContent = try await Task.detached(priority: .background) { @MainActor in
                         return try String(contentsOf: metaYamlPath, encoding: .utf8)
                     }.value
                     

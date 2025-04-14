@@ -39,6 +39,7 @@ public actor ModelLoader {
         
         public init(
             computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
+            //computeUnits: MLComputeUnits = .cpuOnly,
             allowLowPrecision: Bool = false,
             memoryLimit: UInt64? = nil,
             functionName: String? = nil
@@ -309,15 +310,14 @@ public actor ModelLoader {
                 print("Loading inference chunk \(i): \(chunkPath)")
                 modelConfig.functionName = "infer"
                 
-                // Try loading the model but continue if a specific chunk fails
+                // Load inference model and fail immediately if it fails
                 var inferModel: MLModel
                 do {
                     inferModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
                     print("✅ Inference chunk \(i) loaded")
                 } catch {
                     print("❌ Error loading inference chunk \(i): \(error)")
-                    print("Skipping this chunk and continuing...")
-                    continue
+                    throw ModelError.inferenceError("Failed to load inference chunk \(i): \(String(reflecting: error))")
                 }
                 
                 try await progressTracker.updateProgress(
@@ -336,15 +336,14 @@ public actor ModelLoader {
                 print("Loading prefill chunk \(i): \(chunkPath)")
                 modelConfig.functionName = "prefill"
                 
-                // Try loading the prefill model
+                // Load prefill model and fail immediately if it fails
                 var prefillModel: MLModel
                 do {
                     prefillModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
                     print("✅ Prefill chunk \(i) loaded")
                 } catch {
                     print("❌ Error loading prefill chunk \(i): \(error)")
-                    print("Skipping this chunk and continuing...")
-                    continue
+                    throw ModelError.inferenceError("Failed to load prefill chunk \(i): \(String(reflecting: error))")
                 }
                 
                 try await progressTracker.updateProgress(
@@ -356,12 +355,12 @@ public actor ModelLoader {
                 ffnChunks.append(FFNChunk(inferModel: inferModel, prefillModel: prefillModel))
             }
             
-            // Verify that we loaded at least one chunk
-            if ffnChunks.isEmpty {
-                print("❌ ERROR: No FFN chunks were loaded")
-                throw ModelError.inferenceError("Failed to load any FFN chunks")
+            // Verify that we loaded all expected chunks
+            if ffnChunks.count != configCopy.numChunks {
+                print("❌ ERROR: Not all FFN chunks were loaded. Expected \(configCopy.numChunks), got \(ffnChunks.count)")
+                throw ModelError.inferenceError("Failed to load all FFN chunks. Expected \(configCopy.numChunks), got \(ffnChunks.count)")
             } else {
-                print("✅ Successfully loaded \(ffnChunks.count) of \(configCopy.numChunks) FFN chunks")
+                print("✅ Successfully loaded all \(ffnChunks.count) FFN chunks")
             }
             
             // Final update to ensure we reach 100%
@@ -418,9 +417,22 @@ public actor ModelLoader {
     }
 }
 
-public enum ModelError: Error, Sendable {
+public enum ModelError: Error, Sendable, LocalizedError {
     case failedToLoadModel
     case invalidModelFormat(String)
     case inferenceError(String)
     case loadingCancelled
+    
+    public var errorDescription: String? {
+        switch self {
+        case .failedToLoadModel:
+            return "Failed to load model"
+        case .invalidModelFormat(let message):
+            return message
+        case .inferenceError(let message):
+            return message
+        case .loadingCancelled:
+            return "Model loading cancelled"
+        }
+    }
 }

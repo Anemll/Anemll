@@ -3,13 +3,20 @@ import SwiftUI
 
 struct AboutView: View {
     @State private var showingAcknowledgments = false
+    
+    private var versionString: String {
+        if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
+            return "Version \(version)"
+        }
+        return "Version Unknown"
+    }
 
     var body: some View {
         VStack(spacing: 20) {
             Text("anemll-chatbot")
                 .font(.largeTitle)
                 .fontWeight(.bold)
-            Text("Version 1.0")
+            Text(versionString)
                 .font(.title3)
             Text("Copyright © 2025 Anemll")
                 .font(.subheadline)
