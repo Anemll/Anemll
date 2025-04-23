@@ -423,8 +423,8 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
         )
         
         # Generate position IDs for full batch size
-        position_ids = torch.arange(batch_size, dtype=torch.int32)  # Changed: Always use full batch size
-        batch_causal_mask = causal_mask[:, :, :batch_size, :]  # Changed: Use full batch size
+        position_ids = torch.arange(batch_pos, batch_pos+batch_size, dtype=torch.int32)  # Changed: Always use full batch size
+        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos+batch_size, :]  # Changed: Use full batch size
         
         # Run embeddings with proper batch size
         hidden_states = torch.from_numpy(
