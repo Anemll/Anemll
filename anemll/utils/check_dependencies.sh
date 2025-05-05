@@ -87,6 +87,25 @@ if [ "$SKIP_CHECK" = false ]; then
     echo "Checking if Python3 is installed..."
     command -v python3 >/dev/null 2>&1 || { echo >&2 "Python3 is required but it's not installed. Aborting."; echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."; exit 1; }
 
+    # Check Python version
+    echo "Checking Python version..."
+    PYTHON_VERSION_STR=$(python3 --version 2>&1 | cut -d ' ' -f 2)
+    PYTHON_VERSION_MAJOR_MINOR=$(echo "$PYTHON_VERSION_STR" | cut -d '.' -f 1,2)
+
+    case "$PYTHON_VERSION_MAJOR_MINOR" in
+        3.9|3.10|3.11)
+            echo "Found supported Python version: $PYTHON_VERSION_STR"
+            ;;
+        *)
+            echo >&2 "Error: Unsupported Python version found: $PYTHON_VERSION_STR."
+            echo >&2 "This project requires Python 3.9, 3.10, or 3.11."
+            echo >&2 "Python 3.12 and later are NOT supported."
+            echo >&2 "Please switch to a supported Python version or use the ./create_python39_env.sh script."
+            echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+            exit 1
+            ;;
+    esac
+
     # Check for model files
     echo "Checking for model files in the provided directory: $MODEL_DIR"
     if [ ! -f "$MODEL_DIR/config.json" ]; then
