@@ -138,11 +138,20 @@ See [chat.md](./docs/chat.md) for more details
 1. Install ANEMLL:
 We recommend creating a new virtual environment for this project.
 ```bash
-python -m venv anemll-env
-source anemll-env/bin/activate
-pip install -r requirements.txt
-# pip install anemll
-# due to Alpha Release, we do not recommend installing ANEMLL as a package yet
+# Use the provided script to create an environment with a supported Python version (3.9, 3.10, or 3.11)
+./create_python39_env.sh
+# Activate the created environment (e.g., env-anemll)
+source env-anemll/bin/activate
+# Install dependencies using the script inside the environment directory
+cd env-anemll
+./install_dependencies.sh
+cd .. # Return to the project root
+
+# Alternatively, manually create and activate an environment:
+# python3.9 -m venv anemll-env # Or python3.10, python3.11
+# source anemll-env/bin/activate
+# pip install -r requirements.txt
+# pip install anemll # Not recommended for Alpha release
 ```
 CoreML compiler is required to compile the model. It is part of the Xcode command line tools.
 - Ensure that Xcode Command Line Tools are installed, as they include `coremlcompiler`.
