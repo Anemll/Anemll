@@ -24,7 +24,8 @@ The `convert_model.sh` script automates the conversion of LLAMA models to CoreML
 | `--context` | Context length | 512 |
 | `--batch` | Batch size for prefill | 64 |
 | `--lut1` | LUT bits for embeddings | none |
-| `--lut2` | LUT bits for FFN/prefill | 4 |
+| `--lut2` | LUT bits for FFN | 4 |
+| `--lut-prefill` | LUT bits for prefill | same as `--lut2` |
 | `--lut3` | LUT bits for LM head | 6 |
 | `--restart` | Restart from specific step | 1 |
 | `--only` | Run only specified step and exit | none |
@@ -34,6 +35,7 @@ The `convert_model.sh` script automates the conversion of LLAMA models to CoreML
 ## New Arguments
 
 - `--skip-check`: Skip the dependency check step.
+- `--lut-prefill`: Specify different LUT bits for prefill models (if omitted, uses the same value as `--lut2`).
 
 ## Examples
 
@@ -81,6 +83,20 @@ The `convert_model.sh` script automates the conversion of LLAMA models to CoreML
     --lut3 6 \
     --chunk 2
 ```
+
+### Different Prefill & FFN LUT Conversion
+```bash
+./anemll/utils/convert_model.sh \
+    --model ../Meta-Llama-3.2-1B \
+    --output ./converted_models \
+    --context 1024 \
+    --batch 64 \
+    --lut2 4 \
+    --lut-prefill 6 \
+    --lut3 6 \
+    --chunk 2
+```
+> Note: Using different LUT quantization for FFN and Prefill models allows optimizing each for different performance characteristics
 
 ### Fast Model (4-bit LUT)
 ```bash
@@ -174,7 +190,8 @@ The script performs these steps in sequence:
 
 4. **Convert Prefill Models**
    - Creates prefill models for KV cache optimization
-   - Uses same settings as FFN conversion
+   - Uses LUT quantization specified by `--lut-prefill` (or `--lut2` if not specified)
+   - Splits into chunks based on `--chunk` parameter
 
 5. **Combine Models**
    - Merges FFN and prefill chunks
@@ -209,7 +226,8 @@ model_info:
     context_length: 1024
     batch_size: 64
     lut_embeddings: none
-    lut_ffn: 6
+    lut_ffn: 4
+    lut_prefill: 6
     lut_lmhead: 6
     num_chunks: 2
     model_prefix: llama
@@ -240,12 +258,22 @@ converted_models/
 ├── llama_embeddings.mlmodelc/
 ├── llama_lm_head_lutX.mlpackage
 ├── llama_lm_head_lutX.mlmodelc/
+```
+
+If prefill and FFN use the same LUT:
+```
 ├── llama_FFN_PF_lutX_chunk_NNofMM.mlpackage
 └── llama_FFN_PF_lutX_chunk_NNofMM.mlmodelc/
 ```
 
+If prefill and FFN use different LUT values:
+```
+├── llama_FFN_lutX_PF_lutY_chunk_NNofMM.mlpackage
+└── llama_FFN_lutX_PF_lutY_chunk_NNofMM.mlmodelc/
+```
+
 Where:
-- `X` is the LUT bits value used
+- `X` and `Y` are the LUT bits values used for FFN and prefill respectively
 - `NN` is the chunk number
 - `MM` is the total number of chunks
 

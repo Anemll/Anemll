@@ -12,6 +12,7 @@ CONTEXT_LENGTH=512
 BATCH_SIZE=64
 LUT_PART1=""  # No LUT for embeddings
 LUT_PART2=4   # FFN and prefill
+LUT_PREFILL=""  # If empty, will use LUT_PART2
 LUT_PART3=6   # LM head
 RESTART_STEP=1
 ONLY_STEP=""  # Run only this step if set
@@ -19,9 +20,6 @@ PREFIX="llama"  # Default prefix for model names
 MODEL_PATH=""
 OUTPUT_DIR=""
 NUM_CHUNKS=2   # Default number of chunks
-
-# Initialize SKIP_CHECK before parsing arguments
-SKIP_CHECK=false
 
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
@@ -35,13 +33,13 @@ print_usage() {
     echo "  --context       Context length (default: 512)"
     echo "  --batch         Batch size (default: 64)"
     echo "  --lut1          LUT bits for embeddings (default: none)"
-    echo "  --lut2          LUT bits for FFN/prefill (default: 4)"
+    echo "  --lut2          LUT bits for FFN (default: 4)"
+    echo "  --lut-prefill   LUT bits for prefill (default: same as --lut2)"
     echo "  --lut3          LUT bits for LM head (default: 6)"
     echo "  --restart       Restart from specific step (1-8, default: 1)"
     echo "  --only          Run only specified step and exit (1-8)"
     echo "  --prefix        Prefix for model names (default: llama)"
     echo "  --chunk         Number of chunks to split FFN/prefill (default: 2)"
-    echo "  --skip-check    Skip the dependency check step"
     echo "  --skip-check    Skip the dependency check step"
     exit 1
 }
@@ -77,6 +75,10 @@ while [[ $# -gt 0 ]]; do
             LUT_PART2="$2"
             shift 2
             ;;
+        --lut-prefill)
+            LUT_PREFILL="$2"
+            shift 2
+            ;;
         --lut3)
             LUT_PART3="$2"
             shift 2
@@ -92,10 +94,6 @@ while [[ $# -gt 0 ]]; do
         --chunk)
             NUM_CHUNKS="$2"
             shift 2
-            ;;
-        --skip-check)
-            SKIP_CHECK=true
-            shift
             ;;
         --skip-check)
             SKIP_CHECK=true
@@ -136,15 +134,6 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)" || {
     # If output directory doesn't exist, get absolute path another way
     OUTPUT_DIR="$(cd "$(dirname "$OUTPUT_DIR")" && pwd)/$(basename "$OUTPUT_DIR")"
 }
-
-# Step 0: Check dependencies
-if [ "$SKIP_CHECK" = false ]; then
-    "$SCRIPT_DIR/check_dependencies.sh" --model "$MODEL_PATH" --output "$OUTPUT_DIR" "$@"
-    if [ $? -ne 0 ]; then
-        echo "Dependency check failed. Aborting."
-        exit 1
-    fi
-fi
 
 # Step 0: Check dependencies
 if [ "$SKIP_CHECK" = false ]; then
@@ -246,10 +235,18 @@ else
     echo "Skipping step 3: Converting FFN"
 fi
 
+# Set prefill LUT parameter - use LUT2 if LUT_PREFILL is not specified
+LUT_PREFILL_PARAM=""
+if [ ! -z "$LUT_PREFILL" ]; then
+    LUT_PREFILL_PARAM="--lut $LUT_PREFILL"
+elif [ ! -z "$LUT_PART2" ]; then
+    LUT_PREFILL_PARAM="--lut $LUT_PART2"
+fi
+
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
     run_step 4 "Converting Prefill" "python -m anemll.ane_converter.llama_converter \
         --part 2_prefill \
-        $LUT2_PARAM \
+        $LUT_PREFILL_PARAM \
         --chunk $NUM_CHUNKS \
         --context-length $CONTEXT_LENGTH \
         --batch-size $BATCH_SIZE \
@@ -262,20 +259,14 @@ fi
 
 # Step 5: Combine Models
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
-    if [ ! -z "$LUT_PART2" ]; then
-        run_step 5 "Combining Models" "python \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
-            --chunk $NUM_CHUNKS \
-            $LUT2_PARAM \
-            --prefix \"$PREFIX\" \
-            --input \"$OUTPUT_DIR\" \
-            --output \"$OUTPUT_DIR\""
-    else
-        run_step 5 "Combining Models" "python \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
-            --chunk $NUM_CHUNKS \
-            --prefix \"$PREFIX\" \
-            --input \"$OUTPUT_DIR\" \
-            --output \"$OUTPUT_DIR\""
-    fi
+    # Pass both LUT parameters to combine_models.py
+    run_step 5 "Combining Models" "python \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
+        --chunk $NUM_CHUNKS \
+        ${LUT_PART2:+--lut $LUT_PART2} \
+        ${LUT_PREFILL:+--lut-prefill $LUT_PREFILL} \
+        --prefix \"$PREFIX\" \
+        --input \"$OUTPUT_DIR\" \
+        --output \"$OUTPUT_DIR\""
 else
     echo "Skipping step 5: Combining Models"
 fi
@@ -303,7 +294,7 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
         
         # Create meta.yaml
         python3 - \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
-            \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
+            \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PREFILL:-${LUT_PART2:-none}}\" \"${LUT_PART3:-none}\" \
             $NUM_CHUNKS \"$PREFIX\" \"$OUTPUT_DIR/meta.yaml\" <<'EOF_PY'
 import sys
 MODEL_NAME = sys.argv[1]
@@ -311,20 +302,33 @@ CONTEXT = sys.argv[2]
 BATCH = sys.argv[3]
 LUT_EMB = sys.argv[4]
 LUT_FFN = sys.argv[5]
-LUT_LMH = sys.argv[6]
-NUM_CHUNKS = sys.argv[7]
-PREFIX = sys.argv[8]
-OUTFILE = sys.argv[9]
+LUT_PREFILL = sys.argv[6]
+LUT_LMH = sys.argv[7]
+NUM_CHUNKS = sys.argv[8]
+PREFIX = sys.argv[9]
+OUTFILE = sys.argv[10]
 
 # Construct model names with LUT suffixes if specified
 embeddings_name = f'{PREFIX}_embeddings' + (f'_lut{LUT_EMB}' if LUT_EMB != 'none' else '')
 lmhead_name = f'{PREFIX}_lm_head' + (f'_lut{LUT_LMH}' if LUT_LMH != 'none' else '')
-ffn_base = f'{PREFIX}_FFN_PF' + (f'_lut{LUT_FFN}' if LUT_FFN != 'none' else '')
+
+# For FFN/Prefill, we need to handle the case where they might have different LUTs
+ffn_suffix = f'_lut{LUT_FFN}' if LUT_FFN != 'none' else ''
+prefill_suffix = f'_lut{LUT_PREFILL}' if LUT_PREFILL != 'none' else ''
+
+# If prefill has a different LUT than FFN, we need a different base name
+if prefill_suffix != ffn_suffix:
+    ffn_base = f'{PREFIX}_FFN{ffn_suffix}'
+    prefill_base = f'{PREFIX}_PF{prefill_suffix}'
+    ffn_path = f'{ffn_base}.mlmodelc'
+else:
+    # Otherwise, we use the combined name as before
+    ffn_base = f'{PREFIX}_FFN_PF{ffn_suffix}'
+    ffn_path = f'{ffn_base}.mlmodelc'
 
 # Add .mlmodelc extension to model paths
 embeddings_path = f'{embeddings_name}.mlmodelc'
 lmhead_path = f'{lmhead_name}.mlmodelc'
-ffn_path = f'{ffn_base}.mlmodelc'
 
 meta = f'''model_info:
   name: anemll-{MODEL_NAME}-ctx{CONTEXT}
@@ -343,6 +347,7 @@ meta = f'''model_info:
     batch_size: {BATCH}
     lut_embeddings: {LUT_EMB}
     lut_ffn: {LUT_FFN}
+    lut_prefill: {LUT_PREFILL}
     lut_lmhead: {LUT_LMH}
     num_chunks: {NUM_CHUNKS}
     model_prefix: {PREFIX}
@@ -374,7 +379,16 @@ echo "    --meta \"$OUTPUT_DIR/meta.yaml\""
 echo -e "\nOption 2 - Manual configuration:"
 EMBEDDINGS_NAME="${PREFIX}_embeddings${LUT_PART1:+_lut$LUT_PART1}"
 LMHEAD_NAME="${PREFIX}_lm_head${LUT_PART3:+_lut$LUT_PART3}"
-FFN_BASE="${PREFIX}_FFN_PF${LUT_PART2:+_lut$LUT_PART2}"
+
+# Use LUT_PREFILL if specified, otherwise fallback to LUT_PART2
+PREFILL_LUT="${LUT_PREFILL:-$LUT_PART2}"
+if [ -z "$LUT_PREFILL" ] || [ "$LUT_PREFILL" = "$LUT_PART2" ]; then
+    # Same LUT for both, use combined model name
+    FFN_BASE="${PREFIX}_FFN_PF${LUT_PART2:+_lut$LUT_PART2}"
+else
+    # Different LUTs, use separate names
+    FFN_BASE="${PREFIX}_FFN${LUT_PART2:+_lut$LUT_PART2}_PF${LUT_PREFILL:+_lut$LUT_PREFILL}"
+fi
 
 echo "python $PROJECT_ROOT/tests/chat.py \\"
 echo "    --embed $EMBEDDINGS_NAME \\"
