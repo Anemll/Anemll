@@ -89,12 +89,13 @@ def combine_models_custom(models_dict):
     return True
 
 
-def validate_chunk_files(num_chunks, lut_bits=None, mode=None, prefix='llama'):
+def validate_chunk_files(num_chunks, lut_bits=None, lut_prefill=None, mode=None, prefix='llama'):
     """Validate that all required chunk files exist."""
     print("\nDebug: Validating chunk files:")
     print(f"  Current dir: {os.getcwd()}")
     print(f"  Num chunks: {num_chunks}")
-    print(f"  LUT bits: {lut_bits}")
+    print(f"  LUT bits (FFN): {lut_bits}")
+    print(f"  LUT bits (Prefill): {lut_prefill if lut_prefill is not None else lut_bits}")
     print(f"  Prefix: {prefix}")
     
     missing_files = []
@@ -102,9 +103,14 @@ def validate_chunk_files(num_chunks, lut_bits=None, mode=None, prefix='llama'):
     # Get file patterns - use "prefill" instead of "PF" to match actual files
     if lut_bits:
         ffn_template = f"{prefix}_FFN_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
-        pf_template = f"{prefix}_prefill_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
     else:
         ffn_template = f"{prefix}_FFN_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+        
+    # Use specific prefill LUT if provided, otherwise use the same as FFN
+    prefill_lut = lut_prefill if lut_prefill is not None else lut_bits
+    if prefill_lut:
+        pf_template = f"{prefix}_prefill_lut{prefill_lut}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+    else:
         pf_template = f"{prefix}_prefill_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
     
     print("\nLooking for files with patterns:")
@@ -135,17 +141,26 @@ def validate_chunk_files(num_chunks, lut_bits=None, mode=None, prefix='llama'):
         
     return True
 
-def combine_chunks(num_chunks, lut_bits=None, mode=None, prefix='llama'):
+def combine_chunks(num_chunks, lut_bits=None, lut_prefill=None, mode=None, prefix='llama'):
     """Combine FFN and prefill models into chunks."""
     try:
         # Use same naming pattern as validate_chunk_files
         if lut_bits:
             ffn_template = f"{prefix}_FFN_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
-            pf_template = f"{prefix}_prefill_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
-            combined_template = f"{prefix}_FFN_PF_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
         else:
             ffn_template = f"{prefix}_FFN_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            
+        # Use specific prefill LUT if provided, otherwise use the same as FFN
+        prefill_lut = lut_prefill if lut_prefill is not None else lut_bits
+        if prefill_lut:
+            pf_template = f"{prefix}_prefill_lut{prefill_lut}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+        else:
             pf_template = f"{prefix}_prefill_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+        
+        # For backward compatibility, always use the FFN LUT in the output filename, even if Prefill has a different LUT
+        if lut_bits:
+            combined_template = f"{prefix}_FFN_PF_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+        else:
             combined_template = f"{prefix}_FFN_PF_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
         
         for chunk_idx in range(num_chunks):
@@ -208,7 +223,8 @@ def combine_chunks(num_chunks, lut_bits=None, mode=None, prefix='llama'):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Combine FFN and prefill models')
-    parser.add_argument('--lut', type=int, help='LUT bits used in quantization (optional)')
+    parser.add_argument('--lut', type=int, help='LUT bits used for FFN quantization (optional)')
+    parser.add_argument('--lut-prefill', type=int, help='LUT bits used for Prefill quantization (optional, defaults to --lut value)')
     parser.add_argument('--chunk', type=int, required=True,
                       help='Number of chunks')
     parser.add_argument('--input', type=str, default='.',
@@ -221,14 +237,26 @@ def parse_args():
 
 def get_model_names(args):
     """Get input and output model names based on LUT setting"""
+    prefill_lut = args.lut_prefill if hasattr(args, 'lut_prefill') and args.lut_prefill is not None else args.lut
+    
+    # FFN names based on lut
     if args.lut:
         ffn_template = f"{args.prefix}_FFN_lut{args.lut}_chunk_{{:02d}}of{args.chunk:02d}.mlpackage"
-        pf_template = f"{args.prefix}_PF_lut{args.lut}_chunk_{{:02d}}of{args.chunk:02d}.mlpackage"
-        combined_template = f"{args.prefix}_FFN_PF_lut{args.lut}_chunk_{{:02d}}of{args.chunk:02d}.mlpackage"
     else:
         ffn_template = f"{args.prefix}_FFN_chunk_{{:02d}}of{args.chunk:02d}.mlpackage"
+        
+    # Prefill names based on prefill_lut
+    if prefill_lut:
+        pf_template = f"{args.prefix}_prefill_lut{prefill_lut}_chunk_{{:02d}}of{args.chunk:02d}.mlpackage"
+    else:
         pf_template = f"{args.prefix}_prefill_chunk_{{:02d}}of{args.chunk:02d}.mlpackage"
+    
+    # For backward compatibility, always use the FFN LUT in the output filename
+    if args.lut:
+        combined_template = f"{args.prefix}_FFN_PF_lut{args.lut}_chunk_{{:02d}}of{args.chunk:02d}.mlpackage"
+    else:
         combined_template = f"{args.prefix}_FFN_PF_chunk_{{:02d}}of{args.chunk:02d}.mlpackage"
+            
     return ffn_template, pf_template, combined_template
 
 def combine_models(args):
@@ -239,11 +267,12 @@ def combine_models(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # First validate all files exist
-    if not validate_chunk_files(args.chunk, args.lut, None, args.prefix):
+    if not validate_chunk_files(args.chunk, args.lut, args.lut_prefill if hasattr(args, 'lut_prefill') else None, None, args.prefix):
         raise FileNotFoundError("Missing required model files")
     
     # Combine the chunks
-    if combine_chunks(args.chunk, args.lut, None, args.prefix):
+    prefill_lut = args.lut_prefill if hasattr(args, 'lut_prefill') else None
+    if combine_chunks(args.chunk, args.lut, prefill_lut, None, args.prefix):
         print("\nAll chunks combined successfully!")
         return True
     else:
@@ -263,8 +292,12 @@ def main():
         # Move files if needed
         if success and args.output and args.input != args.output:
             output_dir = Path(args.output)
+            
+            # Get the combined model template format
+            _, _, combined_template = get_model_names(args)
+            
             for chunk in range(1, args.chunk + 1):
-                combined_file = f"{args.prefix}_FFN_PF_lut{args.lut}_chunk_{chunk:02d}of{args.chunk:02d}.mlpackage"
+                combined_file = combined_template.format(chunk)
                 if os.path.exists(combined_file):
                     os.rename(combined_file, output_dir / combined_file)
         
