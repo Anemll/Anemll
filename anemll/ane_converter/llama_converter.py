@@ -27,10 +27,12 @@ from .metadata import AddMetadata, get_anemll_version
 import argparse
 import sys
 
+DO_LINEAR = False  # Test with linear quantization
+
 class LlamaConverter(BaseConverter):
     """Handles LLAMA model conversion to Apple Neural Engine format."""
 
-    def __init__(self, model, context_length=512, state_length=None, lut_bits=4, per_channel=8, batch_size=64, num_chunks=1):
+    def __init__(self, model, context_length=512, state_length=None, lut_bits=4, per_channel=8, batch_size=64, num_chunks=1, block_size=32):
         super().__init__(model)
         self.context_length = context_length
         self.state_length = state_length or context_length
@@ -40,6 +42,7 @@ class LlamaConverter(BaseConverter):
         self.converted_model = None
         self.batch_size = batch_size
         self.num_chunks = num_chunks
+        self.block_size = block_size
 
     def convert(self, split_part=None):
         """Convert model to CoreML format with optional splitting.
@@ -394,32 +397,66 @@ class LlamaConverter(BaseConverter):
                         If None, uses default single worker.
         """
         if self.converted_model is not None and self.lut_bits is not None:
-            print(f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)...")
             try:
-                # Set up quantization config
-                config = cto.coreml.OptimizationConfig(
-                    global_config=cto.coreml.OpPalettizerConfig(
-                        mode="kmeans",
-                        nbits=self.lut_bits,
-                        granularity="per_grouped_channel",
-                        group_size=self.per_channel,
-                        num_kmeans_workers=num_workers if num_workers is not None else 1  # Use provided workers or default to 1
-                    ),
-                )
-                
-                # Apply quantization in a try-except block
-                try:
-                    self.converted_model = cto.coreml.palettize_weights(self.converted_model, config)
-                    print("LUT quantization completed")
-                except ValueError as e:
-                    if "Pool not running" in str(e):
-                        print("Warning: Multiprocessing pool error, retrying with single process...")
-                        # Retry with single process
-                        config.global_config.num_kmeans_workers = 1
+
+                if not DO_LINEAR:
+
+                    print(f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)...")
+                    # Set up quantization config
+                    config = cto.coreml.OptimizationConfig(
+                        global_config=cto.coreml.OpPalettizerConfig(
+                            mode="kmeans",
+                            nbits=self.lut_bits,
+                            granularity="per_grouped_channel",
+                            group_size=self.per_channel,
+                            num_kmeans_workers=num_workers if num_workers is not None else 1  # Use provided workers or default to 1
+                        ),
+                    )
+                    
+                    # Apply quantization in a try-except block
+                    try:
                         self.converted_model = cto.coreml.palettize_weights(self.converted_model, config)
-                        print("LUT quantization completed (single process)")
-                    else:
-                        raise
+                        print("LUT quantization completed")
+                    except ValueError as e:
+                        if "Pool not running" in str(e):
+                            print("Warning: Multiprocessing pool error, retrying with single process...")
+                            # Retry with single process
+                            config.global_config.num_kmeans_workers = 1
+                            self.converted_model = cto.coreml.palettize_weights(self.converted_model, config)
+                            print("LUT quantization completed (single process)")
+                        else:
+                            raise
+                else:
+                    # FFN or prefill (
+                    # NOT supported in ANE
+                    # ANE: ANE only support      
+                    # per-cout/per-tensor      
+                    # quantization  
+                    dt = ct.converters.mil.mil.types.int4
+                    config = cto.coreml.OptimizationConfig(
+                        global_config=cto.coreml.OpLinearQuantizerConfig( 
+                            mode="linear_symmetric", 
+                            dtype=ct.converters.mil.mil.types.int4,
+                            granularity="per_channel"
+                            #granularity="per_block",
+                            #block_size=(64,64,1,1)
+                        )
+                    )  
+                    try:
+                        self.converted_model = cto.coreml.linear_quantize_weights(self.converted_model, config)  
+                        print(f"Linear quantization completed per_channel )")
+                    except Exception as e:
+                        print(f"Block size error: {str(e)}")
+                        # Try fallback to per-tensor quantization
+                        config = cto.coreml.OptimizationConfig(
+                            global_config=cto.coreml.OpLinearQuantizerConfig( 
+                                mode="linear_symmetric", 
+                                dtype=ct.converters.mil.mil.types.int4,
+                                granularity="per_tensor"
+                            )
+                        )
+                        self.converted_model  = cto.coreml.linear_quantize_weights(self.converted_model, config)
+                        print("Fallback to per-tensor quantization completed per_tensor")
             except Exception as e:
                 print(f"Warning: LUT quantization failed: {str(e)}")
                 print("Continuing with unquantized model...")
@@ -579,19 +616,51 @@ class LlamaConverter(BaseConverter):
             print(f"Applying LUT quantization with {lut_bits} bits...")
             try:
                 # Set up quantization config
-                config = cto.coreml.OptimizationConfig(
-                    global_config=cto.coreml.OpPalettizerConfig(
-                        mode="kmeans",
-                        nbits=lut_bits,
-                        granularity="per_grouped_channel",
-                        group_size=self.per_channel,
-                        num_kmeans_workers=8
-                    ),
-                )
-                
-                # Apply quantization
-                mlmodel = cto.coreml.palettize_weights(mlmodel, config)
-                print("LUT quantization completed")
+                if not DO_LINEAR:
+                    config = cto.coreml.OptimizationConfig(
+                        global_config=cto.coreml.OpPalettizerConfig(
+                            mode="kmeans",
+                            nbits=lut_bits,
+                            granularity="per_grouped_channel",
+                            group_size=self.per_channel,
+                            num_kmeans_workers=8
+                        ),
+                    )
+                    # Apply quantization
+                    mlmodel = cto.coreml.palettize_weights(mlmodel, config)
+                    print("LUT quantization completed")
+                else:
+                    #LMHEAD
+                    # NOT supported in ANE
+                    # ANE: ANE only support      
+                    # per-cout/per-tensor      
+                    # quantization  
+                    dt = ct.converters.mil.mil.types.int4
+                    config = cto.coreml.OptimizationConfig(
+                        global_config=cto.coreml.OpLinearQuantizerConfig( 
+                            mode="linear_symmetric", 
+                            dtype=ct.converters.mil.mil.types.int4,
+                            granularity="per_channel"
+                            #granularity="per_block",
+                            #block_size=(64,64,1,1)
+                        )
+                    )  
+                    try:
+                        mlmodel = cto.coreml.linear_quantize_weights(mlmodel, config)  
+                        print(f"Linear quantization completed with block size per_channel")
+                    except Exception as e:
+                        print(f"Block size error: {str(e)}")
+                        # Try fallback to per-tensor quantization
+                        config = cto.coreml.OptimizationConfig(
+                            global_config=cto.coreml.OpLinearQuantizerConfig( 
+                                mode="linear_symmetric", 
+                                dtype=ct.converters.mil.mil.types.int4,
+                                granularity="per_tensor"
+                            )
+                        )
+                        mlmodel = cto.coreml.linear_quantize_weights(mlmodel, config)
+                        print("Fallback to per-tensor quantization completed per_tensor")
+             
             except Exception as e:
                 print(f"Warning: LUT quantization failed: {str(e)}")
                 print("Continuing with unquantized model...")
@@ -822,6 +891,7 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=64, help='Batch size for prefill')
     parser.add_argument('--context-length', type=int, default=512, help='Maximum context length')
     parser.add_argument('--lut', type=int, default=None, help='Use LUT quantization with N bits')
+    parser.add_argument('--block-size', type=int, default=32, help='Block size for per_block quantization')
     parser.add_argument('--chunk', type=int, default=None, help='Split into N chunks')
     parser.add_argument('--part', type=str, 
                        choices=['1', '2', '2_prefill', '3', 'all'], 
