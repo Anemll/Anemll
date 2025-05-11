@@ -221,7 +221,7 @@ if [ ! -z "$LUT_PART2" ]; then
     LUT2_PARAM="--lut $LUT_PART2"
 fi
 
-if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "3" ]; then
     run_step 3 "Converting FFN" "python -m anemll.ane_converter.llama_converter \
         --part 2 \
         $LUT2_PARAM \
@@ -243,7 +243,7 @@ elif [ ! -z "$LUT_PART2" ]; then
     LUT_PREFILL_PARAM="--lut $LUT_PART2"
 fi
 
-if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "4" ]; then
     run_step 4 "Converting Prefill" "python -m anemll.ane_converter.llama_converter \
         --part 2_prefill \
         $LUT_PREFILL_PARAM \
@@ -258,7 +258,7 @@ else
 fi
 
 # Step 5: Combine Models
-if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "5" ]; then
     # Pass both LUT parameters to combine_models.py
     run_step 5 "Combining Models" "python \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
         --chunk $NUM_CHUNKS \
