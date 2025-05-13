@@ -422,9 +422,11 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
             value=0
         )
         
-        # Generate position IDs for full batch size
-        position_ids = torch.arange(batch_size, dtype=torch.int32)  # Changed: Always use full batch size
-        batch_causal_mask = causal_mask[:, :, :batch_size, :]  # Changed: Use full batch size
+        # Generate position IDs for this batch - FIXED to match chat_full.py implementation
+        position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+        
+        # Use the pre-initialized causal mask and extract the batch portion
+        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
         
         # Run embeddings with proper batch size
         hidden_states = torch.from_numpy(
@@ -438,9 +440,9 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
         for ffn_model in ffn_models:
             if isinstance(ffn_model, dict):
                 inputs = {
-                    'hidden_states': hidden_states.numpy(),  # [1, 64, hidden_size]
-                    'position_ids': position_ids.numpy(),    # [64]
-                    'causal_mask': batch_causal_mask.numpy(), # [1, 1, 64, context_length]
+                    'hidden_states': hidden_states.numpy(),
+                    'position_ids': position_ids.numpy(),
+                    'causal_mask': batch_causal_mask.numpy(),
                     'current_pos': np.array([batch_pos], dtype=np.int32)  # [1]
                 }
                 output = ffn_model['prefill'].predict(inputs, state)
@@ -452,100 +454,64 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
 
 def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state=None, causal_mask=None, temperature=0.0):
     """Generate the next token."""
-    # Gather last token only if it's a real sequence (not a scalar pos)
-    if isinstance(pos, torch.Tensor) and pos.numel() > 1:
-        # Multi-position case
-        current_token = input_ids[:, -1:]
+    # Get current token, like in chat_full.py
+    current_token = input_ids[:, pos-1:pos]
+    
+    # Run embeddings without batch_size parameter, like in chat_full.py
+    hidden_states = torch.from_numpy(
+        embed_model.predict({'input_ids': current_token.numpy()})['hidden_states']
+    )
+    
+    # Create masks
+    update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
+    update_mask[0, 0, pos-1, 0] = 1.0
+    position_ids = torch.tensor([pos-1], dtype=torch.int32)
+    
+    # Use provided causal mask or create one if not provided
+    if causal_mask is None:
+        causal_mask_data = make_causal_mask(context_length, 0)
+        single_causal_mask = torch.tensor(causal_mask_data[:, :, pos-1:pos, :], dtype=torch.float16)
     else:
-        # Single position case
-        current_token = input_ids[:, -1:]
+        single_causal_mask = causal_mask[:, :, pos-1:pos, :]
     
-    # Debug the input tensor shape and type
-    print(f"\nDEBUG INPUT TENSOR:")
-    print(f"current_token shape: {current_token.shape}")
-    print(f"current_token dtype: {current_token.dtype}")
-    print(f"input_ids shape: {input_ids.shape}")
-    print(f"batch_size in metadata: {getattr(embed_model, 'user_defined_metadata', {}).get('com.anemll.batch_size', 'unknown')}")
+    # Run through FFN chunks with state
+    for ffn_model in ffn_models:
+        if isinstance(ffn_model, dict):
+            inputs = {
+                'hidden_states': hidden_states.numpy(),
+                'update_mask': update_mask.numpy(),
+                'position_ids': position_ids.numpy(),
+                'causal_mask': single_causal_mask.numpy(),
+                'current_pos': position_ids.numpy()
+            }
+            output = ffn_model['infer'].predict(inputs, state)
+            hidden_states = torch.from_numpy(output['output_hidden_states'])
     
-    # Check if we need to pad to match compiled batch size
-    # Many CoreML models are compiled with fixed batch_size=64
-    compiled_batch_size = 64  # Default if unknown
-    if hasattr(embed_model, 'user_defined_metadata') and 'com.anemll.batch_size' in embed_model.user_defined_metadata:
-        compiled_batch_size = int(embed_model.user_defined_metadata['com.anemll.batch_size'])
+    # Run LM head
+    lm_output = lmhead_model.predict({'hidden_states': hidden_states.numpy()})
     
-    # Ensure both correct batch size and data type (int32)
-    if current_token.shape[0] != compiled_batch_size or current_token.dtype != torch.int32:
-        print(f"Padding input from batch_size={current_token.shape[0]} to compiled batch_size={compiled_batch_size}")
-        print(f"And converting dtype from {current_token.dtype} to torch.int32")
-        
-        # Create padded tensor with correct data type
-        padded_token = torch.zeros((compiled_batch_size, current_token.shape[1]), dtype=torch.int32)
-        padded_token[:current_token.shape[0]] = current_token.to(torch.int32)  # Convert to int32
-        current_token = padded_token
-        print(f"Padded token shape: {current_token.shape}, dtype: {current_token.dtype}")
+    # Combine logits1-8 if they exist
+    if 'logits1' in lm_output:
+        # Concatenate all logits parts
+        logits_parts = []
+        for i in range(1, 9):
+            key = f'logits{i}'
+            if key in lm_output:
+                logits_parts.append(torch.from_numpy(lm_output[key]))
+        logits = torch.cat(logits_parts, dim=-1)  # Concatenate along vocab dimension
+    else:
+        # Try output_logits as fallback
+        logits = torch.from_numpy(lm_output['output_logits'])
     
-    try:
-        # Forward pass through embedding model for the current token
-        token_embedding = embed_model.predict({
-            'input_ids': current_token.numpy(),
-            'batch_size': np.array([compiled_batch_size], dtype=np.int32)  # Add explicit batch_size parameter
-        })['hidden_states']
-        
-        # Create masks
-        update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
-        update_mask[0, 0, pos-1, 0] = 1.0
-        position_ids = torch.tensor([pos-1], dtype=torch.int32)  # [1]
-        
-        # Use provided causal mask or create one if not provided
-        if causal_mask is None:
-            causal_mask_data = make_causal_mask(context_length, 0)
-            single_causal_mask = torch.tensor(causal_mask_data[:, :, pos-1:pos, :], dtype=torch.float16)  # [1, 1, 1, context_length]
-        else:
-            single_causal_mask = causal_mask[:, :, pos-1:pos, :]
-        
-        # Run through FFN chunks with state
-        for ffn_model in ffn_models:
-            if isinstance(ffn_model, dict):
-                inputs = {
-                    'hidden_states': token_embedding.numpy(),
-                    'update_mask': update_mask.numpy(),
-                    'position_ids': position_ids.numpy(),
-                    'causal_mask': single_causal_mask.numpy(),
-                    'current_pos': position_ids.numpy()
-                }
-                output = ffn_model['infer'].predict(inputs, state)
-                token_embedding = torch.from_numpy(output['output_hidden_states'])
-        
-        # Run LM head
-        lm_output = lmhead_model.predict({'hidden_states': token_embedding.numpy()})
-        # Debug print
-        #print("\nLM Head output keys:", list(lm_output.keys()))
-        
-        # Combine logits1-8 if they exist
-        if 'logits1' in lm_output:
-            # Concatenate all logits parts
-            logits_parts = []
-            for i in range(1, 9):
-                key = f'logits{i}'
-                if key in lm_output:
-                    logits_parts.append(torch.from_numpy(lm_output[key]))
-            logits = torch.cat(logits_parts, dim=-1)  # Concatenate along vocab dimension
-        else:
-            # Try output_logits as fallback
-            logits = torch.from_numpy(lm_output['output_logits'])
-        
-        # Apply temperature and sample
-        if temperature > 0:
-            logits = logits / temperature
-            probs = F.softmax(logits[0, -1, :], dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).item()
-        else:
-            next_token = torch.argmax(logits[0, -1, :]).item()
-        
-        return next_token
-    except Exception as e:
-        print(f"\nError generating next token: {str(e)}")
-        return None
+    # Apply temperature and sample
+    if temperature > 0:
+        logits = logits / temperature
+        probs = F.softmax(logits[0, -1, :], dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1).item()
+    else:
+        next_token = torch.argmax(logits[0, -1, :]).item()
+    
+    return next_token
 
 def create_unified_state(ffn_models, context_length):
     """Create unified KV cache state for transformer."""
