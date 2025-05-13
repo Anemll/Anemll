@@ -1,0 +1,9 @@
+{
+  "dataset": "hellaswag",
+  "accuracy": 0.573590918143796,
+  "correct": 5760,
+  "total": 10042,
+  "sample_count": 10042,
+  "evaluated_count": 10042,
+  "time_taken": 274.3798360824585
+}

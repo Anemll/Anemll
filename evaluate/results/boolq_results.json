@@ -1,0 +1,9 @@
+{
+  "dataset": "boolq",
+  "accuracy": 0.39204892966360855,
+  "correct": 1282,
+  "total": 3270,
+  "sample_count": 3270,
+  "evaluated_count": 3270,
+  "time_taken": 17.300100803375244
+}

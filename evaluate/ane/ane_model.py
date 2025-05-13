@@ -285,14 +285,41 @@ class ANE_Model:
             self.metadata['lut_bits'] = int(meta.get('com.anemll.lut_bits', self.metadata['lut_bits']))
             self.metadata['num_chunks'] = int(meta.get('com.anemll.num_chunks', self.metadata['num_chunks']))
             
-            print("\nExtracted Parameters:")
+            print("\nExtracted Parameters from model metadata:")
             print(f"  Context Length: {self.metadata['context_length']}")
             print(f"  State Length: {self.metadata['state_length']}")
             print(f"  Compiled Batch Size: {self.metadata['batch_size']}")
             print(f"  LUT Bits: {self.metadata['lut_bits']}")
             print(f"  Number of Chunks: {self.metadata['num_chunks']}")
         else:
-            print("\nWarning: No metadata found in model, using defaults")
+            print("\nNo metadata found in CoreML model, trying meta.yaml...")
+            
+            # Try to load from meta.yaml if available
+            meta_yaml_path = self.model_path / "meta.yaml"
+            if meta_yaml_path.exists():
+                try:
+                    import yaml
+                    with open(meta_yaml_path, 'r') as f:
+                        yaml_data = yaml.safe_load(f)
+                    
+                    # Extract parameters from meta.yaml
+                    if 'model_info' in yaml_data and 'parameters' in yaml_data['model_info']:
+                        params = yaml_data['model_info']['parameters']
+                        self.metadata['context_length'] = int(params.get('context_length', self.metadata['context_length']))
+                        self.metadata['batch_size'] = int(params.get('batch_size', self.metadata['batch_size']))
+                        self.metadata['num_chunks'] = int(params.get('num_chunks', self.metadata['num_chunks']))
+                        
+                        print("\nExtracted Parameters from meta.yaml:")
+                        print(f"  Context Length: {self.metadata['context_length']}")
+                        print(f"  Batch Size: {self.metadata['batch_size']}")
+                        print(f"  Number of Chunks: {self.metadata['num_chunks']}")
+                    else:
+                        print("  No model_info.parameters found in meta.yaml")
+                except Exception as e:
+                    print(f"  Error loading meta.yaml: {str(e)}")
+            else:
+                print("  meta.yaml not found in model directory")
+                print("  Using default parameters")
         
         return self.metadata
     

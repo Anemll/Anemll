@@ -1,0 +1,6 @@
+{
+  "dataset": "arc_challenge",
+  "accuracy": 0.65,
+  "sample_count": 1172,
+  "time_taken": 120.5
+}

@@ -540,13 +540,23 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     )
     
     # Create masks
+
+
     update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
     update_mask[0, 0, pos-1, 0] = 1.0
     position_ids = torch.tensor([pos-1], dtype=torch.int32)
     
     # Use the pre-initialized causal mask and extract the single position portion
     single_causal_mask = causal_mask[:, :, pos-1:pos, :]
-    
+
+    # Debug tensor shapes if debug level > 0
+    if DEBUG_LEVEL > 0:
+        print("\nTensor shapes for generate_next_token:")
+        print(f"current_token: {current_token.shape}")
+        print(f"hidden_states: {hidden_states.shape}")
+        print(f"causal_mask: {causal_mask.shape}")
+        print(f"position_ids: {position_ids.shape}")
+
     # Run through FFN chunks
     for ffn_model in ffn_models:
         if isinstance(ffn_model, dict):

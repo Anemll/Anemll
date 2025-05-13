@@ -7,7 +7,6 @@ This directory contains tools for evaluating ANE/CoreML models on standard LLM b
 ```
 evaluate/
 ├── ane/                      # ANE-specific evaluation code
-│   ├── evaluate_ane.py       # Standalone evaluator script for ANE models
 │   ├── ane_model.py          # ANE model abstraction class
 │   ├── anelm_harness.py      # LM evaluation harness integration
 │   ├── run_eval.sh           # Runner script for harness-based evaluation
@@ -20,7 +19,7 @@ evaluate/
 
 ## Evaluation Approaches
 
-This codebase provides two approaches for evaluating ANE models:
+This codebase provides an approach for evaluating ANE models with lm-evaluation-harness:
 
 ### 1. Harness-Based Evaluation (Recommended)
 
@@ -37,14 +36,7 @@ Uses the lm-evaluation-harness framework with ANE model integration:
 - Debug mode for troubleshooting with verbose output
 - Control over max tokens, batch size, and other parameters
 
-### 2. Standalone Evaluation
 
-Original self-contained evaluation script:
-
-```bash
-# Run with the standalone approach
-python evaluate/ane/evaluate_ane.py --tasks="arc_easy hellaswag" --model=/path/to/model
-```
 
 ## Quick Start (Harness-Based Approach)
 
@@ -111,14 +103,7 @@ Key arguments include:
 - `--debug`: Enable verbose debug output
 - `--perplexity [FILE]`: Run perplexity evaluation (optional path to text file)
 
-### Detailed Usage (Standalone)
 
-- `--model PATH`: Path to the model directory
-- `--output-dir PATH`: Directory to save results
-- `--tasks TASKS`: Space-separated list of tasks to run
-- `--perplexity-text PATH`: Path to text file for perplexity evaluation (or "default")
-- `--sample-limit N`: Limit the number of samples processed during evaluation
-- `--no-early-exit`: Continue running when model loading fails
 
 ## Model Requirements
 
@@ -140,16 +125,7 @@ results/
 ├── perplexity_results.txt                           # Perplexity results (if requested)
 ```
 
-### Standalone Results
 
-```
-results/
-├── perplexity_results.txt        # Perplexity evaluation results
-├── arc_easy_results.json         # ARC Easy results
-├── boolq_results.json            # BoolQ results
-├── ...                           # Other task results
-└── summary.json                  # Overall summary of all results
-```
 
 ## Implementation Notes
 
