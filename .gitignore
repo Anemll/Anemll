@@ -31,3 +31,7 @@ anemll-chatbot/anemll-chatbot.xcodeproj/project.xcworkspace/xcshareddata/swiftpm
 anemll-swift-cli/.swiftpm/
 anemll-swift-cli/build/anemll-swift-cli.build/Release-iphonesimulator/AnemllCore.build/
 env-anemll/pyvenv.cfg
+evaluate/ane/results/
+docs/ane_evaluation_prd.md
+evaluate/ane/evaluate_ane.py
+evaluate/ane/perplexity_test.py
