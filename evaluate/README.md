@@ -10,13 +10,12 @@ evaluate/
 │   ├── evaluate_ane.py       # Standalone evaluator script for ANE models
 │   ├── ane_model.py          # ANE model abstraction class
 │   ├── anelm_harness.py      # LM evaluation harness integration
-│   └── run_eval.sh           # Runner script for harness-based evaluation
+│   ├── run_eval.sh           # Runner script for harness-based evaluation
+│   ├── full_perplexity.py    # Full perplexity evaluation script
+│   └── evaluate_with_harness.py # Evaluation with harness script
 ├── configs/                  # Configuration files
-│   ├── config.sh             # User configuration (create from template)
-│   ├── config.sh.template    # Configuration template
-│   └── sample_text.txt       # Sample text for perplexity evaluation
-├── results/                  # Evaluation results (created during evaluation)
-└── run_ane_evaluations.sh    # Original runner script for standalone evaluation
+│   └── config.json           # Configuration file for evaluation
+└── results/                  # Evaluation results (created during evaluation)
 ```
 
 ## Evaluation Approaches
@@ -44,7 +43,7 @@ Original self-contained evaluation script:
 
 ```bash
 # Run with the standalone approach
-./evaluate/run_ane_evaluations.sh --tasks="arc_easy hellaswag" --model=/path/to/model
+python evaluate/ane/evaluate_ane.py --tasks="arc_easy hellaswag" --model=/path/to/model
 ```
 
 ## Quick Start (Harness-Based Approach)
@@ -114,10 +113,12 @@ Key arguments include:
 
 ### Detailed Usage (Standalone)
 
-- `--model=PATH`: Path to the model directory
-- `--output-dir=PATH`: Directory to save results
-- `--tasks=TASKS`: Space-separated list of tasks to run
-- `--perplexity-text=PATH`: Path to text file for perplexity evaluation (or "default")
+- `--model PATH`: Path to the model directory
+- `--output-dir PATH`: Directory to save results
+- `--tasks TASKS`: Space-separated list of tasks to run
+- `--perplexity-text PATH`: Path to text file for perplexity evaluation (or "default")
+- `--sample-limit N`: Limit the number of samples processed during evaluation
+- `--no-early-exit`: Continue running when model loading fails
 
 ## Model Requirements
 
