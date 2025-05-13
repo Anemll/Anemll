@@ -21,6 +21,22 @@
 #   --debug \
 #   --output-dir results/debug
 #
+# IMPORTANT NOTES ON CHAT TEMPLATES:
+# ---------------------------------
+# By default, chat templates are DISABLED for all tasks, which is correct for standard benchmarks.
+# This ensures proper token alignment for log-likelihood scoring.
+#
+# For instruction-tuned models or chat checkpoints that require chat formatting:
+#
+# python anelm_harness.py \
+#   --model /path/to/instruct-model \
+#   --tasks truthfulqa,openbookqa \
+#   --apply-chat-template \
+#   --output-dir results/chat
+#
+# Remember: For "plain" tasks (BoolQ, ARC-Easy, HellaSwag, MMLU, etc.) do NOT use chat templates
+# as they will interfere with proper evaluation by changing prompt structure.
+#
 
 import os
 import sys
@@ -143,7 +159,9 @@ class ANELM(LM):
         # Chat template settings
         self.use_chat_template = use_chat_template
         if use_chat_template is None:
-            self.use_chat_template = hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template is not None
+            self.use_chat_template = False  # Default to False regardless of tokenizer
+        else:
+            self.use_chat_template = use_chat_template
 
         # Print important configuration info
         print(f"\nANELM Configuration:")
@@ -327,9 +345,10 @@ class ANELM(LM):
                     result.append(self.tokenizer.encode(chat_text))
                 except Exception as e:
                     print(f"Error applying chat template: {str(e)}. Falling back to standard tokenization.")
-                    result.append(self.tokenizer.encode(t, add_special_tokens=True))
+                    result.append(self.tokenizer.encode(t, add_special_tokens=False))
             else:
-                result.append(self.tokenizer.encode(t, add_special_tokens=True))
+                # The harness already decides where BOS/EOS go
+                result.append(self.tokenizer.encode(t, add_special_tokens=False))
         return result
 
     def loglikelihood(self, requests) -> list[tuple[float, bool]]:
@@ -691,7 +710,7 @@ class ANELM(LM):
                 
             # Tokenize context
             context_tokens = self.tokenizer.encode(
-                context, add_special_tokens=not self.use_chat_template
+                context, add_special_tokens=False
             )
             
             # Check if context exceeds max context length
@@ -990,6 +1009,10 @@ def main():
                         help="Chunk size for processing long sequences")
     parser.add_argument("--output-path", type=str, default=None,
                         help="Path to save results JSON file")
+    parser.add_argument("--download-timeout", type=int, default=60,
+                        help="Timeout for dataset downloads in seconds (default: 60)")
+    parser.add_argument("--max-retries", type=int, default=3,
+                        help="Maximum number of download retries (default: 3)")
     
     args = parser.parse_args()
     
@@ -998,6 +1021,42 @@ def main():
     
     # Silence tokenizer warnings
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    
+    # Set higher download timeouts for HuggingFace Hub and datasets
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = str(args.download_timeout)
+    os.environ["HF_DATASETS_TIMEOUT"] = str(args.download_timeout) 
+    
+    # Configure download retries
+    os.environ["HF_HUB_DOWNLOAD_RETRY_COUNT"] = str(args.max_retries)
+    
+    # Try to configure datasets library timeout/retry settings directly
+    try:
+        import datasets
+        from datasets.config import HF_DATASETS_TIMEOUT
+        from huggingface_hub.constants import HF_HUB_DOWNLOAD_TIMEOUT
+        
+        # Set timeouts in the libraries directly if environment variables don't work
+        datasets.config.HF_DATASETS_TIMEOUT = args.download_timeout
+        datasets.config.MAX_RETRIES = args.max_retries
+        
+        # For older versions of huggingface_hub
+        try:
+            import huggingface_hub.constants
+            huggingface_hub.constants.HF_HUB_DOWNLOAD_TIMEOUT = args.download_timeout
+            huggingface_hub.constants.HF_HUB_DOWNLOAD_RETRY_COUNT = args.max_retries
+        except (ImportError, AttributeError):
+            # Try newer versions
+            try:
+                import huggingface_hub.file_download
+                huggingface_hub.file_download.DOWNLOAD_RETRY_COUNT = args.max_retries
+                huggingface_hub.file_download.DEFAULT_TIMEOUT = args.download_timeout
+            except (ImportError, AttributeError):
+                print("Could not set huggingface_hub timeout settings directly")
+        
+        print(f"Configured dataset download timeout: {args.download_timeout}s")
+        print(f"Configured maximum download retries: {args.max_retries}")
+    except (ImportError, AttributeError) as e:
+        print(f"Warning: Could not configure dataset timeout settings: {e}")
     
     # Set random seed
     np.random.seed(args.seed)
@@ -1043,7 +1102,7 @@ def main():
             safe_length = lm.model.metadata['context_length'] - args.safety_margin
             print(f"Applied safety margin of {args.safety_margin} tokens")
             print(f"Safe context length: {safe_length} tokens")
-            
+    
     # If perplexity mode is enabled, make sure wikitext is among tasks
     if args.perplexity and "wikitext" not in args.tasks:
         print("Adding wikitext to tasks for perplexity evaluation")
@@ -1112,8 +1171,24 @@ def main():
     # Run evaluation
     results = lm_eval.simple_evaluate(**eval_args)
     
-    # Save results
-    filename = f"eval_{Path(args.model).name}_{args.num_shots or 0}shot_{'_'.join(args.tasks)}.json"
+    # Get model name from path
+    model_name = Path(args.model).name
+    
+    # Get current date in YYYYMMDD format
+    current_date = time.strftime("%Y%m%d")
+    
+    # Save individual task results 
+    for task, metrics in results["results"].items():
+        # Create task-specific filename
+        task_filename = f"{task}_{model_name}_{current_date}.json"
+        task_output_path = output_dir / task_filename
+        
+        # Save task-specific results
+        task_output_path.write_text(json.dumps({task: metrics}, indent=4))
+        print(f"Saved {task} results to: {task_output_path}")
+    
+    # Also save the complete results
+    filename = f"results_{model_name}_{current_date}.json"
     output_path = args.output_path or output_dir / filename
     
     if isinstance(output_path, str):
@@ -1122,6 +1197,7 @@ def main():
     # Ensure parent directories exist
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
+    # Save complete results
     output_path.write_text(json.dumps(results["results"], indent=4))
     
     # Print summary

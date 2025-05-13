@@ -109,6 +109,13 @@ class ANE_Model:
     2. Processing input tensors with correct shapes and dtypes
     3. Tracking position state between prefill and predict operations
     4. Providing a consistent interface for LM evaluation
+
+    IMPORTANT STATE MANAGEMENT NOTES:
+    - self.current_position always points to the NEXT EMPTY SLOT in the KV cache
+    - Each token is written to the current position, then position is advanced
+    - compute_logprobs() and predict() both write to position and advance it
+    - Never write to position-1 as this causes state corruption
+    - For scoring/perplexity calculations, each position should be written to exactly once
     """
     
     def __init__(self, model_path: Union[str, Path], max_tokens: int = 2048):
@@ -422,9 +429,11 @@ class ANE_Model:
             if self.debug > 0:
                 print(f"Batch input shape after padding: {batch_input.shape}")
             
-            # Generate position IDs for full batch size
-            position_ids = torch.arange(batch_size, dtype=torch.int32)
-            batch_causal_mask = self.causal_mask[:, :, :batch_size, :]
+            # Generate position IDs for this batch - FIXED to match chat_full.py implementation
+            position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+            
+            # Use the pre-initialized causal mask and extract the batch portion
+            batch_causal_mask = self.causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
             
             # Run embeddings with proper batch size
             try:
@@ -533,20 +542,12 @@ class ANE_Model:
             self.current_position = safe_pos
             pos = safe_pos
         
-        # Don't pad to batch_size for prediction (match chat_full.py implementation)
-        if self.debug > 0:
-            print("DEBUG: Not padding to batch_size for prediction")
-            print(f"\nDEBUG INPUT TENSOR:")
-            print(f"input_token shape: {input_token.shape}")
-            print(f"input_token dtype: {input_token.dtype}")
-            print(f"current_position: {pos}")
-        
-        # Make sure token is int32
+        # Get current token at position pos-1, like in chat_full.py
         current_token = input_token.to(torch.int32)
         
         try:
             # Forward pass through embedding model for the current token
-            # IMPORTANT: Don't pass batch_size parameter for prediction
+            # Don't pass batch_size parameter for prediction, matching chat_full.py
             if self.debug > 0:
                 print(f"Predicting with token {current_token[0, 0].item()} at position {pos}")
             
@@ -558,7 +559,8 @@ class ANE_Model:
             
             # Create masks for the attention mechanism - with safety check
             update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
-            position_idx = max(0, min(pos-1, context_length-1))  # Safely constrain between 0 and context_length-1
+            # Ensure the position index is valid
+            position_idx = max(0, min(pos, context_length-1))  # Write into NEXT slot
             update_mask[0, 0, position_idx, 0] = 1.0
             position_ids = torch.tensor([position_idx], dtype=torch.int32)
             
@@ -597,7 +599,7 @@ class ANE_Model:
             # Get next token (greedy)
             next_token = torch.argmax(logits[0, -1, :]).item()
             
-            # Update position
+            # Advance pointer once the write succeeded
             self.current_position += 1
             
             return next_token
@@ -635,12 +637,12 @@ class ANE_Model:
         context_length = self.metadata['context_length']
         pos = self.current_position
         
-        # Make sure token is int32
+        # Get current token
         current_token = input_token.to(torch.int32)
         
         try:
             # Forward pass through embedding model for the current token
-            # IMPORTANT: Don't pass batch_size parameter for prediction
+            # Don't pass batch_size parameter for prediction
             token_embedding = torch.from_numpy(
                 self.embedding_model.predict({
                     'input_ids': current_token.numpy()
@@ -649,11 +651,13 @@ class ANE_Model:
             
             # Create masks
             update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
-            update_mask[0, 0, pos-1, 0] = 1.0
-            position_ids = torch.tensor([pos-1], dtype=torch.int32)
+            # Correctly use pos-1 for position index
+            position_idx = max(0, min(pos-1, context_length-1))
+            update_mask[0, 0, position_idx, 0] = 1.0
+            position_ids = torch.tensor([position_idx], dtype=torch.int32)
             
             # Get causal mask for current position
-            single_causal_mask = self.causal_mask[:, :, pos-1:pos, :]
+            single_causal_mask = self.causal_mask[:, :, position_idx:position_idx+1, :]
             
             # Run through FFN chunks with state
             for ffn_model in self.ffn_models:
@@ -754,6 +758,11 @@ class ANE_Model:
             
         Returns:
             Log probabilities tensor for all tokens or specified candidate tokens
+            
+        WARNING:
+            After using compute_logprobs, you MUST call predict() with the target/ground-truth token
+            to properly advance the state. compute_logprobs() writes the input token to KV-cache
+            but doesn't properly set up the cache for the next token.
         """
         # Similar to predict but returns log probabilities instead of argmax
         if not isinstance(input_token, torch.Tensor):
@@ -779,19 +788,15 @@ class ANE_Model:
             self.current_position = safe_pos
             pos = safe_pos
         
-        # Make sure token is int32
+        # Get current token at position pos-1, like in chat_full.py
         current_token = input_token.to(torch.int32)
         
         if self.debug > 0:
-            print(f"\nDEBUG INPUT TENSOR (compute_logprobs):")
-            print(f"input_token shape: {current_token.shape}")
-            print(f"input_token dtype: {current_token.dtype}")
-            print(f"current_position: {pos} (context length: {context_length})")
-            print(f"Computing logprobs for token {current_token[0, 0].item()} at position {pos}")
+            print(f"\nComputing logprobs for token {current_token[0, 0].item()} at position {pos}")
         
         try:
             # Forward pass through embedding model for the current token
-            # IMPORTANT: Don't pass batch_size parameter for prediction
+            # Don't pass batch_size parameter for prediction, matching chat_full.py
             token_embedding = torch.from_numpy(
                 self.embedding_model.predict({
                     'input_ids': current_token.numpy()
@@ -800,7 +805,8 @@ class ANE_Model:
             
             # Create masks for the attention mechanism - with safety check
             update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
-            position_idx = max(0, min(pos-1, context_length-1))  # Safely constrain between 0 and context_length-1
+            # Ensure the position index is valid
+            position_idx = max(0, min(pos-1, context_length-1))  # Correctly use pos-1
             update_mask[0, 0, position_idx, 0] = 1.0
             position_ids = torch.tensor([position_idx], dtype=torch.int32)
             
@@ -849,7 +855,7 @@ class ANE_Model:
                 # Don't advance position to avoid further corruption
                 return self._run_lm_head_only(token_embedding)
             
-            # Run LM head to get logits
+            # Run LM head to get logits (read-only)
             log_probs = self._run_lm_head_only(token_embedding)
             
             # Filter to candidate tokens if specified
