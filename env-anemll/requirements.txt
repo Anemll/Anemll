@@ -1,0 +1,17 @@
+# ✅ Core Dependencies (required)
+coremltools>=8.2    # Required for Apple Neural Engine support
+torch==2.5.0        # Deep learning framework
+transformers>=4.36.0  # Hugging Face Transformers library
+
+# ⚠️ Development Dependencies (optional for users, required for developers)
+black>=23.12.0      # Code formatting
+flake8>=7.0.0       # Code linting
+pytest>=7.4.0       # Testing framework
+pytest-cov>=4.1.0   # Test coverage reporting
+
+# ⚠️ Optional Dependencies (as needed)
+numpy>=1.24.0       # Required for array operations
+tqdm>=4.66.0        # Progress bars for long-running operations
+
+# System monitoring
+psutil>=5.9.0

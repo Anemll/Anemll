@@ -30,3 +30,4 @@ anemll-swift-cli/.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 anemll-chatbot/anemll-chatbot.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 anemll-swift-cli/.swiftpm/
 anemll-swift-cli/build/anemll-swift-cli.build/Release-iphonesimulator/AnemllCore.build/
+env-anemll/pyvenv.cfg
