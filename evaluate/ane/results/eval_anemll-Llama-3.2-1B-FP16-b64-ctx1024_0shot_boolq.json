@@ -1,7 +1,0 @@
-{
-    "boolq": {
-        "alias": "boolq",
-        "acc,none": 0.2,
-        "acc_stderr,none": 0.13333333333333333
-    }
-}
