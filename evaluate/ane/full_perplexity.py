@@ -39,6 +39,14 @@ except ImportError:
     print("Error: datasets package not found. Please install with: pip install datasets")
     sys.exit(1)
 
+# IMPORTANT NOTE ON STATE MANAGEMENT:
+# When scoring tokens with CoreML models, we need to be careful about state mutations.
+# For each position:
+# 1. Read logits using compute_logprobs(current) to score target token
+# 2. Write ground-truth target token using predict(target) to advance the state properly
+# This ensures each position in the KV-cache contains the correct token with no duplicates
+# or skipped positions.
+
 # Set up timeout handler for prediction calls
 class TimeoutError(Exception):
     pass
@@ -85,7 +93,7 @@ def parse_args():
                        help="Maximum number of chunks to process")
     parser.add_argument("--prediction-timeout", type=int, default=10,
                        help="Timeout in seconds for each prediction call")
-    parser.add_argument("--output-dir", type=str, default="results",
+    parser.add_argument("--output-dir", type=str, default="evaluate/results",
                        help="Directory to save results")
     return parser.parse_args()
 
@@ -119,8 +127,10 @@ def main():
         if args.subset_size:
             dataset_name += f"-{args.subset_size}examples"
         
-    # Tokenize text
-    tokens = tokenizer.encode(text)
+    # Disable special tokens and manually add BOS if needed
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+    if tokenizer.bos_token_id is not None:
+        tokens = [tokenizer.bos_token_id] + tokens
     print(f"Text tokenized to {len(tokens)} tokens")
     
     # Create fixed-size chunks - ensure chunks aren't too large
@@ -128,6 +138,7 @@ def main():
     print(f"Using chunk size of {chunk_size} tokens")
     
     chunks = []
+    # Use non-overlapping chunks for cleaner evaluation
     for i in range(0, len(tokens), chunk_size):
         chunk = tokens[i:i + chunk_size]
         chunks.append(chunk)
@@ -187,13 +198,23 @@ def main():
             "duration_seconds": None
         }
         
-        # Split into inputs and targets
-        inputs, targets = chunk[:-1], chunk[1:]
+        # Calculate midpoint - only score second half of chunk for purer perplexity
+        mid = len(chunk) // 2
+        # Ensure we have enough tokens to score (at least 1)
+        if mid < 1:
+            mid = 1
+        # Fix the sliding-window boundary: leave the last prefix token out of prefill
+        prefix   = chunk[:mid-1]        # prefill   → rows 0 … k‑2
+        currents = chunk[mid-1:-1]      # current   → T(k‑1) … T(n‑1)
+        targets  = chunk[mid:]          # target    → T(k) …  T(n)
+        
+        if args.debug:
+            print(f"Prefill: first {len(prefix)} tokens, Score: next {len(targets)} tokens (of {len(chunk)} total)")
         
         # Reset model and run prefill
         model.reset_state()  # Explicit reset for each chunk
         try:
-            input_tensor = torch.tensor([inputs], dtype=torch.int32)
+            input_tensor = torch.tensor([prefix], dtype=torch.int32)
             _ = model.prefill(input_tensor)
         except Exception as e:
             print(f"Error during prefill: {str(e)}")
@@ -208,12 +229,13 @@ def main():
         if args.debug:
             token_pbar = tqdm(total=len(targets), desc=f"Chunk {i+1} tokens", unit="token", leave=False)
         
-        for j, (current, target) in enumerate(zip(inputs, targets)):
+        for j, (current, target) in enumerate(zip(currents, targets)):
             token_tensor = torch.tensor([[current]], dtype=torch.int32)
             
             # Set timeout for prediction
             signal.setitimer(signal.ITIMER_REAL, args.prediction_timeout)
             try:
+                # 1) Read logits
                 log_probs = model.compute_logprobs(token_tensor)
                 signal.setitimer(signal.ITIMER_REAL, 0)  # Cancel timer
                 
@@ -221,18 +243,17 @@ def main():
                     score = log_probs[target].item()
                     chunk_scores.append(score)
                     
+                    # 2) Write ground-truth token and advance
+                    target_tensor = torch.tensor([[target]], dtype=torch.int32)
+                    model.predict(target_tensor)
+                    
                     # Show first few tokens in debug mode
                     if args.debug and j < 3:
                         curr_text = tokenizer.decode([current])
                         tgt_text = tokenizer.decode([target])
                         print(f"Token {j}: '{curr_text}' → '{tgt_text}', score: {score:.4f}")
+                        print(f"  Current position after predict: {model.current_position}")
                 
-                # Update state for next token
-                if j < len(inputs) - 1:
-                    signal.setitimer(signal.ITIMER_REAL, args.prediction_timeout)
-                    _ = model.predict(token_tensor)
-                    signal.setitimer(signal.ITIMER_REAL, 0)  # Cancel timer
-                    
             except TimeoutError:
                 print(f"\nTimeout during token {j} prediction. Skipping to next chunk.")
                 break
@@ -269,6 +290,10 @@ def main():
             
             if i % 2 == 0 or args.debug:  # Print every 2nd chunk or in debug mode
                 print(f"Chunk {i+1} perplexity: {chunk_ppl:.4f} (tokens: {len(chunk_scores)})")
+                # Sanity check: tokens in second half should be ~chunk_size/2
+                expected_tokens = len(targets)
+                if len(chunk_scores) > 0 and abs(len(chunk_scores) - expected_tokens) > 10:
+                    print(f"  Note: Expected ~{expected_tokens} tokens scored, got {len(chunk_scores)}")
             
             # Add to totals
             total_log_likelihood += sum(chunk_scores)

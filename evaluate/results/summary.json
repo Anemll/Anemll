@@ -3,17 +3,23 @@
   "tasks": [
     "boolq"
   ],
-  "total_duration": 19.794982194900513,
+  "total_duration": 2.6003479957580566,
   "results": {
     "boolq": {
       "dataset": "boolq",
-      "accuracy": 0.39204892966360855,
-      "correct": 1282,
-      "total": 3270,
+      "accuracy": 1.0,
+      "correct": 1,
+      "total": 1,
+      "exact_matches": 0,
+      "failed_matches": 1,
+      "exact_match_rate": 0.0,
       "sample_count": 3270,
-      "evaluated_count": 3270,
-      "time_taken": 17.300100803375244,
-      "duration": 19.794978141784668
+      "evaluated_count": 1,
+      "time_taken": 0.23192906379699707,
+      "suspicious_samples": [
+        0
+      ],
+      "duration": 2.6003429889678955
     }
   }
 }

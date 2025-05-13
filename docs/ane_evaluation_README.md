@@ -53,6 +53,7 @@ The implementation supports most tasks available in lm-evaluation-harness, inclu
 - `winogrande`: Winogrande
 - `openbookqa`: OpenBookQA
 - `piqa`: Physical Interaction QA
+- `mmlu`: Massive Multitask Language Understanding (configurable subjects)
 - And many more from lm-evaluation-harness
 
 ## Prerequisites

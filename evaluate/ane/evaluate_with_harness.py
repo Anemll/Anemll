@@ -513,9 +513,10 @@ class ANELM(LM):
                     result.append(self.tokenizer.encode(chat_text))
                 except Exception as e:
                     print(f"Error applying chat template: {str(e)}. Falling back to standard tokenization.")
-                    result.append(self.tokenizer.encode(t, add_special_tokens=True))
+                    result.append(self.tokenizer.encode(t, add_special_tokens=False))
             else:
-                result.append(self.tokenizer.encode(t, add_special_tokens=True))
+                # The harness already decides where BOS/EOS go
+                result.append(self.tokenizer.encode(t, add_special_tokens=False))
         return result
 
     def loglikelihood(self, requests) -> list[tuple[float, bool]]:

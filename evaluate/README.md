@@ -71,6 +71,7 @@ Uses the lm-evaluation-harness framework with ANE model integration:
 - `winogrande`: Winogrande
 - `openbookqa`: OpenBookQA
 - `piqa`: Physical Interaction QA
+- `mmlu`: Massive Multitask Language Understanding (various subjects)
 - And many more from lm-evaluation-harness
 
 ## Prerequisites
@@ -130,6 +131,6 @@ results/
 ## Implementation Notes
 
 - The harness-based approach (anelm_harness.py) provides better integration with standard benchmarks
-- The standalone approach (evaluate_ane.py) offers more custom metrics and self-contained evaluation
+
 - Both systems are designed to be extensible
 - ANE models should always be evaluated with batch_size=1 for optimal performance 

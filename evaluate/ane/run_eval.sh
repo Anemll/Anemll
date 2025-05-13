@@ -1,13 +1,31 @@
 #!/bin/bash
 # run_eval.sh - ANE model evaluation with lm-evaluation-harness
 # Uses the abstracted ANE_Model class for better state handling
+#
+# Example usage:
+# ./run_eval.sh --model /path/to/your/model --tasks "arc_easy,hellaswag"
+# ./run_eval.sh --tasks "boolq" --limit 10 --debug
+# ./run_eval.sh --tasks "mmlu_abstract_algebra" --limit 20  # Run specific MMLU subject
+# ./run_eval.sh --tasks "mmlu_abstract_algebra,mmlu_high_school_mathematics" --limit 20  # Multiple MMLU subjects
+# ./run_eval.sh --tasks "mmlu" --limit 5  # Run full MMLU benchmark (all subjects, limited samples)
+#
+# Note: When using anelm_harness.py directly, tasks should be space-separated:
+# python anelm_harness.py --model /path/to/model --tasks arc_easy hellaswag --batch-size 1
+#
+# Chat template usage:
+# By default, chat templates are disabled for standard evaluation tasks.
+# For instruction-tuned models or chat checkpoints, enable with --apply-chat-template:
+# ./run_eval.sh --model /path/to/instruct-model --tasks "truthfulqa" --apply-chat-template
+# 
+# Note: For "plain" tasks like BoolQ, ARC-Easy, HellaSwag, MMLU, etc. you should NOT
+# use chat templates as they will interfere with proper evaluation.
 
 # Set default values
 MODEL_PATH="/Users/anemll/Models/ANE/anemll-Llama-3.2-1B-FP16-b64-ctx1024"
 TASKS="hellaswag"
 NUM_SHOTS=0
 BATCH_SIZE=1  # Always use batch_size=1 for ANE models
-OUTPUT_DIR="results"
+OUTPUT_DIR="evaluate/results"
 LIMIT=""
 MAX_TOKENS=""
 CHAT_TEMPLATE=""
@@ -17,6 +35,8 @@ PERPLEXITY_TEXT=""
 SKIP=""
 CHUNK_SIZE=""
 SAFETY_MARGIN=100  # Default safety margin
+DOWNLOAD_TIMEOUT=120  # Default download timeout (seconds)
+MAX_RETRIES=5  # Default number of download retries
 
 print_header() {
     echo "=================== ANE MODEL EVALUATION ==================="
@@ -71,11 +91,15 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --chat-template)
-            CHAT_TEMPLATE="--chat-template $2"
-            shift 2
+            CHAT_TEMPLATE="--apply-chat-template"
+            shift
+            ;;
+        --apply-chat-template)
+            CHAT_TEMPLATE="--apply-chat-template"
+            shift
             ;;
         --max-tokens)
-            MAX_TOKENS="--max_tokens $2"
+            MAX_TOKENS="--max-tokens $2"
             shift 2
             ;;
         --seed)
@@ -104,6 +128,14 @@ while [[ $# -gt 0 ]]; do
             SAFETY_MARGIN="$2"
             shift 2
             ;;
+        --download-timeout)
+            DOWNLOAD_TIMEOUT="$2"
+            shift 2
+            ;;
+        --max-retries)
+            MAX_RETRIES="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -116,25 +148,64 @@ print_header
 # Create output directory if it doesn't exist
 mkdir -p ${OUTPUT_DIR}
 
+# Check if only "mmlu" is specified as a task, then route to sequential script
+if [ "$TASKS" = "mmlu" ]; then
+    echo "Full MMLU benchmark detected - using sequential runner to prevent timeouts"
+    echo "Running: ./run_mmlu_sequential.sh with appropriate parameters"
+    
+    # Call the sequential script with the same parameters
+    ./run_mmlu_sequential.sh \
+        --model "${MODEL_PATH}" \
+        --limit "${LIMIT:+${LIMIT##*--limit }}" \
+        --shots "${NUM_SHOTS}" \
+        --output-dir "${OUTPUT_DIR}" \
+        --download-timeout "${DOWNLOAD_TIMEOUT}" \
+        --max-retries "${MAX_RETRIES}" \
+        --safety-margin "${SAFETY_MARGIN}" \
+        ${DEBUG:+--debug}
+    
+    # Exit with the same status as the sequential script
+    exit $?
+fi
+
 # Run evaluation based on task selection
 if [ -z "$PERPLEXITY_TEXT" ]; then
     # Non-perplexity tasks - standard benchmarks
     echo "Running LM evaluation with ANE_Model on ${TASKS}..."
-    python anelm_harness.py \
-        --model ${MODEL_PATH} \
-        --tasks ${TASKS} \
-        --num-shots ${NUM_SHOTS} \
-        --batch-size ${BATCH_SIZE} \
-        ${CHAT_TEMPLATE} \
-        ${LIMIT} \
-        ${MAX_TOKENS} \
-        ${DEBUG} \
-        ${SKIP} \
-        ${CHUNK_SIZE} \
-        --safety-margin ${SAFETY_MARGIN} \
-        --seed ${SEED} \
-        --output-dir ${OUTPUT_DIR} \
-        --output-path ${OUTPUT_DIR}/results.json
+    # Convert comma-separated tasks to space-separated format
+    TASKS_SPACED="${TASKS//,/ }"
+    
+    # Get model name and date for output files
+    MODEL_NAME=$(basename "${MODEL_PATH}")
+    CURRENT_DATE=$(date +"%Y%m%d")
+    
+    # Create output directory
+    mkdir -p "${OUTPUT_DIR}"
+    
+    # For each task, create a separate output path
+    for TASK in ${TASKS_SPACED}; do
+        TASK_OUTPUT_PATH="${OUTPUT_DIR}/${TASK}_${MODEL_NAME}_${CURRENT_DATE}.json"
+        echo "Running evaluation for task: ${TASK}"
+        echo "Results will be saved to: ${TASK_OUTPUT_PATH}"
+        
+        python anelm_harness.py \
+            --model ${MODEL_PATH} \
+            --tasks ${TASK} \
+            --num-shots ${NUM_SHOTS} \
+            --batch-size ${BATCH_SIZE} \
+            ${CHAT_TEMPLATE} \
+            ${LIMIT} \
+            ${MAX_TOKENS} \
+            ${DEBUG} \
+            ${SKIP} \
+            ${CHUNK_SIZE} \
+            --safety-margin ${SAFETY_MARGIN} \
+            --download-timeout ${DOWNLOAD_TIMEOUT} \
+            --max-retries ${MAX_RETRIES} \
+            --seed ${SEED} \
+            --output-dir ${OUTPUT_DIR} \
+            --output-path ${TASK_OUTPUT_PATH}
+    done
 else
     # Perplexity evaluation with appropriate handling
     echo "Running perplexity evaluation..."
@@ -142,6 +213,17 @@ else
     # Check if perplexity_text is "wikitext" to use the dataset
     if [ "$PERPLEXITY_TEXT" = "wikitext" ]; then
         echo "Using wikitext dataset for perplexity"
+        
+        # Get model name and date for output files
+        MODEL_NAME=$(basename "${MODEL_PATH}")
+        CURRENT_DATE=$(date +"%Y%m%d")
+        
+        # Create output directory
+        mkdir -p "${OUTPUT_DIR}"
+        
+        # Create perplexity output path
+        PERPLEXITY_OUTPUT_PATH="${OUTPUT_DIR}/perplexity_wikitext_${MODEL_NAME}_${CURRENT_DATE}.json"
+        echo "Perplexity results will be saved to: ${PERPLEXITY_OUTPUT_PATH}"
         
         # Use the harness for wikitext perplexity
         echo "Running with harness perplexity evaluation on wikitext..."
@@ -155,8 +237,7 @@ else
             --seed ${SEED} \
             --perplexity \
             --output-dir ${OUTPUT_DIR} \
-            --output-path ${OUTPUT_DIR}/perplexity_results.json
-            
+            --output-path ${PERPLEXITY_OUTPUT_PATH}
     elif [ -f "$PERPLEXITY_TEXT" ]; then
         # Custom text file perplexity calculation
         echo "Using custom text file: ${PERPLEXITY_TEXT}"
@@ -255,8 +336,10 @@ def calculate_perplexity(model_path, text_file, debug=False, chunk_size=None, sa
         with open(text_file, 'r', encoding='latin-1') as f:
             text = f.read()
             
-    # Tokenize the text
-    tokens = tokenizer.encode(text)
+    # Disable special tokens and manually add BOS if needed
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+    if tokenizer.bos_token_id is not None:
+        tokens = [tokenizer.bos_token_id] + tokens
     print(f"Text tokenized to {len(tokens)} tokens")
     
     # Split into manageable chunks
@@ -280,8 +363,13 @@ def calculate_perplexity(model_path, text_file, debug=False, chunk_size=None, sa
             pbar.update(1)
             continue
             
-        # Split into input and target
-        inputs, targets = chunk[:-1], chunk[1:]
+        # Calculate midpoint - only score second half of chunk to avoid boundary issues
+        mid = len(chunk) // 2
+        # Ensure we have enough tokens to score (at least 1)
+        if mid < 1:
+            mid = 1
+        # Split inputs/targets for the scoring portion (second half of chunk)
+        inputs, targets = chunk[:mid], chunk[1:mid+1]
         
         try:
             # Reset model state for this chunk
@@ -479,12 +567,17 @@ def main():
         print("Falling back to default tokenizer")
         tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
     
-    # Tokenize sample text
-    tokens = tokenizer.encode(SAMPLE_TEXT)
+    # Disable special tokens and manually add BOS if needed
+    tokens = tokenizer.encode(SAMPLE_TEXT, add_special_tokens=False)
+    if tokenizer.bos_token_id is not None:
+        tokens = [tokenizer.bos_token_id] + tokens
     print(f"Sample text tokenized to {len(tokens)} tokens")
     
-    # Process the tokens
-    inputs, targets = tokens[:-1], tokens[1:]
+    # Calculate midpoint - only score second half to avoid boundary issues
+    mid = len(tokens) // 2
+    if mid < 1:
+        mid = 1
+    inputs, targets = tokens[:mid], tokens[1:mid+1]
     
     # Reset model state
     model.reset_state()
