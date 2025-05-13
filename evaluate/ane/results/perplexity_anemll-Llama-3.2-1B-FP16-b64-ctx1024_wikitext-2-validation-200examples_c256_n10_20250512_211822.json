@@ -1,0 +1,88 @@
+{
+  "model": "anemll-Llama-3.2-1B-FP16-b64-ctx1024",
+  "model_path": "/Users/anemll/Models/ANE/anemll-Llama-3.2-1B-FP16-b64-ctx1024",
+  "dataset": "wikitext-2-validation-200examples",
+  "date": "2025-05-12T21:16:15.090797",
+  "parameters": {
+    "chunk_size": 256,
+    "max_chunks": 10,
+    "prediction_timeout": 10,
+    "subset_size": 200
+  },
+  "chunks": [
+    {
+      "index": 1,
+      "size": 256,
+      "tokens_processed": 225,
+      "perplexity": 9.840613478664155,
+      "duration_seconds": 12.794267177581787
+    },
+    {
+      "index": 2,
+      "size": 256,
+      "tokens_processed": 225,
+      "perplexity": 12.458384224696822,
+      "duration_seconds": 12.696223258972168
+    },
+    {
+      "index": 3,
+      "size": 256,
+      "tokens_processed": 225,
+      "perplexity": 10.094320568505443,
+      "duration_seconds": 12.680433750152588
+    },
+    {
+      "index": 4,
+      "size": 256,
+      "tokens_processed": 225,
+      "perplexity": 13.530802727716045,
+      "duration_seconds": 12.690896034240723
+    },
+    {
+      "index": 5,
+      "size": 256,
+      "tokens_processed": 225,
+      "perplexity": 12.659438920806448,
+      "duration_seconds": 12.678976058959961
+    },
+    {
+      "index": 6,
+      "size": 256,
+      "tokens_processed": 225,
+      "perplexity": 13.39082773114886,
+      "duration_seconds": 12.679095029830933
+    },
+    {
+      "index": 7,
+      "size": 256,
+      "tokens_processed": 225,
+      "perplexity": 10.547123272191163,
+      "duration_seconds": 12.686546087265015
+    },
+    {
+      "index": 8,
+      "size": 256,
+      "tokens_processed": 225,
+      "perplexity": 16.786228002310125,
+      "duration_seconds": 12.684989929199219
+    },
+    {
+      "index": 9,
+      "size": 256,
+      "tokens_processed": 225,
+      "perplexity": 10.75929781407733,
+      "duration_seconds": 12.695616006851196
+    },
+    {
+      "index": 10,
+      "size": 256,
+      "tokens_processed": 225,
+      "perplexity": 9.366814015006126,
+      "duration_seconds": 12.680891990661621
+    }
+  ],
+  "total_tokens": 14036,
+  "tokens_processed": 2250,
+  "perplexity": 11.761343648442685,
+  "duration_seconds": 134.95296573638916
+}

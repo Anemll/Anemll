@@ -1,0 +1,9 @@
+{
+  "dataset": "arc_easy",
+  "accuracy": 0.6527777777777778,
+  "correct": 1551,
+  "total": 2376,
+  "sample_count": 2376,
+  "evaluated_count": 2376,
+  "time_taken": 35.25452184677124
+}

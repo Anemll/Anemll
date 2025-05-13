@@ -1,0 +1,53 @@
+{
+  "model": "anemll-Llama-3.2-1B-FP16-b64-ctx1024",
+  "model_path": "/Users/anemll/Models/ANE/anemll-Llama-3.2-1B-FP16-b64-ctx1024",
+  "dataset": "wikitext-2-validation-50examples",
+  "date": "2025-05-12T21:08:29.707216",
+  "parameters": {
+    "chunk_size": 200,
+    "max_chunks": 5,
+    "prediction_timeout": 10,
+    "subset_size": 50
+  },
+  "chunks": [
+    {
+      "index": 1,
+      "size": 200,
+      "tokens_processed": 169,
+      "perplexity": 9.97018409186954,
+      "duration_seconds": 9.847307205200195
+    },
+    {
+      "index": 2,
+      "size": 200,
+      "tokens_processed": 169,
+      "perplexity": 10.063661839401652,
+      "duration_seconds": 9.664497137069702
+    },
+    {
+      "index": 3,
+      "size": 200,
+      "tokens_processed": 169,
+      "perplexity": 6.5430423120991605,
+      "duration_seconds": 9.645764112472534
+    },
+    {
+      "index": 4,
+      "size": 200,
+      "tokens_processed": 169,
+      "perplexity": 11.53249297670431,
+      "duration_seconds": 21.88187885284424
+    },
+    {
+      "index": 5,
+      "size": 200,
+      "tokens_processed": 169,
+      "perplexity": 10.513977811685912,
+      "duration_seconds": 22.01112174987793
+    }
+  ],
+  "total_tokens": 2251,
+  "tokens_processed": 845,
+  "perplexity": 9.55401324959383,
+  "duration_seconds": 82.64060807228088
+}

@@ -1,0 +1,25 @@
+{
+  "model_path": "/Users/anemll/Models/ANE/anemll-Llama-3.2-1B-FP16-b64-ctx1024",
+  "tasks": [
+    "boolq"
+  ],
+  "total_duration": 2.6003479957580566,
+  "results": {
+    "boolq": {
+      "dataset": "boolq",
+      "accuracy": 1.0,
+      "correct": 1,
+      "total": 1,
+      "exact_matches": 0,
+      "failed_matches": 1,
+      "exact_match_rate": 0.0,
+      "sample_count": 3270,
+      "evaluated_count": 1,
+      "time_taken": 0.23192906379699707,
+      "suspicious_samples": [
+        0
+      ],
+      "duration": 2.6003429889678955
+    }
+  }
+}

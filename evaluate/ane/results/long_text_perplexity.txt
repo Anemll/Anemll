@@ -1,0 +1,4 @@
+Long sample text perplexity: 583.6463
+Total tokens: 923
+Average log likelihood: -6.3693
+Model: /Users/anemll/Models/ANE/anemll-Llama-3.2-1B-FP16-b64-ctx1024

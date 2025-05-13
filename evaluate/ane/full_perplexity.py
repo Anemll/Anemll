@@ -8,6 +8,8 @@ import argparse
 import math
 import time
 import signal
+import json
+import datetime
 import torch
 from tqdm import tqdm
 from pathlib import Path
@@ -77,16 +79,24 @@ def parse_args():
                        help="Dataset split to use (test, validation, etc.)")
     parser.add_argument("--subset-size", type=int, default=100,
                        help="Number of examples to use from dataset (0 for all)")
-    parser.add_argument("--chunk-size", type=int, default=200,
+    parser.add_argument("--chunk-size", type=int, default=256,
                        help="Size of each chunk in tokens")
     parser.add_argument("--max-chunks", type=int, default=10,
                        help="Maximum number of chunks to process")
     parser.add_argument("--prediction-timeout", type=int, default=10,
                        help="Timeout in seconds for each prediction call")
+    parser.add_argument("--output-dir", type=str, default="results",
+                       help="Directory to save results")
     return parser.parse_args()
+
+def get_model_name(model_path):
+    """Extract a clean model name from the path."""
+    path = Path(model_path)
+    return path.name or path.parent.name
 
 def main():
     args = parse_args()
+    start_time = time.time()
     
     # Initialize model
     print(f"Loading model from {args.model}")
@@ -102,8 +112,12 @@ def main():
     
     # Use standard dataset if requested
     text = SAMPLE_TEXT
+    dataset_name = "sample"
     if args.dataset == "wikitext":
         text = load_wikitext(args.split, args.subset_size)
+        dataset_name = f"wikitext-2-{args.split}"
+        if args.subset_size:
+            dataset_name += f"-{args.subset_size}examples"
         
     # Tokenize text
     tokens = tokenizer.encode(text)
@@ -120,6 +134,25 @@ def main():
         if len(chunks) >= args.max_chunks:
             break
     
+    # Create a result structure to track all details
+    result = {
+        "model": get_model_name(args.model),
+        "model_path": str(args.model),
+        "dataset": dataset_name,
+        "date": datetime.datetime.now().isoformat(),
+        "parameters": {
+            "chunk_size": chunk_size,
+            "max_chunks": args.max_chunks,
+            "prediction_timeout": args.prediction_timeout,
+            "subset_size": args.subset_size
+        },
+        "chunks": [],
+        "total_tokens": 0,
+        "tokens_processed": 0,
+        "perplexity": None,
+        "duration_seconds": None
+    }
+    
     print(f"Processing {len(chunks)} chunks of size ~{chunk_size}")
     
     # Process each chunk
@@ -133,6 +166,8 @@ def main():
     pbar = tqdm(total=len(chunks), desc="Processing chunks", unit="chunk")
     
     for i, chunk in enumerate(chunks):
+        chunk_start_time = time.time()
+        
         if args.debug:
             print(f"\n--- Processing Chunk {i+1}/{len(chunks)} ---")
             print(f"Chunk has {len(chunk)} tokens")
@@ -142,6 +177,15 @@ def main():
             print(f"Skipping chunk {i+1} - too small ({len(chunk)} tokens)")
             pbar.update(1)
             continue
+        
+        # Initialize chunk result data
+        chunk_result = {
+            "index": i+1,
+            "size": len(chunk),
+            "tokens_processed": 0,
+            "perplexity": None,
+            "duration_seconds": None
+        }
         
         # Split into inputs and targets
         inputs, targets = chunk[:-1], chunk[1:]
@@ -206,7 +250,7 @@ def main():
             # Only process a reasonable number of tokens per chunk to avoid slowdowns
             if j >= (chunk_size - 32) and len(chunk_scores) > 0:
                 if args.debug:
-                    print(f"Processed 50 tokens, moving to next chunk")
+                    print(f"Processed {j+1} tokens, moving to next chunk")
                 break
         
         # Close token progress bar
@@ -218,6 +262,11 @@ def main():
             chunk_ll = sum(chunk_scores) / len(chunk_scores)
             chunk_ppl = math.exp(-chunk_ll)
             
+            # Update chunk results
+            chunk_result["tokens_processed"] = len(chunk_scores)
+            chunk_result["perplexity"] = chunk_ppl
+            chunk_result["duration_seconds"] = time.time() - chunk_start_time
+            
             if i % 2 == 0 or args.debug:  # Print every 2nd chunk or in debug mode
                 print(f"Chunk {i+1} perplexity: {chunk_ppl:.4f} (tokens: {len(chunk_scores)})")
             
@@ -226,6 +275,9 @@ def main():
             total_tokens += len(chunk_scores)
         else:
             print(f"Chunk {i+1}: No tokens were successfully scored")
+            
+        # Add chunk result to results
+        result["chunks"].append(chunk_result)
         
         # Update chunk progress bar
         pbar.update(1)
@@ -239,6 +291,13 @@ def main():
     if total_tokens > 0:
         avg_ll = total_log_likelihood / total_tokens
         perplexity = math.exp(-avg_ll)
+        
+        # Update results
+        result["perplexity"] = perplexity
+        result["total_tokens"] = len(tokens)
+        result["tokens_processed"] = total_tokens
+        result["duration_seconds"] = time.time() - start_time
+        
         print(f"\nFull evaluation results:")
         print(f"Dataset: {args.dataset if args.dataset else 'custom'}")
         print(f"Perplexity: {perplexity:.4f}")
@@ -246,6 +305,20 @@ def main():
         print(f"Chunks processed: {len(chunks)}")
     else:
         print("Error: No tokens were successfully scored")
+    
+    # Save results to file
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    
+    model_name = get_model_name(args.model)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"perplexity_{model_name}_{dataset_name}_c{chunk_size}_n{args.max_chunks}_{timestamp}.json"
+    
+    output_path = output_dir / filename
+    with open(output_path, 'w') as f:
+        json.dump(result, f, indent=2)
+    
+    print(f"\nResults saved to: {output_path}")
     
 if __name__ == "__main__":
     main() 

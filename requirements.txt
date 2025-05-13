@@ -2,6 +2,7 @@
 coremltools>=8.2    # Required for Apple Neural Engine support
 torch==2.5.0        # Deep learning framework
 transformers>=4.36.0  # Hugging Face Transformers library
+datasets>=2.14.0    # HuggingFace Datasets for evaluations
 
 # ⚠️ Development Dependencies (optional for users, required for developers)
 black>=23.12.0      # Code formatting
