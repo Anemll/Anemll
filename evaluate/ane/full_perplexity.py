@@ -55,9 +55,14 @@ def timeout_handler(signum, frame):
     raise TimeoutError("Prediction timeout")
 
 # Load standard datasets
-def load_wikitext(split="validation", subset_size=None):
-    print(f"Loading Wikitext-2 {split} dataset...")
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+def load_wikitext(split="validation", subset_size=None, wikitext_version="wikitext-2"):
+    version_name = "wikitext-2-raw-v1" if wikitext_version == "wikitext-2" else "wikitext-103-raw-v1"
+    print(f"Loading {wikitext_version} {split} dataset...")
+    dataset = load_dataset("wikitext", version_name, split=split)
+ 
+#def load_wikitext(split="validation", subset_size=None):
+#    print(f"Loading Wikitext-2 {split} dataset...")
+#    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
     
     # Use only a subset if specified
     if subset_size and subset_size > 0:
@@ -83,6 +88,9 @@ def parse_args():
                        help="Enable debug output")
     parser.add_argument("--dataset", type=str, default=None,
                        help="Standard dataset to use (wikitext)")
+    parser.add_argument("--wikitext-version", type=str, default="wikitext-2",
+                       choices=["wikitext-2", "wikitext-103"],
+                       help="WikiText version to use")
     parser.add_argument("--split", type=str, default="validation",
                        help="Dataset split to use (test, validation, etc.)")
     parser.add_argument("--subset-size", type=int, default=100,
@@ -122,8 +130,8 @@ def main():
     text = SAMPLE_TEXT
     dataset_name = "sample"
     if args.dataset == "wikitext":
-        text = load_wikitext(args.split, args.subset_size)
-        dataset_name = f"wikitext-2-{args.split}"
+        text = load_wikitext(args.split, args.subset_size, args.wikitext_version)
+        dataset_name = f"{args.wikitext_version}-{args.split}"
         if args.subset_size:
             dataset_name += f"-{args.subset_size}examples"
         
@@ -133,9 +141,21 @@ def main():
         tokens = [tokenizer.bos_token_id] + tokens
     print(f"Text tokenized to {len(tokens)} tokens")
     
+    # Get context length from model name
+    model_name = get_model_name(args.model)
+    context_length = 1024  # Default to 1024
+    if "ctx" in model_name:
+        try:
+            ctx_part = model_name.split("ctx")[1]
+            context_length = int(ctx_part)
+        except:
+            pass
+    print(f"Detected context length: {context_length}")
+    
     # Create fixed-size chunks - ensure chunks aren't too large
-    chunk_size = min(args.chunk_size, 512)  # Cap chunk size at 512 tokens to be safe
-    print(f"Using chunk size of {chunk_size} tokens")
+    max_safe_chunk_size = context_length - 64  # Leave 64 tokens as safety margin
+    chunk_size = min(args.chunk_size, max_safe_chunk_size)
+    print(f"Using chunk size of {chunk_size} tokens (max safe: {max_safe_chunk_size})")
     
     chunks = []
     # Use non-overlapping chunks for cleaner evaluation
