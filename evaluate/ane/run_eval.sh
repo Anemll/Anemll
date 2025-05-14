@@ -1,654 +1,248 @@
 #!/bin/bash
-# run_eval.sh - ANE model evaluation with lm-evaluation-harness
-# Uses the abstracted ANE_Model class for better state handling
-#
-# Example usage:
-# ./run_eval.sh --model /path/to/your/model --tasks "arc_easy,hellaswag"
-# ./run_eval.sh --tasks "boolq" --limit 10 --debug
-# ./run_eval.sh --tasks "mmlu_abstract_algebra" --limit 20  # Run specific MMLU subject
-# ./run_eval.sh --tasks "mmlu_abstract_algebra,mmlu_high_school_mathematics" --limit 20  # Multiple MMLU subjects
-# ./run_eval.sh --tasks "mmlu" --limit 5  # Run full MMLU benchmark (all subjects, limited samples)
-#
-# Note: When using anelm_harness.py directly, tasks should be space-separated:
-# python anelm_harness.py --model /path/to/model --tasks arc_easy hellaswag --batch-size 1
-#
-# Chat template usage:
-# By default, chat templates are disabled for standard evaluation tasks.
-# For instruction-tuned models or chat checkpoints, enable with --apply-chat-template:
-# ./run_eval.sh --model /path/to/instruct-model --tasks "truthfulqa" --apply-chat-template
-# 
-# Note: For "plain" tasks like BoolQ, ARC-Easy, HellaSwag, MMLU, etc. you should NOT
-# use chat templates as they will interfere with proper evaluation.
+# Main evaluation script for ANE/CoreML models using anelm_harness.py
 
-# Set default values
-MODEL_PATH="/Users/anemll/Models/ANE/anemll-Llama-3.2-1B-FP16-b64-ctx1024"
-TASKS="hellaswag"
-NUM_SHOTS=0
-BATCH_SIZE=1  # Always use batch_size=1 for ANE models
-OUTPUT_DIR="evaluate/results"
-LIMIT=""
-MAX_TOKENS=""
-CHAT_TEMPLATE=""
-SEED=123
-DEBUG=""
-PERPLEXITY_TEXT=""
-SKIP=""
-CHUNK_SIZE=""
-SAFETY_MARGIN=100  # Default safety margin
-DOWNLOAD_TIMEOUT=120  # Default download timeout (seconds)
-MAX_RETRIES=5  # Default number of download retries
+# Strict mode
+set -euo pipefail
 
-print_header() {
-    echo "=================== ANE MODEL EVALUATION ==================="
-    echo "Model path:   ${MODEL_PATH}"
-    echo "Tasks:        ${TASKS}"
-    echo "Num shots:    ${NUM_SHOTS}"
-    echo "Batch size:   ${BATCH_SIZE} (for strict serial execution)"
-    echo "Output dir:   ${OUTPUT_DIR}"
-    if [ -n "$DEBUG" ]; then
-        echo "Debug mode:   ENABLED"
-    fi
-    if [ -n "$LIMIT" ]; then
-        echo "Limit:        ${LIMIT} samples"
-    fi
-    if [ -n "$SKIP" ]; then
-        echo "Skip:         ${SKIP} samples"
-    fi
-    if [ -n "$CHUNK_SIZE" ]; then
-        echo "Chunk size:   ${CHUNK_SIZE} tokens"
-    fi
-    if [ -n "$SAFETY_MARGIN" ]; then
-        echo "Safety margin: ${SAFETY_MARGIN} tokens"
-    fi
-    echo "=========================================================="
+# Helper function to format duration
+format_duration() {
+    local seconds=$1
+    local h=$((seconds / 3600))
+    local m=$(((seconds % 3600) / 60))
+    local s=$((seconds % 60))
+    printf "%02dh:%02dm:%02ds" $h $m $s
 }
 
-# Parse command-line options
+# Defaults
+MODEL_PATH=""
+TASK_LIST=""
+NUM_SHOTS=0 # Default to 0-shot
+BATCH_SIZE=1 # Default and recommended for harness serial execution
+OUTPUT_DIR_BASE="evaluate/results"
+DEBUG_MODE=false
+LIMIT=""
+SAFETY_MARGIN=100 # Default safety margin for context length
+DOWNLOAD_TIMEOUT=120 # Default download timeout for datasets (seconds)
+MAX_RETRIES=5    # Default max retries for dataset downloads
+SEED=123
+
+# Store the original command line
+OVERALL_CMD_LINE_STR=$(printf "'%s' " "$0" "$@")
+SCRIPT_START_TIME_SECONDS=$(date +%s)
+DATE_STR=$(date +"%Y%m%d")
+TIME_STR_FILENAME=$(date +"%H%M%S")
+TIME_STR_METADATA_START=$(date +"%I:%M:%S%p")
+
+# Parse command-line arguments
 while [[ $# -gt 0 ]]; do
-    case $1 in
+    key="$1"
+    case $key in
         --model)
-            MODEL_PATH="$2"
-            shift 2
-            ;;
+        MODEL_PATH="$2"
+        shift; shift
+        ;;
         --tasks)
-            TASKS="$2"
-            shift 2
-            ;;
-        --shots)
-            NUM_SHOTS="$2"
-            shift 2
-            ;;
-        --limit)
-            LIMIT="--limit $2"
-            shift 2
-            ;;
-        --skip)
-            SKIP="--skip $2"
-            shift 2
-            ;;
+        TASK_LIST="$2"
+        shift; shift
+        ;;
+        --num-shots)
+        NUM_SHOTS="$2"
+        shift; shift
+        ;;
+        --batch-size)
+        BATCH_SIZE="$2"
+        shift; shift
+        ;;
         --output-dir)
-            OUTPUT_DIR="$2"
-            shift 2
-            ;;
-        --chat-template)
-            CHAT_TEMPLATE="--apply-chat-template"
-            shift
-            ;;
-        --apply-chat-template)
-            CHAT_TEMPLATE="--apply-chat-template"
-            shift
-            ;;
-        --max-tokens)
-            MAX_TOKENS="--max-tokens $2"
-            shift 2
-            ;;
-        --seed)
-            SEED="$2"
-            shift 2
-            ;;
+        OUTPUT_DIR_BASE="$2"
+        shift; shift
+        ;;
         --debug)
-            DEBUG="--debug"
-            shift
-            ;;
-        --perplexity)
-            # If no argument is provided, use wikitext as default
-            if [[ "$2" == --* ]] || [[ -z "$2" ]]; then
-                PERPLEXITY_TEXT="wikitext"
-            shift
-            else
-                PERPLEXITY_TEXT="$2"
-                shift 2
-            fi
-            ;;
-        --chunk-size)
-            CHUNK_SIZE="--chunk-size $2"
-            shift 2
-            ;;
+        DEBUG_MODE=true
+        shift
+        ;;
+        --limit)
+        LIMIT="$2"
+        shift; shift
+        ;;
         --safety-margin)
-            SAFETY_MARGIN="$2"
-            shift 2
-            ;;
+        SAFETY_MARGIN="$2"
+        shift; shift
+        ;;
         --download-timeout)
-            DOWNLOAD_TIMEOUT="$2"
-            shift 2
-            ;;
+        DOWNLOAD_TIMEOUT="$2"
+        shift; shift
+        ;;
         --max-retries)
-            MAX_RETRIES="$2"
-            shift 2
-            ;;
+        MAX_RETRIES="$2"
+        shift; shift
+        ;;
+        --seed)
+        SEED="$2"
+        shift; shift
+        ;;
         *)
-            echo "Unknown option: $1"
-            exit 1
-            ;;
+        echo "Unknown option: $1"
+        exit 1
+        ;;
     esac
 done
 
-print_header
-
-# Create output directory if it doesn't exist
-mkdir -p ${OUTPUT_DIR}
-
-# Check if only "mmlu" is specified as a task, then route to sequential script
-if [ "$TASKS" = "mmlu" ]; then
-    echo "Full MMLU benchmark detected - using sequential runner to prevent timeouts"
-    echo "Running: ./run_mmlu_sequential.sh with appropriate parameters"
-    
-    # Call the sequential script with the same parameters
-    ./run_mmlu_sequential.sh \
-        --model "${MODEL_PATH}" \
-        --limit "${LIMIT:+${LIMIT##*--limit }}" \
-        --shots "${NUM_SHOTS}" \
-        --output-dir "${OUTPUT_DIR}" \
-        --download-timeout "${DOWNLOAD_TIMEOUT}" \
-        --max-retries "${MAX_RETRIES}" \
-        --safety-margin "${SAFETY_MARGIN}" \
-        ${DEBUG:+--debug}
-    
-    # Exit with the same status as the sequential script
-    exit $?
+# Validate required arguments
+if [ -z "$MODEL_PATH" ]; then
+    echo "Error: --model is required."
+    exit 1
+fi
+if [ -z "$TASK_LIST" ]; then
+    echo "Error: --tasks is required."
+    exit 1
 fi
 
-# Run evaluation based on task selection
-if [ -z "$PERPLEXITY_TEXT" ]; then
-    # Non-perplexity tasks - standard benchmarks
-    echo "Running LM evaluation with ANE_Model on ${TASKS}..."
-    # Convert comma-separated tasks to space-separated format
-    TASKS_SPACED="${TASKS//,/ }"
-    
-    # Get model name and date for output files
-    MODEL_NAME=$(basename "${MODEL_PATH}")
-    CURRENT_DATE=$(date +"%Y%m%d")
-    
-    # Create output directory
-    mkdir -p "${OUTPUT_DIR}"
-    
-    # For each task, create a separate output path
-    for TASK in ${TASKS_SPACED}; do
-        TASK_OUTPUT_PATH="${OUTPUT_DIR}/${TASK}_${MODEL_NAME}_${CURRENT_DATE}.json"
-        echo "Running evaluation for task: ${TASK}"
-        echo "Results will be saved to: ${TASK_OUTPUT_PATH}"
-        
-        python anelm_harness.py \
-            --model ${MODEL_PATH} \
-            --tasks ${TASK} \
-            --num-shots ${NUM_SHOTS} \
-            --batch-size ${BATCH_SIZE} \
-            ${CHAT_TEMPLATE} \
-            ${LIMIT} \
-            ${MAX_TOKENS} \
-            ${DEBUG} \
-            ${SKIP} \
-            ${CHUNK_SIZE} \
-            --safety-margin ${SAFETY_MARGIN} \
-            --download-timeout ${DOWNLOAD_TIMEOUT} \
-            --max-retries ${MAX_RETRIES} \
-            --seed ${SEED} \
-            --output-dir ${OUTPUT_DIR} \
-            --output-path ${TASK_OUTPUT_PATH}
-    done
-else
-    # Perplexity evaluation with appropriate handling
-    echo "Running perplexity evaluation..."
-    
-    # Check if perplexity_text is "wikitext" to use the dataset
-    if [ "$PERPLEXITY_TEXT" = "wikitext" ]; then
-        echo "Using wikitext dataset for perplexity"
-        
-        # Get model name and date for output files
-        MODEL_NAME=$(basename "${MODEL_PATH}")
-        CURRENT_DATE=$(date +"%Y%m%d")
-        
-        # Create output directory
-        mkdir -p "${OUTPUT_DIR}"
-        
-        # Create perplexity output path
-        PERPLEXITY_OUTPUT_PATH="${OUTPUT_DIR}/perplexity_wikitext_${MODEL_NAME}_${CURRENT_DATE}.json"
-        echo "Perplexity results will be saved to: ${PERPLEXITY_OUTPUT_PATH}"
-        
-        # Use the harness for wikitext perplexity
-        echo "Running with harness perplexity evaluation on wikitext..."
-        python anelm_harness.py \
-            --model ${MODEL_PATH} \
-            --tasks wikitext \
-            --batch-size ${BATCH_SIZE} \
-            ${DEBUG} \
-            ${CHUNK_SIZE} \
-            --safety-margin ${SAFETY_MARGIN} \
-            --seed ${SEED} \
-            --perplexity \
-            --output-dir ${OUTPUT_DIR} \
-            --output-path ${PERPLEXITY_OUTPUT_PATH}
-    elif [ -f "$PERPLEXITY_TEXT" ]; then
-        # Custom text file perplexity calculation
-        echo "Using custom text file: ${PERPLEXITY_TEXT}"
-        
-        # Create a custom perplexity script - Part 1: Imports and setup
-        TEMP_SCRIPT="/tmp/calc_perplexity_$$.py"
-        cat > "${TEMP_SCRIPT}" << 'EOF'
-#!/usr/bin/env python3
-# Temporary script for perplexity calculation
+# Expand ~ in MODEL_PATH
+MODEL_PATH=$(eval echo "$MODEL_PATH")
 
-import os
-import sys
-import numpy as np
-import math
-import torch
-from tqdm import tqdm
+if [ ! -d "$MODEL_PATH" ]; then
+    echo "Error: Model directory not found: $MODEL_PATH"
+    exit 1
+fi
 
-# Import ANE_Model
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-try:
-    from ane_model import ANE_Model
-except ImportError:
-    print("Failed to import ANE_Model from standard paths")
-    # Try alternative paths
-    alt_paths = [
-        os.path.dirname(os.path.abspath("${0}")),  # Script directory
-        "${PWD}",  # Current working directory
-        "/Users/anemll/SourceRelease/GITHUB/ML_playground/anemll/evaluate/ane",  # Absolute path
-        os.path.abspath(".")  # Current directory
-    ]
-    
-    imported = False
-    for path in alt_paths:
-        try:
-            print(f"Trying path: {path}")
-            sys.path.append(path)
-            from ane_model import ANE_Model
-            print(f"Successfully imported ANE_Model from {path}")
-            imported = True
-            break
-        except ImportError:
-            continue
-    
-    if not imported:
-        print("Error: Could not import ANE_Model from any path")
-        sys.exit(1)
+# Ensure jq is installed
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is not installed. Please install jq to continue."
+    echo "On macOS: brew install jq"
+    echo "On Debian/Ubuntu: sudo apt-get install jq"
+    exit 1
+fi
 
-# Try to import tokenizer
-try:
-    from transformers import AutoTokenizer
-except ImportError:
-    print("Error: transformers package not found. Please install it with:")
-    print("pip install transformers")
-    sys.exit(1)
-EOF
 
-        # Part 2: Main perplexity calculation function
-        cat >> "${TEMP_SCRIPT}" << 'EOF'
+# Script directory
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+HARNESS_SCRIPT="${SCRIPT_DIR}/anelm_harness.py"
+OUTPUT_DIR="${OUTPUT_DIR_BASE}" # Use the base name, results will be in e.g. evaluate/results/
+mkdir -p "$OUTPUT_DIR"
 
-def calculate_perplexity(model_path, text_file, debug=False, chunk_size=None, safety_margin=100):
-    """Calculate perplexity for text in a file using sliding window approach."""
-    # Initialize ANE model
-    print(f"Loading model from {model_path}")
-    model = ANE_Model(model_path)
-    model.debug = 1 if debug else 0
-    
-    # Get context length from model metadata
-    ctx_length = model.metadata.get('context_length', 2048)
-    safe_length = ctx_length - safety_margin
-    print(f"Model context length: {ctx_length}")
-    print(f"Safe length with margin: {safe_length}")
-    
-    # Use provided chunk size or a default based on safe_length
-    if chunk_size is None:
-        chunk_size = min(safe_length, 512)  # Default to 512 or less if safe_length is smaller
-    chunk_size = min(chunk_size, safe_length)  # Ensure chunk_size doesn't exceed safe_length
-    print(f"Using chunk size: {chunk_size}")
-    
-    # Load tokenizer
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        if tokenizer is None:
-            raise ValueError("Tokenizer not found")
-    except Exception as e:
-        print(f"Error loading tokenizer from {model_path}: {str(e)}")
-        print("Falling back to Llama tokenizer")
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-    
-    # Read text file
-    print(f"Reading text from {text_file}")
-    try:
-        with open(text_file, 'r', encoding='utf-8') as f:
-            text = f.read()
-    except UnicodeDecodeError:
-        # Try with different encoding if UTF-8 fails
-        with open(text_file, 'r', encoding='latin-1') as f:
-            text = f.read()
-            
-    # Disable special tokens and manually add BOS if needed
-    tokens = tokenizer.encode(text, add_special_tokens=False)
-    if tokenizer.bos_token_id is not None:
-        tokens = [tokenizer.bos_token_id] + tokens
-    print(f"Text tokenized to {len(tokens)} tokens")
-    
-    # Split into manageable chunks
-    chunks = []
-    for i in range(0, len(tokens) - 1, chunk_size // 2):  # 50% overlap between chunks
-        end = min(i + chunk_size, len(tokens))
-        if end - i > 1:  # Only use chunks with at least 2 tokens
-            chunks.append(tokens[i:end])
-    
-    print(f"Split into {len(chunks)} chunks for processing")
-    
-    # Calculate log-likelihood for each chunk
-    total_log_likelihood = 0.0
-    total_tokens = 0
-    
-    # Create progress bar
-    pbar = tqdm(total=len(chunks), desc="Perplexity", unit="chunk")
-    
-    for chunk_idx, chunk in enumerate(chunks):
-        if len(chunk) <= 1:
-            pbar.update(1)
-            continue
-            
-        # Calculate midpoint - only score second half of chunk to avoid boundary issues
-        mid = len(chunk) // 2
-        # Ensure we have enough tokens to score (at least 1)
-        if mid < 1:
-            mid = 1
-        # Split inputs/targets for the scoring portion (second half of chunk)
-        inputs, targets = chunk[:mid], chunk[1:mid+1]
-        
-        try:
-            # Reset model state for this chunk
-            model.reset_state()
-            
-            # Prefill with input tokens
-            input_tensor = torch.tensor([inputs], dtype=torch.int32)
-            _ = model.prefill(input_tensor)
-            
-            # Score each target token
-            chunk_log_likelihood = 0.0
-            processed_tokens = 0
-            
-            for i, target in enumerate(targets):
-                # Get current token
-                current_token = inputs[i] if i < len(inputs) else targets[i-1]
-                
-                try:
-                    # Get log probabilities for current token
-                    token_tensor = torch.tensor([[current_token]], dtype=torch.int32)
-                    log_probs = model.compute_logprobs(token_tensor)
-                    
-                    if log_probs is None:
-                        if debug:
-                            print(f"Warning: No log probabilities for token at position {i}")
-                        continue
-                    
-                    # Score the target token
-                    token_score = log_probs[target].item()
-                    chunk_log_likelihood += token_score
-                    processed_tokens += 1
-                    
-                    # Update state if not the last token
-                    if i < len(targets) - 1:
-                        _ = model.predict(token_tensor)
-                        
-                except Exception as e:
-                    if debug:
-                        print(f"Error processing token {i} in chunk {chunk_idx}: {str(e)}")
-                    # Continue with next token
-                    continue
-            
-            # Update totals
-            if processed_tokens > 0:
-                total_log_likelihood += chunk_log_likelihood
-                total_tokens += processed_tokens
-                
-                # Update progress bar
-                current_ppl = math.exp(-chunk_log_likelihood / processed_tokens) if processed_tokens > 0 else 0
-                pbar.set_postfix(ppl=f"{current_ppl:.2f}")
-                
-        except Exception as e:
-            print(f"\nError processing chunk {chunk_idx}: {str(e)}")
-            if debug:
-                import traceback
-                traceback.print_exc()
-        
-        pbar.update(1)
-    
-    pbar.close()
-    
-    # Calculate perplexity
-    if total_tokens > 0:
-        avg_log_likelihood = total_log_likelihood / total_tokens
-        perplexity = math.exp(-avg_log_likelihood)
-        print(f"\nTotal tokens scored: {total_tokens}")
-        print(f"Average log likelihood: {avg_log_likelihood:.4f}")
-        print(f"Perplexity: {perplexity:.4f}")
-        return perplexity
-    else:
-        print("Error: No tokens were successfully processed")
-        return float('inf')
-EOF
+# Prepare model name for filenames
+MODEL_NAME_FULL=$(basename "$MODEL_PATH")
+MODEL_NAME_SAFE=$(echo "$MODEL_NAME_FULL" | tr '.' '_' | tr '/' '_') # Replace . and / with _
 
-        # Part 3: Main function
-        cat >> "${TEMP_SCRIPT}" << EOF
-if __name__ == "__main__":
-    # Get script directory from first argument if provided
-    if len(sys.argv) > 1:
-        script_dir = sys.argv[1]
-        sys.path.append(script_dir)
-        print(f"Added script directory to path: {script_dir}")
-    
-    model_path = "${MODEL_PATH}"
-    text_file = "${PERPLEXITY_TEXT}"
-    debug = ${DEBUG:+True} ${DEBUG:-False}
-    chunk_size = ${CHUNK_SIZE:+${CHUNK_SIZE##*--chunk-size }} ${CHUNK_SIZE:-None}
-    safety_margin = ${SAFETY_MARGIN}
-    
-    perplexity = calculate_perplexity(model_path, text_file, debug, chunk_size, safety_margin)
-    
-    # Save result to file
-    output_dir = "${OUTPUT_DIR}"
-    os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(output_dir, "perplexity_results.txt"), "w") as f:
-        f.write(f"Perplexity: {perplexity:.4f}\n")
-        f.write(f"Text file: {text_file}\n")
-        f.write(f"Model: {model_path}\n")
-EOF
+# Define and initialize combined JSON output file
+COMBINED_OUTPUT_FILENAME="${OUTPUT_DIR}/all_tasks_${MODEL_NAME_SAFE}_${DATE_STR}_${TIME_STR_FILENAME}.json"
+LIMIT_FOR_METADATA=${LIMIT:-"all"}
 
-        # Make the script executable
-        chmod +x "${TEMP_SCRIPT}"
-        
-        # Run the perplexity script
-        echo "Running custom perplexity calculation..."
-        SCRIPT_DIR="$(pwd)"
-        python3 "${TEMP_SCRIPT}" "${SCRIPT_DIR}"
-        
-        # Clean up
-        rm "${TEMP_SCRIPT}"
-    else
-        # Default sample text for quick testing
-        echo "Using default sample text for perplexity testing"
-        
-        # Create a simple perplexity script with default text
-        TEMP_SCRIPT="/tmp/ppl_default_$$.py"
-        cat > "${TEMP_SCRIPT}" << 'EOF'
-#!/usr/bin/env python3
-# Quick perplexity test with default text
+echo "{}" | jq \
+  --arg overall_cmd_line "$OVERALL_CMD_LINE_STR" \
+  --arg model_path "$MODEL_PATH" \
+  --arg date_str "$DATE_STR" \
+  --arg time_start "$TIME_STR_METADATA_START" \
+  --arg limit_val "$LIMIT_FOR_METADATA" \
+  --arg num_shots_val "$NUM_SHOTS" \
+  --arg batch_size_val "$BATCH_SIZE" \
+  --arg seed_val "$SEED" \
+  '.metadata.overall_cmd_line = $overall_cmd_line |
+   .metadata.model_path = $model_path |
+   .metadata.date = $date_str |
+   .metadata.time_start_run_eval = $time_start |
+   .metadata.limit_per_task = $limit_val |
+   .metadata.num_shots = $num_shots_val |
+   .metadata.batch_size = $batch_size_val |
+   .metadata.seed = $seed_val |
+   .results = {}' > "$COMBINED_OUTPUT_FILENAME"
 
-import os
-import sys
-import math
-import torch
 
-# Get the absolute path to the ANE modules
-current_script_dir = os.path.dirname(os.path.abspath("${0}"))
-sys.path.append(current_script_dir)
+# Display run parameters
+echo "=================== ANE MODEL EVALUATION ==================="
+echo "Model path:   $MODEL_PATH"
+echo "Tasks:        $TASK_LIST"
+echo "Num shots:    $NUM_SHOTS"
+echo "Batch size:   $BATCH_SIZE (for strict serial execution)"
+echo "Output dir:   $OUTPUT_DIR"
+[ "$DEBUG_MODE" = true ] && echo "Debug mode:   ENABLED"
+[ -n "$LIMIT" ] && echo "Limit:        $LIMIT samples"
+echo "Safety margin: $SAFETY_MARGIN tokens"
+echo "Seed:         $SEED"
+echo "Combined results will be saved to: $COMBINED_OUTPUT_FILENAME"
+echo "=========================================================="
 
-# Import ANE_Model - first try with absolute path
-try:
-    script_dir = "${PWD}"
-    sys.path.append(script_dir)
-    from ane_model import ANE_Model
-except ImportError:
-    print(f"Failed to import ANE_Model from {script_dir}")
-    print("Trying alternate paths...")
-    
-    # Try alternative paths
-    alt_paths = [
-        "/Users/anemll/SourceRelease/GITHUB/ML_playground/anemll/evaluate/ane",
-        os.path.dirname(os.path.abspath(__file__)),
-        os.path.abspath(".")
-    ]
-    
-    imported = False
-    for path in alt_paths:
-        try:
-            print(f"Trying path: {path}")
-            sys.path.append(path)
-            from ane_model import ANE_Model
-            print(f"Successfully imported ANE_Model from {path}")
-            imported = True
-            break
-        except ImportError:
-            continue
-    
-    if not imported:
-        print("Error: Could not import ANE_Model from any path")
-        sys.exit(1)
 
-try:
-    from transformers import AutoTokenizer
-except ImportError:
-    print("Error: transformers package not found")
-    sys.exit(1)
+echo "Running LM evaluation with ANE_Model on $TASK_LIST..."
 
-# Sample text for testing
-SAMPLE_TEXT = """
-The quick brown fox jumps over the lazy dog. This pangram contains all the letters of the English alphabet.
-Machine learning models process text by converting words into numerical representations called embeddings.
-These embeddings capture semantic relationships between words, allowing models to understand language.
-The Apple Neural Engine accelerates machine learning tasks on Apple devices, enabling efficient inference.
-"""
+# Loop through each task and run evaluation
+for TASK_NAME in $TASK_LIST; do
+    echo ""
+    echo "Running evaluation for task: $TASK_NAME"
+    # Define task-specific output path for anelm_harness.py
+    TASK_OUTPUT_PATH="${OUTPUT_DIR}/${TASK_NAME}_${MODEL_NAME_SAFE}_${DATE_STR}.json"
+    echo "Results will be saved to: $TASK_OUTPUT_PATH by the Python script."
 
-def main():
-    model_path = sys.argv[1]
-    debug = len(sys.argv) > 2 and sys.argv[2] == "True"
-    output_dir = sys.argv[3] if len(sys.argv) > 3 else "results"
-    script_dir = sys.argv[4] if len(sys.argv) > 4 else os.path.dirname(os.path.abspath(__file__))
-    
-    # Add script directory to path for importing modules
-    sys.path.append(script_dir)
-    print(f"Added script directory to path: {script_dir}")
-    
-    # Initialize model
-    print(f"Loading model from {model_path}")
-    model = ANE_Model(model_path)
-    model.debug = 1 if debug else 0
-    
-    # Load tokenizer
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-    except Exception:
-        print("Falling back to default tokenizer")
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-    
-    # Disable special tokens and manually add BOS if needed
-    tokens = tokenizer.encode(SAMPLE_TEXT, add_special_tokens=False)
-    if tokenizer.bos_token_id is not None:
-        tokens = [tokenizer.bos_token_id] + tokens
-    print(f"Sample text tokenized to {len(tokens)} tokens")
-    
-    # Calculate midpoint - only score second half to avoid boundary issues
-    mid = len(tokens) // 2
-    if mid < 1:
-        mid = 1
-    inputs, targets = tokens[:mid], tokens[1:mid+1]
-    
-    # Reset model state
-    model.reset_state()
-    
-    # Prefill with input tokens
-    input_tensor = torch.tensor([inputs], dtype=torch.int32)
-    _ = model.prefill(input_tensor)
-    
-    # Score each target token
-    total_log_likelihood = 0.0
-    total_tokens = 0
-    
-    for i, target in enumerate(targets):
-        # Get current token
-        current_token = inputs[i]
-        
-        # Get log probabilities
-        token_tensor = torch.tensor([[current_token]], dtype=torch.int32)
-        log_probs = model.compute_logprobs(token_tensor)
-        
-        if log_probs is None:
-            print(f"Warning: No log probabilities for token at position {i}")
-            continue
-        
-        # Score target token
-        try:
-            token_score = log_probs[target].item()
-            total_log_likelihood += token_score
-            total_tokens += 1
-            
-            if debug and i < 5:
-                print(f"Token {i}: {current_token} → {target}, score: {token_score:.4f}")
-            
-            # Update model state
-            if i < len(targets) - 1:
-                _ = model.predict(token_tensor)
-                
-        except Exception as e:
-            print(f"Error scoring token {target}: {str(e)}")
-    
-    # Calculate perplexity
-    if total_tokens > 0:
-        avg_log_likelihood = total_log_likelihood / total_tokens
-        perplexity = math.exp(-avg_log_likelihood)
-        print(f"\nTotal tokens scored: {total_tokens}")
-        print(f"Average log likelihood: {avg_log_likelihood:.4f}")
-        print(f"Perplexity: {perplexity:.4f}")
-        
-        # Save result
-        os.makedirs(output_dir, exist_ok=True)
-        with open(os.path.join(output_dir, "perplexity_results.txt"), "w") as f:
-            f.write(f"Sample text perplexity: {perplexity:.4f}\n")
-    else:
-        print("Error: No tokens were successfully processed")
+    PYTHON_CMD_ARGS=(
+        "--model" "$MODEL_PATH"
+        "--tasks" "$TASK_NAME" # Pass one task at a time
+        "--num-shots" "$NUM_SHOTS"
+        "--batch-size" "$BATCH_SIZE"
+        "--safety-margin" "$SAFETY_MARGIN"
+        "--download-timeout" "$DOWNLOAD_TIMEOUT"
+        "--max-retries" "$MAX_RETRIES"
+        "--seed" "$SEED"
+        "--output-dir" "$OUTPUT_DIR" # anelm_harness uses this if output-path is not set
+        "--output-path" "$TASK_OUTPUT_PATH" # Explicit output path for the Python script
+    )
 
-if __name__ == "__main__":
-    main()
-EOF
-
-        # Make the script executable
-        chmod +x "${TEMP_SCRIPT}"
-        
-        # Run the default perplexity script
-        echo "Running default sample text perplexity test..."
-        SCRIPT_DIR="$(pwd)"
-        python3 "${TEMP_SCRIPT}" "${MODEL_PATH}" "${DEBUG:+True}${DEBUG:-False}" "${OUTPUT_DIR}" "${SCRIPT_DIR}"
-        
-        # Clean up
-        rm "${TEMP_SCRIPT}"
+    if [ "$DEBUG_MODE" = true ]; then
+        PYTHON_CMD_ARGS+=("--debug")
     fi
-fi
 
-echo "Evaluation complete! Results saved to ${OUTPUT_DIR}"
-exit 0 
+    if [ -n "$LIMIT" ]; then
+        PYTHON_CMD_ARGS+=("--limit" "$LIMIT")
+    fi
+    
+    # Pass the overall run_eval.sh command line to anelm_harness.py for its metadata
+    PYTHON_CMD_ARGS+=("--cmd-line-str" "$OVERALL_CMD_LINE_STR")
+
+
+    echo "Executing: python $HARNESS_SCRIPT ... (see full command below)"
+    if [ "$DEBUG_MODE" = true ]; then
+        set -x # Print command before execution
+    fi
+    python "$HARNESS_SCRIPT" "${PYTHON_CMD_ARGS[@]}"
+    PYTHON_EXIT_CODE=$?
+    if [ "$DEBUG_MODE" = true ]; then
+        set +x
+    fi
+
+    if [ $PYTHON_EXIT_CODE -eq 0 ]; then
+        echo "Task $TASK_NAME completed. Results saved to $TASK_OUTPUT_PATH by the Python script."
+        if [ -f "$TASK_OUTPUT_PATH" ]; then
+            # Merge this task's result into the combined JSON file
+            # The content of TASK_OUTPUT_PATH is like {"task_name": {metrics_and_metadata...}}
+            # We want to add this directly to .results in COMBINED_OUTPUT_FILENAME
+            jq --slurpfile task_data "$TASK_OUTPUT_PATH" \
+               '.results += $task_data[0]' "$COMBINED_OUTPUT_FILENAME" > tmp_combined.json && mv tmp_combined.json "$COMBINED_OUTPUT_FILENAME"
+            echo "Merged results for $TASK_NAME into $COMBINED_OUTPUT_FILENAME"
+            # Optionally, remove individual task file: rm "$TASK_OUTPUT_PATH"
+        else
+            echo "Warning: Task output file $TASK_OUTPUT_PATH not found for merging, though Python script exited successfully."
+        fi
+    else
+        echo "Error: Evaluation for task $TASK_NAME failed with exit code $PYTHON_EXIT_CODE."
+        # Optionally, decide if the whole script should exit on first task failure
+    fi
+done
+
+# Calculate and print total script duration
+SCRIPT_END_TIME_SECONDS=$(date +%s)
+TOTAL_SCRIPT_DURATION_SECONDS=$((SCRIPT_END_TIME_SECONDS - SCRIPT_START_TIME_SECONDS))
+TOTAL_SCRIPT_DURATION_FORMATTED=$(format_duration $TOTAL_SCRIPT_DURATION_SECONDS)
+TIME_STR_METADATA_END=$(date +"%I:%M:%S%p")
+
+# Finalize combined JSON with overall script duration and end time
+jq --arg end_time "$TIME_STR_METADATA_END" \
+   --arg duration "$TOTAL_SCRIPT_DURATION_FORMATTED" \
+   '.metadata.time_end_run_eval = $end_time |
+    .metadata.total_duration_run_eval = $duration' "$COMBINED_OUTPUT_FILENAME" > tmp_combined.json && mv tmp_combined.json "$COMBINED_OUTPUT_FILENAME"
+
+echo ""
+echo "=========================================================="
+echo "Evaluation script run complete!"
+echo "Combined results for all tasks saved to: $COMBINED_OUTPUT_FILENAME"
+echo "Total script duration: $TOTAL_SCRIPT_DURATION_FORMATTED"
+echo "==========================================================" 
