@@ -4,6 +4,7 @@
 import numpy as np
 import torch
 import os
+import glob
 from transformers import AutoTokenizer
 from anemll.models.qwen_model import QwenForCausalLM, QwenConfig
 import warnings
@@ -13,12 +14,19 @@ def test_kvcache_without_prefill():
     print("🔬 KV Cache Test - No Prefill (Single Token Generation Only)")
     print("=" * 80)
     
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B", trust_remote_code=True)
+    # Find model path
+    model_path = "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/"
+    model_dirs = glob.glob(os.path.expanduser(model_path + "*"))
+    if not model_dirs:
+        print("❌ Error: Qwen model not found in cache")
+        return False
     
-    # Load PyTorch Qwen model
-    model_path = os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/e6de91484c29aa9480d55605af694f39b081c455/")
-    config = QwenConfig.from_json(os.path.join(model_path, 'config.json'))
+    model_dir = model_dirs[0]
+    print(f"Using model from: {model_dir}")
+    
+    # Load tokenizer and config
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
+    config = QwenConfig.from_json(os.path.join(model_dir, 'config.json'))
     
     # CoreML-style fixed window parameters
     CONTEXT_LENGTH = 256  # Fixed context window size (matches model's state_length)
@@ -51,22 +59,23 @@ def test_kvcache_without_prefill():
         padded_tokens = original_tokens + [PAD_TOKEN_ID] * (CONTEXT_LENGTH - seq_len)
         padded_input_ids = torch.tensor([padded_tokens], dtype=torch.long, device=TEST_DEVICE)
         
-        # Create position IDs for full context
-        position_ids = torch.arange(CONTEXT_LENGTH, dtype=torch.long, device=TEST_DEVICE)
+        # For single token processing (CoreML style), we only care about the last real token position
+        position_ids = torch.tensor([seq_len - 1], dtype=torch.long, device=TEST_DEVICE)  # Single position
         
         # Current position is the last position of actual content
         current_pos = torch.tensor([seq_len - 1], dtype=torch.long, device=TEST_DEVICE)
         
-        # Create full-sized causal mask (CoreML style)
-        causal_mask = torch.zeros((1, 1, CONTEXT_LENGTH, CONTEXT_LENGTH), dtype=MODEL_DTYPE, device=TEST_DEVICE)
-        for i in range(CONTEXT_LENGTH):
-            for j in range(i + 1, CONTEXT_LENGTH):
-                causal_mask[0, 0, i, j] = float('-inf')
+        # Create single-row causal mask for single token (CoreML style)
+        # For single token processing, we need [1, 1, 1, CONTEXT_LENGTH] shape
+        causal_mask = torch.zeros((1, 1, 1, CONTEXT_LENGTH), dtype=MODEL_DTYPE, device=TEST_DEVICE)
+        # Allow attention to positions up to current position (seq_len - 1)
+        # Block attention to future positions 
+        for j in range(seq_len, CONTEXT_LENGTH):
+            causal_mask[0, 0, 0, j] = float('-inf')
         
-        # Create update mask - only update positions with actual content
+        # Create update mask for single token processing
         update_mask = torch.zeros((1, 1, CONTEXT_LENGTH, 1), dtype=MODEL_DTYPE, device=TEST_DEVICE)
-        for i in range(seq_len):
-            update_mask[0, 0, i, 0] = 1.0
+        update_mask[0, 0, seq_len - 1, 0] = 1.0  # Only update the last real token position
         
         print(f"    input_ids shape: {padded_input_ids.shape}")
         print(f"    update_mask shape: {update_mask.shape}")
@@ -78,7 +87,7 @@ def test_kvcache_without_prefill():
         print(f"🟢 Method 1: Disable KV Cache (CoreML fixed window simulation)")
         
         model_no_cache = QwenForCausalLM(config, enable_coreml=False, disable_kv_cache=True)
-        model_no_cache.load_pretrained_weights(model_path)
+        model_no_cache.load_pretrained_weights(model_dir)
         model_no_cache.eval()
         
         with torch.no_grad():
@@ -108,7 +117,7 @@ def test_kvcache_without_prefill():
         print(f"🔴 Method 2: Enable KV Cache (CoreML fixed window simulation)")
         
         model_kv_cache = QwenForCausalLM(config, enable_coreml=False, disable_kv_cache=False)
-        model_kv_cache.load_pretrained_weights(model_path)
+        model_kv_cache.load_pretrained_weights(model_dir)
         model_kv_cache.eval()
         model_kv_cache.model.kv_cache_0.zero_()  # Start with clean cache
         
@@ -132,7 +141,7 @@ def test_kvcache_without_prefill():
         print(f"🟡 Method 3: KV Cache with Incremental Processing (CoreML style)")
         
         model_kv_cache3 = QwenForCausalLM(config, enable_coreml=False, disable_kv_cache=False)
-        model_kv_cache3.load_pretrained_weights(model_path)
+        model_kv_cache3.load_pretrained_weights(model_dir)
         model_kv_cache3.eval()
         model_kv_cache3.model.kv_cache_0.zero_()  # Start with clean cache
         
@@ -209,6 +218,8 @@ def test_kvcache_without_prefill():
                     print(f"      {marker} {i+1}. {token_id.item()}: '{tokenizer.decode([token_id.item()])}' (logit: {logit.item():.3f})")
         
         print()
+    
+    return True
 
 if __name__ == "__main__":
     from anemll.models.qwen_model import TEST_DEVICE, MODEL_DTYPE

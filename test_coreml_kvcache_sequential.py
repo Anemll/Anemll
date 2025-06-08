@@ -6,6 +6,7 @@ import torch
 import numpy as np
 import argparse
 import os
+import glob
 from pathlib import Path
 import coremltools as ct
 from transformers import AutoTokenizer
@@ -134,21 +135,53 @@ def generate_next_token_coreml(model, token_id, position, causal_mask, metadata,
         model, token_id, position, causal_mask, state
     )
     
-    # Extract logits from output
-    if 'logits' in output:
+    # Extract logits from output - handle multiple logits parts
+    num_logits = metadata.get('num_logits', 16)
+    
+    # Try to extract and concatenate logits1-N (like in other tests)
+    if 'logits1' in output:
+        print(f"    Found chunked logits output (logits1-{num_logits})")
+        logits_parts = []
+        for i in range(1, num_logits + 1):
+            key = f'logits{i}'
+            if key in output:
+                part = output[key]
+                print(f"      {key}: shape {part.shape}")
+                logits_parts.append(part)
+        
+        if len(logits_parts) == num_logits:
+            # Concatenate along vocab dimension  
+            logits = np.concatenate(logits_parts, axis=-1)
+            print(f"    Concatenated logits shape: {logits.shape}")
+        else:
+            raise ValueError(f"Expected {num_logits} logits parts, got {len(logits_parts)}")
+            
+    elif 'logits' in output:
         logits = output['logits']
+        print(f"    Found single logits output: {logits.shape}")
     elif 'output_logits' in output:
         logits = output['output_logits']
+        print(f"    Found output_logits: {logits.shape}")
     else:
+        # Debug: print all available keys
+        print(f"    Available output keys: {list(output.keys())}")
         # Try to find any logits output
         logits_keys = [k for k in output.keys() if 'logits' in k.lower()]
         if logits_keys:
             logits = output[logits_keys[0]]
+            print(f"    Using fallback logits key '{logits_keys[0]}': {logits.shape}")
         else:
             raise ValueError(f"Could not find logits in model output. Available keys: {list(output.keys())}")
     
-    # Get next token (greedy sampling)
-    next_token = np.argmax(logits[0, -1, :])
+    # Get next token (greedy sampling) - use last position for single token output
+    if logits.ndim == 3:
+        # Shape: [batch, seq_len, vocab_size] - use last position
+        next_token = np.argmax(logits[0, -1, :])
+    elif logits.ndim == 2:
+        # Shape: [batch, vocab_size] - direct indexing
+        next_token = np.argmax(logits[0, :])
+    else:
+        raise ValueError(f"Unexpected logits shape: {logits.shape}")
     
     print(f"    Total: {processing_time*1000:.1f}ms")
     
@@ -179,9 +212,20 @@ def test_coreml_kv_cache_sequential():
         # Extract metadata
         metadata = extract_metadata(model)
         
-        # Load tokenizer using Hugging Face model identifier
-        print(f"\n🔧 Loading Qwen tokenizer: {args.tokenizer}")
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=False, trust_remote_code=True)
+        # Find model path for tokenizer
+        print(f"\n🔧 Finding Qwen model for tokenizer...")
+        model_path = "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/"
+        model_dirs = glob.glob(os.path.expanduser(model_path + "*"))
+        if not model_dirs:
+            print("❌ Error: Qwen model not found in cache")
+            return False
+        
+        model_dir = model_dirs[0]
+        print(f"Using model from: {model_dir}")
+        
+        # Load tokenizer from local model directory
+        print(f"🔧 Loading Qwen tokenizer from local cache...")
+        tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
         print(f"✅ Loaded tokenizer: {tokenizer.__class__.__name__}")
         
         # Create unified state
@@ -237,13 +281,14 @@ def test_coreml_kv_cache_sequential():
         inference_times = []
         current_pos = len(input_ids)
         
-        # Get the last input token to start generation
-        current_token = input_ids[-1]
+        # Start with the last input token for the first generation step
+        current_token = input_ids[-1] if input_ids else 0
         
         inference_start = time.time()
         
         for gen_step in range(max_new_tokens):
             print(f"\nGeneration step {gen_step+1}/{max_new_tokens}:")
+            print(f"    Input token: {current_token} ('{tokenizer.decode([current_token])}')")
             
             next_token, token_time = generate_next_token_coreml(
                 model, current_token, current_pos, causal_mask, metadata, state
@@ -251,6 +296,8 @@ def test_coreml_kv_cache_sequential():
             
             generated_tokens.append(next_token)
             inference_times.append(token_time)
+            
+            # Update for next iteration: use the generated token as input for the next step
             current_token = next_token
             current_pos += 1
             

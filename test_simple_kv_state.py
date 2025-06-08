@@ -22,7 +22,8 @@ def create_causal_mask(context_length):
     return mask
 
 def initialize_kv_state(model):
-    """Initialize KV cache state (similar to create_unified_state in chat.py)."""
+    """Initialize KV cache state (similar to create_unified_state 
+    in chat.py)."""
     # Zero out the KV cache to create clean state
     if hasattr(model.model, 'kv_cache_0'):
         model.model.kv_cache_0.zero_()
