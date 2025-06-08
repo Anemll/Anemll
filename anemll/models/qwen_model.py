@@ -525,6 +525,7 @@ class QwenModel(nn.Module):
     def __init__(self, config: QwenConfig) -> None:
         super().__init__()
         self.config = config
+        self.disable_kv_cache = False  # Will be set by parent model
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size).to(
             TEST_DEVICE
         )
@@ -642,48 +643,136 @@ class QwenModel(nn.Module):
         """Process a single transformer layer in regular (non-prefill) mode"""
         layer = self.layers[layer_idx]
         batch_size = position_ids.shape[0]
+        seq_len = hidden_states.shape[1]
 
         normalized_states = layer.input_layernorm(hidden_states)
         
-        # Get query, key and value states for regular processing
-        query_states, key_states, value_states = layer.self_attn.get_new_kv_cache(
-            normalized_states,
-            current_pos,
-            rotary_emb
-        )
-
-        # Get group indices
-        group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
-
-        # Get the combined KV cache for this group
-        if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
-            kv_cache = getattr(self, "kv_cache_0")
+        # Choose appropriate method based on sequence length
+        if seq_len == 1:
+            # Single token - use the single token method
+            query_states, key_states, value_states = layer.self_attn.get_new_kv_cache(
+                normalized_states,
+                current_pos,
+                rotary_emb
+            )
         else:
-            kv_cache = getattr(self, f"kv_cache_{group_idx}")
+            # Multi-token - use the prefill method 
+            query_states, key_states, value_states = layer.self_attn.get_new_kv_cache_prefill(
+                normalized_states,
+                current_pos,
+                rotary_emb
+            )
 
-        key_idx = layer_in_group_idx
-        value_idx = layer_in_group_idx + layers_per_group
+        if not self.disable_kv_cache:
+            # Standard KV cache path
+            # Get group indices
+            group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
 
-        pos = current_pos            
-        #kv_cache[key_idx, :, pos, :] = key_states.squeeze(0).squeeze(1)  # Remove batch and seq dims
-        #kv_cache[value_idx, :, pos, :] = value_states.squeeze(0).squeeze(1)  # Remove batch and seq dims
+            # Get the combined KV cache for this group
+            if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
+                kv_cache = getattr(self, "kv_cache_0")
+            else:
+                kv_cache = getattr(self, f"kv_cache_{group_idx}")
 
-        kv_cache[key_idx:key_idx + 1, :, pos:pos + 1, :] = key_states
-        kv_cache[value_idx:value_idx + 1, :, pos:pos + 1, :] = value_states
+            key_idx = layer_in_group_idx
+            value_idx = layer_in_group_idx + layers_per_group
 
-        
-        # Get the key and value states for this layer from the merged cache
-        key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
-        value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+            if seq_len == 1:
+                # Single token storage
+                pos = current_pos            
+                kv_cache[key_idx:key_idx + 1, :, pos:pos + 1, :] = key_states
+                kv_cache[value_idx:value_idx + 1, :, pos:pos + 1, :] = value_states
+            else:
+                # Multi-token storage (like prefill)
+                pos = current_pos.item() if isinstance(current_pos, torch.Tensor) else current_pos
+                kv_cache[key_idx:key_idx + 1, :, pos:pos + seq_len, :] = key_states
+                kv_cache[value_idx:value_idx + 1, :, pos:pos + seq_len, :] = value_states
 
-        # Run attention with the updated KV cache
-        attn_output = layer.self_attn.forward_regular(
-            hidden_states=normalized_states,
-            query_states=query_states,
-            kv_cache_layer=(key_cache, value_cache),
-            causal_mask=causal_mask,
-            current_pos=current_pos,
-        )
+            
+            # Get the key and value states for this layer from the merged cache
+            key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+            value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+
+            # Run attention with the updated KV cache
+            if seq_len == 1:
+                attn_output = layer.self_attn.forward_regular(
+                    hidden_states=normalized_states,
+                    query_states=query_states,
+                    kv_cache_layer=(key_cache, value_cache),
+                    causal_mask=causal_mask,
+                    current_pos=current_pos,
+                )
+            else:
+                # For multi-token sequences, adjust causal mask to match cache dimensions
+                cache_len = self.config.state_length
+                adjusted_causal_mask = torch.zeros((1, 1, seq_len, cache_len), dtype=MODEL_DTYPE, device=TEST_DEVICE)
+                
+                # Apply causal mask only to the positions we're using (pos:pos+seq_len)
+                pos = current_pos.item() if isinstance(current_pos, torch.Tensor) else current_pos
+                for i in range(seq_len):
+                    for j in range(pos + i + 1, pos + seq_len):
+                        if j < cache_len:  # Make sure we don't go out of bounds
+                            adjusted_causal_mask[0, 0, i, j] = float('-inf')
+                
+                attn_output = layer.self_attn.forward_prefill(
+                    hidden_states=normalized_states,
+                    query_states=query_states,
+                    kv_cache_layer=(key_cache, value_cache),
+                    causal_mask=adjusted_causal_mask,
+                )
+        else:
+            # No KV cache path - use the computed K/V directly without cache
+            # Repeat KV for multi-head attention (same logic as forward_regular)
+            n_rep = layer.self_attn.num_heads // layer.self_attn.num_kv_heads
+            
+            # Create fake cache with just current K/V for attention computation
+            fake_key_cache = torch.zeros((layer.self_attn.num_kv_heads, self.config.state_length, layer.self_attn.head_dim), 
+                                       dtype=MODEL_DTYPE, device=TEST_DEVICE)
+            fake_value_cache = torch.zeros((layer.self_attn.num_kv_heads, self.config.state_length, layer.self_attn.head_dim), 
+                                         dtype=MODEL_DTYPE, device=TEST_DEVICE)
+            
+            # Place current K/V at the correct position
+            pos = current_pos.item() if isinstance(current_pos, torch.Tensor) else current_pos
+            if seq_len == 1:
+                fake_key_cache[:, pos:pos+1, :] = key_states.squeeze(0)
+                fake_value_cache[:, pos:pos+1, :] = value_states.squeeze(0)
+            else:
+                fake_key_cache[:, pos:pos+seq_len, :] = key_states.squeeze(0)
+                fake_value_cache[:, pos:pos+seq_len, :] = value_states.squeeze(0)
+            
+            # For disable KV cache, create a causal mask that only covers the actual sequence
+            # This avoids dimension mismatches with the full cache size
+            if seq_len == 1:
+                # Single token - use original causal mask logic
+                adjusted_causal_mask = causal_mask
+            else:
+                # Multi-token - create a causal mask that covers the full cache length
+                # but only applies causal restriction to the actual sequence positions
+                cache_len = self.config.state_length
+                adjusted_causal_mask = torch.zeros((1, 1, seq_len, cache_len), dtype=MODEL_DTYPE, device=TEST_DEVICE)
+                
+                # Apply causal mask only to the positions we're using (pos:pos+seq_len)
+                for i in range(seq_len):
+                    for j in range(pos + i + 1, pos + seq_len):
+                        if j < cache_len:  # Make sure we don't go out of bounds
+                            adjusted_causal_mask[0, 0, i, j] = float('-inf')
+            
+            # Run attention with fake cache (same computation as forward_regular/prefill)
+            if seq_len == 1:
+                attn_output = layer.self_attn.forward_regular(
+                    hidden_states=normalized_states,
+                    query_states=query_states,
+                    kv_cache_layer=(fake_key_cache, fake_value_cache),
+                    causal_mask=adjusted_causal_mask,
+                    current_pos=current_pos,
+                )
+            else:
+                attn_output = layer.self_attn.forward_prefill(
+                    hidden_states=normalized_states,
+                    query_states=query_states,
+                    kv_cache_layer=(fake_key_cache, fake_value_cache),
+                    causal_mask=adjusted_causal_mask,
+                )
 
         hidden_states = hidden_states + attn_output
 
@@ -836,6 +925,8 @@ class QwenForCausalLM(nn.Module):
         self.enable_coreml = enable_coreml
         self.disable_kv_cache = disable_kv_cache or DISABLE_KV_CACHE
         self.model = QwenModel(config)
+        # Set the disable_kv_cache flag on the model
+        self.model.disable_kv_cache = self.disable_kv_cache
         
         # Initialize lm_head as Conv2d for ANE optimization following llama_model.py pattern
         if ENABLE_CONV2D:
@@ -891,18 +982,15 @@ class QwenForCausalLM(nn.Module):
             ), "position_ids length must match input_ids in prefill"
 
         if self.disable_kv_cache:
-            # Simple forward path without KV cache
-            hidden_states = self.model.embed_tokens(input_ids)
-            
-            for layer in self.model.layers:
-                hidden_states = layer(
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    current_pos,
-                )
-            
-            hidden_states = self.model.norm(hidden_states)
+            # Use the same forward path as KV cache, but without cache operations
+            # This ensures identical attention computation
+            hidden_states = self.model(
+                input_ids,
+                causal_mask,
+                position_ids,
+                current_pos,
+                IN_PREFILL=IN_PREFILL,
+            )
         else:
             # Standard KV cache path
             hidden_states = self.model(
