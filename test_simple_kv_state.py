@@ -26,7 +26,7 @@ def initialize_kv_state(model):
     # Zero out the KV cache to create clean state
     if hasattr(model.model, 'kv_cache_0'):
         model.model.kv_cache_0.zero_()
-        print(f"✅ Initialized KV cache state with shape: {model.model.kv_cache_0.shape}")
+        print(f" Initialized KV cache state with shape: {model.model.kv_cache_0.shape}")
         return model.model.kv_cache_0
     else:
         print("❌ No KV cache found in model")

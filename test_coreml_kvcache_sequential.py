@@ -65,15 +65,15 @@ def load_coreml_model(path, function_name=None):
 def extract_metadata(model):
     """Extract metadata from CoreML model."""
     metadata = {
-        'context_length': 512,
-        'state_length': 512,
+        'context_length': 256,
+        'state_length': 256,
         'batch_size': 64,
-        'num_logits': 8
+        'num_logits': 16
     }
     
     if hasattr(model, 'user_defined_metadata'):
         meta = model.user_defined_metadata
-        metadata['context_length'] = int(meta.get('com.anemll.context_length', 512))
+        metadata['context_length'] = int(meta.get('com.anemll.context_length', 256))
         metadata['state_length'] = int(meta.get('com.anemll.state_length', metadata['context_length']))
         metadata['batch_size'] = int(meta.get('com.anemll.batch_size', 64))
         

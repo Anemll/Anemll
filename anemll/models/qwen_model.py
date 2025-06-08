@@ -316,6 +316,10 @@ class QwenAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
         value_states = self.v_proj(hidden_states).view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
         
+        # Apply query and key normalization (critical for Qwen!)
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+        
         # Use provided rotary embeddings (single token version)
         cos, sin = rotary_emb
         query_states, key_states = apply_rotary_pos_emb_single(query_states, key_states, cos, sin)
@@ -339,6 +343,10 @@ class QwenAttention(nn.Module):
         query_states = query_states.view(1, self.num_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)  # [1, num_heads, seq_len, head_dim]
         key_states = key_states.view(1, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)  # [1, num_kv_heads, seq_len, head_dim]
         value_states = value_states.view(1, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)  # [1, num_kv_heads, seq_len, head_dim]
+
+        # Apply query and key normalization (critical for Qwen!)
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
 
         # Get rotary embeddings for all positions at once
         cos, sin = rotary_emb
@@ -425,9 +433,9 @@ class QwenAttention(nn.Module):
         if causal_mask is not None:
             # Match the causal mask to the actual dimensions being used
             q_seq_len = query_states.shape[-2]  # Query sequence length (usually 1 for single token)
-            k_seq_len = key_states.shape[-2]   # Key sequence length (cache length)
+            k_seq_len = key_states.shape[-2]   # Key sequence length (actual filled cache length)
             attn_weights = attn_weights + causal_mask.to(MODEL_DTYPE)[:, :, :q_seq_len, :k_seq_len]
-        
+
         # Optimized softmax for batch_size=1
         attn_weights = torch.softmax(attn_weights, dim=-1)
         
@@ -656,15 +664,13 @@ class QwenModel(nn.Module):
         key_idx = layer_in_group_idx
         value_idx = layer_in_group_idx + layers_per_group
 
-        # CRITICAL FIX: Store current K/V in cache BEFORE getting cache for attention
-        # Ensure proper tensor assignment with explicit indexing
-        if isinstance(current_pos, torch.Tensor):
-            pos = current_pos.item()
-        else:
-            pos = current_pos
-            
-        kv_cache[key_idx, :, pos, :] = key_states.squeeze(0).squeeze(1)  # Remove batch and seq dims
-        kv_cache[value_idx, :, pos, :] = value_states.squeeze(0).squeeze(1)  # Remove batch and seq dims
+        pos = current_pos            
+        #kv_cache[key_idx, :, pos, :] = key_states.squeeze(0).squeeze(1)  # Remove batch and seq dims
+        #kv_cache[value_idx, :, pos, :] = value_states.squeeze(0).squeeze(1)  # Remove batch and seq dims
+
+        kv_cache[key_idx:key_idx + 1, :, pos:pos + 1, :] = key_states
+        kv_cache[value_idx:value_idx + 1, :, pos:pos + 1, :] = value_states
+
         
         # Get the key and value states for this layer from the merged cache
         key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
