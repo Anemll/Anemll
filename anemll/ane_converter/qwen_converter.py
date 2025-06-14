@@ -54,7 +54,7 @@ class QwenConverter(BaseConverter):
         self.num_chunks = num_chunks
 
     @staticmethod
-    def GetTransformerStates(model, part=None, prefix="model.model."):
+    def GetTransformerStates(model, part=None, prefix="model."):
         """Get the transformer states for CoreML conversion"""
         head_dim = getattr(
             model.config,
@@ -288,7 +288,7 @@ class QwenConverter(BaseConverter):
                 ct.TensorType(name="logits15", dtype=np.float16),
                 ct.TensorType(name="logits16", dtype=np.float16),
             ],
-            states=self.GetTransformerStates(model, part=None, prefix="model.model."),
+            states=self.GetTransformerStates(model, part=None, prefix="model."),
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
@@ -421,7 +421,7 @@ class QwenConverter(BaseConverter):
                 super().__init__()
                 self.model = model.model
                 self.states = QwenConverter.GetTransformerStates(
-                    model, part="2", prefix="model.model."
+                    model, part="2", prefix="model."
                 )
 
             def forward(self, hidden_states, position_ids, causal_mask, current_pos):
@@ -505,7 +505,7 @@ class QwenConverter(BaseConverter):
                 super().__init__()
                 self.model = model.model
                 self.states = QwenConverter.GetTransformerStates(
-                    model, part="2_prefill", prefix="model.model."
+                    model, part="2_prefill", prefix="model."
                 )
 
             def forward(self, hidden_states, position_ids, causal_mask, current_pos):
@@ -607,7 +607,7 @@ class QwenConverter(BaseConverter):
             ) -> torch.Tensor:
                 # Prefill mode: only process transformer layers, skip embeddings and LM head
                 # This updates KV cache state without generating logits
-                return self.model.model.forward_prefill(
+                return self.model.forward_prefill(
                     hidden_states=hidden_states,
                     position_ids=position_ids,
                     causal_mask=causal_mask,
@@ -680,9 +680,7 @@ class QwenConverter(BaseConverter):
                     name="output_hidden_states", dtype=np.float16
                 ),  # Only output hidden states, no logits
             ],
-            states=self.GetTransformerStates(
-                model, part="prefill", prefix="model.model."
-            ),
+            states=self.GetTransformerStates(model, part="prefill", prefix="model."),
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
