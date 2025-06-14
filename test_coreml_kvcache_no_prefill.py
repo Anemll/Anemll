@@ -12,27 +12,79 @@ from anemll.models.qwen_model import QwenForCausalLM, QwenConfig
 import warnings
 warnings.filterwarnings('ignore')
 
+def compile_model_if_needed(mlpackage_path):
+    """Compile .mlpackage to .mlmodelc if needed and return the compiled path."""
+    mlpackage_path = Path(mlpackage_path)
+    mlmodelc_path = mlpackage_path.with_suffix('.mlmodelc')
+    
+    # If .mlmodelc exists and is newer than .mlpackage, use it
+    if mlmodelc_path.exists():
+        if mlpackage_path.exists():
+            if mlmodelc_path.stat().st_mtime >= mlpackage_path.stat().st_mtime:
+                print(f"Using existing compiled model: {mlmodelc_path}")
+                return str(mlmodelc_path)
+            else:
+                print(f"Compiled model is older than package, recompiling...")
+        else:
+            print(f"Using existing compiled model: {mlmodelc_path}")
+            return str(mlmodelc_path)
+    
+    # Need to compile
+    if not mlpackage_path.exists():
+        raise FileNotFoundError(f"Model package not found: {mlpackage_path}")
+    
+    print(f"Compiling {mlpackage_path} to {mlmodelc_path}...")
+    
+    # Remove existing .mlmodelc if it exists
+    if mlmodelc_path.exists():
+        import shutil
+        shutil.rmtree(mlmodelc_path)
+        print(f"Removed existing {mlmodelc_path}")
+    
+    # Compile using xcrun coremlcompiler
+    import subprocess
+    try:
+        cmd = ["xcrun", "coremlcompiler", "compile", str(mlpackage_path), str(mlpackage_path.parent)]
+        print(f"Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print(f"✅ Successfully compiled to {mlmodelc_path}")
+        return str(mlmodelc_path)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Compilation failed: {e}")
+        print(f"stdout: {e.stdout}")
+        print(f"stderr: {e.stderr}")
+        print(f"Falling back to .mlpackage")
+        return str(mlpackage_path)
+
 def load_coreml_model(path):
-    """Load CoreML model with proper error handling."""
+    """Load CoreML model with compilation support and proper error handling."""
     path = Path(path)
     
-    # Try different path variations
+    # Try different path variations, prefer .mlpackage for compilation
     candidates = [
-        path,
-        path.with_suffix('.mlmodelc'),
         path.with_suffix('.mlpackage'),
+        path.with_suffix('.mlmodelc'),
+        Path(str(path) + '.mlpackage'),
         Path(str(path) + '.mlmodelc'),
-        Path(str(path) + '.mlpackage')
+        path.with_suffix(''),
+        path
     ]
     
     for candidate in candidates:
         if candidate.exists():
             print(f"Found CoreML model at: {candidate}")
             try:
-                if candidate.suffix == '.mlmodelc':
-                    return ct.models.CompiledMLModel(str(candidate), ct.ComputeUnit.CPU_AND_NE)
+                # If it's a .mlpackage, try to compile to .mlmodelc first
+                if candidate.suffix == '.mlpackage':
+                    model_path = compile_model_if_needed(candidate)
                 else:
-                    return ct.models.MLModel(str(candidate), compute_units=ct.ComputeUnit.CPU_AND_NE)
+                    model_path = str(candidate)
+                
+                final_path = Path(model_path)
+                if final_path.suffix == '.mlmodelc':
+                    return ct.models.CompiledMLModel(str(final_path), ct.ComputeUnit.CPU_AND_NE)
+                else:
+                    return ct.models.MLModel(str(final_path), compute_units=ct.ComputeUnit.CPU_AND_NE)
             except Exception as e:
                 print(f"Failed to load {candidate}: {e}")
                 continue

@@ -924,6 +924,13 @@ class QwenForCausalLM(nn.Module):
         self.config = config
         self.enable_coreml = enable_coreml
         self.disable_kv_cache = disable_kv_cache or DISABLE_KV_CACHE
+        
+        # Update global ENABLE_COREML flag when instance is created with enable_coreml=True
+        if enable_coreml:
+            global ENABLE_COREML
+            ENABLE_COREML = True
+            print(f"Set global ENABLE_COREML = {ENABLE_COREML} for CoreML conversion")
+        
         self.model = QwenModel(config)
         # Set the disable_kv_cache flag on the model
         self.model.disable_kv_cache = self.disable_kv_cache
@@ -974,12 +981,13 @@ class QwenForCausalLM(nn.Module):
         IN_PREFILL: bool = False,
     ) -> torch.Tensor:
         assert len(input_ids.shape) == 2, "input_ids must be 2D"
-        if not IN_PREFILL:
-            assert position_ids.ndim in (1, 2), "position_ids must be 1D or 2D"
-        else:
-            assert (
-                position_ids.shape[-1] == input_ids.shape[-1]
-            ), "position_ids length must match input_ids in prefill"
+        if not ENABLE_COREML:
+            if not IN_PREFILL:
+                assert position_ids.ndim in (1, 2), "position_ids must be 1D or 2D"
+            else:
+                assert (
+                    position_ids.shape[-1] == input_ids.shape[-1]
+                ), "position_ids length must match input_ids in prefill"
 
         if self.disable_kv_cache:
             # Use the same forward path as KV cache, but without cache operations

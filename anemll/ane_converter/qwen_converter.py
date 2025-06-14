@@ -13,6 +13,7 @@ from typing import Optional
 import numpy as np
 import torch
 import coremltools as ct
+import coremltools.optimize as cto
 
 from .base_converter import BaseConverter
 from ..models.qwen_model import (
@@ -67,16 +68,64 @@ class QwenConverter(BaseConverter):
         ]
         return states
 
+    def postprocess(self, num_workers=None):
+        """Apply LUT quantization if configured.
+        
+        Args:
+            num_workers: Optional number of workers for parallel processing.
+                        If None, uses default single worker.
+        """
+        if self.converted_model is not None and self.lut_bits is not None:
+            print(f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)...")
+            try:
+                # Set up quantization config
+                config = cto.coreml.OptimizationConfig(
+                    global_config=cto.coreml.OpPalettizerConfig(
+                        mode="kmeans",
+                        nbits=self.lut_bits,
+                        granularity="per_grouped_channel",
+                        group_size=self.per_channel,
+                        num_kmeans_workers=num_workers if num_workers is not None else 1  # Use provided workers or default to 1
+                    ),
+                )
+                
+                # Apply quantization
+                self.converted_model = cto.coreml.palettize_weights(self.converted_model, config)
+                print(f"✅ LUT quantization completed successfully")
+                
+            except Exception as e:
+                print(f"❌ LUT quantization failed: {str(e)}")
+                print("Continuing without quantization...")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def convert(self) -> ct.models.MLModel:
-        """Convert the wrapped model to CoreML format."""
-        print("QwenConverter.convert() called")
+    def convert(self, part: str = "full") -> ct.models.MLModel:
+        """Convert the wrapped model to CoreML format.
+        
+        Args:
+            part: Which part of the model to convert:
+                 "full" - complete model (default)
+                 "prefill" - prefill mode for initial sequence processing
+                 "embeddings" - embeddings only (input_ids -> hidden_states)
+                 
+        Returns:
+            ct.models.MLModel: Converted model
+        """
+        print(f"QwenConverter.convert() called with part={part}")
         print("Calling preprocess()...")
         self.preprocess()
-        print("Calling convert_to_coreml()...")
-        mlmodel = self.convert_to_coreml(self.model)
+        
+        if part == "prefill":
+            print("Converting prefill mode...")
+            mlmodel = self.convert_prefill(self.model)
+        elif part == "embeddings":
+            print("Converting embeddings...")
+            mlmodel = self.convert_embeddings(self.model)
+        else:
+            print("Converting full model...")
+            mlmodel = self.convert_to_coreml(self.model)
+            
         print("Calling postprocess()...")
         self.postprocess()
         print("QwenConverter.convert() completed")
@@ -187,6 +236,180 @@ class QwenConverter(BaseConverter):
         )
         print("CoreML conversion completed!")
 
+        # Apply LUT quantization if specified
+        if self.lut_bits:
+            self.converted_model = mlmodel  # Set for postprocess
+            self.postprocess(num_workers=8)  # Allow passing num_workers if needed
+            mlmodel = self.converted_model
+
+        return mlmodel
+
+    def convert_prefill(self, model: QwenForCausalLM) -> ct.models.MLModel:
+        """Convert Qwen model to CoreML format for prefill mode.
+        
+        Args:
+            model: The Qwen model to convert
+            
+        Returns:
+            ct.models.MLModel: Converted model for prefill processing
+        """
+        print("Converting Qwen model for prefill mode...")
+
+        class PrefillWrapper(torch.nn.Module):
+            def __init__(self, model: QwenForCausalLM, context_length: int, batch_size: int) -> None:
+                super().__init__()
+                self.model = model
+                self.context_length = context_length
+                self.batch_size = batch_size
+
+            def forward(
+                self,
+                hidden_states: torch.Tensor,
+                position_ids: torch.Tensor,
+                causal_mask: torch.Tensor,
+                current_pos: torch.Tensor,
+            ) -> torch.Tensor:
+                # Prefill mode: only process transformer layers, skip embeddings and LM head
+                # This updates KV cache state without generating logits
+                return self.model.model.forward_prefill(
+                    hidden_states=hidden_states,
+                    position_ids=position_ids,
+                    causal_mask=causal_mask,
+                    current_pos=current_pos,
+                )
+
+        wrapper = PrefillWrapper(model, self.context_length, self.batch_size)
+        wrapper.eval()
+        print("Prefill wrapper model created and set to eval mode")
+
+        print("Preparing prefill model inputs for tracing...")
+        # Use batch_size for prefill mode (multiple tokens at once)
+        # Input is hidden_states instead of input_ids (skip embeddings)
+        sample_hidden_states = torch.zeros((1, self.batch_size, model.config.hidden_size), dtype=torch.float16, device=TEST_DEVICE)  # [1, batch_size, hidden_size]
+        sample_position_ids = torch.zeros((self.batch_size,), dtype=torch.int32, device=TEST_DEVICE)  # [batch_size] 
+        sample_causal_mask = torch.zeros((1, 1, self.batch_size, self.context_length), dtype=torch.float16, device=TEST_DEVICE)  # [1, 1, batch_size, context_length]
+        sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)  # [1] - current position
+        
+        print("Prefill sample inputs created")
+        print(f"sample_hidden_states shape: {sample_hidden_states.shape}")
+        print(f"sample_position_ids shape: {sample_position_ids.shape}")
+        print(f"sample_causal_mask shape: {sample_causal_mask.shape}")
+        print(f"sample_current_pos shape: {sample_current_pos.shape}")
+
+        print("Starting torch.jit.trace for prefill...")
+        traced = torch.jit.trace(
+            wrapper,
+            (
+                sample_hidden_states,
+                sample_position_ids,
+                sample_causal_mask,
+                sample_current_pos,
+            ),
+        )
+        print("torch.jit.trace for prefill completed!")
+
+        print("Starting CoreML conversion for prefill...")
+        mlmodel = ct.convert(
+            traced,
+            inputs=[
+                ct.TensorType(
+                    name="hidden_states", shape=sample_hidden_states.shape, dtype=np.float16
+                ),
+                ct.TensorType(
+                    name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
+                ),
+                ct.TensorType(
+                    name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
+                ),
+                ct.TensorType(
+                    name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
+                ),
+            ],
+            outputs=[
+                ct.TensorType(name="output_hidden_states", dtype=np.float16),  # Only output hidden states, no logits
+            ],
+            states=self.GetTransformerStates(model, part="prefill", prefix="model.model."),
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram",
+        )
+        print("CoreML conversion for prefill completed!")
+
+        # Apply LUT quantization if specified
+        if self.lut_bits:
+            self.converted_model = mlmodel
+            self.postprocess(num_workers=8)  # Allow passing num_workers if needed
+            mlmodel = self.converted_model
+
+        return mlmodel
+
+    def convert_embeddings(self, model: QwenForCausalLM) -> ct.models.MLModel:
+        """Convert embeddings layer to CoreML format.
+        
+        Args:
+            model: The Qwen model containing embeddings
+            
+        Returns:
+            ct.models.MLModel: Converted CoreML model for embeddings
+        """
+        print("\nConverting Qwen embeddings layer...")
+        
+        class EmbeddingsWrapper(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.embed_tokens = model.model.embed_tokens
+                
+            def forward(self, input_ids):
+                hidden_states = self.embed_tokens(input_ids)
+                return hidden_states.to(MODEL_DTYPE)
+        
+        # Create wrapper and ensure eval mode
+        wrapper = EmbeddingsWrapper(model)
+        wrapper.eval()
+        
+        # Create sample input for tracing
+        sample_input = torch.zeros((1, 1), dtype=torch.int32, device=TEST_DEVICE)
+        
+        # Trace model
+        print("Tracing embeddings model...")
+        traced_model = torch.jit.trace(wrapper, sample_input)
+        
+        # Define flexible input shapes for both single token and batch processing
+        input_shape = ct.EnumeratedShapes(
+            shapes=[[1, 1], [1, self.batch_size]],  # Support single token and batch_size tokens
+            default=[1, 1]  # Use single token as default
+        )
+        
+        print(f"Converting embeddings model with input shape: {input_shape}")
+
+        # Convert to CoreML
+        mlmodel = ct.convert(
+            traced_model,
+            inputs=[
+                ct.TensorType(
+                    name="input_ids",
+                    shape=input_shape,  # Use enumerated shapes for flexibility
+                    dtype=np.int32
+                )
+            ],
+            outputs=[
+                ct.TensorType(name="hidden_states", dtype=np.float16)
+            ],
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram"
+        )
+        
+        print("Embeddings conversion completed")
+
+        # Apply LUT quantization if specified
+        if self.lut_bits:
+            self.converted_model = mlmodel
+            self.postprocess(num_workers=8)  # Allow passing num_workers if needed
+            mlmodel = self.converted_model
+
         return mlmodel
 
 
@@ -255,9 +478,21 @@ def test_conversion(
     lut_bits: Optional[int] = None,
     batch_size: int = 64,
     output_dir: str = ".",
+    part: str = "full",
 ) -> ct.models.MLModel:
-    """Convert a Qwen model and save the result."""
-    print(f"test_conversion called with model_path={model_path}, prefix={prefix}")
+    """Convert a Qwen model and save the result.
+    
+    Args:
+        model: Pre-loaded Qwen model (optional)
+        model_path: Path to model directory  
+        prefix: Model name prefix
+        context_length: Context length for conversion
+        lut_bits: LUT quantization bits
+        batch_size: Batch size for conversion
+        output_dir: Output directory
+        part: Part to convert ("full" or "prefill")
+    """
+    print(f"test_conversion called with model_path={model_path}, prefix={prefix}, part={part}")
 
     if model is None:
         if model_path is None:
@@ -292,7 +527,7 @@ def test_conversion(
     )
 
     print("Starting conversion...")
-    mlmodel = converter.convert()
+    mlmodel = converter.convert(part=part)
     print("Conversion completed!")
 
     print(f"Creating output directory: {output_dir}")

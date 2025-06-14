@@ -18,47 +18,109 @@ DARK_BLUE = "\033[34m"
 LIGHT_GREEN = "\033[92m"
 RESET_COLOR = "\033[0m"
 
+def compile_model_if_needed(mlpackage_path):
+    """Compile .mlpackage to .mlmodelc if needed and return the compiled path."""
+    mlpackage_path = Path(mlpackage_path)
+    mlmodelc_path = mlpackage_path.with_suffix('.mlmodelc')
+    
+    # If .mlmodelc exists and is newer than .mlpackage, use it
+    if mlmodelc_path.exists():
+        if mlpackage_path.exists():
+            if mlmodelc_path.stat().st_mtime >= mlpackage_path.stat().st_mtime:
+                print(f"Using existing compiled model: {mlmodelc_path}")
+                return str(mlmodelc_path)
+            else:
+                print(f"Compiled model is older than package, recompiling...")
+        else:
+            print(f"Using existing compiled model: {mlmodelc_path}")
+            return str(mlmodelc_path)
+    
+    # Need to compile
+    if not mlpackage_path.exists():
+        raise FileNotFoundError(f"Model package not found: {mlpackage_path}")
+    
+    print(f"Compiling {mlpackage_path} to {mlmodelc_path}...")
+    
+    # Remove existing .mlmodelc if it exists
+    if mlmodelc_path.exists():
+        import shutil
+        shutil.rmtree(mlmodelc_path)
+        print(f"Removed existing {mlmodelc_path}")
+    
+    # Compile using xcrun coremlcompiler
+    import subprocess
+    try:
+        cmd = ["xcrun", "coremlcompiler", "compile", str(mlpackage_path), str(mlpackage_path.parent)]
+        print(f"Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print(f"✅ Successfully compiled to {mlmodelc_path}")
+        return str(mlmodelc_path)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Compilation failed: {e}")
+        print(f"stdout: {e.stdout}")
+        print(f"stderr: {e.stderr}")
+        print(f"Falling back to .mlpackage")
+        return str(mlpackage_path)
+
 def parse_model_path(path):
-    """Parse model path and return full path with .mlmodelc or .mlpackage extension."""
+    """Parse model path and return full path, preferring compiled .mlmodelc."""
     path = Path(path)
     
     # If path exists exactly as specified, return it
     if path.exists():
+        if path.suffix == '.mlpackage':
+            # Try to compile to .mlmodelc
+            return compile_model_if_needed(path)
         return str(path)
         
-    # Try with both extensions
+    # Try with both extensions, prefer .mlpackage for compilation
     candidates = [
-        path,
-        path.with_suffix('.mlmodelc'),
         path.with_suffix('.mlpackage'),
+        path.with_suffix('.mlmodelc'),
+        Path(str(path) + '.mlpackage'),
         Path(str(path) + '.mlmodelc'),
-        Path(str(path) + '.mlpackage')
+        path
     ]
     
     for candidate in candidates:
         if candidate.exists():
             print(f"Found model at: {candidate}")
+            if candidate.suffix == '.mlpackage':
+                # Try to compile to .mlmodelc
+                return compile_model_if_needed(candidate)
             return str(candidate)
             
     print(f"\nError: Model not found. Tried: {candidates}")
     raise FileNotFoundError(f"Model not found: {path}")
 
 def load_coreml_model(path, function_name=None):
-    """Load a CoreML model."""
+    """Load a CoreML model, handling both .mlmodelc and .mlpackage formats."""
     path = Path(path)
     compute_unit = ct.ComputeUnit.CPU_AND_NE
     
     try:
         if path.suffix == '.mlmodelc':
+            # For compiled models (.mlmodelc), use CompiledMLModel
             if function_name:
                 return ct.models.CompiledMLModel(str(path), compute_unit, function_name=function_name)
             else:
                 return ct.models.CompiledMLModel(str(path), compute_unit)
         else:
+            # For packages (.mlpackage)
             if function_name:
                 return ct.models.MLModel(str(path), function_name=function_name)
             else:
                 return ct.models.MLModel(str(path))
+                
+    except RuntimeError as e:
+        if "valid manifest does not exist" in str(e):
+            print(f"\nError: Could not load compiled model at {path}")
+            print("This might be because:")
+            print("1. The model is not properly compiled")
+            print("2. The model was compiled for a different OS version")
+            print("3. The model needs to be recompiled")
+            print("\nTry using the .mlpackage version instead, or recompile the model.")
+        raise
     except Exception as e:
         print(f"Error loading model {path}: {e}")
         raise
@@ -121,6 +183,16 @@ def single_token_prefill_coreml(model, token_id, position, causal_mask, state):
         'current_pos': current_pos
     }
     
+    # Debug: Print input tensors for first few tokens
+    if position <= 2:
+        print(f"    🔍 DEBUG - Token {position} inputs:")
+        print(f"      input_ids: {input_ids} (shape: {input_ids.shape})")
+        print(f"      position_ids: {position_ids} (shape: {position_ids.shape})")
+        print(f"      current_pos: {current_pos} (shape: {current_pos.shape})")
+        print(f"      update_mask: shape {update_mask.shape}, sum: {update_mask.sum()}")
+        print(f"      causal_mask: shape {single_causal_mask.shape}, min: {single_causal_mask.min():.1f}, max: {single_causal_mask.max():.1f}")
+        print(f"      causal_mask first 10 values: {single_causal_mask.flatten()[:10]}")
+    
     output = model.predict(inputs, state)
     total_time = time.time() - start_time
     
@@ -146,7 +218,7 @@ def generate_next_token_coreml(model, token_id, position, causal_mask, metadata,
             key = f'logits{i}'
             if key in output:
                 part = output[key]
-                print(f"      {key}: shape {part.shape}")
+                #print(f"      {key}: shape {part.shape}")
                 logits_parts.append(part)
         
         if len(logits_parts) == num_logits:
@@ -191,11 +263,13 @@ def test_coreml_kv_cache_sequential():
     """Test CoreML KV cache with sequential processing."""
     parser = argparse.ArgumentParser(description='Test CoreML KV cache sequential processing')
     parser.add_argument('--model', '-m', type=str, 
-                       default='/tmp/qwen-test/float32/test_qwen.mlpackage',
+                       default='/tmp/qwen-test/full/test_qwen.mlpackage',
                        help='Path to CoreML model file')
     parser.add_argument('--tokenizer', type=str, 
                        default='Qwen/Qwen3-0.6B',
                        help='Hugging Face model identifier for Qwen tokenizer')
+    parser.add_argument('--max-tokens', type=int, default=100,
+                       help='Maximum number of tokens to generate (default: 100)')
     
     args = parser.parse_args()
     
@@ -240,7 +314,8 @@ def test_coreml_kv_cache_sequential():
         print(f"✅ Created causal mask for actual state length: {actual_state_length} (model expects 256)")
         
         # Test prompt
-        prompt = "What is Apple Neural Engine"
+        #prompt = "What is Apple Neural Engine"
+        prompt = 'The capital of France is'
         print(f"\n🔥 Test prompt: '{prompt}'")
         
         # Tokenize
@@ -276,7 +351,7 @@ def test_coreml_kv_cache_sequential():
         print(f"\n🚀 Inference Phase (Generation)")
         print("-" * 40)
         
-        max_new_tokens = 10
+        max_new_tokens = args.max_tokens
         generated_tokens = []
         inference_times = []
         current_pos = len(input_ids)
