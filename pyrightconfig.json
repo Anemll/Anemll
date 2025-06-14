@@ -1,0 +1,4 @@
+{
+  "include": ["anemll"],
+  "typeCheckingMode": "off"
+}

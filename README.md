@@ -125,6 +125,9 @@ See [chat.md](./docs/chat.md) for more details
 > [Note]
 >The first time the model loads, macOS will take some time to place it on the device. Subsequent loads will be instantaneous. Use Ctrl-D to exit, Ctrl-C to interrupt inference.
 
+> [!Note]
+> The unit tests rely on Core ML. On systems without Core ML (such as the Codex VM) they are skipped during collection.
+
 
 
 ## Installation
