@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+__all__ = ["coreml_available", "require_coreml"]
+
 
 def coreml_available() -> bool:
     """Return True if coremltools is importable."""
