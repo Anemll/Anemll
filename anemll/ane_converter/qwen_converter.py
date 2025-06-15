@@ -54,7 +54,7 @@ class QwenConverter(BaseConverter):
         self.num_chunks = num_chunks
 
     @staticmethod
-    def GetTransformerStates(model, part=None, prefix="model."):
+    def GetTransformerStates(model, part=None, prefix="model.model."):
         """Get the transformer states for CoreML conversion"""
         head_dim = getattr(
             model.config,
@@ -288,7 +288,7 @@ class QwenConverter(BaseConverter):
                 ct.TensorType(name="logits15", dtype=np.float16),
                 ct.TensorType(name="logits16", dtype=np.float16),
             ],
-            states=self.GetTransformerStates(model, part=None, prefix="model."),
+            states=self.GetTransformerStates(model, part=None, prefix="model.model."),
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
@@ -419,14 +419,14 @@ class QwenConverter(BaseConverter):
         class FFNWrapper(torch.nn.Module):
             def __init__(self, model: QwenForCausalLM) -> None:
                 super().__init__()
-                self.model = model.model
+                self.model = model  # Use QwenForCausalLM as root
                 self.states = QwenConverter.GetTransformerStates(
-                    model, part="2", prefix="model."
+                    model, part="2", prefix="model.model."
                 )
 
             def forward(self, hidden_states, position_ids, causal_mask, current_pos):
-                rotary = self.model.get_rotary_embeddings_s(current_pos)
-                out = self.model.process_layers(
+                rotary = self.model.model.get_rotary_embeddings_s(current_pos)
+                out = self.model.model.process_layers(
                     hidden_states,
                     position_ids,
                     causal_mask,
@@ -436,7 +436,7 @@ class QwenConverter(BaseConverter):
                     end_layer=end_layer,
                     IN_PREFILL=False,
                 )
-                out = self.model.norm(out)
+                out = self.model.model.norm(out)
                 return out
 
         wrapper = FFNWrapper(model)
@@ -472,7 +472,7 @@ class QwenConverter(BaseConverter):
                 ),
             ],
             outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
-            states=wrapper.states,
+            states=self.states,
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
@@ -501,30 +501,32 @@ class QwenConverter(BaseConverter):
             end_layer = None
 
         class PrefillWrapper(torch.nn.Module):
-            def __init__(self, model: QwenForCausalLM) -> None:
+            def __init__(self, model: QwenForCausalLM, start_layer=0, end_layer=None):
                 super().__init__()
-                self.model = model.model
+                self.model = model  # Use QwenForCausalLM as root
+                self.start_layer = start_layer
+                self.end_layer = end_layer
                 self.states = QwenConverter.GetTransformerStates(
-                    model, part="2_prefill", prefix="model."
+                    model, part="2_prefill", prefix="model.model."
                 )
 
             def forward(self, hidden_states, position_ids, causal_mask, current_pos):
-                rotary = self.model.get_rotary_embedding_prefill(position_ids)
-                out = self.model.process_layers(
+                rotary = self.model.model.get_rotary_embedding_prefill(position_ids)
+                out = self.model.model.process_layers(
                     hidden_states,
                     position_ids,
                     causal_mask,
                     current_pos,
                     rotary,
-                    start_layer=start_layer,
-                    end_layer=end_layer,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
                     IN_PREFILL=True,
                 )
-                if end_layer is None or end_layer == len(self.model.layers):
-                    out = self.model.norm(out)
+                if self.end_layer is None or self.end_layer == len(self.model.model.layers):
+                    out = self.model.model.norm(out)
                 return out
 
-        wrapper = PrefillWrapper(model)
+        wrapper = PrefillWrapper(model, start_layer, end_layer)
         wrapper.eval()
 
         hidden_states = torch.zeros(
@@ -680,7 +682,7 @@ class QwenConverter(BaseConverter):
                     name="output_hidden_states", dtype=np.float16
                 ),  # Only output hidden states, no logits
             ],
-            states=self.GetTransformerStates(model, part="prefill", prefix="model."),
+            states=self.states,
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
