@@ -24,7 +24,7 @@ NUM_CHUNKS=2   # Default number of chunks
 SKIP_CHECK=false
 
 # Default converter; may be overridden after parsing config.json
-CONVERTER="python -m anemll.ane_converter.llama_converter"
+CONVERTER="python3 -m anemll.ane_converter.llama_converter"
 
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
@@ -145,9 +145,9 @@ CONFIG_FILE="$MODEL_PATH/config.json"
 if [ -f "$CONFIG_FILE" ]; then
     ARCH=$(jq -r '.model_type // (.architectures[0] // "")' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
     if [[ "$ARCH" == qwen* ]]; then
-        CONVERTER="python -m anemll.ane_converter.qwen_converter"
+        CONVERTER="python3 -m anemll.ane_converter.qwen_converter"
     else
-        CONVERTER="python -m anemll.ane_converter.llama_converter"
+        CONVERTER="python3 -m anemll.ane_converter.llama_converter"
     fi
 fi
 
@@ -277,14 +277,14 @@ fi
 # Step 5: Combine Models
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
     if [ ! -z "$LUT_PART2" ]; then
-        run_step 5 "Combining Models" "python \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
+        run_step 5 "Combining Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
             --chunk $NUM_CHUNKS \
             $LUT2_PARAM \
             --prefix \"$PREFIX\" \
             --input \"$OUTPUT_DIR\" \
             --output \"$OUTPUT_DIR\""
     else
-        run_step 5 "Combining Models" "python \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
+        run_step 5 "Combining Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
             --chunk $NUM_CHUNKS \
             --prefix \"$PREFIX\" \
             --input \"$OUTPUT_DIR\" \
@@ -295,10 +295,10 @@ else
 fi
 
 # Step 6: Compile Models - Always run compilation for all parts that have LUT specified
-run_step 6 "Compiling Models Part 1" "python \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 1 ${LUT_PART1:+--lut $LUT_PART1} --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
-run_step 6 "Compiling Models Part 3" "python \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 3 ${LUT_PART3:+--lut $LUT_PART3} --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+run_step 6 "Compiling Models Part 1" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 1 ${LUT_PART1:+--lut $LUT_PART1} --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+run_step 6 "Compiling Models Part 3" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 3 ${LUT_PART3:+--lut $LUT_PART3} --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
-    run_step 6 "Compiling Models Part 2" "python \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 2 ${LUT_PART2:+--lut $LUT_PART2} --chunk $NUM_CHUNKS --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+    run_step 6 "Compiling Models Part 2" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 2 ${LUT_PART2:+--lut $LUT_PART2} --chunk $NUM_CHUNKS --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
 fi
 
 # Step 7: Copy tokenizer files and create meta.yaml
@@ -308,17 +308,29 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
         # Copy tokenizer files if they exist
         (cp \"$MODEL_PATH/tokenizer.json\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/tokenizer_config.json\" \"$OUTPUT_DIR/\" || true) && \
+        (cp \"$MODEL_PATH/vocab.json\" \"$OUTPUT_DIR/\" || true) && \
+        (cp \"$MODEL_PATH/merges.txt\" \"$OUTPUT_DIR/\" || true) && \
         
         # Create config.json if it doesn't exist
         if [ ! -f \"$OUTPUT_DIR/config.json\" ]; then
             echo \"Creating config.json for iOS tokenizer...\" && \
-            python -m anemll.ane_converter.create_config_json --output \"$OUTPUT_DIR/config.json\"
+            if [[ \"$ARCH\" == qwen* ]]; then
+                # Create Qwen-specific config.json
+                cat > \"$OUTPUT_DIR/config.json\" <<'EOF_CONFIG'
+{
+  \"tokenizer_class\": \"Qwen2Tokenizer\",
+  \"model_type\": \"qwen3\"
+}
+EOF_CONFIG
+            else
+                python3 -m anemll.ane_converter.create_config_json --output \"$OUTPUT_DIR/config.json\"
+            fi
         fi && \
         
         # Create meta.yaml
         python3 - \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
-            $NUM_CHUNKS \"$PREFIX\" \"$OUTPUT_DIR/meta.yaml\" <<'EOF_PY'
+            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR/meta.yaml\" <<'EOF_PY'
 import sys
 MODEL_NAME = sys.argv[1]
 CONTEXT = sys.argv[2]
@@ -328,7 +340,8 @@ LUT_FFN = sys.argv[5]
 LUT_LMH = sys.argv[6]
 NUM_CHUNKS = sys.argv[7]
 PREFIX = sys.argv[8]
-OUTFILE = sys.argv[9]
+ARCH = sys.argv[9]
+OUTFILE = sys.argv[10]
 
 # Construct model names with LUT suffixes if specified
 embeddings_name = f'{PREFIX}_embeddings' + (f'_lut{LUT_EMB}' if LUT_EMB != 'none' else '')
@@ -339,6 +352,9 @@ ffn_base = f'{PREFIX}_FFN_PF' + (f'_lut{LUT_FFN}' if LUT_FFN != 'none' else '')
 embeddings_path = f'{embeddings_name}.mlmodelc'
 lmhead_path = f'{lmhead_name}.mlmodelc'
 ffn_path = f'{ffn_base}.mlmodelc'
+
+# Set split_lm_head based on architecture
+split_lm_head = 16 if ARCH.startswith('qwen') else 8
 
 meta = f'''model_info:
   name: anemll-{MODEL_NAME}-ctx{CONTEXT}
@@ -363,6 +379,7 @@ meta = f'''model_info:
     embeddings: {embeddings_path}
     lm_head: {lmhead_path}
     ffn: {ffn_path}
+    split_lm_head: {split_lm_head}
 '''
 with open(OUTFILE, 'w') as f:
     f.write(meta)
@@ -372,17 +389,17 @@ fi
 
 
 # Step 8: Test with chat.py
-run_step 8 "Testing with chat.py" "python \"$PROJECT_ROOT/tests/chat.py\" \
+run_step 8 "Testing with chat.py" "python3 \"$PROJECT_ROOT/tests/chat.py\" \
     --meta \"$OUTPUT_DIR/meta.yaml\" \
     --prompt \"Who are you ?\""
 
 # Print chat.py command for reference
 echo -e "\nTo chat with the model, use:"
 echo -e "\nOption 1 - Using meta.yaml (recommended):"
-echo "python $PROJECT_ROOT/tests/chat.py \\"
+echo "python3 $PROJECT_ROOT/tests/chat.py \\"
 echo "    --meta \"$OUTPUT_DIR/meta.yaml\""
 echo -e "\nOr for full conversation mode:"
-echo "python $PROJECT_ROOT/tests/chat_full.py \\"
+echo "python3 $PROJECT_ROOT/tests/chat_full.py \\"
 echo "    --meta \"$OUTPUT_DIR/meta.yaml\""
 
 echo -e "\nOption 2 - Manual configuration:"
@@ -390,7 +407,7 @@ EMBEDDINGS_NAME="${PREFIX}_embeddings${LUT_PART1:+_lut$LUT_PART1}"
 LMHEAD_NAME="${PREFIX}_lm_head${LUT_PART3:+_lut$LUT_PART3}"
 FFN_BASE="${PREFIX}_FFN_PF${LUT_PART2:+_lut$LUT_PART2}"
 
-echo "python $PROJECT_ROOT/tests/chat.py \\"
+echo "python3 $PROJECT_ROOT/tests/chat.py \\"
 echo "    --embed $EMBEDDINGS_NAME \\"
 echo "    --lmhead $LMHEAD_NAME \\"
 echo "    --ffn ${FFN_BASE}_chunk_01of$(printf "%02d" $NUM_CHUNKS) \\"

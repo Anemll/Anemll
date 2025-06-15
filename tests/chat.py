@@ -376,8 +376,15 @@ def initialize_tokenizer(model_path=None):
         print(f"\nError: Failed to load tokenizer from {model_path}")
         print(f"Error details: {str(e)}")
         print(f"Error type: {type(e)}")
-        print("\nThis code requires a Llama 3.2 model for chat template functionality.")
-        print("Please provide the path to a Llama 3.2 model directory.")
+        print("\nThis appears to be a tokenizer loading issue.")
+        
+        # Check if it's the specific Qwen tokenizer file issue
+        if "expected str, bytes or os.PathLike object, not NoneType" in str(e):
+            print("\nThis error suggests the tokenizer files are missing or incomplete.")
+            print("For Qwen models, you need the original model directory with tokenizer files.")
+            print("Try using: --tokenizer ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/YOUR_SNAPSHOT_ID")
+        else:
+            print("Please provide the path to a compatible model directory with tokenizer files.")
         import traceback
         traceback.print_exc()
         raise
@@ -490,8 +497,9 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     # Debug print
     #print("\nLM Head output keys:", list(lm_output.keys()))
     
-    # Get number of logits from metadata, default to 8
-    num_logits = metadata.get('num_logits', 8)
+    # Get number of logits from metadata, using split_lm_head if available
+    # First check for split_lm_head (new), then num_logits (legacy), default to 8
+    num_logits = metadata.get('split_lm_head', metadata.get('num_logits', 8))
     
     # Combine logits1-N if they exist
     if 'logits1' in lm_output:
@@ -750,7 +758,9 @@ def parse_args():
     parser.add_argument('--batch-size', type=int,
                        help='Batch size for prefill (default: 64)')
     parser.add_argument('--num-logits', type=int, default=8,
-                       help='Number of logits outputs from LM head (default: 8)')
+                       help='Number of logits outputs from LM head (default: 8, legacy)')
+    parser.add_argument('--split-lm-head', type=int, 
+                       help='Number of logits splits from LM head (default: 8 for llama, 16 for qwen)')
     
     args = parser.parse_args()
     
@@ -780,7 +790,12 @@ def parse_args():
             if not args.ffn:
                 args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
             if not args.tokenizer:
-                args.tokenizer = args.d
+                # Check if there's a tokenizer_path parameter in meta.yaml
+                if 'tokenizer_path' in params:
+                    args.tokenizer = params['tokenizer_path']
+                else:
+                    # Default to the model directory, but this might need manual override
+                    args.tokenizer = args.d
             
             # Set other parameters if not overridden by command line
             if args.context_length is None:
@@ -792,11 +807,18 @@ def parse_args():
             if 'num_logits' in params:
                 args.num_logits = int(params['num_logits'])
             
+            # Add split_lm_head parameter with default of 8
+            if 'split_lm_head' in params:
+                args.split_lm_head = int(params['split_lm_head'])
+            else:
+                args.split_lm_head = 8  # Default value for backward compatibility
+            
             print(f"\nLoaded parameters from {args.meta}:")
             print(f"  Context Length: {args.context_length}")
             print(f"  Batch Size: {args.batch_size}")
             print(f"  Num Chunks: {args.num_chunks}")
             print(f"  Num Logits: {args.num_logits}")
+            print(f"  Split LM Head: {args.split_lm_head}")
             print(f"  Models Directory: {args.d}")
             print(f"  Embeddings: {args.embed}")
             print(f"  LM Head: {args.lmhead}")
@@ -805,6 +827,10 @@ def parse_args():
         except Exception as e:
             print(f"\nError loading meta.yaml: {str(e)}")
             sys.exit(1)
+    else:
+        # If no meta.yaml, set default split_lm_head if not provided
+        if not hasattr(args, 'split_lm_head') or args.split_lm_head is None:
+            args.split_lm_head = args.num_logits  # Use num_logits as fallback
     
     return args
 
@@ -830,9 +856,22 @@ def main():
         if args.tokenizer is None:
             args.tokenizer = str(model_dir)
         
-        if not Path(args.tokenizer).exists():
+        # Check if tokenizer directory exists and has required files
+        tokenizer_path = Path(args.tokenizer)
+        if not tokenizer_path.exists():
             print(f"\nError: Tokenizer directory not found: {args.tokenizer}")
             return 1
+        
+        # Check if tokenizer has the required files
+        required_files = ['tokenizer.json', 'tokenizer_config.json']
+        missing_files = [f for f in required_files if not (tokenizer_path / f).exists()]
+        
+        if missing_files:
+            print(f"\nWarning: Tokenizer directory missing required files: {missing_files}")
+            print(f"Current tokenizer path: {args.tokenizer}")
+            print("\nFor Qwen models, you may need to specify the original model directory:")
+            print("  python chat.py --meta /tmp/qwen/meta.yaml --tokenizer ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/YOUR_SNAPSHOT_ID")
+            print("\nOr add 'tokenizer_path' to your meta.yaml file.")
     
         args.tokenizer = str(Path(args.tokenizer).resolve())  # Convert to absolute path
         print(f"Using tokenizer path: {args.tokenizer}")
@@ -849,10 +888,14 @@ def main():
             metadata['state_length'] = args.context_length  # Also update state_length
             print(f"\nOverriding context length from command line: {args.context_length}")
         
-        # Add num_logits to metadata
+        # Add num_logits to metadata (legacy support)
         metadata['num_logits'] = getattr(args, 'num_logits', 8)
         
+        # Add split_lm_head to metadata (preferred)
+        metadata['split_lm_head'] = getattr(args, 'split_lm_head', getattr(args, 'num_logits', 8))
+        
         print(f"\nMetadata after load_models: {metadata}")
+        print(f"Using split_lm_head value: {metadata.get('split_lm_head', 8)}")
         
         # Load tokenizer with resolved path
         tokenizer = initialize_tokenizer(args.tokenizer)

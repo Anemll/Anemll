@@ -359,11 +359,18 @@ class QwenConverter(BaseConverter):
 
         wrapper = LMHeadWrapper(model)
         wrapper.eval()
+        
+        # Ensure no gradients
+        for param in wrapper.parameters():
+            param.requires_grad = False
 
         sample_input = torch.zeros(
             (1, 1, model.config.hidden_size), dtype=MODEL_DTYPE, device=TEST_DEVICE
         )
-        traced = torch.jit.trace(wrapper, sample_input)
+        
+        # Trace with no_grad context
+        with torch.no_grad():
+            traced = torch.jit.trace(wrapper, sample_input)
 
         if getattr(wrapper, "mode") == "16":
             outputs = [
@@ -472,7 +479,7 @@ class QwenConverter(BaseConverter):
                 ),
             ],
             outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
-            states=self.states,
+            states=self.GetTransformerStates(model, part=None, prefix="model.model."),
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
@@ -682,7 +689,7 @@ class QwenConverter(BaseConverter):
                     name="output_hidden_states", dtype=np.float16
                 ),  # Only output hidden states, no logits
             ],
-            states=self.states,
+            states=self.GetTransformerStates(model, part=None, prefix="model.model."),
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
@@ -882,6 +889,12 @@ def test_conversion(
         print("Loading pretrained weights...")
         model.load_pretrained_weights(model_path)
         print("Model loaded successfully!")
+        
+        # Ensure model is in eval mode and gradients are disabled
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+        print("Model set to eval mode and gradients disabled")
 
     print("Creating converter...")
     converter = QwenConverter(

@@ -87,45 +87,56 @@ if [ "$SKIP_CHECK" = false ]; then
     echo "Checking if Python3 is installed..."
     command -v python3 >/dev/null 2>&1 || { echo >&2 "Python3 is required but it's not installed. Aborting."; echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."; exit 1; }
 
-    # Check for model files
-    echo "Checking for model files in the provided directory: $MODEL_DIR"
-    if [ ! -f "$MODEL_DIR/config.json" ]; then
-        echo "config.json is required but not found in the model directory. Aborting. (Issue #5)"
-        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
-        exit 1
-    fi
-    if [ ! -f "$MODEL_DIR/tokenizer.json" ]; then
-        echo "tokenizer.json is required but not found in the model directory. Aborting. (Issue #5)"
-        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
-        exit 1
-    fi
-    if [ ! -f "$MODEL_DIR/tokenizer_config.json" ]; then
-        echo "tokenizer_config.json is required but not found in the model directory. Aborting. (Issue #5)"
-        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
-        exit 1
-    fi
+    # Check for model files only if MODEL_DIR is provided
+    if [ ! -z "$MODEL_DIR" ]; then
+        echo "Checking for model files in the provided directory: $MODEL_DIR"
+        if [ ! -f "$MODEL_DIR/config.json" ]; then
+            echo "config.json is required but not found in the model directory. Aborting. (Issue #5)"
+            echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+            exit 1
+        fi
+        if [ ! -f "$MODEL_DIR/tokenizer.json" ]; then
+            echo "tokenizer.json is required but not found in the model directory. Aborting. (Issue #5)"
+            echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+            exit 1
+        fi
+        if [ ! -f "$MODEL_DIR/tokenizer_config.json" ]; then
+            echo "tokenizer_config.json is required but not found in the model directory. Aborting. (Issue #5)"
+            echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+            exit 1
+        fi
 
-    # Check for quantization in config.json
-    QUANTIZATION_PRESENT=$(jq -e '.quantization | length > 0' "$MODEL_DIR/config.json" 2>/dev/null)
-    if [ "$QUANTIZATION_PRESENT" = "true" ]; then
-        echo "Quantized models are not supported. Aborting. (Issue #6)"
-        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
-        exit 1
-    fi
+        # Check for quantization in config.json
+        QUANTIZATION_PRESENT=$(jq -e '.quantization | length > 0' "$MODEL_DIR/config.json" 2>/dev/null)
+        if [ "$QUANTIZATION_PRESENT" = "true" ]; then
+            echo "Quantized models are not supported. Aborting. (Issue #6)"
+            echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+            exit 1
+        fi
 
-    # Check for supported architectures in config.json
-    echo "Checking for supported architectures in config.json..."
-    SUPPORTED_ARCHS=("llama")
-    CONFIG_ARCH=$(jq -r '.architectures[]' "$MODEL_DIR/config.json" 2>/dev/null)
-    CONFIG_MODEL_TYPE=$(jq -r '.model_type' "$MODEL_DIR/config.json" 2>/dev/null)
+        # Check for supported architectures in config.json
+        echo "Checking for supported architectures in config.json..."
+        SUPPORTED_ARCHS=("llama" "qwen")
+        CONFIG_ARCH=$(jq -r '.architectures[]' "$MODEL_DIR/config.json" 2>/dev/null)
+        CONFIG_MODEL_TYPE=$(jq -r '.model_type' "$MODEL_DIR/config.json" 2>/dev/null)
 
-    CONFIG_ARCH_LOWER=$(echo "$CONFIG_ARCH" | tr '[:upper:]' '[:lower:]')
-    CONFIG_MODEL_TYPE_LOWER=$(echo "$CONFIG_MODEL_TYPE" | tr '[:upper:]' '[:lower:]')
+        CONFIG_ARCH_LOWER=$(echo "$CONFIG_ARCH" | tr '[:upper:]' '[:lower:]')
+        CONFIG_MODEL_TYPE_LOWER=$(echo "$CONFIG_MODEL_TYPE" | tr '[:upper:]' '[:lower:]')
 
-    if [[ ! " ${SUPPORTED_ARCHS[@]} " =~ " $CONFIG_ARCH_LOWER " ]] && [[ ! " ${SUPPORTED_ARCHS[@]} " =~ " $CONFIG_MODEL_TYPE_LOWER " ]]; then
-        echo "Unsupported architecture or model type in config.json. Supported types: ${SUPPORTED_ARCHS[@]}. Aborting. (Issue #7)"
-        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
-        exit 1
+        # Check if architecture contains any supported pattern
+        ARCH_SUPPORTED=false
+        for arch in "${SUPPORTED_ARCHS[@]}"; do
+            if [[ "$CONFIG_ARCH_LOWER" == *"$arch"* ]] || [[ "$CONFIG_MODEL_TYPE_LOWER" == *"$arch"* ]]; then
+                ARCH_SUPPORTED=true
+                break
+            fi
+        done
+        
+        if [ "$ARCH_SUPPORTED" = false ]; then
+            echo "Unsupported architecture or model type in config.json. Supported types: ${SUPPORTED_ARCHS[@]}. Aborting. (Issue #7)"
+            echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+            exit 1
+        fi
     fi
 
     # Add more checks as needed

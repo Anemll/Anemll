@@ -267,10 +267,17 @@ def parse_args():
                 args.batch_size = int(params['batch_size'])
             args.num_chunks = num_chunks
             
+            # Parse split_lm_head parameter from meta.yaml
+            if 'split_lm_head' in params:
+                args.split_lm_head = int(params['split_lm_head'])
+            else:
+                args.split_lm_head = 8  # Default value
+            
             print(f"\nLoaded parameters from {args.meta}:")
             print(f"  Context Length: {args.context_length}")
             print(f"  Batch Size: {args.batch_size}")
             print(f"  Num Chunks: {args.num_chunks}")
+            print(f"  Split LM Head: {args.split_lm_head}")
             print(f"  Models Directory: {args.d}")
             print(f"  Embeddings: {args.embed}")
             print(f"  LM Head: {args.lmhead}")
@@ -529,7 +536,7 @@ def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length,
     
     return torch.tensor([current_pos], dtype=torch.int32)
 
-def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state, causal_mask, temperature=0.0):
+def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state, causal_mask, metadata=None, temperature=0.0):
     """Generate the next token."""
     # Get current token
     current_token = input_ids[:, pos-1:pos]
@@ -565,7 +572,7 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     
     if 'logits1' in lm_output:
         logits_parts = []
-        for i in range(1, 9):
+        for i in range(1, metadata.get('split_lm_head', 8) + 1):
             key = f'logits{i}'
             if key in lm_output:
                 logits_parts.append(torch.from_numpy(lm_output[key]))
@@ -758,6 +765,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
             if not warmup:
                 print(f"\n{LIGHT_BLUE}Assistant:{RESET_COLOR}", end=' ', flush=True)
             
+            # split_lm_head should already be in metadata from caller
+            
             # Initialize token printer and collect response
             token_printer = TokenPrinter(tokenizer)
             response_tokens = []
@@ -828,7 +837,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                         pos,
                         context_length,
                         state,
-                        causal_mask
+                        causal_mask,
+                        metadata
                     )
                     
                     # Add token
@@ -935,6 +945,9 @@ def main():
         
         # Initialize causal mask once
         causal_mask = initialize_causal_mask(metadata['context_length'])
+        
+        # Add split_lm_head to metadata for generate_next_token
+        metadata['split_lm_head'] = getattr(args, 'split_lm_head', 8)
         
         # Warmup runs to prevent Python GIL issues with CoreML !
         if not args.nw:
