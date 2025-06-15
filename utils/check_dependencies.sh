@@ -115,7 +115,7 @@ if [ "$SKIP_CHECK" = false ]; then
 
     # Check for supported architectures in config.json
     echo "Checking for supported architectures in config.json..."
-    SUPPORTED_ARCHS=("llama")
+    SUPPORTED_ARCHS=("llama" "qwen" "qwen3")
     CONFIG_ARCH=$(jq -r '.architectures[]' "$MODEL_DIR/config.json" 2>/dev/null)
     CONFIG_MODEL_TYPE=$(jq -r '.model_type' "$MODEL_DIR/config.json" 2>/dev/null)
 
