@@ -488,7 +488,12 @@ class QwenConverter(BaseConverter):
 
         if self.lut_bits:
             self.converted_model = mlmodel
-            self.postprocess(num_workers=8)
+            # WORKAROUND: CoreMLTools has a known bug where LUT quantization fails with multiple workers
+            # when processing chunked models. The second chunk quantization fails with "Pool not running".
+            # Setting workers to None (single-threaded) avoids this issue.
+            # TODO: File bug report with Apple CoreMLTools team about multi-worker quantization failure on chunked models
+            num_workers = None if total_chunks > 1 else 8
+            self.postprocess(num_workers=num_workers)
             mlmodel = self.converted_model
 
         return mlmodel
@@ -581,7 +586,12 @@ class QwenConverter(BaseConverter):
 
         if self.lut_bits:
             self.converted_model = mlmodel
-            self.postprocess(num_workers=8)
+            # WORKAROUND: CoreMLTools has a known bug where LUT quantization fails with multiple workers
+            # when processing chunked models. The second chunk quantization fails with "Pool not running".
+            # Setting workers to None (single-threaded) avoids this issue.
+            # TODO: File bug report with Apple CoreMLTools team about multi-worker quantization failure on chunked models
+            num_workers = None if total_chunks > 1 else 8
+            self.postprocess(num_workers=num_workers)
             mlmodel = self.converted_model
 
         return mlmodel
