@@ -44,7 +44,7 @@ def main():
     # Adjust output directory and prefix based on part
     if args.part == "prefill":
         output_dir = os.path.join(args.output, "prefill/")
-        prefix = args.prefix  # Don't add suffix, converter handles it
+        prefix = args.prefix + "_prefill"  # Add suffix for prefill
     elif args.part == "embeddings":
         output_dir = os.path.join(args.output, "embeddings/")
         prefix = args.prefix  # Don't add suffix, converter handles it
