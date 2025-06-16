@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(grep:*)",
-      "Bash(diff:*)"
+      "Bash(diff:*)",
+      "Bash(ls:*)"
     ],
     "deny": []
   }

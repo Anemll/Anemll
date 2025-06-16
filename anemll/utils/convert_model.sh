@@ -146,6 +146,10 @@ if [ -f "$CONFIG_FILE" ]; then
     ARCH=$(jq -r '.model_type // (.architectures[0] // "")' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
     if [[ "$ARCH" == qwen* ]]; then
         CONVERTER="python3 -m anemll.ane_converter.qwen_converter"
+        # Use "qwen" as default prefix for Qwen models unless explicitly set
+        if [ "$PREFIX" = "llama" ]; then
+            PREFIX="qwen"
+        fi
     else
         CONVERTER="python3 -m anemll.ane_converter.llama_converter"
     fi

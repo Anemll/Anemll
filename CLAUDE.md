@@ -20,6 +20,16 @@ xcode-select --install
 xcrun --find coremlcompiler  # Verify installation
 ```
 
+**Important**: Always activate the virtual environment before running any Python scripts in this repository:
+```bash
+source env-anemll/bin/activate  # or anemll-env/bin/activate depending on your setup
+```
+
+You can verify the environment is active by checking:
+- The prompt should show `(env-anemll)` or `(anemll-env)`
+- `which python` should point to the virtual environment's Python
+- `python --version` should show Python 3.9.x
+
 ### Model Conversion
 ```bash
 # Single-shot model conversion script
