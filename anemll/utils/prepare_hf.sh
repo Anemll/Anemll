@@ -145,6 +145,19 @@ prepare_common_files() {
     cp "$INPUT_DIR/tokenizer.json" "$target_dir/"
     cp "$INPUT_DIR/tokenizer_config.json" "$target_dir/"
     
+    # Copy tokenizer vocabulary files if they exist
+    if [ -f "$INPUT_DIR/vocab.json" ]; then
+        cp "$INPUT_DIR/vocab.json" "$target_dir/"
+    else
+        echo "Warning: vocab.json not found - may be required for tokenization"
+    fi
+    
+    if [ -f "$INPUT_DIR/merges.txt" ]; then
+        cp "$INPUT_DIR/merges.txt" "$target_dir/"
+    else
+        echo "Warning: merges.txt not found - may be required for BPE tokenization"
+    fi
+    
     # Always generate new config.json for tokenizer (forcing overwrite)
     echo "Generating config.json for tokenizer (overwriting any existing file)..."
     # Remove existing config.json if it exists

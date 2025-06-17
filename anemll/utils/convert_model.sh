@@ -372,6 +372,7 @@ meta = f'''model_info:
   author: Anemll
   framework: Core ML
   language: Python
+  architecture: {ARCH}
   parameters:
     context_length: {CONTEXT}
     batch_size: {BATCH}
