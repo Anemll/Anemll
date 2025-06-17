@@ -1140,6 +1140,24 @@ class QwenForCausalLM(nn.Module):
                     safetensors.torch.load_file(os.path.join(model_path, file))
                 )
         
+        # Handle lm_head weight (following llama_model.py pattern)
+        lm_head_present = False
+        embed_tokens_key = None
+        for k, v in state_dict.items():
+            if k == "lm_head.weight":
+                lm_head_present = True
+            if "embed_tokens.weight" in k:
+                embed_tokens_key = k
+
+        if not lm_head_present:
+            print("lm_head.weight not found in the model file dictionary")
+            if embed_tokens_key:
+                print(f"Using {embed_tokens_key} for lm_head.weight")
+                state_dict['lm_head.weight'] = state_dict[embed_tokens_key].clone()
+            else:
+                print("embed_tokens.weight not found. Unable to set lm_head.weight")
+                return False
+        
         # Handle lm_head weight loading and splitting
         lm_head_weight = None
         for k, v in state_dict.items():

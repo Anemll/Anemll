@@ -17,6 +17,7 @@ import CoreFoundation
     // Change timing property to CFAbsoluteTime
     private var prefillEndTime: CFAbsoluteTime?
     private var FilterLLAMA01: Bool = false
+    private let splitLMHead: Int
     
     private var lmheadOutputBackings: [String: MLMultiArray]?
     private var hiddenStatesBackings_emb: [String: MLMultiArray]?  // For embed output
@@ -49,7 +50,7 @@ import CoreFoundation
     }
 
 
-    public init(models: LoadedModels, contextLength: Int, batchSize: Int, debugLevel: Int = 0, v110: Bool = false) throws {  // Make init throwing
+    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false) throws {  // Make init throwing
         self.debugLevel = debugLevel
         self.embedModel = models.embedModel
         self.lmheadModel = models.lmheadModel
@@ -57,10 +58,11 @@ import CoreFoundation
         self.ffnChunks = models.ffnChunks
         self.contextLength = contextLength
         self.batchSize = batchSize
+        self.splitLMHead = splitLMHead
         self.v110 = v110 // Set the v110 flag based on the parameter
 
         
-        print("InferenceManager initialized with v110=\(v110)")
+        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize)")
         self.fullCausalMask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: contextLength)], dataType: .float16)
 
         self.initState()
@@ -126,7 +128,7 @@ import CoreFoundation
     
     private func initializeLMHeadOutputBackings() throws {
         let outputDescription = lmheadModel.modelDescription.outputDescriptionsByName
-        let featureNames = (1...8).map { i in "logits\(i)" }
+        let featureNames = (1...splitLMHead).map { i in "logits\(i)" }
         var outputBackingsDict: [String: MLMultiArray] = [:]
         
         for featureName in featureNames {
@@ -187,13 +189,29 @@ import CoreFoundation
     }
     
     private func initializeHiddenStatesBackings() throws {
+        // Check embedding model shapes first
+        if debugLevel >= 1 {
+            print("\n=== Embedding Model Shapes ===")
+            for (name, desc) in embedModel.modelDescription.inputDescriptionsByName {
+                if let constraint = desc.multiArrayConstraint {
+                    print("Embed Input \(name):", constraint.shape.map { $0.intValue })
+                }
+            }
+            for (name, desc) in embedModel.modelDescription.outputDescriptionsByName {
+                if let constraint = desc.multiArrayConstraint {
+                    print("Embed Output \(name):", constraint.shape.map { $0.intValue })
+                }
+            }
+        }
+        
         // Get shape from FFN model's input
         if let desc = ffnChunks[0].inferModel.modelDescription.inputDescriptionsByName["hidden_states"],
            let constraint = desc.multiArrayConstraint {
             let shape = constraint.shape
             
             if debugLevel >= 1 {
-                print("\nFFN Model Input Shape:", shape.map { $0.intValue })
+                print("\n=== FFN Model Shapes ===")
+                print("FFN Model Input Shape:", shape.map { $0.intValue })
                 print("\nFFN Model Features:")
                 print("Inputs:", ffnChunks[0].inferModel.modelDescription.inputDescriptionsByName.keys)
                 print("Outputs:", ffnChunks[0].inferModel.modelDescription.outputDescriptionsByName.keys)
@@ -224,6 +242,10 @@ import CoreFoundation
             
             // Store embed output backing
             hiddenStatesBackings_emb = ["hidden_states": MLMultiArray(pixelBuffer: embedBuffer, shape: shape)]
+            
+            if debugLevel >= 1 {
+                print("Single-token embed backing shape:", shape.map { $0.intValue })
+            }
             
             // Create FFN output backing
             var ffnPixelBuffer: CVPixelBuffer?
@@ -288,6 +310,13 @@ import CoreFoundation
         let shape: [NSNumber] = [1, NSNumber(value: batchSize), NSNumber(value: hiddenSize)]
         let attributes: [String: Any] = [kCVPixelBufferMetalCompatibilityKey as String: true]
         
+        if debugLevel >= 1 {
+            print("\n=== Prefill Backing Initialization ===")
+            print("Hidden size:", hiddenSize)
+            print("Batch size:", batchSize)
+            print("Prefill backing shape:", shape.map { $0.intValue })
+        }
+        
         // Embedding prefill backing
         var embedPixelBuffer: CVPixelBuffer?
         let embedStatus = CVPixelBufferCreate(
@@ -302,6 +331,10 @@ import CoreFoundation
             throw InferenceError.inferenceError("Failed to create embed prefill pixel buffer")
         }
         hiddenStatesBackings_emb_prefill = ["hidden_states": MLMultiArray(pixelBuffer: embedBuffer, shape: shape)]
+        
+        if debugLevel >= 1 {
+            print("Embed prefill backing created with shape:", shape.map { $0.intValue })
+        }
         
         // FFN prefill backing
         var ffnPixelBuffer: CVPixelBuffer?
@@ -404,6 +437,7 @@ import CoreFoundation
         if debugLevel >= 1 {
             print("\n=== Starting Prefill Phase ===")
             print("Input context length:", contextPos)
+            print("Configured batch size:", batchSize)
             debugTokens(Array(contextTokens.prefix(contextPos)), prefix: "Input")
         }
         guard let ffnChunks = ffnChunks else {
@@ -413,6 +447,10 @@ import CoreFoundation
         while batchPos < contextPos {
             let batchEnd = min(batchPos + batchSize, contextPos)
             let currentBatchSize = batchEnd - batchPos
+            
+            if debugLevel >= 1 {
+                print("\nPrefill batch: \(batchPos) to \(batchEnd), currentBatchSize: \(currentBatchSize)")
+            }
             
             // Create input tensor for current batch
             let batchInput = try MLMultiArray(shape: [1, NSNumber(value: batchSize)], dataType: .int32)
@@ -451,11 +489,26 @@ import CoreFoundation
             let embedOptions = MLPredictionOptions()
             if let backings = hiddenStatesBackings_emb_prefill {
                 embedOptions.outputBackings = backings
+                if debugLevel >= 1 {
+                    print("Using embedding prefill backing with shape:", backings["hidden_states"]?.shape.map { $0.intValue } ?? [])
+                    print("Embedding input shape:", batchInput.shape.map { $0.intValue })
+                }
+            }
+            
+            if debugLevel >= 1 {
+                print("About to run embedding model prediction...")
             }
             let _ = try await embedModel.prediction(from: embedInput, options: embedOptions)
+            if debugLevel >= 1 {
+                print("Embedding model prediction completed successfully")
+            }
             
             guard let hiddenStates = hiddenStatesBackings_emb_prefill?["hidden_states"] else {
                 throw InferenceError.inferenceError("Missing embed prefill output backing")
+            }
+            
+            if debugLevel >= 1 {
+                print("Retrieved hidden states from embedding with shape:", hiddenStates.shape.map { $0.intValue })
             }
             
             // Process FFN chunks
@@ -466,14 +519,18 @@ import CoreFoundation
                 let isLastChunk = index == chunkCount - 1
                 let ffnOptions = MLPredictionOptions()
                 
+                if debugLevel >= 1 {
+                    print("\nFFN chunk \(index + 1)/\(chunkCount), isLastChunk: \(isLastChunk)")
+                    print("Current hidden states shape:", currentHiddenStates.shape.map { $0.intValue })
+                }
+                
                 // Assign output backing BEFORE predict
-                if isLastChunk && !v110 {
-                    guard let lastBackingDict = hiddenStatesBackings_last else {
-                        throw InferenceError.inferenceError("Missing last chunk output backing dictionary")
+                // During prefill, ALWAYS use prefill backing, never the last chunk backing
+                if let backings = hiddenStatesBackings_ffn_prefill {
+                    ffnOptions.outputBackings = backings  // Shape: [1, batch_size, hidden_states]
+                    if debugLevel >= 1 {
+                        print("Using FFN prefill backing with shape:", backings["output_hidden_states"]?.shape.map { $0.intValue } ?? [])
                     }
-                    ffnOptions.outputBackings = lastBackingDict  // Shape: [1, 1, hidden_states]
-                } else if let backings = hiddenStatesBackings_ffn_prefill {
-                    ffnOptions.outputBackings = backings  // Shape: [1, 128, hidden_states]
                 }
                 
                 let currentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
@@ -493,18 +550,11 @@ import CoreFoundation
                     options: ffnOptions
                 )
                 
-                // Update currentHiddenStates based on the backing used
-                if isLastChunk {
-                    guard let lastHiddenStates = hiddenStatesBackings_last?["output_hidden_states"] else {
-                        throw InferenceError.inferenceError("Missing last chunk output_hidden_states")
-                    }
-                    currentHiddenStates = lastHiddenStates  // Shape: [1, 1, hidden_states]
-                } else {
-                    guard let nextHiddenStates = hiddenStatesBackings_ffn_prefill?["output_hidden_states"] else {
-                        throw InferenceError.inferenceError("Missing FFN prefill output backing")
-                    }
-                    currentHiddenStates = nextHiddenStates  // Shape: [1, 128, hidden_states]
+                // Update currentHiddenStates - during prefill always use prefill backing
+                guard let nextHiddenStates = hiddenStatesBackings_ffn_prefill?["output_hidden_states"] else {
+                    throw InferenceError.inferenceError("Missing FFN prefill output backing")
                 }
+                currentHiddenStates = nextHiddenStates  // Shape: [1, batch_size, hidden_states]
                 
                 if debugLevel >= 2 {
                     debugTensor(currentHiddenStates, prefix: "FFN chunk \(index + 1) output")
@@ -653,7 +703,7 @@ import CoreFoundation
         if GreedySearch {
             // --- Argmax branch: process each logits part in parallel ---
             let partialResults = try await withThrowingTaskGroup(of: PartialMax.self) { group -> [PartialMax] in
-                for i in 1...8 {
+                for i in 1...splitLMHead {
                     let partIndex = i
                     let logitsKey = "logits\(partIndex)"
                     

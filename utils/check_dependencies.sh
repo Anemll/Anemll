@@ -110,11 +110,65 @@ if [ "$SKIP_CHECK" = false ]; then
         fi
 
         # Check for quantization in config.json
+        echo "Checking if model is quantized..."
+        
+        # Check for quantization_config field (used by FP8, GPTQ, AWQ, etc.)
+        QUANTIZATION_CONFIG=$(jq -r '.quantization_config // empty' "$MODEL_DIR/config.json" 2>/dev/null)
+        
+        # Also check the old quantization field for backward compatibility
         QUANTIZATION_PRESENT=$(jq -e '.quantization | length > 0' "$MODEL_DIR/config.json" 2>/dev/null)
-        if [ "$QUANTIZATION_PRESENT" = "true" ]; then
-            echo "Quantized models are not supported. Aborting. (Issue #6)"
+        
+        if [ ! -z "$QUANTIZATION_CONFIG" ] || [ "$QUANTIZATION_PRESENT" = "true" ]; then
+            echo ""
+            echo "⚠️  ERROR: Quantized model detected!"
+            echo ""
+            
+            # Get more details about the quantization
+            if [ ! -z "$QUANTIZATION_CONFIG" ]; then
+                QUANT_METHOD=$(jq -r '.quantization_config.quant_method // "unknown"' "$MODEL_DIR/config.json" 2>/dev/null)
+                QUANT_FORMAT=$(jq -r '.quantization_config.fmt // .quantization_config.bits // "unknown"' "$MODEL_DIR/config.json" 2>/dev/null)
+                echo "Quantization method: $QUANT_METHOD"
+                echo "Format/bits: $QUANT_FORMAT"
+                
+                if [ "$QUANT_METHOD" = "fp8" ]; then
+                    echo "This is an FP8 quantized model which cannot be properly converted."
+                elif [ "$QUANT_METHOD" = "gptq" ] || [ "$QUANT_METHOD" = "awq" ]; then
+                    echo "This is a $QUANT_METHOD quantized model with $QUANT_FORMAT-bit weights."
+                fi
+            fi
+            
+            echo ""
+            echo "Quantized models are not supported for ANEMLL conversion. (Issue #6)"
+            echo ""
+            echo "Please use an unquantized (full precision) version of this model."
+            echo "Look for model names without 'fp8', 'gptq', 'awq', '4bit', '8bit' etc."
+            echo ""
+            echo "For example:"
+            echo "  ❌ qwen3_4b_fp8     -> ✅ qwen3_4B"
+            echo "  ❌ llama-8b-gptq    -> ✅ llama-8b"
+            echo "  ❌ model-awq-4bit   -> ✅ model"
+            echo ""
+            echo "Alternatively, you can convert this quantized model to unquantized FP16/BF16:"
+            echo ""
+            echo "  Option 1: Download the original unquantized model from Hugging Face"
+            echo "  Option 2: Use the dequantization script (if available):"
+            echo "           python utils/dequantize_model.py --input $MODEL_DIR --output ./dequantized_model"
+            echo "  Option 3: In Python, load and save as FP16:"
+            echo "           from transformers import AutoModelForCausalLM"
+            echo "           model = AutoModelForCausalLM.from_pretrained('$MODEL_DIR', device_map='cpu')"
+            echo "           model.save_pretrained('./unquantized_model', torch_dtype='float16')"
+            echo ""
             echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
             exit 1
+        fi
+        
+        # Also check filename for quantization hints
+        MODEL_BASENAME=$(basename "$MODEL_DIR" | tr '[:upper:]' '[:lower:]')
+        if [[ "$MODEL_BASENAME" == *"fp8"* ]] || [[ "$MODEL_BASENAME" == *"gptq"* ]] || [[ "$MODEL_BASENAME" == *"awq"* ]] || [[ "$MODEL_BASENAME" == *"4bit"* ]] || [[ "$MODEL_BASENAME" == *"8bit"* ]]; then
+            echo ""
+            echo "⚠️  WARNING: Model directory name suggests quantization: $MODEL_BASENAME"
+            echo "Please ensure you are using an unquantized model."
+            echo ""
         fi
 
         # Check for supported architectures in config.json

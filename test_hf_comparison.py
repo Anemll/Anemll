@@ -7,21 +7,30 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import sys
 import os
 import glob
+import argparse
 
-def test_original_hf_model():
+def test_original_hf_model(model_path=None):
     """Test the original Hugging Face model to see expected behavior."""
     
     print("🟢 Testing Original Hugging Face Qwen3 Model")
     print("=" * 60)
     
-    # Find model path
-    model_path = "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/"
-    model_dirs = glob.glob(os.path.expanduser(model_path + "*"))
-    if not model_dirs:
-        print("❌ Error: Qwen model not found in cache")
-        return False
+    # Use provided model path or default
+    if model_path:
+        model_dir = os.path.expanduser(model_path)
+        if not os.path.exists(model_dir):
+            print(f"❌ Error: Model not found at {model_dir}")
+            return False
+    else:
+        # Find model path in cache
+        cache_path = "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/"
+        model_dirs = glob.glob(os.path.expanduser(cache_path + "*"))
+        if not model_dirs:
+            print("❌ Error: Qwen model not found in cache")
+            return False
+        model_dir = model_dirs[0]
     
-    model_dir = model_dirs[0]
+    print(f"Using model: {model_dir}")
     
     # Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
@@ -71,16 +80,28 @@ def test_original_hf_model():
     
     return True
 
-def inspect_hf_model_config():
+def inspect_hf_model_config(model_path=None):
     """Inspect the HF model configuration to understand the architecture."""
     
     print(f"\n🔍 Inspecting HF Model Configuration")
     print("=" * 60)
     
-    # Find model path
-    model_path = "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/"
-    model_dirs = glob.glob(os.path.expanduser(model_path + "*"))
-    model_dir = model_dirs[0]
+    # Use provided model path or default
+    if model_path:
+        model_dir = os.path.expanduser(model_path)
+        if not os.path.exists(model_dir):
+            print(f"❌ Error: Model not found at {model_dir}")
+            return False
+    else:
+        # Find model path in cache
+        cache_path = "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/"
+        model_dirs = glob.glob(os.path.expanduser(cache_path + "*"))
+        if not model_dirs:
+            print("❌ Error: Qwen model not found in cache")
+            return False
+        model_dir = model_dirs[0]
+    
+    print(f"Using model: {model_dir}")
     
     # Load model
     original_model = AutoModelForCausalLM.from_pretrained(model_dir)
@@ -122,11 +143,16 @@ def inspect_hf_model_config():
     return True
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Analyze Hugging Face Qwen3 models")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Path to the model directory (e.g., ~/Models/HF/qwen3_1.7B)")
+    args = parser.parse_args()
+    
     print("🔍 Hugging Face Qwen3 Model Analysis")
     print("=" * 70)
     
     # Test 1: See what the original model generates
-    test_original_hf_model()
+    test_original_hf_model(args.model)
     
     # Test 2: Inspect the model configuration
-    inspect_hf_model_config() 
+    inspect_hf_model_config(args.model) 

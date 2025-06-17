@@ -332,6 +332,7 @@ struct AnemllCLI: AsyncParsableCommand {
             models: models,
             contextLength: config.contextLength,
             batchSize: config.batchSize,
+            splitLMHead: config.splitLMHead,
             debugLevel: debugLevel,
             v110: config.configVersion == "0.1.1"  // Set v110 flag based on version
         )

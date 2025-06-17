@@ -3,7 +3,9 @@
     "allow": [
       "Bash(grep:*)",
       "Bash(diff:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(swift build:*)",
+      "Bash(swift run:*)"
     ],
     "deny": []
   }

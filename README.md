@@ -136,6 +136,7 @@ See [chat.md](./docs/chat.md) for more details
 - macOS Sequoia with Apple Neural Engine
 - Minimum 16GB RAM
 - Python 3.9
+- Dependencies: coremltools>=8.2, transformers>=4.39.0, scikit-learn<=1.5.1
 
 ### Setup Steps
 

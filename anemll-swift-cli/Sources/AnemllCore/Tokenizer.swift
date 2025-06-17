@@ -272,7 +272,13 @@ public final class Tokenizer: @unchecked Sendable {
                 return tokens
             } catch {
                 print("Error applying chat template: \(error)")
-                // In case of failure, return empty
+                // Fallback: use simple prompt formatting for complex templates
+                print("Using fallback prompt formatting...")
+                if let userMessage = messagesArray.first(where: { $0["role"] as? String == "user" }),
+                   let content = userMessage["content"] as? String {
+                    let formattedPrompt = "<|im_start|>user\n\(content)<|im_end|>\n<|im_start|>assistant\n"
+                    return tokenizer.encode(text: formattedPrompt)
+                }
                 return []
             }
         }

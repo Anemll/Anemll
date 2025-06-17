@@ -156,7 +156,7 @@ These tests are primarily for development validation rather than CI/CD.
 - **System**: macOS Sequoia with Apple Neural Engine
 - **Memory**: Minimum 16GB RAM
 - **Python**: 3.9 (strictly required)
-- **Dependencies**: coremltools>=8.2, transformers>=4.36.0, numpy>=1.24.0
+- **Dependencies**: coremltools>=8.2, transformers>=4.36.0, numpy>=1.24.0, scikit-learn<=1.5.1
 - **Tools**: Xcode Command Line Tools for coremlcompiler
 
 ## Model Support
