@@ -151,6 +151,22 @@ The project includes extensive testing files (test_*.py) focusing on:
 
 These tests are primarily for development validation rather than CI/CD.
 
+## Development Guidelines
+
+### Test and Debug File Organization
+
+**IMPORTANT**: Always create test, debug, and development files in `./tests/dev/` to keep the root directory clean.
+
+When working on:
+- **Bug fixes**: Create debug scripts in `./tests/dev/debug_<issue_name>.py`
+- **New architecture support**: Create test files in `./tests/dev/test_<arch>_<feature>.py`
+- **Model validation**: Create comparison scripts in `./tests/dev/test_<model>_vs_<reference>.py`
+- **Development utilities**: Place tools in `./tests/dev/` with descriptive names
+
+**Never** create test or debug files directly in the root directory. This keeps the project structure clean and professional.
+
+See `./tests/dev/README.md` for a complete catalog of existing development files organized by architecture and purpose.
+
 ## Requirements
 
 - **System**: macOS Sequoia with Apple Neural Engine
