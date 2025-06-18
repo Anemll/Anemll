@@ -5,9 +5,11 @@ anemll-swift-cli/.build/
 lib/
 bin/
 share/
-evaluate/*  # model quality testing
+
 ./*.logs/  # logs / test results
 
+evaluate/results/
+results/
 # macOS system files
 .DS_Store
 
