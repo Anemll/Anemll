@@ -8,11 +8,12 @@ PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 print_usage() {
-    echo "Usage: $0 --input <converted_model_dir> [--output <output_dir>] [--org <huggingface_org>] [--ios]"
+    echo "Usage: $0 --input <converted_model_dir> [--output <output_dir>] [--org <huggingface_org>] [--name <model_name>] [--ios]"
     echo "Options:"
     echo "  --input    Directory containing converted model files (required)"
     echo "  --output   Output directory for HF distribution (optional, defaults to input_dir/hf_dist)"
     echo "  --org      Hugging Face organization/account (optional, defaults to anemll)"
+    echo "  --name     Custom model name for HuggingFace upload (optional, defaults to name from meta.yaml)"
     echo "  --ios      Prepare iOS-ready version with unzipped MLMODELC files (if omitted, prepares standard distribution)"
     exit 1
 }
@@ -30,6 +31,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --org)
             HF_ORG="$2"
+            shift 2
+            ;;
+        --name)
+            CUSTOM_MODEL_NAME="$2"
             shift 2
             ;;
         --ios)
@@ -109,7 +114,13 @@ if [ -z "$LUT_EMBEDDINGS" ]; then
 fi
 
 # Construct full model name with version
-FULL_MODEL_NAME="${MODEL_NAME}_${MODEL_VERSION}"
+if [ -n "$CUSTOM_MODEL_NAME" ]; then
+    FULL_MODEL_NAME="$CUSTOM_MODEL_NAME"
+    echo "Using custom model name: $FULL_MODEL_NAME"
+else
+    FULL_MODEL_NAME="${MODEL_NAME}_${MODEL_VERSION}"
+    echo "Using model name from meta.yaml: $FULL_MODEL_NAME"
+fi
 
 # Set output directory if not specified
 if [ -z "$OUTPUT_DIR" ]; then
@@ -287,6 +298,9 @@ fi
 sed -e "s|%NAME_OF_THE_FOLDER_WE_UPLOAD%|$FULL_MODEL_NAME|g" \
     -e "s|%PATH_TO_META_YAML%|./meta.yaml|g" \
     -e "s|%HF_ORG%|$HF_ORG|g" \
+    -e "s|%CONTEXT_LENGTH%|$CONTEXT_LENGTH|g" \
+    -e "s|%BATCH_SIZE%|$BATCH_SIZE|g" \
+    -e "s|%NUM_CHUNKS%|$NUM_CHUNKS|g" \
     "$README_TEMPLATE" > "$TARGET_DIR/README.md"
 
 # Also create a copy in the main output directory for reference

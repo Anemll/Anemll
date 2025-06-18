@@ -3,6 +3,8 @@ license: mit
 tags:
 - coreml
 - ANE
+- LLaMA
+- Qwen
 - DeepSeek
 - Apple
 - Apple Neural Engine
@@ -26,9 +28,12 @@ For more information, visit the [ANEMLL GitHub repository](https://github.com/an
 ## License
 
 ANEMLL is licensed under the [MIT License](https://opensource.org/license/mit).  
-The model is based on Meta's LLaMA 3.2 and may require a separate license.
+The original model may require a separate license depending on the architecture:
+- LLaMA models: Based on Meta's LLaMA and may require Meta's license
+- Qwen models: Based on Alibaba's Qwen and may require Alibaba's license
+- Other models: Check respective original model licenses
 
-This test model is exclusively for the Meta's LLaMA architecture  converted for CoreML, released before the official launch of the ANEMLL repository and minimal documentation. It is intended for early adopters only who requested an early release.
+This model is converted for CoreML using ANEMLL's open-source conversion pipeline. It supports multiple LLM architectures including LLaMA, Qwen, and DeepSeek variants.
 
 ---
 
