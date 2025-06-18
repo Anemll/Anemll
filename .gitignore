@@ -13,6 +13,10 @@ results/
 # macOS system files
 .DS_Store
 
+# Backup files
+*.bk
+*.backup
+
 # Xcode and Swift Package Manager
 .swiftpm/
 xcuserdata/
