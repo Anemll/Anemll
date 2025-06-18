@@ -10,3 +10,9 @@ evaluate/*  # model quality testing
 
 # macOS system files
 .DS_Store
+
+# Xcode and Swift Package Manager
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+*.xcworkspacexcuserdata/
