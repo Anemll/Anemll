@@ -2,3 +2,11 @@ __pycache__/
 =8.2
 env-anemll/
 anemll-swift-cli/.build/
+lib/
+bin/
+share/
+evaluate/*  # model quality testing
+./*.logs/  # logs / test results
+
+# macOS system files
+.DS_Store

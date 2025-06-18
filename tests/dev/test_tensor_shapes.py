@@ -69,7 +69,7 @@ def test_coreml_shapes():
     
     # Use our actual model path
     model_paths = [
-        "/Users/user/SourceRelease/GITHUB/ML_playground/private-anemll/Qwen3-0.6B",
+        "~/SourceRelease/GITHUB/ML_playground/private-anemll/Qwen3-0.6B",
         "downloaded_models/Qwen3-0.6B"
     ]
     
