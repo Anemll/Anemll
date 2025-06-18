@@ -525,11 +525,33 @@ import CoreFoundation
                 }
                 
                 // Assign output backing BEFORE predict
-                // During prefill, ALWAYS use prefill backing, never the last chunk backing
-                if let backings = hiddenStatesBackings_ffn_prefill {
-                    ffnOptions.outputBackings = backings  // Shape: [1, batch_size, hidden_states]
+                // Check what shape the model expects by looking at its OUTPUT description
+                var useLastChunkBacking = false
+                
+                if let outputDesc = chunk.prefillModel.modelDescription.outputDescriptionsByName["output_hidden_states"],
+                   let constraint = outputDesc.multiArrayConstraint {
+                    let expectedBatchDim = constraint.shape[1].intValue
                     if debugLevel >= 1 {
-                        print("Using FFN prefill backing with shape:", backings["output_hidden_states"]?.shape.map { $0.intValue } ?? [])
+                        print("Chunk \(index + 1) prefill model expects output shape: \(constraint.shape.map { $0.intValue })")
+                    }
+                    // If model expects output batch dim of 1, use last chunk backing
+                    useLastChunkBacking = (expectedBatchDim == 1)
+                }
+                
+                if useLastChunkBacking && !v110 {
+                    if let backings = hiddenStatesBackings_last {
+                        ffnOptions.outputBackings = backings  // Shape: [1, 1, hidden_states]
+                        if debugLevel >= 1 {
+                            print("Using last chunk backing with shape:", backings["output_hidden_states"]?.shape.map { $0.intValue } ?? [])
+                        }
+                    }
+                } else {
+                    // For models expecting batch shape or when v110=true
+                    if let backings = hiddenStatesBackings_ffn_prefill {
+                        ffnOptions.outputBackings = backings  // Shape: [1, batch_size, hidden_states]
+                        if debugLevel >= 1 {
+                            print("Using FFN prefill backing with shape:", backings["output_hidden_states"]?.shape.map { $0.intValue } ?? [])
+                        }
                     }
                 }
                 
@@ -550,11 +572,18 @@ import CoreFoundation
                     options: ffnOptions
                 )
                 
-                // Update currentHiddenStates - during prefill always use prefill backing
-                guard let nextHiddenStates = hiddenStatesBackings_ffn_prefill?["output_hidden_states"] else {
-                    throw InferenceError.inferenceError("Missing FFN prefill output backing")
+                // Update currentHiddenStates - use the appropriate backing based on what model expects
+                if useLastChunkBacking && !v110 {
+                    guard let nextHiddenStates = hiddenStatesBackings_last?["output_hidden_states"] else {
+                        throw InferenceError.inferenceError("Missing last chunk output backing")
+                    }
+                    currentHiddenStates = nextHiddenStates  // Shape: [1, 1, hidden_states]
+                } else {
+                    guard let nextHiddenStates = hiddenStatesBackings_ffn_prefill?["output_hidden_states"] else {
+                        throw InferenceError.inferenceError("Missing FFN prefill output backing")
+                    }
+                    currentHiddenStates = nextHiddenStates  // Shape: [1, batch_size, hidden_states]
                 }
-                currentHiddenStates = nextHiddenStates  // Shape: [1, batch_size, hidden_states]
                 
                 if debugLevel >= 2 {
                     debugTensor(currentHiddenStates, prefix: "FFN chunk \(index + 1) output")

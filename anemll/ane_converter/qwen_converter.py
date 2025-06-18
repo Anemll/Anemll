@@ -541,16 +541,28 @@ class QwenConverter(BaseConverter):
         wrapper = PrefillWrapper(model, start_layer, end_layer)
         wrapper.eval()
 
+        # Check if this is the last chunk in a multi-chunk model
+        is_last_chunk = (chunk_idx == total_chunks - 1) and (total_chunks > 1)
+        
+        # For last chunk in multi-chunk models, use shape (1, 1, hidden_size)
+        # For single chunk or non-last chunks, use shape (1, batch_size, hidden_size)
+        if is_last_chunk:
+            batch_dim = 1
+            print(f"Using last chunk shape for prefill: (1, 1, {model.config.hidden_size})")
+        else:
+            batch_dim = self.batch_size
+            print(f"Using standard batch shape for prefill: (1, {self.batch_size}, {model.config.hidden_size})")
+
         hidden_states = torch.zeros(
-            (1, self.batch_size, model.config.hidden_size),
+            (1, batch_dim, model.config.hidden_size),
             dtype=torch.float16,
             device=TEST_DEVICE,
         )
         position_ids = torch.zeros(
-            (self.batch_size,), dtype=torch.int32, device=TEST_DEVICE
+            (batch_dim,), dtype=torch.int32, device=TEST_DEVICE
         )
         causal_mask = torch.zeros(
-            (1, 1, self.batch_size, self.context_length),
+            (1, 1, batch_dim, self.context_length),
             dtype=torch.float16,
             device=TEST_DEVICE,
         )

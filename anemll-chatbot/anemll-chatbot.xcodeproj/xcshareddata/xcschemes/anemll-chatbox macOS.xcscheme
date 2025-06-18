@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Scheme
-   LastUpgradeVersion = "1630"
+   LastUpgradeVersion = "1620"
    version = "1.7">
    <BuildAction
       parallelizeBuildables = "YES"
@@ -15,9 +15,9 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "094505FC2D6A94C3000DCAB7"
-               BuildableName = "anemll-chatbot.app"
-               BlueprintName = "anemll-chatbot"
+               BlueprintIdentifier = "0961E5CA2D6D730500DF1803"
+               BuildableName = "anemll-chatbox macOS.app"
+               BlueprintName = "anemll-chatbox macOS"
                ReferencedContainer = "container:anemll-chatbot.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -29,33 +29,9 @@
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES"
       shouldAutocreateTestPlan = "YES">
-      <Testables>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "YES">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "0945060B2D6A94C5000DCAB7"
-               BuildableName = "anemll-chatbotTests.xctest"
-               BlueprintName = "anemll-chatbotTests"
-               ReferencedContainer = "container:anemll-chatbot.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "YES">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "094506152D6A94C5000DCAB7"
-               BuildableName = "anemll-chatbotUITests.xctest"
-               BlueprintName = "anemll-chatbotUITests"
-               ReferencedContainer = "container:anemll-chatbot.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
-      </Testables>
    </TestAction>
    <LaunchAction
-      buildConfiguration = "Release"
+      buildConfiguration = "Debug"
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       launchStyle = "0"
@@ -68,9 +44,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "094505FC2D6A94C3000DCAB7"
-            BuildableName = "anemll-chatbot.app"
-            BlueprintName = "anemll-chatbot"
+            BlueprintIdentifier = "0961E5CA2D6D730500DF1803"
+            BuildableName = "anemll-chatbox macOS.app"
+            BlueprintName = "anemll-chatbox macOS"
             ReferencedContainer = "container:anemll-chatbot.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -85,9 +61,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "094505FC2D6A94C3000DCAB7"
-            BuildableName = "anemll-chatbot.app"
-            BlueprintName = "anemll-chatbot"
+            BlueprintIdentifier = "0961E5CA2D6D730500DF1803"
+            BuildableName = "anemll-chatbox macOS.app"
+            BlueprintName = "anemll-chatbox macOS"
             ReferencedContainer = "container:anemll-chatbot.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
