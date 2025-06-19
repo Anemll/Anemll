@@ -19,8 +19,8 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 ./install_dependencies.sh
 
 # 3. Test conversion pipeline
-./tests/conv/test_qwen_simple.sh    # Test Qwen models
-./tests/conv/test_llama_simple.sh   # Test LLaMA models
+python tests/test_qwen_model.py     # Test Qwen models
+python tests/test_llama_model.py    # Test LLaMA models
 
 # 4. Convert your own models
 ./anemll/utils/convert_model.sh --model <path> --output <dir>
@@ -66,8 +66,8 @@ ANEMLL provides five main components for Apple Neural Engine inference developme
 ### Pre-converted Models
 
 We provide sample converted models ready for use:
-- **LLAMA 3.1/3.2** (1B and 8B variants) including iOS "friendly builds"
-- **🆕 Qwen 3** (0.6B and 8B) - **New in 0.3.3!** Initial support with custom converter
+- **LLAMA 3.1/3.2** (1B and B variants) including iOS "friendly builds"
+- **🆕 Qwen 3** (0.6B and 4B) - **New in 0.3.3!** Initial support with custom converter
 - **DeepSeek** distilled models
 - **DeepHermes** distilled models
 
@@ -75,9 +75,31 @@ We provide sample converted models ready for use:
 > Please note that Quantization should be improved. LUT4 quality is fairly low due to lack of Block Quantization on Apple Neural Engine.
 
 ### 🧪 **New Testing Infrastructure**
-- **Automated conversion tests**: Run `./tests/conv/test_qwen_simple.sh` or `./tests/conv/test_llama_simple.sh`
+
+#### Quick Model Testing
+- **Generic HF Model Testing**: `./tests/conv/test_hf_model.sh [model_name] [output_dir] [chunks]`
+- **LLaMA Testing**: `python tests/test_llama_model.py`
+- **Qwen Testing**: `python tests/test_qwen_model.py`
+
+#### Test Any HuggingFace Model
+```bash
+# Test any model with automatic naming
+./tests/conv/test_hf_model.sh meta-llama/Llama-3.2-1B-Instruct
+
+# Test with custom output directory
+./tests/conv/test_hf_model.sh Qwen/Qwen2.5-0.5B-Instruct /tmp/my-test
+
+# Test larger models with chunks
+./tests/conv/test_hf_model.sh meta-llama/Llama-3.2-8B-Instruct /tmp/llama8b 4
+```
+
+#### Features
+- **Auto-downloads models**: No manual setup required, downloads models from HuggingFace
+- **Fast validation**: Uses unquantized FP16 conversion for quick pipeline testing
+- **Virtual environment aware**: Automatically activates env-anemll if present
 - **End-to-end validation**: Tests cover conversion → Python inference → Swift CLI inference
 - **Clean testing**: Uses `/tmp` directories to avoid cluttering your workspace
+- **HuggingFace Authentication**: Automatically uses your HF token for gated models
 > Some GPTQ and Spin Quant should greatly improve LUT4 models.
 
 Visit our [Hugging Face repository](https://huggingface.co/anemll) for the latest converted models.
@@ -144,7 +166,17 @@ Features of chat_full.py:
 - Shows generation speed and token statistics
 - Better handles multi-turn conversations
 
-Example running Chats:
+### Quick Testing with Conversion Scripts
+
+```bash
+# Test complete pipeline: download → convert → inference
+./tests/conv/test_qwen_simple.sh    # Tests Qwen3-0.6B conversion
+./tests/conv/test_llama_simple.sh   # Tests meta-llama/Llama-3.2-1B (requires HF access)
+```
+
+> **📝 Note:** Test scripts use small models (0.6B-1B parameters) with unquantized FP16 conversion for faster testing and validation. For production models with quantization (LUT4/LUT6), use the full conversion script with your preferred model size.
+
+### Manual Chat Testing
 
 ```bash
 # Basic chat
@@ -158,8 +190,6 @@ See [chat.md](./docs/chat.md) for more details
 > [Note]
 >The first time the model loads, macOS will take some time to place it on the device. Subsequent loads will be instantaneous. Use Ctrl-D to exit, Ctrl-C to interrupt inference.
 
-> [!Note]
-> The unit tests rely on Core ML. On systems without Core ML (such as the Codex VM) they are skipped during collection.
 
 
 
@@ -182,9 +212,9 @@ See [chat.md](./docs/chat.md) for more details
 # 2. Install all dependencies (auto-detects and activates virtual environment)
 ./install_dependencies.sh
 
-# 3. Verify installation with automated tests (optional - requires pre-downloaded models)
-./tests/conv/test_qwen_simple.sh    # Test Qwen conversion
-./tests/conv/test_llama_simple.sh   # Test LLaMA conversion
+# 3. Verify installation with automated tests (downloads models automatically)
+./tests/conv/test_qwen_simple.sh    # Test Qwen conversion (auto-downloads ~2.4GB)
+./tests/conv/test_llama_simple.sh   # Test LLaMA conversion (auto-downloads ~500MB)
 ```
 
 **🔧 Manual Setup (if needed):**
@@ -197,18 +227,12 @@ source env-anemll/bin/activate
 ./install_dependencies.sh
 ```
 
-> **📝 Note on Test Scripts:** The automated test scripts require specific models to be downloaded first:
-> - `test_qwen_simple.sh` requires: `~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/[hash]/`
-> - `test_llama_simple.sh` requires: `~/Models/HF/Meta-Llama-3.2-1B/`
+> **📝 Note on Test Scripts:** The automated test scripts will automatically download required models from HuggingFace:
+> - `test_qwen_simple.sh` downloads `Qwen/Qwen3-0.6B` (2.4GB) - tiny model, unquantized FP16
+> - `test_llama_simple.sh` downloads `HuggingFaceTB/SmolLM-135M` (500MB) - tiny model, unquantized FP16
 > 
-> **To download required models:**
-> ```bash
-> # Download Qwen model (will be cached automatically)
-> python -c "from transformers import AutoModelForCausalLM; AutoModelForCausalLM.from_pretrained('Qwen/Qwen3-0.6B')"
-> 
-> # Download LLaMA model to specific path
-> python -c "from transformers import AutoModelForCausalLM; AutoModelForCausalLM.from_pretrained('meta-llama/Llama-3.2-1B', cache_dir='~/Models/HF')"
-> ```
+> **First run may take longer due to model downloads. Models are cached for subsequent runs.**
+> These use small models with no quantization for fast validation - ideal for testing the pipeline.
 > 
 > **Alternative: Test with your own models:**
 > ```bash
@@ -264,7 +288,7 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 | LLaMA 3.1/3.2 | 1B, 8B | 512-2048 | ✅ Yes | 🟢 Stable |
 | DeepSeek R1 | 8B | 512-1024 | ✅ Yes | 🟢 Stable |
 | DeepHermes | 3B, 8B | 512-1024 | ✅ Yes | 🟢 Stable |
-| Qwen 3 | 0.6B, 8B | 512-2048 | ⚠️ Experimental | 🟡 Alpha |
+| Qwen 3 | 0.6B, 4B | 512-2048 | ⚠️ Experimental | 🟡 Alpha |
 
 ### 🎯 **ANE Performance Notes**
 - **Recommended context**: 512-1024 tokens for best performance
