@@ -1,4 +1,4 @@
-# ANEMLL Roadmap POST WWDC'25
+# ANEMLL Roadmap 
 
 ## Completed Milestones ✅
 - [x] Initial Release - Basic conversion/test
@@ -9,7 +9,7 @@
 - [x] Qwen Architecture Support
 
 ## In Progress Milestones 🚧
-- [ ] Model/Quantization Quality testing (/eval)
+- [ ] Model Quality testing  (/eval)
 - [ ] Re-add monolithic model support ( export_coreml)
 - [ ] SpinQuant and other Quantizatio workflows Implementation
 
@@ -22,6 +22,7 @@
 - [ ] Basic ANE Server Implementation w/Third-party API
 - [ ] Profiling/Benchmarking scripts
 - [ ] Re-add monolithic model support (partial in export_coreml)
+- [ ] Add AFM-like Swift API to call models
 
 
 
