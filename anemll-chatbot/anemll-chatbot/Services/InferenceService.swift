@@ -408,7 +408,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     initialTokens: tokens,
                     temperature: defaultTemperature,
                     maxTokens: maxTokens,
-                    eosToken: tokenizer.eosTokenId,
+                    eosTokens: tokenizer.eosTokenId,
                     tokenizer: tokenizer,
                     onToken: { token in
                         print("🔥 TEST: Generated token \(token)")
@@ -446,7 +446,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                 initialTokens: tokens,
                 temperature: defaultTemperature,
                 maxTokens: maxTokens,
-                eosToken: tokenizer.eosTokenId,
+                eosTokens: tokenizer.eosTokenId,
                 tokenizer: tokenizer,
                 onToken: { token in
                     // Just log every 5 tokens for monitoring
@@ -1809,7 +1809,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         initialTokens: tokens,
                         temperature: defaultTemperature,
                         maxTokens: maxGenerationTokens,
-                        eosToken: eosTokenId, // Use the model-specific EOS token ID
+                        eosTokens: eosTokenId, // Use the model-specific EOS token ID
                         tokenizer: tokenizer,
                         onToken: { token in
                             // Increment token count
@@ -2262,7 +2262,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         initialTokens: currentPrompt,
                         temperature: defaultTemperature,
                         maxTokens: maxGenerationTokens,
-                        eosToken: tokenizer.eosTokenId,
+                        eosTokens: tokenizer.eosTokenId,
                         tokenizer: tokenizer,
                         onToken: { [tokenizer, tokenBuffer] token in
                             // Check if cancellation is already in progress
