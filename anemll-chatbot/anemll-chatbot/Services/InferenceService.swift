@@ -408,7 +408,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     initialTokens: tokens,
                     temperature: defaultTemperature,
                     maxTokens: maxTokens,
-                    eosTokens: tokenizer.eosTokenId,
+                    eosTokens: tokenizer.eosTokenIds.first ?? 2,
                     tokenizer: tokenizer,
                     onToken: { token in
                         print("🔥 TEST: Generated token \(token)")
@@ -446,7 +446,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                 initialTokens: tokens,
                 temperature: defaultTemperature,
                 maxTokens: maxTokens,
-                eosTokens: tokenizer.eosTokenId,
+                eosTokens: tokenizer.eosTokenIds.first ?? 2,
                 tokenizer: tokenizer,
                 onToken: { token in
                     // Just log every 5 tokens for monitoring
@@ -1788,7 +1788,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         print("DEBUG - Long generation: \(allowLongGeneration ? "enabled" : "disabled")")
         
         // Get the EOS token directly from the tokenizer
-        let eosTokenId = tokenizer.eosTokenId
+        let eosTokenId = tokenizer.eosTokenIds.first ?? 2
         print("DEBUG - Using EOS token ID from tokenizer: \(eosTokenId)")
         
         // Create a token printer for streaming output
@@ -1938,7 +1938,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         
                         // Provide information about the EOS token
                         print("\nEOS token information:")
-                        print("Configured EOS token ID: \(tokenizer.eosTokenId)")
+                        print("Configured EOS token ID: \(tokenizer.eosTokenIds.first ?? 2)")
                         print("Used EOS token ID: \(eosTokenId)")
                         print("EOS token representation: \"\(tokenizer.decode(tokens: [eosTokenId], skipSpecialTokens: false))\"")
                         
@@ -2262,7 +2262,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         initialTokens: currentPrompt,
                         temperature: defaultTemperature,
                         maxTokens: maxGenerationTokens,
-                        eosTokens: tokenizer.eosTokenId,
+                        eosTokens: tokenizer.eosTokenIds.first ?? 2,
                         tokenizer: tokenizer,
                         onToken: { [tokenizer, tokenBuffer] token in
                             // Check if cancellation is already in progress
