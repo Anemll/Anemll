@@ -1,32 +1,22 @@
-*.pyc
-bin/
-lib/
-share/
-LOG.txt
-log_bad.txt
-log_good.txt
-*.ml*
-tests/old_chat.py
-R1-min2.py
-.DS_Store
-anemll-env/pyvenv.cfg
-.gitignore
-anemll/ane_converter/__pycache__/
-anemll/models/__pycache__/*
+__pycache__/
+env-anemll/
 anemll-swift-cli/.build/
-anemll-chatbot/build/
-*.bak
-*.zip
-../anemll-swift-cli/.swiftpm/
-../anemll-swift-cli/.build/
-../anemll-swift-cli/build/
-anemll-chatbot.xcodeproj/xcuserdata/
-FileSharing_Instructions.md
-ModelManagementView_Performance_Improvements.md
-huggingface_download_flow.md                    
-ZIPFoundation_Instructions.md
-anemll-chatbot/anemll-chatbot.xcodeproj/Sources/anemll-chatbot.xcodeproj/anemll_chatbot_xcodeproj.swift
-anemll-swift-cli/.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
-anemll-chatbot/anemll-chatbot.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
-anemll-swift-cli/.swiftpm/
-anemll-swift-cli/build/anemll-swift-cli.build/Release-iphonesimulator/AnemllCore.build/
+lib/
+bin/
+share/
+./*.logs/  # logs / test results
+evaluate/results/
+results/
+# macOS system files
+.DS_Store
+
+# Backup files
+*.bk
+*.backup
+
+# Xcode and Swift Package Manager
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+*.xcworkspacexcuserdata/
+=*

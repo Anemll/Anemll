@@ -11,6 +11,7 @@ public struct YAMLConfig: Sendable {
     public let batchSize: Int
     public let lutBits: Int
     public let numChunks: Int
+    public let splitLMHead: Int
     
     // Model paths
     public let embedPath: String
@@ -43,6 +44,7 @@ public struct YAMLConfig: Sendable {
         self.stateLength = yaml["state_length"] as? Int ?? self.contextLength
         self.lutBits = yaml["lut_bits"] as? Int ?? 4
         self.numChunks = yaml["num_chunks"] as? Int ?? 1
+        self.splitLMHead = yaml["split_lm_head"] as? Int ?? 8
         
         // Extract paths from yaml
         self.embedPath = yaml["embed_path"] as? String ?? ""
@@ -69,7 +71,7 @@ public struct YAMLConfig: Sendable {
             self.ffnPath = rawFFNPath
         }
         
-        self.configVersion = yaml["version"] as? String ?? "0.3.0"
+        self.configVersion = yaml["version"] as? String ?? "0.3.3"
     }
     
     /// Load configuration from a file path
@@ -122,6 +124,7 @@ public struct YAMLConfig: Sendable {
             let lutLMHead = String(params["lut_lmhead"] as? Int ?? -1)
             let lutEmbeddings = String(params["lut_embeddings"] as? Int ?? -1)
             let numChunks = params["num_chunks"] as? Int ?? 1
+            let splitLMHead = params["split_lm_head"] as? Int ?? 8
             
             // Check for predefined paths in parameters
             let predefinedEmbedPath = params["embeddings"] as? String
@@ -151,14 +154,40 @@ public struct YAMLConfig: Sendable {
             
             let ffnPath: String
             if let definedPath = predefinedFFNPath {
-                ffnPath = "\(baseDir)/\(definedPath)"
+                // Check if the predefined path exists, or if we need to add chunk suffix
+                let fullPath = "\(baseDir)/\(definedPath)"
+                if FileManager.default.fileExists(atPath: fullPath) {
+                    ffnPath = fullPath
+                } else if numChunks == 1 {
+                    // Try with _chunk_01of01 suffix
+                    let pathWithoutExt = definedPath.replacingOccurrences(of: ".mlmodelc", with: "")
+                    let chunkedPath = "\(baseDir)/\(pathWithoutExt)_chunk_01of01.mlmodelc"
+                    if FileManager.default.fileExists(atPath: chunkedPath) {
+                        ffnPath = chunkedPath
+                        print("Found single-chunk FFN model with chunk suffix: \(chunkedPath)")
+                    } else {
+                        ffnPath = fullPath // Fall back to original path
+                    }
+                } else {
+                    ffnPath = fullPath
+                }
             } else if numChunks > 1 {
                 // For multi-chunk models, use the canonical chunk path format
                 ffnPath = "\(baseDir)/\(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "")_chunk_01of\(String(format: "%02d", numChunks)).mlmodelc"
                 print("Generated canonical chunked FFN path: \(ffnPath)")
             } else {
-                // For single-chunk models
-                ffnPath = "\(baseDir)/\(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "").mlmodelc"
+                // For single-chunk models, check if _chunk_01of01 exists
+                let baseFFNPath = "\(baseDir)/\(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "")"
+                let chunkedPath = "\(baseFFNPath)_chunk_01of01.mlmodelc"
+                let nonChunkedPath = "\(baseFFNPath).mlmodelc"
+                
+                // Check if chunked version exists
+                if FileManager.default.fileExists(atPath: chunkedPath) {
+                    ffnPath = chunkedPath
+                    print("Found single-chunk FFN model with chunk suffix: \(chunkedPath)")
+                } else {
+                    ffnPath = nonChunkedPath
+                }
             }
             
             print("\nModel paths (Python style):")
@@ -191,7 +220,8 @@ public struct YAMLConfig: Sendable {
                 "version": modelInfo["version"] as? String ?? "1.0",
                 "embed_path": embedPath,
                 "ffn_path": ffnPath,
-                "lmhead_path": lmheadPath
+                "lmhead_path": lmheadPath,
+                "split_lm_head": splitLMHead
             ]
             
             let yamlString = try Yams.dump(object: configDict)
@@ -217,7 +247,8 @@ public struct YAMLConfig: Sendable {
         numChunks: Int, 
         lutFFN: String, 
         lutLMHead: String, 
-        lutEmbeddings: String
+        lutEmbeddings: String,
+        splitLMHead: Int
     ) throws -> YAMLConfig {
         // Create YAML string for init(from:)
         let configDict: [String: Any] = [
@@ -235,7 +266,8 @@ public struct YAMLConfig: Sendable {
             "version": modelInfo["version"] as? String ?? "1.0",
             "embed_path": embedPath,
             "ffn_path": ffnPath,
-            "lmhead_path": lmheadPath
+            "lmhead_path": lmheadPath,
+            "split_lm_head": splitLMHead
         ]
         
         let yamlString = try Yams.dump(object: configDict)

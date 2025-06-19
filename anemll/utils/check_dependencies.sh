@@ -87,45 +87,112 @@ if [ "$SKIP_CHECK" = false ]; then
     echo "Checking if Python3 is installed..."
     command -v python3 >/dev/null 2>&1 || { echo >&2 "Python3 is required but it's not installed. Aborting."; echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."; exit 1; }
 
-    # Check for model files
-    echo "Checking for model files in the provided directory: $MODEL_DIR"
-    if [ ! -f "$MODEL_DIR/config.json" ]; then
-        echo "config.json is required but not found in the model directory. Aborting. (Issue #5)"
-        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
-        exit 1
-    fi
-    if [ ! -f "$MODEL_DIR/tokenizer.json" ]; then
-        echo "tokenizer.json is required but not found in the model directory. Aborting. (Issue #5)"
-        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
-        exit 1
-    fi
-    if [ ! -f "$MODEL_DIR/tokenizer_config.json" ]; then
-        echo "tokenizer_config.json is required but not found in the model directory. Aborting. (Issue #5)"
-        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
-        exit 1
-    fi
+    # Check for model files only if MODEL_DIR is provided
+    if [ ! -z "$MODEL_DIR" ]; then
+        echo "Checking for model files in the provided directory: $MODEL_DIR"
+        if [ ! -f "$MODEL_DIR/config.json" ]; then
+            echo "config.json is required but not found in the model directory. Aborting. (Issue #5)"
+            echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+            exit 1
+        fi
+        if [ ! -f "$MODEL_DIR/tokenizer.json" ]; then
+            echo "tokenizer.json is required but not found in the model directory. Aborting. (Issue #5)"
+            echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+            exit 1
+        fi
+        if [ ! -f "$MODEL_DIR/tokenizer_config.json" ]; then
+            echo "tokenizer_config.json is required but not found in the model directory. Aborting. (Issue #5)"
+            echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+            exit 1
+        fi
 
-    # Check for quantization in config.json
-    QUANTIZATION_PRESENT=$(jq -e '.quantization | length > 0' "$MODEL_DIR/config.json" 2>/dev/null)
-    if [ "$QUANTIZATION_PRESENT" = "true" ]; then
-        echo "Quantized models are not supported. Aborting. (Issue #6)"
-        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
-        exit 1
-    fi
+        # Check for quantization in config.json
+        echo "Checking if model is quantized..."
+        
+        # Check for quantization_config field (used by FP8, GPTQ, AWQ, etc.)
+        QUANTIZATION_CONFIG=$(jq -r '.quantization_config // empty' "$MODEL_DIR/config.json" 2>/dev/null)
+        
+        # Also check the old quantization field for backward compatibility
+        QUANTIZATION_PRESENT=$(jq -e '.quantization | length > 0' "$MODEL_DIR/config.json" 2>/dev/null)
+        
+        if [ ! -z "$QUANTIZATION_CONFIG" ] || [ "$QUANTIZATION_PRESENT" = "true" ]; then
+            echo ""
+            echo "⚠️  ERROR: Quantized model detected!"
+            echo ""
+            
+            # Get more details about the quantization
+            if [ ! -z "$QUANTIZATION_CONFIG" ]; then
+                QUANT_METHOD=$(jq -r '.quantization_config.quant_method // "unknown"' "$MODEL_DIR/config.json" 2>/dev/null)
+                QUANT_FORMAT=$(jq -r '.quantization_config.fmt // .quantization_config.bits // "unknown"' "$MODEL_DIR/config.json" 2>/dev/null)
+                echo "Quantization method: $QUANT_METHOD"
+                echo "Format/bits: $QUANT_FORMAT"
+                
+                if [ "$QUANT_METHOD" = "fp8" ]; then
+                    echo "This is an FP8 quantized model which cannot be properly converted."
+                elif [ "$QUANT_METHOD" = "gptq" ] || [ "$QUANT_METHOD" = "awq" ]; then
+                    echo "This is a $QUANT_METHOD quantized model with $QUANT_FORMAT-bit weights."
+                fi
+            fi
+            
+            echo ""
+            echo "Quantized models are not supported for ANEMLL conversion. (Issue #6)"
+            echo ""
+            echo "Please use an unquantized (full precision) version of this model."
+            echo "Look for model names without 'fp8', 'gptq', 'awq', '4bit', '8bit' etc."
+            echo ""
+            echo "For example:"
+            echo "  ❌ qwen3_4b_fp8     -> ✅ qwen3_4B"
+            echo "  ❌ llama-8b-gptq    -> ✅ llama-8b"
+            echo "  ❌ model-awq-4bit   -> ✅ model"
+            echo ""
+            echo "Alternatively, you can convert this quantized model to unquantized FP16/BF16:"
+            echo ""
+            echo "  Option 1: Download the original unquantized model from Hugging Face"
+            echo "  Option 2: Use the HuggingFace dequantization script:"
+            echo "           python utils/dequantize_model.py --input $MODEL_DIR --output ./dequantized_model"
+            echo "  Option 3: Use MLX dequantization (for MLX-compatible models):"
+            echo "           python utils/dequantize_mlx.py --model $MODEL_DIR --save-path ./mlx_dequantized --de-quantize"
+            echo "  Option 4: In Python, load and save as FP16:"
+            echo "           from transformers import AutoModelForCausalLM"
+            echo "           model = AutoModelForCausalLM.from_pretrained('$MODEL_DIR', device_map='cpu')"
+            echo "           model.save_pretrained('./unquantized_model', torch_dtype='float16')"
+            echo ""
+            echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+            exit 1
+        fi
+        
+        # Also check filename for quantization hints
+        MODEL_BASENAME=$(basename "$MODEL_DIR" | tr '[:upper:]' '[:lower:]')
+        if [[ "$MODEL_BASENAME" == *"fp8"* ]] || [[ "$MODEL_BASENAME" == *"gptq"* ]] || [[ "$MODEL_BASENAME" == *"awq"* ]] || [[ "$MODEL_BASENAME" == *"4bit"* ]] || [[ "$MODEL_BASENAME" == *"8bit"* ]]; then
+            echo ""
+            echo "⚠️  WARNING: Model directory name suggests quantization: $MODEL_BASENAME"
+            echo "Please ensure you are using an unquantized model."
+            echo ""
+        fi
 
-    # Check for supported architectures in config.json
-    echo "Checking for supported architectures in config.json..."
-    SUPPORTED_ARCHS=("llama")
-    CONFIG_ARCH=$(jq -r '.architectures[]' "$MODEL_DIR/config.json" 2>/dev/null)
-    CONFIG_MODEL_TYPE=$(jq -r '.model_type' "$MODEL_DIR/config.json" 2>/dev/null)
+        # Check for supported architectures in config.json
+        echo "Checking for supported architectures in config.json..."
+        SUPPORTED_ARCHS=("llama" "qwen")
+        CONFIG_ARCH=$(jq -r '.architectures[]' "$MODEL_DIR/config.json" 2>/dev/null)
+        CONFIG_MODEL_TYPE=$(jq -r '.model_type' "$MODEL_DIR/config.json" 2>/dev/null)
 
-    CONFIG_ARCH_LOWER=$(echo "$CONFIG_ARCH" | tr '[:upper:]' '[:lower:]')
-    CONFIG_MODEL_TYPE_LOWER=$(echo "$CONFIG_MODEL_TYPE" | tr '[:upper:]' '[:lower:]')
+        CONFIG_ARCH_LOWER=$(echo "$CONFIG_ARCH" | tr '[:upper:]' '[:lower:]')
+        CONFIG_MODEL_TYPE_LOWER=$(echo "$CONFIG_MODEL_TYPE" | tr '[:upper:]' '[:lower:]')
 
-    if [[ ! " ${SUPPORTED_ARCHS[@]} " =~ " $CONFIG_ARCH_LOWER " ]] && [[ ! " ${SUPPORTED_ARCHS[@]} " =~ " $CONFIG_MODEL_TYPE_LOWER " ]]; then
-        echo "Unsupported architecture or model type in config.json. Supported types: ${SUPPORTED_ARCHS[@]}. Aborting. (Issue #7)"
-        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
-        exit 1
+        # Check if architecture contains any supported pattern
+        ARCH_SUPPORTED=false
+        for arch in "${SUPPORTED_ARCHS[@]}"; do
+            if [[ "$CONFIG_ARCH_LOWER" == *"$arch"* ]] || [[ "$CONFIG_MODEL_TYPE_LOWER" == *"$arch"* ]]; then
+                ARCH_SUPPORTED=true
+                break
+            fi
+        done
+        
+        if [ "$ARCH_SUPPORTED" = false ]; then
+            echo "Unsupported architecture or model type in config.json. Supported types: ${SUPPORTED_ARCHS[@]}. Aborting. (Issue #7)"
+            echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+            exit 1
+        fi
     fi
 
     # Add more checks as needed

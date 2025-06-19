@@ -1,0 +1,5 @@
+{
+    "default_model_path": "~/Models/ANE/anemll-Llama-3.2-1B-FP16-b64-ctx1024/",
+    "default_output_dir": "./evaluate/results",
+    "default_tasks": ["boolq", "arc_easy", "hellaswag"]
+}

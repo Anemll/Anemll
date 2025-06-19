@@ -750,7 +750,11 @@ class LlamaConverter(BaseConverter):
             wrapper = PrefillWrapper(model, start_layer, end_layer)
             wrapper.eval()
             
-            # Create sample inputs with correct shapes for prefill
+            # Always use consistent batch_size input shape for prefill
+            # The model will handle output shape changes (returns [:, 0:1, :] for last chunk)
+            print(f"Using standard prefill shape: (1, {self.batch_size}, {model.config.hidden_size})")
+            
+            # Create sample inputs with consistent shapes for prefill
             hidden_states = torch.zeros(
                 (1, self.batch_size, model.config.hidden_size),  # Shape: (1, batch_size, hidden)
                 dtype=torch.float16, device=TEST_DEVICE

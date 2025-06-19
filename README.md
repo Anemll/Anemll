@@ -2,6 +2,30 @@
 
 ANEMLL (pronounced like "animal") is an open-source project focused on accelerating the porting of Large Language Models (LLMs) to tensor processors, starting with the Apple Neural Engine (ANE).
 
+## 🚀 Version 0.3.3 Alpha Release - Initial Support for QWEN 3 Architecture
+
+### 🆕 **New Features**
+- **QWEN 3 Architecture Support**: Added support for Qwen3-0.6B and Qwen3-8B models with custom converter optimizations
+- **Streamlined Installation**: One-command setup with automatic virtual environment detection
+- **Automated Testing Framework**: End-to-end validation scripts for conversion and inference workflows
+- **Enhanced Developer Experience**: Improved error handling, better feedback, and simplified testing
+
+### 📦 **Quick Start (New Simplified Workflow)**
+```bash
+# 1. Setup environment (one-time)
+./create_python39_env.sh
+
+# 2. Install dependencies (auto-detects virtual environment)
+./install_dependencies.sh
+
+# 3. Test conversion pipeline
+./tests/conv/test_qwen_simple.sh    # Test Qwen models
+./tests/conv/test_llama_simple.sh   # Test LLaMA models
+
+# 4. Convert your own models
+./anemll/utils/convert_model.sh --model <path> --output <dir>
+```
+
 ## Goals
 > The goal is to provide a fully open-source pipeline from model conversion to inference for common LLM architectures running on ANE.
 > This enables seamless integration and on-device inference for low-power applications on edge devices, ensuring maximum privacy and security.
@@ -13,7 +37,7 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 
 See update [Roadmap.md](./docs/Roadmap.md) for more details
 
-## Main Components in 0.3.0 Alpha Release
+## Main Components in 0.3.3 Alpha Release
 
 ANEMLL provides five main components for Apple Neural Engine inference development:
 
@@ -42,29 +66,39 @@ ANEMLL provides five main components for Apple Neural Engine inference developme
 ### Pre-converted Models
 
 We provide sample converted models ready for use:
-- LLAMA 3.1 (1B and 8B variants) including iOS "friendly builds"
-- DeepSeek  distilled models
-- DeepHermes distilled models
+- **LLAMA 3.1/3.2** (1B and 8B variants) including iOS "friendly builds"
+- **🆕 Qwen 3** (0.6B and 8B) - **New in 0.3.3!** Initial support with custom converter
+- **DeepSeek** distilled models
+- **DeepHermes** distilled models
+
 > [!NOTE]
 > Please note that Quantization should be improved. LUT4 quality is fairly low due to lack of Block Quantization on Apple Neural Engine.
+
+### 🧪 **New Testing Infrastructure**
+- **Automated conversion tests**: Run `./tests/conv/test_qwen_simple.sh` or `./tests/conv/test_llama_simple.sh`
+- **End-to-end validation**: Tests cover conversion → Python inference → Swift CLI inference
+- **Clean testing**: Uses `/tmp` directories to avoid cluttering your workspace
 > Some GPTQ and Spin Quant should greatly improve LUT4 models.
 
 Visit our [Hugging Face repository](https://huggingface.co/anemll) for the latest converted models.
 
-> [!Important]
-> This is Alpha Release 0.3.0 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
-> This is Alpha Release 0.3.0 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
-> - This release only supports LLAMA models including DeepSeek and DeepHermes distilled models on LLaMA 3.1 architecture
-> - The future release will add support for more models and architectures
-> - Please visit https://huggingface.co/anemll where we upload the latest models and X: [@anemll](https://x.com/anemll) for updates
-> - Please star this repo to support the project!
+### ⚠️ **Important Alpha Release Notes**
+> This is **Alpha Release 0.3.3** - **QWEN 3 support is experimental**
+> - **Breaking Change**: `install_dependencies.sh` moved to project root
+> - **Enhanced Python Support**: Now supports Python 3.9-3.13 (recommended: 3.9-3.11)
+> - **New Architecture**: Initial Qwen 3 support with custom converter optimizations
+> - **Improved Testing**: Automated validation scripts for conversion workflows
+> 
+> Please visit https://huggingface.co/anemll for pre-converted models and follow [@anemll](https://x.com/anemll) for updates
+> 
+> ⭐ **Please star this repo to support the project!**
 
-### New in 0.3.0 🚀
-
-Swift UI Sample Code
-- Sample iOS/macOS inference Chat-Bot App (Alpha)
-- Updates to Model conversion and upload scripts 
-- Updates to Swift Package and CLI App
+### 🔄 **What's New in 0.3.3**
+- **🆕 Qwen 3 Architecture Support** - Initial implementation with custom converter
+- **📦 Streamlined Installation** - Auto-detecting virtual environment setup
+- **🧪 Automated Testing** - End-to-end validation scripts
+- **🛠 Enhanced Developer Experience** - Better error handling and feedback
+- **🔧 Bug Fixes** - Resolved Swift CLI tensor shape mismatches
 
 
 ### Sample iOS/macOS Applications
@@ -124,43 +158,132 @@ See [chat.md](./docs/chat.md) for more details
 > [Note]
 >The first time the model loads, macOS will take some time to place it on the device. Subsequent loads will be instantaneous. Use Ctrl-D to exit, Ctrl-C to interrupt inference.
 
+> [!Note]
+> The unit tests rely on Core ML. On systems without Core ML (such as the Codex VM) they are skipped during collection.
+
 
 
 ## Installation
 
 ### System Requirements
-- macOS Sequoia with Apple Neural Engine
-- Minimum 16GB RAM
-- Python 3.9
+- **macOS Sequoia** with Apple Neural Engine (Apple Silicon recommended)
+- **Minimum 16GB RAM** (32GB recommended for 8B models)
+- **Python 3.9-3.11** (Python 3.9 strongly recommended for best compatibility)
+- **Xcode Command Line Tools** (for CoreML compiler)
+- Dependencies: coremltools>=8.2, transformers>=4.36.0, numpy>=1.24.0, scikit-learn<=1.5.1
 
-### Setup Steps
+### 📦 Installation (New Streamlined Process)
 
-1. Install ANEMLL:
-We recommend creating a new virtual environment for this project.
+**🚀 One-Command Setup:**
 ```bash
-python -m venv anemll-env
-source anemll-env/bin/activate
-pip install -r requirements.txt
-# pip install anemll
-# due to Alpha Release, we do not recommend installing ANEMLL as a package yet
+# 1. Create Python environment with correct version (auto-detects Python 3.9/3.10/3.11)
+./create_python39_env.sh
+
+# 2. Install all dependencies (auto-detects and activates virtual environment)
+./install_dependencies.sh
+
+# 3. Verify installation with automated tests (optional - requires pre-downloaded models)
+./tests/conv/test_qwen_simple.sh    # Test Qwen conversion
+./tests/conv/test_llama_simple.sh   # Test LLaMA conversion
 ```
-CoreML compiler is required to compile the model. It is part of the Xcode command line tools.
-- Ensure that Xcode Command Line Tools are installed, as they include `coremlcompiler`.
-- You can install them by running `xcode-select --install`.
-- Verify that the `xcrun` command is available and correctly configured in your PATH.
-- Use `xcrun --find coremlcompiler` to verify the installation.
-- If above fails, please try following steps:
-- Download Xcode from the App Store.
-- Run `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer/` to set the path.
-- Use `xcrun --find coremlcompiler` to verify the installation.
-- Run `sudo xcodebuild -license` and agree to the license.
+
+**🔧 Manual Setup (if needed):**
+```bash
+# Create virtual environment with Python 3.9 (recommended)
+python3.9 -m venv env-anemll
+source env-anemll/bin/activate
+
+# Install dependencies
+./install_dependencies.sh
+```
+
+> **📝 Note on Test Scripts:** The automated test scripts require specific models to be downloaded first:
+> - `test_qwen_simple.sh` requires: `~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/[hash]/`
+> - `test_llama_simple.sh` requires: `~/Models/HF/Meta-Llama-3.2-1B/`
+> 
+> **To download required models:**
+> ```bash
+> # Download Qwen model (will be cached automatically)
+> python -c "from transformers import AutoModelForCausalLM; AutoModelForCausalLM.from_pretrained('Qwen/Qwen3-0.6B')"
+> 
+> # Download LLaMA model to specific path
+> python -c "from transformers import AutoModelForCausalLM; AutoModelForCausalLM.from_pretrained('meta-llama/Llama-3.2-1B', cache_dir='~/Models/HF')"
+> ```
+> 
+> **Alternative: Test with your own models:**
+> ```bash
+> # Convert any HuggingFace model
+> ./anemll/utils/convert_model.sh --model <your_model_path> --output /tmp/test-model
+> python3 tests/chat.py --meta /tmp/test-model/meta.yaml --prompt "Hello!"
+> ```
+
+### ✅ **Verification Steps**
+
+The installation script automatically verifies:
+- ✅ Python version compatibility (3.9-3.11 supported, 3.9 recommended)
+- ✅ Xcode Command Line Tools (`xcode-select --install` if missing)
+- ✅ CoreML compiler (`xcrun --find coremlcompiler`)
+- ✅ PyTorch with MPS support
+- ✅ CoreML Tools compatibility
+- ✅ Apple Neural Engine availability
+
+**Manual verification commands:**
+```bash
+# Check CoreML compiler
+xcrun --find coremlcompiler
+
+# Verify Python environment
+python --version  # Should show 3.9.x - 3.11.x
+pip list | grep -E "(torch|coremltools|transformers)"
+
+# Test Apple Neural Engine
+python -c "import torch; print('MPS available:', torch.backends.mps.is_available())"
+```
 
 
-## Model Support
+## 🤖 Model Support
 
-Currently optimized for:
-- Meta's LLaMA 3.2 1B and 8B (1024 context) model including DeepSeek R1 8B distilled model, DeepHermes 3B and 8B models
-- More models are coming soon
+### ✅ **Fully Supported Architectures**
+
+**🦙 LLaMA Family (Stable)**
+- **Meta LLaMA 3.1/3.2** (1B, 8B) - Production ready
+- **DeepSeek R1** (8B distilled) - Based on LLaMA architecture
+- **DeepHermes** (3B, 8B) - LLaMA-based fine-tuned models
+- **Context lengths**: Up to 2048 tokens (512-1024 recommended for optimal ANE performance, 4K verified)
+
+**🆕 Qwen Family (Alpha - New in 0.3.3!)**
+- **Qwen 3** (0.6B, 1.7B, 4B) - Initial support with custom converter
+- **Architecture**: Transformer with RMSNorm, SwiGLU, and RoPE
+- **Context lengths**: Up to 32K (512-2048 recommended for ANE, 4K verified)
+- **Status**: Experimental - please report issues, needs TopK and Temperature support
+
+### 🔧 **Model Specifications**
+
+| Model Family | Sizes | Context | ANE Optimized | Status |
+|-------------|-------|---------|---------------|---------|
+| LLaMA 3.1/3.2 | 1B, 8B | 512-2048 | ✅ Yes | 🟢 Stable |
+| DeepSeek R1 | 8B | 512-1024 | ✅ Yes | 🟢 Stable |
+| DeepHermes | 3B, 8B | 512-1024 | ✅ Yes | 🟢 Stable |
+| Qwen 3 | 0.6B, 8B | 512-2048 | ⚠️ Experimental | 🟡 Alpha |
+
+### 🎯 **ANE Performance Notes**
+- **Recommended context**: 512-1024 tokens for best performance
+- **Memory requirements**: 16GB+ RAM for 1B models, 32GB+ for 8B models
+- **Quantization**: LUT4 (FFN) + LUT6 (LM Head) for optimal speed/quality balance
+- **Chunking**: Automatic chunking for large models to fit ANE constraints
+
+### 🚀 **Coming Soon**
+- **Additional Qwen variants** (1.5B, 3B)
+- **Mistral family** support
+- **Gemma models**
+- **Enhanced quantization** (GPTQ, SpinQuant integration)
+- **Larger context lengths** (4K, 8K optimization)
+
+### 📥 **Pre-converted Models**
+Ready-to-use models available at [Hugging Face](https://huggingface.co/anemll):
+- iOS-friendly builds (unzipped .mlmodelc)
+- Standard builds for macOS development
+- Multiple quantization levels (FP16, LUT4, LUT6)
 
 ## Acknowledgements
 

@@ -1322,6 +1322,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                             
                             // Check for meta.yaml to determine if v110 flag should be set
                             var shouldUseV110 = false
+                            var modelConfig: ModelConfiguration? = nil  // Declare modelConfig outside the do-catch block
                             let metaYamlPath = url.appendingPathComponent("meta.yaml")
                             
                             // Print the model path for debugging
@@ -1333,14 +1334,16 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                     let yamlContent = try String(contentsOf: metaYamlPath, encoding: .utf8)
                                     
                                     // Pass the model path to the ModelConfiguration initializer
-                                    let modelConfig = try ModelConfiguration(from: yamlContent, modelPath: url.path)
+                                    modelConfig = try ModelConfiguration(from: yamlContent, modelPath: url.path)
                                     
                                     // You can manually override the v110 flag here if needed
                                     // Uncomment the next line and set to true/false to manually control v110
                                     // modelConfig.shouldUseV110 = true
                                     
-                                    shouldUseV110 = modelConfig.shouldUseV110
-                                    print("📊 Setting v110 flag to \(shouldUseV110) based on model version \(modelConfig.version)")
+                                    if let config = modelConfig {
+                                        shouldUseV110 = config.shouldUseV110
+                                        print("📊 Setting v110 flag to \(shouldUseV110) based on model version \(config.version)")
+                                    }
                                 } catch {
                                     print("⚠️ Error reading meta.yaml for v110 check: \(error). Using default v110=false")
                                     print("📂 Model directory path: \(url.path)")
@@ -1365,6 +1368,10 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                     print("📊 DEBUG: Setting up InferenceManager")
                                     print("📊 DEBUG: Context length: \(localConfig.contextLength)")
                                     print("📊 DEBUG: Batch size: \(localConfig.batchSize)")
+                                    
+                                    // Get splitLMHead from modelConfig or use default value of 8
+                                    let splitLMHead = modelConfig?.splitLMHead ?? 8
+                                    print("📊 DEBUG: Split LM Head: \(splitLMHead)")
                                     print("📊 DEBUG: v110 flag: \(shouldUseV110)")
                                     print("📊 DEBUG: Debug level: \(self.debugLevel)")
                                     
@@ -1372,6 +1379,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                         models: models,
                                         contextLength: localConfig.contextLength,
                                         batchSize: localConfig.batchSize,
+                                        splitLMHead: splitLMHead,  // Pass split_lm_head for Qwen support
                                         debugLevel: self.debugLevel,  // Pass debug level to show hidden states
                                         v110: shouldUseV110  // Pass the v110 flag based on model version
                                     )

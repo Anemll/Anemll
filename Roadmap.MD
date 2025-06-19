@@ -1,24 +1,27 @@
-# ANEMLL Roadmap before WWDC'25
+# ANEMLL Roadmap POST WWDC'25
 
 ## Completed Milestones ✅
 - [x] Initial Release - Basic conversion/test
 - [x] Automated single script workflow
 - [x] Documentation and guides
+- [x] Swift Sample Code
+- [x] iOS/SwiftUI Sample Application
+- [x] Qwen Architecture Support
+
+## In Progress Milestones 🚧
+- [ ] Model/Quantization Quality testing (/eval)
+- [ ] Re-add monolithic model support ( export_coreml)
+- [ ] SpinQuant and other Quantizatio workflows Implementation
+
 
 ## Upcoming Milestones 🚧
-
-- [ ] Swift Sample Code
-- [ ] iOS/SwiftUI Sample Application
-- [ ] Qwen Architecture Support
-- [ ] Conversion/Quantization Pipeline Re-factoring
-- [ ] SpinQuant Implementation
 - [ ] Add Int4 Linear Quantization
+- [ ] Gemma Architecture Support
+- [ ] Conversion/Quantization Pipeline Re-factoring
 - [ ] Add LoRA Support
 - [ ] Basic ANE Server Implementation w/Third-party API
-- [ ] Model/Quantization Quality testing ( e.g. perplexity)
 - [ ] Profiling/Benchmarking scripts
-- [ ] re-add monolithic model support
-
+- [ ] Re-add monolithic model support (partial in export_coreml)
 
 
 

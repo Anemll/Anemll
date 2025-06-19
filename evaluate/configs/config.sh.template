@@ -1,0 +1,31 @@
+#!/bin/bash
+# Configuration file for ANE/CoreML model evaluation
+# Copy this file to config.sh and customize as needed
+
+# Model paths 
+DEFAULT_MODEL_PATH="~/Models/ANE/aneml-llama-3.2-1B-ctx1024-v2"
+
+# Output directories
+DEFAULT_OUTPUT_DIR="./evaluate/results"
+
+# Default tasks to run
+DEFAULT_TASKS="winogrande boolq arc_challenge arc_easy hellaswag openbookqa piqa"
+
+# Add or remove tasks as needed:
+# Available tasks:
+# - arc_easy: AI2 Reasoning Challenge (Easy)
+# - arc_challenge: AI2 Reasoning Challenge (Challenge)
+# - boolq: Boolean Questions
+# - hellaswag: HellaSwag
+# - winogrande: Winogrande
+# - openbookqa: OpenBookQA
+# - piqa: Physical Interaction QA
+# - perplexity: Perplexity evaluation (requires text file)
+
+# Advanced options
+# Set this to the path of your perplexity evaluation text
+# PERPLEXITY_TEXT="./evaluate/configs/custom_text.txt"
+
+# Python environment options
+# PYTHON_PATH="/path/to/python"
+# VENV_DIR="custom_venv_dir" 

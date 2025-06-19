@@ -7,3 +7,5 @@ This example shows:
 3. Converting to Apple Neural Engine format with LUT quantization
 4. Saving the converted model
 """
+
+#SEE tests/conv/test_llama_simple.sh

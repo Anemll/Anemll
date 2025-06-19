@@ -1,0 +1,147 @@
+---
+license: mit
+tags:
+- coreml
+- ANE
+- DeepSeek
+- Apple
+- Apple Neural Engine
+- DeepHermes
+---
+# ANEMLL
+
+**ANEMLL** (pronounced like "animal") is an open-source project focused on accelerating the porting of Large Language Models (LLMs) to tensor processors, starting with the Apple Neural Engine (ANE).
+
+The goal is to provide a fully open-source pipeline from model conversion to inference for common LLM architectures running on ANE.
+
+This enables seamless integration and on-device inference for low-power applications on edge devices, ensuring maximum privacy and security.
+
+This is critical for autonomous applications, where models run directly on the device without requiring an internet connection.
+
+For more information, visit the [ANEMLL GitHub repository](https://github.com/anemll/anemll).
+
+
+---
+
+## License
+
+ANEMLL is licensed under the [MIT License](https://opensource.org/license/mit).  
+The model is based on Meta's LLaMA 3.2 and may require a separate license.
+
+This test model is exclusively for the Meta's LLaMA architecture  converted for CoreML, released before the official launch of the ANEMLL repository and minimal documentation. It is intended for early adopters only who requested an early release.
+
+---
+
+## Requirements
+
+- **macOS Sequoia** with Apple Neural Engine and 8GB RAM or more
+- **CoreML Tools** and **HuggingFace Transformers** libraries 
+- **Python 3.9**
+
+`chat.py` provides a sample inference script.  
+`chat_full.py` provides a sample inference script with history and conversation management.  
+
+**Installation**
+
+1. Download the model from Hugging Face:
+```bash
+# Install required tools
+pip install huggingface_hub
+
+# Install Git LFS (Large File Support)
+# macOS with Homebrew:
+brew install git-lfs
+# Or Ubuntu/Debian:
+# sudo apt-get install git-lfs
+
+# Initialize Git LFS
+git lfs install
+
+# Clone the repository with model files
+git clone https://huggingface.co/%HF_ORG%/%NAME_OF_THE_FOLDER_WE_UPLOAD%
+```
+
+2. Extract model files:
+```bash
+# Navigate to cloned directory
+cd %NAME_OF_THE_FOLDER_WE_UPLOAD%
+
+# Pull LFS files (model weights)
+git lfs pull
+
+# Extract CoreML model files
+find . -type f -name "*.zip" -exec unzip {} \;
+```
+
+3. Install dependencies:
+```bash
+pip install coremltools transformers
+```
+
+**Coremltools:**
+
+See coremltools installation guide at https://coremltools.readme.io/v4.0/docs/installation 
+
+**How to Run**
+
+1. Basic chat interface:
+```bash
+python chat.py --meta %PATH_TO_META_YAML%
+```
+
+2. Full conversation mode with history:
+```bash
+python chat_full.py --meta %PATH_TO_META_YAML%
+```
+
+> Note: The first time the model loads, macOS will take some time to place it on the device.
+> Subsequent loads will be instantaneous.
+> Use Ctrl-D to exit, Ctrl-C to interrupt inference.
+
+**More Info**
+Please check following links for later updates:
+
+* [GitHub](https://github.com/anemll)
+* [Hugging Face Models](https://huggingface.co/anemll)
+* [Twitter/X](https://x.com/anemll)
+* [Website](https://anemll.com)
+
+
+realanemll@gmail.com
+
+# %NAME_OF_THE_FOLDER_WE_UPLOAD%
+
+This is a CoreML model converted using ANEMLL for Apple Neural Engine inference.
+
+## Available Distributions
+
+### Standard Distribution
+- Contains zipped MLMODELC files
+- Suitable for macOS and development
+
+### iOS Distribution
+- Contains unzipped MLMODELC files
+- Ready for iOS deployment
+- Includes offline tokenizer support
+
+## Model Information
+- Context Length: %CONTEXT_LENGTH%
+- Batch Size: %BATCH_SIZE%
+- Number of Chunks: %NUM_CHUNKS%
+
+## Quick Start
+
+### Test in iOS/macOS App
+Try our sample Chat-Bot app on TestFlight:
+1. Install TestFlight from App Store
+2. Join beta test: [TestFlight Link](https://testflight.apple.com/join/jrQq1D1C)
+3. App includes a small demo model pre-installed
+4. You can add custom models via HuggingFace URLs
+
+> [!Note]
+> - The TestFlight app works on both iOS and macOS
+> - Demonstrates proper model integration and provides a reference implementation
+> - iOS requires unzipped MLMODELC files and config.json for offline tokenizer
+> - macOS supports both zipped and unzipped model formats
+
+```

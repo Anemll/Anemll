@@ -12,9 +12,6 @@ import UIKit
 #else
 import AppKit
 #endif
-#if canImport(Yams)
-import Yams
-#endif
 
 // MARK: - Logging System
 
@@ -427,33 +424,11 @@ struct ModelManagementView: View {
                 Text("Do you want to download this model? Existing files will be preserved.")
             }
         }
-        #if targetEnvironment(macCatalyst)
-        .overlay(
-            Group {
-                if showModelInfo, let model = modelForInfo {
-                    Color.black.opacity(0.3)
-                        .edgesIgnoringSafeArea(.all)
-                        .onTapGesture {
-                            showModelInfo = false
-                            modelForInfo = nil
-                        }
-                    
-                    ModelInfoSheet(model: model, isPresented: $showModelInfo)
-                        .frame(width: 500, height: 600)
-                        .background(Color(.systemBackground))
-                        .cornerRadius(10)
-                        .shadow(radius: 10)
-                        .padding()
-                }
-            }
-        )
-        #else
         .sheet(isPresented: $showModelInfo) {
             if let model = modelForInfo {
                 ModelInfoSheet(model: model, isPresented: $showModelInfo)
             }
         }
-        #endif
         .alert("Delete Model", isPresented: $showDeleteConfirmation) {
             Button("Cancel", role: .cancel) { 
                 modelToDelete = nil
@@ -1647,27 +1622,9 @@ struct ModelManagementView: View {
     
     // Function to show model info
     private func showModelInfo(_ model: Model) {
-        Task { @MainActor in
-            // Store current model state before showing info
-            self.modelForInfo = model
-            
-            #if targetEnvironment(macCatalyst)
-            // On macCatalyst, ensure proper overlay setup
-            if showModelInfo {
-                // If overlay is already showing, update the model
-                modelForInfo = model
-            } else {
-                // Small delay to ensure view hierarchy is ready
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-                showModelInfo = true
-            }
-            #else
-            // iOS presentation logic
-            // Add a small delay to ensure consistent presentation 
-            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-            showModelInfo = true
-            #endif
-        }
+        // print("Showing info for model: \(model.id)")
+        modelForInfo = model
+        showModelInfo = true
     }
     
     // MARK: - Lifecycle Management
@@ -2373,134 +2330,107 @@ struct ModelInfoSheet: View {
     }
     
     var body: some View {
-        #if targetEnvironment(macCatalyst)
-        // Mac Catalyst: Single view with custom header
-        VStack(spacing: 0) {
-            // Custom header
-            HStack {
-                Text("Model Info")
-                    .font(.headline)
-                Spacer()
-                Button("Close") {
-                    isPresented = false
-                }
-            }
-            .padding()
-            .background(Color(.systemGray6))
-            
-            // Content
-            contentView
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        #else
-        // iOS: NavigationView-based layout
         NavigationView {
-            contentView
-                .navigationTitle("Model Information")
-                .navigationBarItems(trailing: Button("Done") { isPresented = false })
-        }
-        #endif
-    }
-    
-    // Extract content view to avoid duplication
-    private var contentView: some View {
-        List {
-            if model.isDownloaded {
-                Section(header: Text("Verification")) {
-                    Button(action: {
-                        verifySizes()
-                    }) {
-                        HStack {
-                            Text("Verify files and size")
-                                .foregroundColor(.blue)
-                            Spacer()
-                            if isVerifyingSizes {
-                                ProgressView()
-                            } else {
-                                Image(systemName: "chevron.right")
-                                    .foregroundColor(.gray)
-                            }
-                        }
+            List {
+                Section(header: Text("Basic Information")) {
+                    infoRow(title: "Name", value: model.name)
+                    infoRow(title: "ID", value: model.id)
+                    infoRow(title: "Size", value: formatFileSize(model.size))
+                    if !model.description.isEmpty {
+                        infoRow(title: "Description", value: model.description)
                     }
-                    .disabled(isVerifyingSizes)
+                    infoRow(title: "Status", value: model.isDownloaded ? "Downloaded" : "Not Downloaded")
                 }
                 
-                if showSizeVerification {
-                    Section(header: Text("Size Verification Results")) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                Image(systemName: sizeVerificationIsValid ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                    .foregroundColor(sizeVerificationIsValid ? .green : .orange)
-                                Text(sizeVerificationIsValid ? "Size verification passed" : "Size verification found issues")
-                                    .fontWeight(.medium)
-                                    .foregroundColor(sizeVerificationIsValid ? .green : .orange)
-                            }
-                            
-                            Text(sizeVerificationResults)
-                                .font(.system(.footnote, design: .monospaced))
+                if isLoadingInfo {
+                    Section(header: Text("Additional Details")) {
+                        HStack {
+                            Text("Loading information...")
+                            Spacer()
+                            ProgressView()
                         }
-                        .padding(.vertical, 4)
+                    }
+                } else if !additionalInfo.isEmpty {
+                    Section(header: Text("Additional Details")) {
+                        ForEach(additionalInfo.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in
+                            infoRow(title: formatInfoKey(key), value: value)
+                        }
                     }
                 }
-            }
-            
-            Section(header: Text("Basic Information")) {
-                infoRow(title: "Name", value: model.name)
-                infoRow(title: "ID", value: model.id)
-                infoRow(title: "Size", value: formatFileSize(model.size))
-                if !model.description.isEmpty {
-                    infoRow(title: "Description", value: model.description)
-                }
-                infoRow(title: "Status", value: model.isDownloaded ? "Downloaded" : "Not Downloaded")
-            }
-            
-            if isLoadingInfo {
-                Section(header: Text("Additional Details")) {
-                    HStack {
-                        Text("Loading information...")
-                        Spacer()
-                        ProgressView()
-                    }
-                }
-            } else if !additionalInfo.isEmpty {
-                Section(header: Text("Additional Details")) {
-                    ForEach(additionalInfo.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in
-                        infoRow(title: formatInfoKey(key), value: value)
-                    }
-                }
-            }
-            
-            if let sourceURL = additionalInfo["source_url"], !sourceURL.isEmpty {
-                Section(header: Text("Source")) {
-                    let displayURL = formatSourceURL(sourceURL)
-                    
-                    VStack(alignment: .leading) {
-                        // Display the formatted URL text
-                        Text(displayURL)
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                        
-                        // Only make it clickable if it's a web URL
-                        if !displayURL.contains("${MODEL_ROOT}") && sourceURL.hasPrefix("http") {
-                            Link(destination: URL(string: sourceURL) ?? URL(string: "https://huggingface.co")!) {
-                                HStack {
-                                    Text("Open Source URL")
-                                        .foregroundColor(.blue)
-                                    Spacer()
-                                    Image(systemName: "arrow.up.right.square")
-                                        .foregroundColor(.blue)
+                
+                if model.isDownloaded {
+                    Section(header: Text("Verification")) {
+                        Button(action: {
+                            verifySizes()
+                        }) {
+                            HStack {
+                                Text("Verify Model Size")
+                                    .foregroundColor(.blue)
+                                Spacer()
+                                if isVerifyingSizes {
+                                    ProgressView()
+                                } else {
+                                    Image(systemName: "chevron.right")
+                                        .foregroundColor(.gray)
                                 }
                             }
-                        } else {
-                            Text("Local Custom Model")
+                        }
+                        .disabled(isVerifyingSizes)
+                    }
+                    
+                    if showSizeVerification {
+                        Section(header: Text("Size Verification Results")) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack {
+                                    Image(systemName: sizeVerificationIsValid ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                        .foregroundColor(sizeVerificationIsValid ? .green : .orange)
+                                    Text(sizeVerificationIsValid ? "Size verification passed" : "Size verification found issues")
+                                        .fontWeight(.medium)
+                                        .foregroundColor(sizeVerificationIsValid ? .green : .orange)
+                                }
+                                
+                                Text(sizeVerificationResults)
+                                    .font(.system(.footnote, design: .monospaced))
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+                
+                if let sourceURL = additionalInfo["source_url"], !sourceURL.isEmpty {
+                    Section(header: Text("Source")) {
+                        let displayURL = formatSourceURL(sourceURL)
+                        
+                        VStack(alignment: .leading) {
+                            // Display the formatted URL text
+                            Text(displayURL)
+                                .font(.footnote)
                                 .foregroundColor(.secondary)
+                            
+                            // Only make it clickable if it's a web URL
+                            if !displayURL.contains("${MODEL_ROOT}") && sourceURL.hasPrefix("http") {
+                                Link(destination: URL(string: sourceURL) ?? URL(string: "https://huggingface.co")!) {
+                                    HStack {
+                                        Text("Open Source URL")
+                                            .foregroundColor(.blue)
+                                        Spacer()
+                                        Image(systemName: "arrow.up.right.square")
+                                            .foregroundColor(.blue)
+                                    }
+                                }
+                            } else {
+                                Text("Local Custom Model")
+                                    .foregroundColor(.secondary)
+                            }
                         }
                     }
                 }
             }
-        }
-        .onAppear {
-            loadAdditionalInfo()
+            .navigationTitle("Model Information")
+            .navigationBarItems(trailing: Button("Done") { isPresented = false })
+            .onAppear {
+                loadAdditionalInfo()
+            }
         }
     }
     
@@ -2511,77 +2441,13 @@ struct ModelInfoSheet: View {
         
         // Run verification in background
         Task {
-            do {
-                // First do a detailed verification to get missing files
-                let verificationDetails = modelService.verifyModelWithDetails(modelId: model.id, verbose: true)
-                let missingFiles = verificationDetails.missingFiles
-                let actualSize = verificationDetails.actualSize
-                let expectedSize = model.size
-                let sizePercentage = Float(actualSize) / Float(expectedSize) * 100.0
-                
-                // Build complete verification results
-                var completeResults = "📊 Size Verification:\n"
-                completeResults += "  - Expected size: \(formatFileSize(expectedSize))\n"
-                completeResults += "  - Actual size: \(formatFileSize(actualSize))\n"
-                completeResults += "  - Completeness: \(String(format: "%.1f", sizePercentage))%\n"
-                completeResults += "  - Size validation: \(sizePercentage >= 95.0 ? "✅" : "❌") \(sizePercentage >= 95.0 ? "Valid" : "Invalid")\n\n"
-                
-                // Get all .mlmodelc directories to check for missing weight files
-                let modelPath = modelService.getModelPath(for: model.id)
-                let fileManager = FileManager.default
-                
-                // Get contents of model directory
-                if let contents = try? fileManager.contentsOfDirectory(at: modelPath, includingPropertiesForKeys: nil) {
-                    var missingWeightFiles: [String] = []
-                    
-                    // Check each .mlmodelc directory for weight.bin
-                    for item in contents {
-                        if item.pathExtension == "mlmodelc" {
-                            let weightPath = item.appendingPathComponent("weights/weight.bin")
-                            if !fileManager.fileExists(atPath: weightPath.path) {
-                                // Store relative path for cleaner display
-                                let relativePath = item.lastPathComponent + "/weights/weight.bin"
-                                missingWeightFiles.append(relativePath)
-                            }
-                        }
-                    }
-                    
-                    // Add missing files section if any weight files are missing
-                    if !missingWeightFiles.isEmpty {
-                        completeResults += "❌ MISSING WEIGHT FILES:\n"
-                        completeResults += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        for file in missingWeightFiles {
-                            completeResults += "❌ Critical file missing: \(file)\n"
-                        }
-                    }
-                    
-                    // Add other missing files if any
-                    let otherMissingFiles = missingFiles.filter { !missingWeightFiles.contains($0) }
-                    if !otherMissingFiles.isEmpty {
-                        if !missingWeightFiles.isEmpty {
-                            completeResults += "\n"
-                        }
-                        completeResults += "❌ OTHER MISSING FILES:\n"
-                        completeResults += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        for file in otherMissingFiles {
-                            completeResults += "❌ \(file)\n"
-                        }
-                    }
-                }
-                
-                // Update UI on main thread
-                await MainActor.run {
-                    sizeVerificationResults = completeResults
-                    // Model is valid only if size is good AND no missing files
-                    sizeVerificationIsValid = sizePercentage >= 95.0 && missingFiles.isEmpty
-                    isVerifyingSizes = false
-                }
-            } catch {
-                await MainActor.run {
-                    sizeVerificationResults = "Error during verification: \(error.localizedDescription)"
-                    sizeVerificationIsValid = false
-                    isVerifyingSizes = false
-                }
+            let (isValid, _, sizeInfo) = modelService.verifyModelSizes(modelId: model.id)
+            
+            // Update UI on main thread
+            await MainActor.run {
+                sizeVerificationResults = sizeInfo
+                sizeVerificationIsValid = isValid
+                isVerifyingSizes = false
             }
         }
     }
@@ -2596,15 +2462,6 @@ struct ModelInfoSheet: View {
     
     // Format info key to be more user-friendly
     private func formatInfoKey(_ key: String) -> String {
-        // Special handling for parameter_ prefix
-        if key.hasPrefix("parameter_") {
-            let paramName = key.replacingOccurrences(of: "parameter_", with: "")
-            let formatted = paramName.replacingOccurrences(of: "_", with: " ")
-                .capitalized
-            return "Param: " + formatted
-        }
-        
-        // Normal formatting
         let formatted = key.replacingOccurrences(of: "_", with: " ")
             .capitalized
         return formatted
@@ -2628,40 +2485,34 @@ struct ModelInfoSheet: View {
             isLoadingInfo = true
             var info: [String: String] = [:]
             
-            // First check if there's a source_url in model downloadURL property
-            if !model.downloadURL.isEmpty && model.downloadURL.hasPrefix("http") {
-                info["source_url"] = model.downloadURL
-            }
-            
-            // If that failed, try to get info from meta.yaml
-            if info["source_url"] == nil || info["source_url"]?.isEmpty == true {
-                if let sourceURL = modelService.getSourceURLFromMetaYaml(for: model.id) {
-                    info["source_url"] = sourceURL
-                }
-            }
-            
-            // If still no URL and it's a custom model, use a placeholder
-            if (info["source_url"] == nil || info["source_url"]?.isEmpty == true) && model.id.contains("custom") {
-                info["source_url"] = "file://\(modelService.getModelPath(for: model.id).path)"
-            }
-            
-            // Try to get info from meta.yaml first for ALL models
-            if model.isDownloaded {
-                let modelPath = modelService.getModelPath(for: model.id)
-                info = await getModelInfoFromMetadata(modelPath: modelPath, info: info)
-            }
-            
-            // If meta.yaml parsing didn't yield enough info and it's a predefined model,
-            // supplement with hardcoded info as a fallback
-            if isPredefinedModel(model.id) && (info["version"] == nil || info.count < 3) {
-                print("Using predefined info as fallback for \(model.id)")
-                let predefinedInfo = getPredefinedModelInfo(model.id)
+            // Different approach based on model type
+            if isPredefinedModel(model.id) {
+                // For predefined models, load hardcoded info
+                info = getPredefinedModelInfo(model.id)
+            } else {
+                // For custom models, try multiple sources to get the URL
                 
-                // Merge predefined info, preserving any meta.yaml info we found
-                for (key, value) in predefinedInfo {
-                    if info[key] == nil {
-                        info[key] = value
+                // First check if there's a source_url in model downloadURL property
+                if !model.downloadURL.isEmpty && model.downloadURL.hasPrefix("http") {
+                    info["source_url"] = model.downloadURL
+                }
+                
+                // If that failed, try to get info from meta.yaml
+                if info["source_url"] == nil || info["source_url"]?.isEmpty == true {
+                    if let sourceURL = modelService.getSourceURLFromMetaYaml(for: model.id) {
+                        info["source_url"] = sourceURL
                     }
+                }
+                
+                // If still no URL and it's a custom model, use a placeholder
+                if (info["source_url"] == nil || info["source_url"]?.isEmpty == true) && model.id.contains("custom") {
+                    info["source_url"] = "file://\(modelService.getModelPath(for: model.id).path)"
+                }
+                
+                // Try to get additional info from model directory
+                if model.isDownloaded {
+                    let modelPath = modelService.getModelPath(for: model.id)
+                    info = await getModelInfoFromMetadata(modelPath: modelPath, info: info)
                 }
             }
             
@@ -2675,33 +2526,9 @@ struct ModelInfoSheet: View {
     
     // Check if a model is a predefined model
     private func isPredefinedModel(_ modelId: String) -> Bool {
-        // List of exact model IDs that are considered predefined
-        let exactPredefinedIds = [
-            "llama-3.2-1b"
-        ]
-        
-        if exactPredefinedIds.contains(modelId) {
-            return true
-        }
-        
-        // More specific substring matching to avoid false positives
-        // Only treat as predefined if it starts with these prefixes
-        let predefinedPrefixes = [
-            "llama_3_2_1b-", 
-            "llama-3.2-"
-        ]
-        
-        for prefix in predefinedPrefixes {
-            if modelId.hasPrefix(prefix) {
-                return true
-            }
-        }
-        
-        // Don't match any llama 3.2 substring as predefined anymore
-        // This was causing custom models with "llama-3.2" in their name
-        // to be treated as predefined and skip meta.yaml parsing
-        
-        return false
+        return modelId == "llama-3.2-1b" || 
+               modelId.contains("llama_3_2_1b") || 
+               modelId.contains("llama-3.2")
     }
     
     // Get predefined info for built-in models
@@ -2727,13 +2554,12 @@ struct ModelInfoSheet: View {
     // Get info from meta.yaml or other metadata files
     private func getModelInfoFromMetadata(modelPath: URL, info: [String: String]) async -> [String: String] {
         var updatedInfo = info
-        print("getModelInfoFromMetadata: Getting model info from metadata for \(model.id)")
         
         // Check for meta.yaml
         let metaYamlPath = modelPath.appendingPathComponent("meta.yaml")
         
         do {
-            // Read file content in background thread
+            // Read file content in background thread - don't use try with Task.detached, only with its result
             let contentOptional = await Task.detached(priority: .background) {
                 do {
                     return try String(contentsOf: metaYamlPath, encoding: .utf8)
@@ -2745,61 +2571,20 @@ struct ModelInfoSheet: View {
             
             // Only proceed if we have content
             if !contentOptional.isEmpty {
-                print("Meta.yaml content for \(model.id): found")
-                
-                #if canImport(Yams)
-                // Use Yams library for proper YAML parsing if available
-                do {
-                    if let yaml = try Yams.load(yaml: contentOptional) as? [String: Any] {
-                        print("Successfully parsed YAML with Yams")
-                        
-                        // Extract model_info
-                        if let modelInfo = yaml["model_info"] as? [String: Any] {
-                            // Get direct model_info properties
-                            if let version = modelInfo["version"] as? String {
-                                updatedInfo["version"] = version
+                // Parse the YAML content for key information
+                let lines = contentOptional.components(separatedBy: CharacterSet.newlines)
+                for line in lines {
+                    if line.contains(":") {
+                        let components = line.components(separatedBy: ":")
+                        if components.count >= 2 {
+                            let key = components[0].trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                            let value = components[1].trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                            if !key.isEmpty && !value.isEmpty {
+                                updatedInfo[key] = value
                             }
-                            
-                            if let name = modelInfo["name"] as? String {
-                                updatedInfo["name"] = name
-                            }
-                            
-                            if let author = modelInfo["author"] as? String {
-                                updatedInfo["author"] = author
-                            }
-                            
-                            if let license = modelInfo["license"] as? String {
-                                updatedInfo["license"] = license
-                            }
-                            
-                            if let framework = modelInfo["framework"] as? String {
-                                updatedInfo["framework"] = framework
-                            }
-                            
-                            // Extract parameters
-                            if let params = modelInfo["parameters"] as? [String: Any] {
-                                for (key, value) in params {
-                                    updatedInfo["parameter_" + key] = String(describing: value)
-                                }
-                            }
-                        }
-                        
-                        // Directly get top-level properties
-                        for (key, value) in yaml where key != "model_info" {
-                            updatedInfo[key] = String(describing: value)
                         }
                     }
-                } catch {
-                    print("Error parsing YAML with Yams: \(error)")
-                    // Fall back to regex parsing if Yams fails
-                    parseWithRegex(contentOptional, updatedInfo: &updatedInfo)
                 }
-                #else
-                // Use regex parsing if Yams is not available
-                parseWithRegex(contentOptional, updatedInfo: &updatedInfo)
-                #endif
-                
-                print("Final parsed model info: \(updatedInfo)")
             }
             
             // Add a potential throw to make catch block reachable
@@ -2811,164 +2596,6 @@ struct ModelInfoSheet: View {
         }
         
         return updatedInfo
-    }
-    
-    // Helper function to parse YAML with regex when Yams is not available
-    private func parseWithRegex(_ content: String, updatedInfo: inout [String: String]) {
-        // First try extracting version directly (highest priority)
-        var versionFound = false
-        if let versionMatch = content.range(of: "model_info:([\\s\\S]*?)version: ([^\\n]+)", options: .regularExpression) {
-            let versionLine = String(content[versionMatch])
-            if let versionValue = versionLine.range(of: "version: ([^\\n]+)", options: .regularExpression) {
-                let version = String(versionLine[versionValue])
-                    .replacingOccurrences(of: "version:", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !version.isEmpty {
-                    print("Found version directly: \(version)")
-                    updatedInfo["version"] = version
-                    versionFound = true
-                }
-            }
-        }
-        
-        // Process main model_info fields
-        if let modelInfoRange = content.range(of: "model_info:([\\s\\S]*?)(?=\\n\\S|$)", options: .regularExpression) {
-            let modelInfoBlock = String(content[modelInfoRange])
-            let lines = modelInfoBlock.components(separatedBy: .newlines)
-            
-            for line in lines.dropFirst() { // Skip the model_info: line
-                let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                
-                // Skip empty lines, comments, and section headers
-                if trimmedLine.isEmpty || trimmedLine.hasPrefix("#") || 
-                   trimmedLine == "parameters:" || trimmedLine.hasSuffix(":") {
-                    continue
-                }
-                
-                // Skip lines that have deeper indentation (likely in parameters)
-                if line.hasPrefix("    ") {
-                    continue
-                }
-                
-                // Process normal key-value pairs at model_info level
-                if line.hasPrefix("  ") && trimmedLine.contains(":") {
-                    let components = trimmedLine.components(separatedBy: ":")
-                    if components.count >= 2 {
-                        let key = components[0].trimmingCharacters(in: .whitespacesAndNewlines)
-                        let value = components[1].trimmingCharacters(in: .whitespacesAndNewlines)
-                        
-                        // Skip empty values and description with pipe symbol
-                        if !key.isEmpty && !value.isEmpty && key != "description" {
-                            print("Adding model_info key: \(key), value: \(value)")
-                            updatedInfo[key] = value
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Extract parameters (using the exact path shown in logs)
-        if let paramsRange = content.range(of: "parameters:([\\s\\S]*?)(?=\\n  \\S|$)", options: .regularExpression) {
-            let paramsBlock = String(content[paramsRange])
-            let lines = paramsBlock.components(separatedBy: .newlines)
-            
-            for line in lines.dropFirst() { // Skip the parameters: line
-                let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                
-                // Skip empty lines and comments
-                if trimmedLine.isEmpty || trimmedLine.hasPrefix("#") {
-                    continue
-                }
-                
-                // Only process parameter lines with proper indentation
-                if line.hasPrefix("    ") && trimmedLine.contains(":") {
-                    let components = trimmedLine.components(separatedBy: ":")
-                    if components.count >= 2 {
-                        let key = components[0].trimmingCharacters(in: .whitespacesAndNewlines)
-                        let value = components[1].trimmingCharacters(in: .whitespacesAndNewlines)
-                        
-                        if !key.isEmpty && !value.isEmpty {
-                            print("Adding parameter: \(key), value: \(value)")
-                            updatedInfo["parameter_" + key] = value
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Fall back to simpler methods if we couldn't find the version
-        if !versionFound && !updatedInfo.keys.contains(where: { $0 == "version" }) {
-            print("Trying direct version extraction")
-            if let versionRange = content.range(of: "version:\\s+([0-9.]+)", options: .regularExpression) {
-                let versionText = String(content[versionRange])
-                let version = versionText.replacingOccurrences(of: "version:", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !version.isEmpty {
-                    print("Found version via direct extraction: \(version)")
-                    updatedInfo["version"] = version
-                }
-            }
-        }
-        
-        // Add key parameters that are displayed in logs but might be missing
-        if let numChunksValue = extractYamlValue(from: content, path: "model_info.parameters.num_chunks") {
-            updatedInfo["parameter_num_chunks"] = numChunksValue
-        }
-        
-        if let contextLengthValue = extractYamlValue(from: content, path: "model_info.parameters.context_length") {
-            updatedInfo["parameter_context_length"] = contextLengthValue
-        }
-        
-        if let batchSizeValue = extractYamlValue(from: content, path: "model_info.parameters.batch_size") {
-            updatedInfo["parameter_batch_size"] = batchSizeValue
-        }
-        
-        if let modelPrefixValue = extractYamlValue(from: content, path: "model_info.parameters.model_prefix") {
-            updatedInfo["parameter_model_prefix"] = modelPrefixValue
-        }
-    }
-    
-    // Helper to extract values from YAML using dot notation path
-    private func extractYamlValue(from yamlString: String, path: String) -> String? {
-        let components = path.components(separatedBy: ".")
-        if components.count < 2 {
-            return nil
-        }
-        
-        // Build a regex pattern based on the path
-        var pattern = ""
-        var indentation = ""
-        
-        for (index, component) in components.enumerated() {
-            if index == 0 {
-                pattern += "\(component):"
-            } else {
-                indentation += "  "
-                pattern += "(?:[\\s\\S]*?)\(indentation)\(component):\\s+([^\\n]+)"
-            }
-        }
-        
-        if let match = yamlString.range(of: pattern, options: .regularExpression) {
-            let matchedString = String(yamlString[match])
-            let lines = matchedString.components(separatedBy: .newlines)
-            let lastLine = lines.last ?? ""
-            
-            if let valueRange = lastLine.range(of: ":\\s+(.+)$", options: .regularExpression) {
-                let valueWithColon = String(lastLine[valueRange])
-                let value = valueWithColon.components(separatedBy: ":").dropFirst().joined(separator: ":")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                
-                // Handle quoted values
-                var cleanValue = value
-                if cleanValue.hasPrefix("\"") && cleanValue.hasSuffix("\"") {
-                    cleanValue = String(cleanValue.dropFirst().dropLast())
-                }
-                
-                return cleanValue
-            }
-        }
-        
-        return nil
     }
 }
 

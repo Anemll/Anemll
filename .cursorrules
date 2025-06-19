@@ -1,0 +1,52 @@
+# ANEMLL Cursor Rules
+
+## Apple Neural Engine Model Development Guidelines
+
+### Critical ANE Constraints
+- All dense layers MUST be `nn.Conv2d` with `kernel_size=(1,1)` - never use `nn.Linear`
+- Tensor ranks MUST be ≤4 with dimensions `(N, C, H, W)`
+- Height/Width dimensions MUST NOT exceed 16,384 elements
+- Channel dimension MUST NOT exceed 65,536 elements
+- Maintain trailing dimension ≥64 for better ANE tiling
+
+### RMSNorm Implementation (CRITICAL)
+- NEVER implement "true" RMSNorm (variance-only normalization) - it causes precision issues on ANE
+- ALWAYS follow llama_model.py pattern: subtract mean first, then use F.layer_norm()
+- Required pattern:
+```python
+def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    mean = hidden_states.mean(-1, keepdim=True)
+    hidden_states = hidden_states - mean
+    return F.layer_norm(hidden_states, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
+```
+
+### Device and Dtype Management (CRITICAL)
+- ALWAYS use `.to(TEST_DEVICE).to(MODEL_DTYPE)` at the end of forward passes
+- MODEL_DTYPE MUST be torch.float16 throughout
+- Initialize all parameters on correct device in __init__
+- Maintain consistent dtype across entire computation pipeline
+- Never let tensors drift to different devices or dtypes
+
+### Model Architecture Rules
+- Never modify llama_model.py - it's already functional
+- Don't subclass new models from Llama - copy and rename instead
+- Follow LM-head width slicing pattern for matrices >16,384 width
+- Use step-by-step computation like LlamaMLP to prevent numerical explosion
+
+### Weight Loading
+- Reshape Hugging Face weights from (out, in) to (out, in, 1, 1) for Conv2d
+- Handle vocab splitting for lm_head weights properly
+- Verify numerical parity with HF implementation in tests
+
+### Code Quality
+- Format with ruff and black - zero linter warnings
+- Write unit tests verifying shape parity and deterministic inference
+- Test without internet access requirement
+
+### When implementing new models:
+1. Start by copying the closest existing model (e.g., llama_model.py for Qwen)
+2. Rename all classes and variables to match new model
+3. Ensure RMSNorm follows mean-subtraction pattern
+4. Verify device/dtype preservation throughout
+5. Test numerical parity with reference implementation
+6. Follow ANE constraints for all layers 

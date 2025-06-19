@@ -15,6 +15,7 @@ public struct ModelConfiguration {
     let batchSize: Int
     let version: String
     var modelPath: String?  // Add model path property
+    let splitLMHead: Int  // Add split_lm_head parameter for Qwen support
     
     // Make shouldUseV110 settable while keeping the default behavior
     var shouldUseV110: Bool {
@@ -46,6 +47,7 @@ public struct ModelConfiguration {
         var contextLength = 2048
         var batchSize = 512
         var version = "0.0.0"
+        var splitLMHead = 8  // Default to 8 for LLaMA models
         
         // Helper function to extract parameter value from a section
         func extractParameterFromSection(section: String, key: String) -> String? {
@@ -158,6 +160,15 @@ public struct ModelConfiguration {
                         print("✅ Set batchSize to \(batchInt)")
                     }
                 }
+                
+                // Parse split_lm_head from nested parameters
+                if let splitValue = extractParameterFromSection(section: nestedParamsContent, key: "split_lm_head") {
+                    print("🔍 Parsing split_lm_head from model_info.parameters: '\(splitValue)'")
+                    if let splitInt = Int(splitValue) {
+                        splitLMHead = splitInt
+                        print("✅ Set splitLMHead to \(splitInt)")
+                    }
+                }
             } else {
                 print("⚠️ No nested parameters section found in model_info section")
             }
@@ -185,8 +196,9 @@ public struct ModelConfiguration {
         self.batchSize = batchSize
         self.version = version
         self.modelPath = modelPath
+        self.splitLMHead = splitLMHead
         
-        print("📊 ModelConfiguration initialized: modelPrefix='\(modelPrefix)', numChunks=\(numChunks), lutLMHead=\(String(describing: lutLMHead)), lutFFN=\(String(describing: lutFFN)), lutEmbeddings=\(String(describing: lutEmbeddings)), contextLength=\(contextLength), batchSize=\(batchSize), version=\(version)")
+        print("📊 ModelConfiguration initialized: modelPrefix='\(modelPrefix)', numChunks=\(numChunks), lutLMHead=\(String(describing: lutLMHead)), lutFFN=\(String(describing: lutFFN)), lutEmbeddings=\(String(describing: lutEmbeddings)), contextLength=\(contextLength), batchSize=\(batchSize), splitLMHead=\(splitLMHead), version=\(version)")
         
         let v110Reason = self._manualV110Flag != nil ? "MANUALLY SET" : "version check"
         print("📊 v110 flag is: \(self.shouldUseV110 ? "TRUE" : "FALSE") (\(v110Reason)) based on version \(version)")
