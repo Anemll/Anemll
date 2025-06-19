@@ -154,7 +154,11 @@ class LlamaRotaryEmbedding(nn.Module):
         super().__init__()
         self.dim = config.hidden_size // config.num_attention_heads
         self.max_position_embeddings = config.max_position_embeddings
+        
+        # Apply rope_scaling factor if present
         self.base = config.rope_theta
+        if hasattr(config, 'rope_scaling') and config.rope_scaling and 'factor' in config.rope_scaling:
+            self.base = config.rope_theta * config.rope_scaling['factor']
         
         # Generate and cache the inverse frequency buffer
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(TEST_DEVICE) / self.dim))

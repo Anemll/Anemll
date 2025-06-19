@@ -136,10 +136,15 @@ class QwenRotaryEmbedding(nn.Module):
         self.dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
+        
+        # Apply rope_scaling factor if present
+        self.base = config.rope_theta
+        if hasattr(config, 'rope_scaling') and config.rope_scaling and 'factor' in config.rope_scaling:
+            self.base = config.rope_theta * config.rope_scaling['factor']
+        
         inv_freq = 1.0 / (
-            config.rope_theta ** (torch.arange(0, self.dim, 2).float().to(TEST_DEVICE) / self.dim)
+            self.base ** (torch.arange(0, self.dim, 2).float().to(TEST_DEVICE) / self.dim)
         )
-        #inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(TEST_DEVICE) / self.dim))
 
         self.register_buffer("inv_freq", inv_freq)
         t = torch.arange(config.max_position_embeddings, device=TEST_DEVICE).type_as(self.inv_freq)
