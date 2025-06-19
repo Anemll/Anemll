@@ -151,6 +151,17 @@ if [[ "$VIRTUAL_ENV" != "" ]]; then
         exit 1
     fi
     echo "✅ Confirmed using virtual environment Python: $CURRENT_PYTHON_PATH"
+    
+    # Also verify pip is from virtual environment
+    CURRENT_PIP_PATH=$(which $PIP_CMD)
+    if [[ "$CURRENT_PIP_PATH" != "$VIRTUAL_ENV"* ]]; then
+        echo "❌ ERROR: pip is not from virtual environment!"
+        echo "Expected pip path starting with: $VIRTUAL_ENV"
+        echo "Actual pip path: $CURRENT_PIP_PATH"
+        echo "Using virtual environment pip instead..."
+        PIP_CMD="$PYTHON_CMD -m pip"
+    fi
+    echo "✅ Confirmed using virtual environment pip: $($PYTHON_CMD -m pip --version)"
 else
     echo "⚠️  WARNING: No virtual environment detected!"
     echo "Installing to system Python may cause dependency conflicts."
