@@ -31,8 +31,31 @@ if [[ "$VIRTUAL_ENV" != "" ]]; then
 elif [[ -f "./env-anemll/bin/activate" ]]; then
     echo "🔄 Found env-anemll virtual environment, activating it..."
     source ./env-anemll/bin/activate
-    PYTHON_CMD=python
-    PIP_CMD=pip
+    
+    # Verify activation worked
+    if [[ "$VIRTUAL_ENV" == "" ]]; then
+        echo "❌ Failed to activate virtual environment"
+        exit 1
+    fi
+    
+    # In virtual environment, prefer python3 if python is not available
+    if command -v python &> /dev/null; then
+        PYTHON_CMD=python
+    elif command -v python3 &> /dev/null; then
+        PYTHON_CMD=python3
+    else
+        echo "❌ Error: Neither python nor python3 found in virtual environment"
+        exit 1
+    fi
+    
+    if command -v pip &> /dev/null; then
+        PIP_CMD=pip
+    elif command -v pip3 &> /dev/null; then
+        PIP_CMD=pip3
+    else
+        echo "❌ Error: Neither pip nor pip3 found in virtual environment"
+        exit 1
+    fi
 else
     echo "⚠️  No virtual environment detected"
     # Detect Python command
@@ -118,6 +141,31 @@ if [[ "$VIRTUAL_ENV" != "" ]]; then
     echo "✅ Using virtual environment: $VIRTUAL_ENV"
     # Unset any user installation flags
     unset PIP_USER
+    
+    # Verify we're actually using the virtual environment Python
+    CURRENT_PYTHON_PATH=$($PYTHON_CMD -c "import sys; print(sys.executable)")
+    if [[ "$CURRENT_PYTHON_PATH" != "$VIRTUAL_ENV"* ]]; then
+        echo "❌ ERROR: Python is not from virtual environment!"
+        echo "Expected path starting with: $VIRTUAL_ENV"
+        echo "Actual path: $CURRENT_PYTHON_PATH"
+        exit 1
+    fi
+    echo "✅ Confirmed using virtual environment Python: $CURRENT_PYTHON_PATH"
+else
+    echo "⚠️  WARNING: No virtual environment detected!"
+    echo "Installing to system Python may cause dependency conflicts."
+    echo "It's recommended to create and activate a virtual environment first."
+    echo ""
+    echo "To create a virtual environment, run:"
+    echo "  ./create_python39_env.sh"
+    echo "  source env-anemll/bin/activate"
+    echo ""
+    read -p "Continue with system installation? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Installation cancelled."
+        exit 1
+    fi
 fi
 
 # Upgrade pip first
