@@ -10,8 +10,24 @@ echo "🚀 Installing ANEMLL Dependencies..."
 # Check if we're in a virtual environment
 if [[ "$VIRTUAL_ENV" != "" ]]; then
     echo "✅ Virtual environment detected: $VIRTUAL_ENV"
-    PYTHON_CMD=python
-    PIP_CMD=pip
+    # In virtual environment, prefer python3 if python is not available
+    if command -v python &> /dev/null; then
+        PYTHON_CMD=python
+    elif command -v python3 &> /dev/null; then
+        PYTHON_CMD=python3
+    else
+        echo "❌ Error: Neither python nor python3 found in virtual environment"
+        exit 1
+    fi
+    
+    if command -v pip &> /dev/null; then
+        PIP_CMD=pip
+    elif command -v pip3 &> /dev/null; then
+        PIP_CMD=pip3
+    else
+        echo "❌ Error: Neither pip nor pip3 found in virtual environment"
+        exit 1
+    fi
 elif [[ -f "./env-anemll/bin/activate" ]]; then
     echo "🔄 Found env-anemll virtual environment, activating it..."
     source ./env-anemll/bin/activate
@@ -97,6 +113,13 @@ else
     echo "⚠️  Non-macOS system detected - some Apple-specific features will not be available"
 fi
 
+# Ensure we're not installing to user directory in virtual environment
+if [[ "$VIRTUAL_ENV" != "" ]]; then
+    echo "✅ Using virtual environment: $VIRTUAL_ENV"
+    # Unset any user installation flags
+    unset PIP_USER
+fi
+
 # Upgrade pip first
 echo "📦 Upgrading pip..."
 $PIP_CMD install --upgrade pip
@@ -145,8 +168,8 @@ $PIP_CMD install tqdm
 $PIP_CMD install matplotlib
 $PIP_CMD install seaborn
 
-# Install ANEMLL package in development mode if setup.py exists
-if [ -f "setup.py" ]; then
+# Install ANEMLL package in development mode if setup.py or pyproject.toml exists
+if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
     echo "📦 Installing ANEMLL package in development mode..."
     $PIP_CMD install -e .
 fi
@@ -192,7 +215,7 @@ echo ""
 echo "📋 Next steps:"
 echo "  1. Verify your virtual environment is activated"
 echo "  2. Test conversion with: ./anemll/utils/convert_model.sh --help"
-echo "  3. Run tests with: ./tests/conv/test_qwen_simple.sh"
+echo "  3. Run tests with: python tests/test_qwen_model.py"
 echo ""
 echo "📖 For more information, see:"
 echo "  - README.md for usage instructions"
