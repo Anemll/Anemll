@@ -5,7 +5,7 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 ## 🚀 Version 0.3.3 Alpha Release - Initial Support for QWEN 3 Architecture
 
 ### 🆕 **New Features**
-- **QWEN 3 Architecture Support**: Added support for Qwen3-0.6B and Qwen3-8B models with custom converter optimizations
+- **QWEN 3 Architecture Support**: Added support for Qwen3-0.6B and Qwen3-4B models with custom converter optimizations
 - **Streamlined Installation**: One-command setup with automatic virtual environment detection
 - **Automated Testing Framework**: End-to-end validation scripts for conversion and inference workflows
 - **Enhanced Developer Experience**: Improved error handling, better feedback, and simplified testing
