@@ -370,7 +370,7 @@ split_lm_head = 16 if ARCH.startswith('qwen') else 8
 
 meta = f'''model_info:
   name: anemll-{MODEL_NAME}-ctx{CONTEXT}
-  version: 0.3.0
+  version: 0.3.3
   description: |
     Demonstarates running {MODEL_NAME} on Apple Neural Engine
     Context length: {CONTEXT}

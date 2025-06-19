@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: anemll
-Version: 0.3.0
+Version: 0.3.3
 Summary: Open-source pipeline for accelerating LLMs on Apple Neural Engine (ANE)
 Author: ANEMLL Team
 Author-email: ANEMLL Team <realanemll@gmail.com>
@@ -159,6 +159,9 @@ See [chat.md](./docs/chat.md) for more details
 > [Note]
 >The first time the model loads, macOS will take some time to place it on the device. Subsequent loads will be instantaneous. Use Ctrl-D to exit, Ctrl-C to interrupt inference.
 
+> [!Note]
+> The unit tests rely on Core ML. On systems without Core ML (such as the Codex VM) they are skipped during collection.
+
 
 
 ## Installation
@@ -167,6 +170,7 @@ See [chat.md](./docs/chat.md) for more details
 - macOS Sequoia with Apple Neural Engine
 - Minimum 16GB RAM
 - Python 3.9
+- Dependencies: coremltools>=8.2, transformers>=4.39.0, scikit-learn<=1.5.1
 
 ### Setup Steps
 

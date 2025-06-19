@@ -1,13 +1,10 @@
 __pycache__/
-=8.2
 env-anemll/
 anemll-swift-cli/.build/
 lib/
 bin/
 share/
-
 ./*.logs/  # logs / test results
-
 evaluate/results/
 results/
 # macOS system files
@@ -22,3 +19,4 @@ results/
 xcuserdata/
 *.xcuserstate
 *.xcworkspacexcuserdata/
+=*

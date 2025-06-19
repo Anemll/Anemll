@@ -21,5 +21,6 @@ anemll/models/llama_model.py
 anemll/utils/__init__.py
 tests/test_llama_model.py
 tests/test_py_llama.py
+tests/test_qwen_converter_parts.py
 tests/test_qwen_inference.py
 tests/test_qwen_model.py

@@ -37,7 +37,7 @@ if [ ! -f "$PYTHON_PATH" ]; then
             echo "  brew install python@3.10"
             echo "  brew install python@3.11"
             echo ""
-            echo "NOTE: Python 3.12 and 3.13 are NOT supported by this project."
+            echo "NOTE: Python 3.12 and 3.13 are NOT officially supported by this project."
             exit 1
         fi
     fi
@@ -73,14 +73,22 @@ cp requirements.txt "$ENV_NAME/"
 echo ""
 echo "Python $PYTHON_VERSION virtual environment created successfully!"
 echo ""
-echo "To activate the environment, run:"
-echo "  source $ENV_NAME/bin/activate"
+echo "✅ Environment is now ACTIVE. Your prompt should show (env-anemll)."
 echo ""
-echo "Then run the installation script:"
-echo "  cd $ENV_NAME"
+echo "To install dependencies, run:"
 echo "  ./install_dependencies.sh"
 echo ""
-echo "After installation, return to the main directory and run your scripts with this Python environment"
+echo "To deactivate the environment later, run:"
+echo "  deactivate"
 echo ""
-echo "IMPORTANT: This project works with Python 3.9, 3.10, or 3.11."
-echo "Python 3.12 and 3.13 are NOT supported and will likely cause errors." 
+echo "To reactivate the environment in future sessions, run:"
+echo "  source $ENV_NAME/bin/activate"
+echo ""
+echo "IMPORTANT: This project works best with Python 3.9, 3.10, or 3.11."
+echo "Python 3.12 and 3.13 may work but are not officially supported."
+
+# Keep the environment active by using exec to replace the current shell
+# This ensures the user stays in the activated environment
+echo ""
+echo "Starting new shell with activated environment..."
+exec "$SHELL"
