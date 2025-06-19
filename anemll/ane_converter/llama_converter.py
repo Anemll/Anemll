@@ -750,29 +750,21 @@ class LlamaConverter(BaseConverter):
             wrapper = PrefillWrapper(model, start_layer, end_layer)
             wrapper.eval()
             
-            # Check if this is the last chunk in a multi-chunk model
-            is_last_chunk = (chunk_idx is not None and chunk_idx == self.num_chunks - 1) and (self.num_chunks > 1)
+            # Always use consistent batch_size input shape for prefill
+            # The model will handle output shape changes (returns [:, 0:1, :] for last chunk)
+            print(f"Using standard prefill shape: (1, {self.batch_size}, {model.config.hidden_size})")
             
-            # For last chunk in multi-chunk models, use shape (1, 1, hidden_size)
-            # For single chunk or non-last chunks, use shape (1, batch_size, hidden_size)
-            if is_last_chunk:
-                batch_dim = 1
-                print(f"Using last chunk shape for prefill: (1, 1, {model.config.hidden_size})")
-            else:
-                batch_dim = self.batch_size
-                print(f"Using standard batch shape for prefill: (1, {self.batch_size}, {model.config.hidden_size})")
-            
-            # Create sample inputs with correct shapes for prefill
+            # Create sample inputs with consistent shapes for prefill
             hidden_states = torch.zeros(
-                (1, batch_dim, model.config.hidden_size),  # Shape: (1, batch_dim, hidden)
+                (1, self.batch_size, model.config.hidden_size),  # Shape: (1, batch_size, hidden)
                 dtype=torch.float16, device=TEST_DEVICE
             )
             position_ids = torch.zeros(
-                (batch_dim,),  # Shape: (batch_dim,)
+                (self.batch_size,),  # Shape: (batch_size,)
                 dtype=torch.long, device=TEST_DEVICE
             )
             causal_mask = torch.full(
-                (1, 1, batch_dim, self.context_length),  # Shape: (1, 1, batch_dim, context_len)
+                (1, 1, self.batch_size, self.context_length),  # Shape: (1, 1, batch_size, context_len)
                 torch.finfo(MODEL_DTYPE).min,
                 dtype=MODEL_DTYPE, device=TEST_DEVICE
             )

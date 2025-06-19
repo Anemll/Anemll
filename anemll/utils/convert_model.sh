@@ -307,7 +307,15 @@ fi
 
 # Step 7: Copy tokenizer files and create meta.yaml
 if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
-    MODEL_NAME=$(basename "$MODEL_PATH")
+    # Detect HuggingFace cache path and extract proper model name
+    if [[ "$MODEL_PATH" =~ \.cache/huggingface/hub/models--([^/]+)--([^/]+)/snapshots/ ]]; then
+        # Extract org and model name from HF cache path
+        HF_ORG="${BASH_REMATCH[1]}"
+        HF_MODEL="${BASH_REMATCH[2]}"
+        MODEL_NAME="${HF_ORG}-${HF_MODEL}"
+    else
+        MODEL_NAME=$(basename "$MODEL_PATH")
+    fi
     run_step 7 "Copying tokenizer files and creating meta.yaml" "
         # Copy tokenizer files if they exist
         (cp \"$MODEL_PATH/tokenizer.json\" \"$OUTPUT_DIR/\" || true) && \
@@ -420,4 +428,15 @@ echo "    --tokenizer \"$OUTPUT_DIR\" \\"
 echo "    --context-length $CONTEXT_LENGTH \\"
 echo "    --d \"$OUTPUT_DIR\""
 
-echo "Conversion completed successfully!" 
+echo -e "\nOption 3 - Using Swift CLI (requires building anemll-swift-cli):"
+echo "cd $PROJECT_ROOT/anemll-swift-cli && swift run anemllcli \\"
+echo "    --meta \"$OUTPUT_DIR/meta.yaml\""
+
+echo -e "\nTo prepare model for HuggingFace upload:"
+echo "# For standard distribution:"
+echo "./anemll/utils/prepare_hf.sh --input \"$OUTPUT_DIR\""
+echo ""
+echo "# For iOS-ready version (with unzipped MLMODELC files):"
+echo "./anemll/utils/prepare_hf.sh --input \"$OUTPUT_DIR\" --ios"
+
+echo -e "\nConversion completed successfully!" 

@@ -416,7 +416,7 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
     # Process in batches
     batch_pos = 0
     while batch_pos < context_pos:
-        batch_end = min(batch_pos + batch_size, context_pos)
+c        batch_end = min(batch_pos + batch_size, context_pos)
         current_batch_size = batch_end - batch_pos
         
         # Get current batch
