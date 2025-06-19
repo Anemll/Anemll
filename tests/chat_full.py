@@ -891,8 +891,14 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     if warmup and tokens_generated >= WARMUP_TOKEN_LIMIT:
                         break
                     
-                    if next_token == tokenizer.eos_token_id:
-                        break
+                    # Check for all possible EOS tokens
+                    eos_token_ids = tokenizer.eos_token_id
+                    if isinstance(eos_token_ids, list):
+                        if next_token in eos_token_ids:
+                            break
+                    else:
+                        if next_token == eos_token_ids:
+                            break
                 
                 inference_time = time.time() - inference_start  # Calculate inference time
                 

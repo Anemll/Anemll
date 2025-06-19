@@ -571,7 +571,7 @@ def create_unified_state(ffn_models, context_length):
         print("\nCreated unified transformer state")
         return state
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None):
     """Interactive chat loop."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
@@ -708,9 +708,19 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     # Check limits
                     if warmup and tokens_generated >= WARMUP_TOKEN_LIMIT:
                         break
-                        
-                    if next_token == tokenizer.eos_token_id:
+                    
+                    # Check max_tokens limit
+                    if max_tokens is not None and tokens_generated >= max_tokens:
                         break
+                        
+                    # Check for all possible EOS tokens
+                    eos_token_ids = tokenizer.eos_token_id
+                    if isinstance(eos_token_ids, list):
+                        if next_token in eos_token_ids:
+                            break
+                    else:
+                        if next_token == eos_token_ids:
+                            break
                 
                 # Calculate inference timing
                 inference_time = time.time() - inference_start
@@ -787,6 +797,10 @@ def parse_args():
     # Add save option
     parser.add_argument('--save', type=str,
                        help='Save assistant\'s response to specified file')
+    
+    # Add max-tokens option
+    parser.add_argument('--max-tokens', type=int,
+                       help='Maximum number of tokens to generate')
     
     # Add no-warmup flag
     parser.add_argument('--nw', action='store_true',

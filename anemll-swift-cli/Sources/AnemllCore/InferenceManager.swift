@@ -920,7 +920,7 @@ import CoreFoundation
         initialTokens: [Int],
         temperature: Float,
         maxTokens: Int,
-        eosToken: Int,
+        eosTokens: [Int],  // Changed to array to support multiple EOS tokens
         tokenizer: Tokenizer,
         onToken: ((Int) -> Void)? = nil,
         onWindowShift: (() -> Void)? = nil
@@ -1024,14 +1024,12 @@ import CoreFoundation
                     print("\nToken check:")
                     print("Next token: \(nextToken)")
                     print("Decoded: '\(tokenizer.decode(tokens: [nextToken], skipSpecialTokens: false))'")
-                    print("Is EOS? \(nextToken == eosToken)")
+                    print("Is EOS? \(eosTokens.contains(nextToken))")
                     print("Is EOT? \(nextToken == eotToken)")  // Direct comparison
                 }
                 
                 // Check for stop tokens before adding to generated tokens
-                //if nextToken == eosToken || nextToken == 0 {
-                if nextToken == eosToken  { // cannot be zero ?
-
+                if eosTokens.contains(nextToken) {
                     stopReason = "eos_token"
                     if debugLevel >= 1 {
                         print("\nStopping: EOS token detected (\(nextToken))")

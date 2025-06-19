@@ -6,7 +6,7 @@ import CoreML
 /// Wraps a tokenizer from the swift-transformers package.
 public final class Tokenizer: @unchecked Sendable {
     private let tokenizer: Tokenizers.Tokenizer
-    public let eosTokenId: Int
+    public let eosTokenIds: [Int]  // Changed to array to support multiple EOS tokens
     public let bosTokenId: Int  // Add BOS token ID property
     public let padTokenId: Int  // Add PAD token ID property
     private let debug: Bool = true
@@ -74,12 +74,29 @@ public final class Tokenizer: @unchecked Sendable {
                 print("tokenizer_config.json not found.")
             }
 
-            // Define a variable to hold the EOS token
+            // Define variables to hold the tokens
             var eosToken = "</s>"  // Default value
-            // Define a variable to hold the BOS token
             var bosToken = "<s>"   // Default value
-            // Define a variable to hold the PAD token
             var padToken = "<pad>"  // Default value
+            var eosTokenIdsList: [Int] = []  // To store multiple EOS token IDs
+            
+            // First, try to get eos_token_id from config.json
+            var configJson: [String: Any]? = nil
+            if fileManager.fileExists(atPath: configPath.path) {
+                let configData = try Data(contentsOf: configPath)
+                configJson = try JSONSerialization.jsonObject(with: configData) as? [String: Any]
+                
+                // Check for eos_token_id (can be single Int or array of Ints)
+                if let eosId = configJson?["eos_token_id"] {
+                    if let singleId = eosId as? Int {
+                        eosTokenIdsList = [singleId]
+                        print("Found single eos_token_id in config.json: \(singleId)")
+                    } else if let multipleIds = eosId as? [Int] {
+                        eosTokenIdsList = multipleIds
+                        print("Found multiple eos_token_ids in config.json: \(multipleIds)")
+                    }
+                }
+            }
 
             // Try to get EOS token from tokenizer_config.json
             if let config = tokenizerConfig {
@@ -180,14 +197,20 @@ public final class Tokenizer: @unchecked Sendable {
                 }
             }
 
-            // Now encode the correct EOS token
-            let eosTokens = tokenizer.encode(text: eosToken)
-            if let eos = eosTokens.first {
-                self.eosTokenId = eos
-                print("✓ EOS token ID: \(eos) for token '\(eosToken)'")
-            } else {
-                throw TokenizerError.initializationFailed("Could not find EOS token ID for '\(eosToken)'")
+            // If we didn't get EOS token IDs from config.json, encode the EOS token string
+            if eosTokenIdsList.isEmpty {
+                let eosTokens = tokenizer.encode(text: eosToken)
+                if let eos = eosTokens.first {
+                    eosTokenIdsList = [eos]
+                    print("✓ EOS token ID: \(eos) for token '\(eosToken)'")
+                } else {
+                    throw TokenizerError.initializationFailed("Could not find EOS token ID for '\(eosToken)'")
+                }
             }
+            
+            // Set the EOS token IDs
+            self.eosTokenIds = eosTokenIdsList
+            print("✓ Using EOS token IDs: \(eosTokenIdsList)")
 
             // Now encode the correct BOS token
             let bosTokens = tokenizer.encode(text: bosToken)

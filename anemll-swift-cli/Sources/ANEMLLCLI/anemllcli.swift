@@ -373,7 +373,7 @@ struct AnemllCLI: AsyncParsableCommand {
                 initialTokens: tokens,
                 temperature: temperature,
                 maxTokens: effectiveMaxTokens,
-                eosToken: tokenizer.eosTokenId,
+                eosTokens: tokenizer.eosTokenIds,
                 tokenizer: tokenizer,
                 onToken: { token in
                     Task {
@@ -418,10 +418,12 @@ struct AnemllCLI: AsyncParsableCommand {
                 
                 // Try to include the stop token if it was EOS
                 if stopReason == "eos" {
-                    print("STOP_TOKEN:", tokenizer.eosTokenId)
-                    // Also try to get the text representation of the stop token
-                    let stopTokenText = tokenizer.decode(tokens: [tokenizer.eosTokenId], skipSpecialTokens: false)
-                    print("STOP_TOKEN_TEXT:", stopTokenText)
+                    print("STOP_TOKENS:", tokenizer.eosTokenIds)
+                    // Also try to get the text representation of the stop tokens
+                    for eosId in tokenizer.eosTokenIds {
+                        let stopTokenText = tokenizer.decode(tokens: [eosId], skipSpecialTokens: false)
+                        print("STOP_TOKEN_TEXT for \(eosId):", stopTokenText)
+                    }
                 }
             }
         } else {
@@ -530,7 +532,7 @@ struct AnemllCLI: AsyncParsableCommand {
                     initialTokens: tokens,
                     temperature: temperature,
                     maxTokens: effectiveMaxTokens,
-                    eosToken: tokenizer.eosTokenId,
+                    eosTokens: tokenizer.eosTokenIds,
                     tokenizer: tokenizer,
                     onToken: { token in
                         Task {
