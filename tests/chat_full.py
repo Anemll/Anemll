@@ -140,6 +140,30 @@ def parse_model_path(path):
         if candidate.exists():
             print(f"Found model at: {candidate}")
             return str(candidate)
+    
+    # If embeddings with LUT suffix not found, try without LUT suffix
+    if "_lut" in str(path) and "embeddings" in str(path):
+        print(f"Failed to find {path}, trying without LUT suffix...")
+        # Remove LUT suffix
+        path_no_lut = str(path).split("_lut")[0]
+        path_no_lut = Path(path_no_lut)
+        
+        # Try candidates without LUT suffix
+        candidates_no_lut = [
+            path_no_lut,
+            path_no_lut.with_suffix('.mlmodelc'),
+            path_no_lut.with_suffix('.mlpackage'),
+            Path(str(path_no_lut) + '.mlmodelc'),
+            Path(str(path_no_lut) + '.mlpackage')
+        ]
+        
+        for candidate in candidates_no_lut:
+            if candidate.exists():
+                print(f"Found model at: {candidate}")
+                return str(candidate)
+        
+        # Add no-LUT candidates to the list for error reporting
+        candidates.extend(candidates_no_lut)
             
     # If we get here, no valid path was found
     print("\nError: Model not found. Tried following paths:")
@@ -320,12 +344,24 @@ def load_metadata(model,args):
         print("\nModel Shapes:")
         if hasattr(model, 'input_description'):
             print("  Inputs:")
-            for name, desc in model.input_description.items():
-                print(f"    {name}: {desc}")
+            try:
+                if hasattr(model.input_description, 'items'):
+                    for name, desc in model.input_description.items():
+                        print(f"    {name}: {desc}")
+                else:
+                    print(f"    {model.input_description}")
+            except:
+                print(f"    Input description: {type(model.input_description)}")
         if hasattr(model, 'output_description'):
             print("  Outputs:")
-            for name, desc in model.output_description.items():
-                print(f"    {name}: {desc}")
+            try:
+                if hasattr(model.output_description, 'items'):
+                    for name, desc in model.output_description.items():
+                        print(f"    {name}: {desc}")
+                else:
+                    print(f"    {model.output_description}")
+            except:
+                print(f"    Output description: {type(model.output_description)}")
     else:
         print("\nWarning: No metadata found in model")
 
