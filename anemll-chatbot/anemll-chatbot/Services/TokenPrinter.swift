@@ -27,7 +27,7 @@ class TokenPrinter {
     /// - Throws: An error if the tokenizer is not valid
     func validateTokenizer() throws {
         // This method is used to make a potential throwing point in the call chain
-        if tokenizer.eosTokenId < 0 {
+        if tokenizer.eosTokenIds.isEmpty || (tokenizer.eosTokenIds.first ?? -1) < 0 {
             throw InferenceError.inferenceError("Tokenizer has invalid EOS token ID")
         }
     }

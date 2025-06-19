@@ -408,7 +408,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                     initialTokens: tokens,
                     temperature: defaultTemperature,
                     maxTokens: maxTokens,
-                    eosTokens: tokenizer.eosTokenIds.first ?? 2,
+                    eosTokens: tokenizer.eosTokenIds.isEmpty ? [2] : tokenizer.eosTokenIds,
                     tokenizer: tokenizer,
                     onToken: { token in
                         print("🔥 TEST: Generated token \(token)")
@@ -446,7 +446,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                 initialTokens: tokens,
                 temperature: defaultTemperature,
                 maxTokens: maxTokens,
-                eosTokens: tokenizer.eosTokenIds.first ?? 2,
+                eosTokens: tokenizer.eosTokenIds.isEmpty ? [2] : tokenizer.eosTokenIds,
                 tokenizer: tokenizer,
                 onToken: { token in
                     // Just log every 5 tokens for monitoring
@@ -1731,7 +1731,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     /// Gets the correct EOS token ID based on the model type
     private func getCorrectEosTokenId(modelId: String? = nil) -> Int {
         // Default to the tokenizer's EOS token ID
-        let defaultEosTokenId = tokenizer?.eosTokenId ?? 2 // Fallback to 2 if tokenizer is nil
+        let defaultEosTokenId = tokenizer?.eosTokenIds.first ?? 2 // Fallback to 2 if tokenizer is nil
         
         // If no model ID is provided, use the current model ID
         let modelIdToCheck = modelId ?? currentModelId ?? ""
@@ -1809,7 +1809,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         initialTokens: tokens,
                         temperature: defaultTemperature,
                         maxTokens: maxGenerationTokens,
-                        eosTokens: eosTokenId, // Use the model-specific EOS token ID
+                        eosTokens: [eosTokenId], // Use the model-specific EOS token ID
                         tokenizer: tokenizer,
                         onToken: { token in
                             // Increment token count
@@ -2262,7 +2262,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                         initialTokens: currentPrompt,
                         temperature: defaultTemperature,
                         maxTokens: maxGenerationTokens,
-                        eosTokens: tokenizer.eosTokenIds.first ?? 2,
+                        eosTokens: tokenizer.eosTokenIds.isEmpty ? [2] : tokenizer.eosTokenIds,
                         tokenizer: tokenizer,
                         onToken: { [tokenizer, tokenBuffer] token in
                             // Check if cancellation is already in progress
