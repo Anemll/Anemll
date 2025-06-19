@@ -416,7 +416,7 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
     # Process in batches
     batch_pos = 0
     while batch_pos < context_pos:
-c        batch_end = min(batch_pos + batch_size, context_pos)
+        batch_end = min(batch_pos + batch_size, context_pos)
         current_batch_size = batch_end - batch_pos
         
         # Get current batch
@@ -611,7 +611,12 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 prefill_start = time.time()
                 
                 # Run prefill with state and causal mask
-                current_pos = run_prefill(
+                # Ensure batch_size is not None
+                if batch_size is None:
+                    batch_size = 64
+                    print(f"Warning: batch_size was None, using default: {batch_size}")
+                
+                _ = run_prefill(
                     embed_model,
                     ffn_models,
                     input_ids,
@@ -910,7 +915,7 @@ def main():
         
         # Warmup runs to prevent Python GIL issues with CoreML !
         if not args.nw:
-            for i in range(2):
+            for _ in range(2):
                 chat_loop(
                     embed_model=embed_model,
                     ffn_models=ffn_models,
