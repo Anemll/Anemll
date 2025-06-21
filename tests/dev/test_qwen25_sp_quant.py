@@ -5,7 +5,7 @@
 #  found in the LICENSE.txt file or at https://opensource.org/license/mit
 
 """
-PyTorch-only test script for Qwen 2.5 model with sparse per-tensor quantization.
+PyTorch-only test script for Qwen 2.5 model with SP per-tensor quantization.
 This script tests the quantized model directly in PyTorch without CoreML conversion.
 """
 
@@ -44,11 +44,11 @@ def setup_model_path(model_id):
         return None
 
 def test_quantized_model(model_id, model_path):
-    """Test sparse quantized Qwen2.5 model in PyTorch"""
+    """Test SP quantized Qwen2.5 model in PyTorch"""
     try:
         from anemll.models.qwen2_5_model import Qwen25ForCausalLM, Qwen25Config
         
-        print(f"\n=== Testing Sparse Quantized Model: {model_id} ===")
+        print(f"\n=== Testing SP Quantized Model: {model_id} ===")
         
         # Load configuration
         config_file = os.path.join(model_path, "config.json")
@@ -59,8 +59,8 @@ def test_quantized_model(model_id, model_path):
             print(f"Config not found, using defaults")
             config = Qwen25Config()
         
-        # Create model with sparse quantization enabled
-        print("Creating model with sparse quantization...")
+        # Create model with SP quantization enabled
+        print("Creating model with SP quantization...")
         model = Qwen25ForCausalLM(config, disable_kv_cache=False)
         
         # Load weights
@@ -324,16 +324,16 @@ def test_quantized_model(model_id, model_path):
         return False
 
 def run_sp_quant_tests():
-    """Run sparse quantization tests for Qwen 2.5 models"""
+    """Run SP quantization tests for Qwen 2.5 models"""
     
     print("===========================================")
-    print("  Qwen 2.5 Sparse Quantization Test Suite")
+    print("  Qwen 2.5 SP Quantization Test Suite")
     print("===========================================")
-    print("Testing sparse per-tensor quantized models in PyTorch")
+    print("Testing SP per-tensor quantized models in PyTorch")
     
-    # Set environment variable for sparse quantization
+    # Set environment variable for SP quantization
     os.environ['ENABLE_SP_QUANT'] = '1'
-    print(f"✓ ENABLE_SP_QUANT=1 (Sparse quantization enabled)")
+    print(f"✓ ENABLE_SP_QUANT=1 (SP quantization enabled)")
     
     # Test models
     test_models = [
@@ -397,7 +397,7 @@ def run_sp_quant_tests():
     print(f"\nTotal: {passed + failed} tests, {passed} passed, {failed} failed")
     
     if failed == 0:
-        print("\n🎉 All sparse quantization tests PASSED!")
+        print("\n🎉 All SP quantization tests PASSED!")
         return 0
     else:
         print(f"\n❌ {failed} test(s) FAILED")

@@ -90,6 +90,8 @@ python tests/test_sp_qwen2.5_model.py
 # Standalone test with auto-download
 python tests/dev/test_qwen25_sp_quant.py
 
+#compare output vs transformers
+python tests/dev/test_final_inference.py
 
 # TEST CONVERT ONLY  FFN ONLY (part5_)
 python tests/dev/test_ffn_sp_qwen2_5_model.py 
