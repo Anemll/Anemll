@@ -40,7 +40,7 @@ ENABLE_VACAB_SPLIT8 = bool(0)  # Split vocab into 8 parts
 ENABLE_VACAB_SPLIT16 = bool(1)  # Split vocab into 16 parts
 ENABLE_LOGITS2 = bool(1)    # Return separate logits arrays for CoreML
 ENABLE_COREML = bool(0)     # CoreML-specific returns
-ENABLE_SP_QUANT = bool(1)   # Enable per-tensor quantization
+ENABLE_SP_QUANT = bool(int(os.environ.get('ENABLE_SP_QUANT', '0')))   # Enable per-tensor quantization from environment
 SKIP_SP_FORWARD = bool(0)  # Skip quantization in forward pass for debugging
 
 
