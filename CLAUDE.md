@@ -140,6 +140,26 @@ The model conversion follows an 8-step process:
 - **LUT Quantization**: Lookup table quantization for different model parts (4-bit, 6-bit)
 - **Meta Configuration**: YAML-based model configuration for easy deployment
 
+### ANE-Specific Implementation Requirements
+
+**CRITICAL**: When implementing models for ANE (Apple Neural Engine) compatibility:
+
+1. **RMSNorm Implementation**: Always use ANE-aware RMSNorm that:
+   - Subtracts the mean first: `hidden_states = hidden_states - mean`
+   - Then uses `F.layer_norm()` instead of manual computation
+   - Example:
+   ```python
+   def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+       mean = hidden_states.mean(-1, keepdim=True)
+       hidden_states = hidden_states - mean
+       return F.layer_norm(hidden_states, self.weight.shape, self.weight, bias=None, eps=float(self.eps))
+   ```
+   - This is REQUIRED for ANE compatibility - standard RMSNorm without mean subtraction will fail on ANE
+
+2. **Conv2d Layers**: All dense layers must be expressed as `nn.Conv2d` with `kernel_size=1`
+
+3. **Weight Reshaping**: Weights from HuggingFace models need proper reshaping for Conv2d format
+
 ### Testing Infrastructure
 
 The project includes extensive testing files (test_*.py) focusing on:
