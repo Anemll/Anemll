@@ -40,10 +40,29 @@ ENABLE_VACAB_SPLIT8 = bool(0)  # Split vocab into 8 parts
 ENABLE_VACAB_SPLIT16 = bool(1)  # Split vocab into 16 parts
 ENABLE_LOGITS2 = bool(1)    # Return separate logits arrays for CoreML
 ENABLE_COREML = bool(0)     # CoreML-specific returns
-ENABLE_SP_QUANT = bool(int(os.environ.get('ENABLE_SP_QUANT', '0')))   # Enable per-tensor quantization from environment
+ENABLE_SP_QUANT = bool(1) #bool(int(os.environ.get('ENABLE_SP_QUANT', '0')))   # Enable per-tensor quantization from environment
 SKIP_SP_FORWARD = bool(0)  # Skip quantization in forward pass for debugging
 
+def snap_to_codebook(x: torch.Tensor, cb: torch.Tensor) -> torch.Tensor:
+    """
+    Replace every element of `x` with the nearest value in the 1-D `cb`
+    in O(N log K) time and O(N+K) memory  (N = x.numel(), K = cb.numel()).
 
+    Works by:
+      1. sorting the code-book                   – O(K log K)
+      2. computing mid-points between entries    – O(K)
+      3. bucketising each element of x           – O(N log K)
+    """
+    if cb.ndim != 1:
+        cb = cb.view(-1)              # (K,)
+
+    cb_sorted, _ = torch.sort(cb)     # (K,)  ascending
+    mid = (cb_sorted[:-1] + cb_sorted[1:]) * 0.5   # (K-1,)
+
+    # idx ∈ [0 … K-1] gives, for each x element, the index of the nearest code word
+    idx = torch.bucketize(x.view(-1), mid)
+
+    return cb_sorted[idx].view_as(x)
 def defuse_quantization_scales(weight: torch.Tensor, input_scale: torch.Tensor, output_scale: torch.Tensor, codebook: torch.Tensor = None) -> torch.Tensor:
     """Utility function to de-fuse both input and output scales from weights for per-tensor quantization.
     
@@ -73,17 +92,7 @@ def defuse_quantization_scales(weight: torch.Tensor, input_scale: torch.Tensor, 
     
     # Apply codebook quantization if provided
     if codebook is not None:
-        # Flatten result for efficient distance computation
-        original_shape = result.shape
-        result_flat = result.view(-1)
-        
-        # Find nearest codebook entries using broadcasting
-        # result_flat: [N], codebook: [1, K] -> distances: [N, K]
-        distances = torch.abs(result_flat.unsqueeze(1) - codebook.view(1, -1))
-        nearest_indices = torch.argmin(distances, dim=1)
-        
-        # Map to nearest codebook values and reshape back
-        result = codebook.view(-1)[nearest_indices].view(original_shape)
+        result = snap_to_codebook(result, codebook.to(MODEL_DTYPE))        
     
     return result.to(MODEL_DTYPE)
 
@@ -156,6 +165,7 @@ class Qwen25RMSNorm(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Following ANEMLL requirements: always subtract mean first, then use F.layer_norm()
         # This is required for ANE compatibility
+
         mean = hidden_states.mean(-1, keepdim=True)
         hidden_states = hidden_states - mean
         return F.layer_norm(hidden_states, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
@@ -259,7 +269,7 @@ class Qwen25MLP(nn.Module):
         self.intermediate_size = config.intermediate_size
 
         # Use single Conv2d layers (no splitting for Qwen 2.5 for now)
-        # Enable bias for per-tensor quantization
+        # Enable bias for per-tensor quantization - bias is part of quantized model architecture
         use_bias = ENABLE_SP_QUANT
         self.gate_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=use_bias, dtype=MODEL_DTYPE).to(TEST_DEVICE).to(MODEL_DTYPE)
         self.up_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=use_bias, dtype=MODEL_DTYPE).to(TEST_DEVICE).to(MODEL_DTYPE)
@@ -333,32 +343,37 @@ class Qwen25Attention(nn.Module):
         q_proj_dim = self.num_heads * self.head_dim  # 14 * 64 = 896
         kv_proj_dim = self.num_kv_heads * self.head_dim  # 2 * 64 = 128
         
+        # Bias configuration: Qwen 2.5 normally uses bias for q/k/v projections,
+        # and o_proj gets bias when quantized. Bias is part of the model architecture.
+        qkv_bias = True
+        o_bias = ENABLE_SP_QUANT
+        
         self.q_proj = nn.Conv2d(
             self.hidden_size,
             q_proj_dim,
             1,
-            bias=True,  # Qwen 2.5 uses bias
+            bias=qkv_bias,
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE).to(MODEL_DTYPE)
         self.k_proj = nn.Conv2d(
             self.hidden_size,
             kv_proj_dim,
             1,
-            bias=True,  # Qwen 2.5 uses bias
+            bias=qkv_bias,
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE).to(MODEL_DTYPE)
         self.v_proj = nn.Conv2d(
             self.hidden_size,
             kv_proj_dim,
             1,
-            bias=True,  # Qwen 2.5 uses bias
+            bias=qkv_bias,
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE).to(MODEL_DTYPE)
         self.o_proj = nn.Conv2d(
             q_proj_dim,
             self.hidden_size,
             1,
-            bias=ENABLE_SP_QUANT,  # Enable bias for quantized models
+            bias=o_bias,
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE).to(MODEL_DTYPE)
         
@@ -1026,7 +1041,13 @@ class Qwen25Model(nn.Module):
         
         # Second pass: process weights and biases
         for k, v in state_dict.items():
-            new_k = k.replace("model.", "") if k.startswith("model.") else k
+            print(f"Processing  {k} with shape {v.shape}")
+            # ANEMLL inner model (self.model) expects parameters WITHOUT "model." prefix
+            # Remove "model." prefix from safetensors keys to match inner model parameter names
+            if k.startswith("model."):
+                new_k = k[6:]  # Remove "model." prefix (more precise than replace)
+            else:
+                new_k = k
             if "lm_head.weight" in new_k:
                 continue
             if "codebook" in new_k:
@@ -1086,10 +1107,29 @@ class Qwen25Model(nn.Module):
                 if ENABLE_SP_QUANT:
                     output_scale_key = k.replace(".bias", ".output_scales")
                     if output_scale_key in output_scales:
+                        #input_scale = output_scales[output_scale_key].to(MODEL_DTYPE)
                         output_scale = output_scales[output_scale_key].to(MODEL_DTYPE)
-                        # Leave bias as-is since we apply output_scale during forward pass
-                        pass  # Don't modify bias - output scaling is applied in forward()
-                bias_tensor = v.to(MODEL_DTYPE)
+                        # Correct bias handling: loaded_bias = stored_bias / output_scale
+                        # Since bias is added before output scaling in forward pass
+                        # Ensure proper shape compatibility: flatten output_scale if needed
+                        scale = (output_scale).to(MODEL_DTYPE)
+                        if scale.numel() == v.numel():
+                            # If same number of elements, reshape to match bias
+                            scale = scale.view_as(v)
+                        elif scale.shape[-1] == 1 and scale.shape[0] == v.shape[0]:
+                            # Handle [output_dim, 1] -> [output_dim] case
+                            scale = scale.squeeze(-1)
+
+                        
+                        #bias_tensor = (v / scale).to(MODEL_DTYPE)
+                        # should not scale, scaled on export for SmoothQuant?
+                        bias_tensor = (v).to(MODEL_DTYPE)
+
+                        print(f"De-scaled bias for {new_k}: stored_bias shape {v.shape}, output_scale shape {output_scale.shape}")
+                    else:
+                        bias_tensor = v.to(MODEL_DTYPE)
+                else:
+                    bias_tensor = v.to(MODEL_DTYPE)
                 conv_state[new_k] = bias_tensor
             else:
                 # Ensure all other weights/parameters are also converted to MODEL_DTYPE
@@ -1119,6 +1159,8 @@ class Qwen25Model(nn.Module):
             else:
                 print("Warning: No output scales found in quantized model")
 
+        # Weight loading completed
+        
         missing, unexpected = self.load_state_dict(conv_state, strict=False)
         missing = [m for m in missing if "rotary_emb.inv_freq" not in m]
         # Filter out expected missing keys including KV cache buffer
@@ -1126,9 +1168,29 @@ class Qwen25Model(nn.Module):
         missing = [m for m in missing if m not in expected_missing]
         if missing or unexpected:
             print("Missing keys", missing)
-            print("Unexpected keys", unexpected)
+            print("Unexpected keys", unexpected[:5])  # Show first 5 unexpected keys
         
-        return not missing and not unexpected
+        # For SP quantization, check that only codebooks/scales should be missing (not actual weights)
+        if ENABLE_SP_QUANT and missing:
+            actual_missing_weights = [m for m in missing if not any(x in m for x in ['input_scales', 'output_scales', 'codebook', 'rotary_emb.inv_freq', 'kv_cache'])]
+            if actual_missing_weights:
+                print(f"ERROR: SP Quantization enabled but missing actual weights: {actual_missing_weights[:10]}")
+                print("HARD STOP: Cannot proceed with missing weights!")
+                raise RuntimeError(f"Missing critical weights: {len(actual_missing_weights)} weights not loaded")
+            else:
+                print("✓ SP Quantization: Only scales/codebooks missing as expected")
+        
+        if missing:
+            print(f"ERROR: Missing weights detected: {len(missing)} total")
+            print("HARD STOP: Cannot proceed with missing weights!")
+           # raise RuntimeError(f"Missing weights: {missing[:10]}")
+        
+        if unexpected:
+            print(f"ERROR: Unexpected weights detected: {len(unexpected)} total")
+            print("HARD STOP: Cannot proceed with unexpected weights!")
+          #  raise RuntimeError(f"Unexpected weights: {unexpected[:10]}")
+        
+        return True
 
 
 class Qwen25ForCausalLM(nn.Module):
