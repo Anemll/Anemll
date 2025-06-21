@@ -40,7 +40,52 @@ ENABLE_VACAB_SPLIT8 = bool(0)  # Split vocab into 8 parts
 ENABLE_VACAB_SPLIT16 = bool(1)  # Split vocab into 16 parts
 ENABLE_LOGITS2 = bool(1)    # Return separate logits arrays for CoreML
 ENABLE_COREML = bool(0)     # CoreML-specific returns
+ENABLE_SP_QUANT = bool(1)   # Enable per-tensor quantization
+SKIP_SP_FORWARD = bool(0)  # Skip quantization in forward pass for debugging
 
+
+def defuse_quantization_scales(weight: torch.Tensor, input_scale: torch.Tensor, output_scale: torch.Tensor, codebook: torch.Tensor = None) -> torch.Tensor:
+    """Utility function to de-fuse both input and output scales from weights for per-tensor quantization.
+    
+    Quantized weights are stored as: stored_weight = weight * input_scale * output_scale
+    We need to recover the original weight: weight = stored_weight / (input_scale * output_scale)
+    Optionally quantize to nearest codebook values.
+    
+    Args:
+        weight: The stored weight tensor to de-fuse
+        input_scale: The input scale to divide from the weight
+        output_scale: The output scale to divide from the weight
+        codebook: Optional codebook tensor for quantization. If provided, de-fused weights
+                 will be quantized to nearest codebook values.
+        
+    Returns:
+        De-fused weight tensor with MODEL_DTYPE, optionally quantized to codebook values
+    """
+    # Ensure all operands are in MODEL_DTYPE before division to avoid dtype promotion
+    weight = weight.to(MODEL_DTYPE)
+    
+    # Convert scales to MODEL_DTYPE for element-wise operations
+    input_scale = input_scale.to(MODEL_DTYPE)   # shape (1, Cin) or (Cin,)
+    output_scale = output_scale.to(MODEL_DTYPE)  # shape (Cout, 1)
+    
+    # De-fuse both scales: weight = stored_weight / (input_scale * output_scale) - element-wise
+    result = weight / (input_scale * output_scale)
+    
+    # Apply codebook quantization if provided
+    if codebook is not None:
+        # Flatten result for efficient distance computation
+        original_shape = result.shape
+        result_flat = result.view(-1)
+        
+        # Find nearest codebook entries using broadcasting
+        # result_flat: [N], codebook: [1, K] -> distances: [N, K]
+        distances = torch.abs(result_flat.unsqueeze(1) - codebook.view(1, -1))
+        nearest_indices = torch.argmin(distances, dim=1)
+        
+        # Map to nearest codebook values and reshape back
+        result = codebook.view(-1)[nearest_indices].view(original_shape)
+    
+    return result.to(MODEL_DTYPE)
 
 class Qwen25Config:
     def __init__(self, **kwargs):
@@ -105,7 +150,7 @@ class Qwen25RMSNorm(nn.Module):
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(torch.ones(hidden_size))  # Keep as fp32 for numerical stability
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -214,22 +259,57 @@ class Qwen25MLP(nn.Module):
         self.intermediate_size = config.intermediate_size
 
         # Use single Conv2d layers (no splitting for Qwen 2.5 for now)
-        self.gate_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
-        self.up_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
-        self.down_proj = nn.Conv2d(self.intermediate_size, self.hidden_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
+        # Enable bias for per-tensor quantization
+        use_bias = ENABLE_SP_QUANT
+        self.gate_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=use_bias, dtype=MODEL_DTYPE).to(TEST_DEVICE).to(MODEL_DTYPE)
+        self.up_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=use_bias, dtype=MODEL_DTYPE).to(TEST_DEVICE).to(MODEL_DTYPE)
+        self.down_proj = nn.Conv2d(self.intermediate_size, self.hidden_size, kernel_size=1, bias=use_bias, dtype=MODEL_DTYPE).to(TEST_DEVICE).to(MODEL_DTYPE)
 
         self.act_fn = F.silu
+        
+        # Initialize input and output scale buffers for per-tensor quantization
+        if ENABLE_SP_QUANT:
+            # Input scales (applied before Conv2D) - shape [1, input_dim]
+            self.register_buffer('gate_proj_input_scale', torch.ones(1, self.hidden_size, dtype=MODEL_DTYPE))
+            self.register_buffer('up_proj_input_scale', torch.ones(1, self.hidden_size, dtype=MODEL_DTYPE))
+            self.register_buffer('down_proj_input_scale', torch.ones(1, self.intermediate_size, dtype=MODEL_DTYPE))
+            # Output scales (applied after Conv2D) - shape [output_dim, 1]
+            self.register_buffer('gate_proj_output_scale', torch.ones(self.intermediate_size, 1, dtype=MODEL_DTYPE))
+            self.register_buffer('up_proj_output_scale', torch.ones(self.intermediate_size, 1, dtype=MODEL_DTYPE))
+            self.register_buffer('down_proj_output_scale', torch.ones(self.hidden_size, 1, dtype=MODEL_DTYPE))
 
     def forward(self, x):
         # Use identical step-by-step computation to QwenMLP to prevent numerical explosion
         x = x.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)  # Ensure proper dtype and shape
         
         # Step-by-step computation for numerical stability (like QwenMLP)
-        a = self.gate_proj(x)      # gate projection
-        b = self.up_proj(x)        # up projection
+        
+        # Gate projection
+        if ENABLE_SP_QUANT and not SKIP_SP_FORWARD:
+            a = self.gate_proj(x * self.gate_proj_input_scale.view(1, -1, 1, 1))
+            # Apply output scale: [1, 4864, 1, 1] * [4864, 1] → [1, 4864, 1, 1]
+            a = a * self.gate_proj_output_scale.view(1, -1, 1, 1)
+        else:
+            a = self.gate_proj(x)
+            
+        # Up projection
+        if ENABLE_SP_QUANT and not SKIP_SP_FORWARD:
+            b = self.up_proj(x * self.up_proj_input_scale.view(1, -1, 1, 1))
+            # Apply output scale: [1, 4864, 1, 1] * [4864, 1] → [1, 4864, 1, 1]
+            b = b * self.up_proj_output_scale.view(1, -1, 1, 1)
+        else:
+            b = self.up_proj(x)
+            
         c = self.act_fn(a)         # activation on gate
         d = c * b                  # multiply gate * up
-        e = self.down_proj(d)      # down projection
+        
+        # Down projection
+        if ENABLE_SP_QUANT and not SKIP_SP_FORWARD:
+            e = self.down_proj(d * self.down_proj_input_scale.view(1, -1, 1, 1))
+            # Apply output scale: [1, 896, 1, 1] * [896, 1] → [1, 896, 1, 1]
+            e = e * self.down_proj_output_scale.view(1, -1, 1, 1)
+        else:
+            e = self.down_proj(d)
         
         return e.squeeze(2).permute(0, 2, 1)  # Final output shape: [bsz, seq_len, hidden_size]
 
@@ -259,30 +339,44 @@ class Qwen25Attention(nn.Module):
             1,
             bias=True,  # Qwen 2.5 uses bias
             dtype=MODEL_DTYPE,
-        ).to(TEST_DEVICE)
+        ).to(TEST_DEVICE).to(MODEL_DTYPE)
         self.k_proj = nn.Conv2d(
             self.hidden_size,
             kv_proj_dim,
             1,
             bias=True,  # Qwen 2.5 uses bias
             dtype=MODEL_DTYPE,
-        ).to(TEST_DEVICE)
+        ).to(TEST_DEVICE).to(MODEL_DTYPE)
         self.v_proj = nn.Conv2d(
             self.hidden_size,
             kv_proj_dim,
             1,
             bias=True,  # Qwen 2.5 uses bias
             dtype=MODEL_DTYPE,
-        ).to(TEST_DEVICE)
+        ).to(TEST_DEVICE).to(MODEL_DTYPE)
         self.o_proj = nn.Conv2d(
             q_proj_dim,
             self.hidden_size,
             1,
-            bias=False,
+            bias=ENABLE_SP_QUANT,  # Enable bias for quantized models
             dtype=MODEL_DTYPE,
-        ).to(TEST_DEVICE)
+        ).to(TEST_DEVICE).to(MODEL_DTYPE)
+        
         # Note: Qwen 2.5 does not use per-head normalization
         self.scale = 1 / math.sqrt(self.head_dim)
+        
+        # Initialize input and output scale buffers for per-tensor quantization
+        if ENABLE_SP_QUANT:
+            # Input scales (applied before Conv2D) - shape [1, input_dim]
+            self.register_buffer('q_proj_input_scale', torch.ones(1, self.hidden_size, dtype=MODEL_DTYPE))
+            self.register_buffer('k_proj_input_scale', torch.ones(1, self.hidden_size, dtype=MODEL_DTYPE))
+            self.register_buffer('v_proj_input_scale', torch.ones(1, self.hidden_size, dtype=MODEL_DTYPE))
+            self.register_buffer('o_proj_input_scale', torch.ones(1, q_proj_dim, dtype=MODEL_DTYPE))
+            # Output scales (applied after Conv2D) - shape [output_dim, 1]
+            self.register_buffer('q_proj_output_scale', torch.ones(q_proj_dim, 1, dtype=MODEL_DTYPE))
+            self.register_buffer('k_proj_output_scale', torch.ones(kv_proj_dim, 1, dtype=MODEL_DTYPE))
+            self.register_buffer('v_proj_output_scale', torch.ones(kv_proj_dim, 1, dtype=MODEL_DTYPE))
+            self.register_buffer('o_proj_output_scale', torch.ones(self.hidden_size, 1, dtype=MODEL_DTYPE))
 
     def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
         """
@@ -304,9 +398,30 @@ class Qwen25Attention(nn.Module):
         hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
         
         # Perform projections with fixed dimensions
-        query_states = self.q_proj(hidden_states).view(1, self.num_heads, 1, self.head_dim).to(MODEL_DTYPE)
-        key_states = self.k_proj(hidden_states).view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
-        value_states = self.v_proj(hidden_states).view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
+        
+        # Q projection: apply input scale before Conv2D, output scale after
+        if ENABLE_SP_QUANT and not SKIP_SP_FORWARD:
+            query_states = self.q_proj(hidden_states * self.q_proj_input_scale.view(1, -1, 1, 1))
+            query_states = query_states * self.q_proj_output_scale.view(1, -1, 1, 1)
+        else:
+            query_states = self.q_proj(hidden_states)
+        query_states = query_states.view(1, self.num_heads, 1, self.head_dim).to(MODEL_DTYPE)
+        
+        # K projection: apply input scale before Conv2D, output scale after
+        if ENABLE_SP_QUANT and not SKIP_SP_FORWARD:
+            key_states = self.k_proj(hidden_states * self.k_proj_input_scale.view(1, -1, 1, 1))
+            key_states = key_states * self.k_proj_output_scale.view(1, -1, 1, 1)
+        else:
+            key_states = self.k_proj(hidden_states)
+        key_states = key_states.view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
+        
+        # V projection: apply input scale before Conv2D, output scale after
+        if ENABLE_SP_QUANT and not SKIP_SP_FORWARD:
+            value_states = self.v_proj(hidden_states * self.v_proj_input_scale.view(1, -1, 1, 1))
+            value_states = value_states * self.v_proj_output_scale.view(1, -1, 1, 1)
+        else:
+            value_states = self.v_proj(hidden_states)
+        value_states = value_states.view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
         
         # Note: Qwen 2.5 does not use query and key normalization
         
@@ -325,9 +440,19 @@ class Qwen25Attention(nn.Module):
         hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)  # [1, hidden_size, 1, seq_len]
 
         # Project all tokens at once using Conv2d
-        query_states = self.q_proj(hidden_states)  # [1, num_heads * head_dim, 1, seq_len]
-        key_states = self.k_proj(hidden_states)    # [1, num_kv_heads * head_dim, 1, seq_len]
-        value_states = self.v_proj(hidden_states)  # [1, num_kv_heads * head_dim, 1, seq_len]
+        if ENABLE_SP_QUANT:
+            query_states = self.q_proj(hidden_states * self.q_proj_input_scale.view(1, -1, 1, 1))  # [1, num_heads * head_dim, 1, seq_len]
+            query_states = query_states * self.q_proj_output_scale.view(1, -1, 1, 1)
+            
+            key_states = self.k_proj(hidden_states * self.k_proj_input_scale.view(1, -1, 1, 1))    # [1, num_kv_heads * head_dim, 1, seq_len]
+            key_states = key_states * self.k_proj_output_scale.view(1, -1, 1, 1)
+            
+            value_states = self.v_proj(hidden_states * self.v_proj_input_scale.view(1, -1, 1, 1))  # [1, num_kv_heads * head_dim, 1, seq_len]
+            value_states = value_states * self.v_proj_output_scale.view(1, -1, 1, 1)
+        else:
+            query_states = self.q_proj(hidden_states)  # [1, num_heads * head_dim, 1, seq_len]
+            key_states = self.k_proj(hidden_states)    # [1, num_kv_heads * head_dim, 1, seq_len]
+            value_states = self.v_proj(hidden_states)  # [1, num_kv_heads * head_dim, 1, seq_len]
 
         # Reshape to final dimensions
         query_states = query_states.view(1, self.num_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)  # [1, num_heads, seq_len, head_dim]
@@ -354,22 +479,18 @@ class Qwen25Attention(nn.Module):
         current_pos: torch.LongTensor,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
-        hs = hidden_states.permute(0, 2, 1).unsqueeze(2)
-        query_states = (
-            self.q_proj(hs)
-            .view(bsz, self.num_heads, self.head_dim, seq_len)
-            .permute(0, 1, 3, 2)
-        )
-        key_states = (
-            self.k_proj(hs)
-            .view(bsz, self.num_kv_heads, self.head_dim, seq_len)
-            .permute(0, 1, 3, 2)
-        )
-        value_states = (
-            self.v_proj(hs)
-            .view(bsz, self.num_kv_heads, self.head_dim, seq_len)
-            .permute(0, 1, 3, 2)
-        )
+        hs = hidden_states.permute(0, 2, 1).unsqueeze(2)  # [B, C, 1, L]
+
+        if ENABLE_SP_QUANT:
+            q = self.q_proj(hs * self.q_proj_input_scale.view(1, -1, 1, 1)) * self.q_proj_output_scale.view(1, -1, 1, 1)
+            k = self.k_proj(hs * self.k_proj_input_scale.view(1, -1, 1, 1)) * self.k_proj_output_scale.view(1, -1, 1, 1)
+            v = self.v_proj(hs * self.v_proj_input_scale.view(1, -1, 1, 1)) * self.v_proj_output_scale.view(1, -1, 1, 1)
+        else:
+            q = self.q_proj(hs); k = self.k_proj(hs); v = self.v_proj(hs)
+
+        query_states = q.view(bsz, self.num_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)
+        key_states = k.view(bsz, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)
+        value_states = v.view(bsz, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)
 
         n_rep = self.num_heads // self.num_kv_heads
         key_states = self.repeat_kv(key_states.squeeze(0), n_rep)
@@ -390,11 +511,16 @@ class Qwen25Attention(nn.Module):
             causal_mask_slice = causal_mask[:, :, :seq_len, :seq_len]
             attn_weights = attn_weights + causal_mask_slice.to(attn_weights.dtype)
         attn_weights = torch.softmax(attn_weights, dim=-1)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = torch.matmul(attn_weights, value_states).to(MODEL_DTYPE)
         attn_output = (
             attn_output.permute(0, 2, 1, 3).contiguous().view(bsz, seq_len, -1)
         )
-        out = self.o_proj(attn_output.permute(0, 2, 1).unsqueeze(2))
+        
+        o_in = attn_output.permute(0, 2, 1).unsqueeze(2)
+        if ENABLE_SP_QUANT:
+            out = self.o_proj(o_in * self.o_proj_input_scale.view(1, -1, 1, 1)) * self.o_proj_output_scale.view(1, -1, 1, 1)
+        else:
+            out = self.o_proj(o_in)
         return out.squeeze(2).permute(0, 2, 1)
 
     def forward_regular(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None, current_pos=None):
@@ -431,10 +557,16 @@ class Qwen25Attention(nn.Module):
         
         # Reshape before projecting: [1, heads, q_len, head_dim] -> [1, q_len, heads*head_dim]
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim).to(MODEL_DTYPE)
         
         # Project output (this will reshape from num_heads*head_dim back to hidden_size)
-        attn_output = self.o_proj(attn_output.permute(0, 2, 1).unsqueeze(2))
+        # O projection: apply input scale before Conv2D, output scale after
+        o_input = attn_output.permute(0, 2, 1).unsqueeze(2)
+        if ENABLE_SP_QUANT:
+            attn_output = self.o_proj(o_input * self.o_proj_input_scale.view(1, -1, 1, 1))
+            attn_output = attn_output * self.o_proj_output_scale.view(1, -1, 1, 1)
+        else:
+            attn_output = self.o_proj(o_input)
         return attn_output.squeeze(2).permute(0, 2, 1)
 
     def forward_prefill(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None):
@@ -470,10 +602,16 @@ class Qwen25Attention(nn.Module):
         # Use actual tensor dimensions instead of input q_len
         attn_output = attn_output.transpose(1, 2).contiguous()
         actual_bsz, actual_seq_len, num_heads, head_dim = attn_output.shape
-        attn_output = attn_output.reshape(actual_bsz, actual_seq_len, num_heads * head_dim)
+        attn_output = attn_output.reshape(actual_bsz, actual_seq_len, num_heads * head_dim).to(MODEL_DTYPE)
         
         # Project output (this will reshape from num_heads*head_dim back to hidden_size)
-        attn_output = self.o_proj(attn_output.permute(0, 2, 1).unsqueeze(2))
+        # O projection: apply input scale before Conv2D, output scale after
+        o_input = attn_output.permute(0, 2, 1).unsqueeze(2)
+        if ENABLE_SP_QUANT:
+            attn_output = self.o_proj(o_input * self.o_proj_input_scale.view(1, -1, 1, 1))
+            attn_output = attn_output * self.o_proj_output_scale.view(1, -1, 1, 1)
+        else:
+            attn_output = self.o_proj(o_input)
         return attn_output.squeeze(2).permute(0, 2, 1)
 
 
@@ -515,7 +653,7 @@ class Qwen25Model(nn.Module):
         self.disable_kv_cache = False  # Will be set by parent model
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size).to(
             TEST_DEVICE
-        )
+        ).to(MODEL_DTYPE)
         self.layers = nn.ModuleList(
             [Qwen25DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
@@ -872,10 +1010,30 @@ class Qwen25Model(nn.Module):
                 )
 
         conv_state = {}
+        # Collect all input scales, output scales, and codebooks
+        input_scales = {}
+        output_scales = {}
+        codebooks = {}
+        
+        # First pass: collect scales and codebooks
+        for k, v in state_dict.items():
+            if "input_scales" in k:
+                input_scales[k] = v
+            elif "output_scales" in k:
+                output_scales[k] = v
+            elif "codebook" in k:
+                codebooks[k] = v
+        
+        # Second pass: process weights and biases
         for k, v in state_dict.items():
             new_k = k.replace("model.", "") if k.startswith("model.") else k
             if "lm_head.weight" in new_k:
                 continue
+            if "codebook" in new_k:
+                continue  # Skip codebooks - they're processed separately
+            if "input_scales" in new_k or "output_scales" in new_k:
+                continue  # Skip scale tensors - they're processed in the third pass
+                
             if any(
                 proj in new_k
                 for proj in [
@@ -888,7 +1046,30 @@ class Qwen25Model(nn.Module):
                     "down_proj.weight",
                 ]
             ):
-                conv_state[new_k] = v.view(v.shape[0], v.shape[1], 1, 1)
+                # Remove output scaling if available (weights are stored as weight * input_scale * output_scale)
+                if ENABLE_SP_QUANT:
+                    output_scale_key = k.replace(".weight", ".output_scales")
+                    input_scale_key = k.replace(".weight", ".input_scales")
+                    codebook_key = k.replace(".weight", ".codebook")
+                    
+                    if output_scale_key in output_scales and input_scale_key in input_scales:
+                        output_scale = output_scales[output_scale_key]
+                        input_scale = input_scales[input_scale_key]
+                        codebook = codebooks.get(codebook_key, None)  # Optional codebook
+                        
+                        v = defuse_quantization_scales(v, input_scale, output_scale, codebook)
+                        
+                        codebook_info = f" with {len(codebook)} codebook entries" if codebook is not None else " (no codebook)"
+                        print(f"De-fused scales for {new_k}: input_scale shape {input_scale.shape}, output_scale shape {output_scale.shape}{codebook_info}")
+                
+                # Ensure consistent dtype and Conv2d format for all projection weights
+                if len(v.shape) == 2:
+                    # Reshape 2D weights to Conv2d format
+                    reshaped = v.view(v.shape[0], v.shape[1], 1, 1).to(MODEL_DTYPE)
+                else:
+                    # Already in correct shape, just convert dtype
+                    reshaped = v.to(MODEL_DTYPE)
+                conv_state[new_k] = reshaped
             elif any(
                 proj in new_k
                 for proj in [
@@ -896,12 +1077,47 @@ class Qwen25Model(nn.Module):
                     "k_proj.bias",
                     "v_proj.bias",
                     "o_proj.bias",
+                    "gate_proj.bias",
+                    "up_proj.bias",
+                    "down_proj.bias",
                 ]
             ):
-                # Handle bias tensors for QKV projections
-                conv_state[new_k] = v
+                # Handle bias tensors for projections (bias is stored as bias / output_scale)
+                if ENABLE_SP_QUANT:
+                    output_scale_key = k.replace(".bias", ".output_scales")
+                    if output_scale_key in output_scales:
+                        output_scale = output_scales[output_scale_key].to(MODEL_DTYPE)
+                        # Leave bias as-is since we apply output_scale during forward pass
+                        pass  # Don't modify bias - output scaling is applied in forward()
+                bias_tensor = v.to(MODEL_DTYPE)
+                conv_state[new_k] = bias_tensor
             else:
-                conv_state[new_k] = v
+                # Ensure all other weights/parameters are also converted to MODEL_DTYPE
+                conv_state[new_k] = v.to(MODEL_DTYPE)
+        
+        # Third pass: set input and output scales
+        if ENABLE_SP_QUANT:
+            # Load input scales - preserve original tensor shapes for element-wise operations
+            if input_scales:
+                for k, v in input_scales.items():
+                    new_k = k.replace("model.", "") if k.startswith("model.") else k
+                    # Convert key format from .input_scales to _input_scale
+                    new_k = new_k.replace(".input_scales", "_input_scale")
+                    # Keep original scale tensor shapes for element-wise operations
+                    conv_state[new_k] = v.to(MODEL_DTYPE)
+                    print(f"Loading input scale: {new_k} with shape {v.shape}")
+            
+            # Load output scales - preserve original tensor shapes for element-wise operations
+            if output_scales:
+                for k, v in output_scales.items():
+                    new_k = k.replace("model.", "") if k.startswith("model.") else k
+                    # Convert key format from .output_scales to _output_scale
+                    new_k = new_k.replace(".output_scales", "_output_scale")
+                    # Keep original scale tensor shapes for element-wise operations
+                    conv_state[new_k] = v.to(MODEL_DTYPE)
+                    print(f"Loading output scale: {new_k} with shape {v.shape}")
+            else:
+                print("Warning: No output scales found in quantized model")
 
         missing, unexpected = self.load_state_dict(conv_state, strict=False)
         missing = [m for m in missing if "rotary_emb.inv_freq" not in m]
@@ -911,6 +1127,7 @@ class Qwen25Model(nn.Module):
         if missing or unexpected:
             print("Missing keys", missing)
             print("Unexpected keys", unexpected)
+        
         return not missing and not unexpected
 
 
@@ -1119,7 +1336,7 @@ class Qwen25ForCausalLM(nn.Module):
         
         # Process through model to update KV cache
         with torch.no_grad():
-            self.model.forward_prefill(
+            self.model.forward_prefill( 
                 hidden_states=hidden_states,
                 position_ids=position_ids,
                 causal_mask=causal_mask_prefill,
@@ -1174,7 +1391,7 @@ class Qwen25ForCausalLM(nn.Module):
                     split_sizes = [vocab_split + (1 if i < vocab_remainder else 0) for i in range(16)]
                     splits = torch.split(reshaped_weight, split_sizes)
                     for i, split in enumerate(splits):
-                        getattr(self, f"lm_head16_{i+1}").weight.data.copy_(split)
+                        getattr(self, f"lm_head16_{i+1}").weight.data.copy_(split.to(MODEL_DTYPE))
                         print(f"Loaded lm_head16_{i+1}.weight with shape {split.shape}")
                 elif ENABLE_VACAB_SPLIT8:
                     vocab_split = self.config.vocab_size // 8
@@ -1183,19 +1400,19 @@ class Qwen25ForCausalLM(nn.Module):
                     split_sizes = [vocab_split + (1 if i < vocab_remainder else 0) for i in range(8)]
                     splits = torch.split(reshaped_weight, split_sizes)
                     for i, split in enumerate(splits):
-                        getattr(self, f"lm_head8_{i+1}").weight.data.copy_(split)
+                        getattr(self, f"lm_head8_{i+1}").weight.data.copy_(split.to(MODEL_DTYPE))
                         print(f"Loaded lm_head8_{i+1}.weight with shape {split.shape}")
                 elif ENABLE_VACAB_SPLIT:
                     vocab_split = self.config.vocab_size // 2
                     split1, split2 = torch.split(reshaped_weight, [vocab_split, self.config.vocab_size - vocab_split])
-                    self.lm_head2_1.weight.data.copy_(split1)
-                    self.lm_head2_2.weight.data.copy_(split2)
+                    self.lm_head2_1.weight.data.copy_(split1.to(MODEL_DTYPE))
+                    self.lm_head2_2.weight.data.copy_(split2.to(MODEL_DTYPE))
                     print(f"Loaded lm_head2_1.weight and lm_head2_2.weight")
                 else:
-                    self.lm_head1.weight.data.copy_(reshaped_weight)
+                    self.lm_head1.weight.data.copy_(reshaped_weight.to(MODEL_DTYPE))
                     print(f"Loaded lm_head1.weight")
             else:
-                self.lm_head.weight.data.copy_(lm_head_weight.view(lm_head_weight.shape[0], lm_head_weight.shape[1], 1, 1))
+                self.lm_head.weight.data.copy_(lm_head_weight.view(lm_head_weight.shape[0], lm_head_weight.shape[1], 1, 1).to(MODEL_DTYPE))
         else:
             print("Warning: lm_head.weight not found in model weights")
             return False
