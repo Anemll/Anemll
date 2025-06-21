@@ -43,6 +43,10 @@ def run_qwen25_tests():
         print(f"\n--- Testing {test_case['name']} ---")
         
         try:
+            # Set environment variable for standard quantization (SP_QUANT disabled)
+            env = os.environ.copy()
+            env['ENABLE_SP_QUANT'] = '0'
+            
             # Run the test script
             cmd = [
                 str(test_script),
@@ -52,7 +56,8 @@ def run_qwen25_tests():
             ]
             
             print(f"Running: {' '.join(cmd)}")
-            result = subprocess.run(cmd, check=True, cwd=project_root)
+            print(f"  with ENABLE_SP_QUANT=0")
+            result = subprocess.run(cmd, check=True, cwd=project_root, env=env)
             
             if result.returncode == 0:
                 print(f"✓ {test_case['name']} test passed")

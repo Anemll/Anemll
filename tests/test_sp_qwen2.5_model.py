@@ -89,7 +89,7 @@ def run_qwen25_tests():
             
             # Set environment variable for per-tensor quantization
             env = os.environ.copy()
-            env['ENABLE_SP_QUANT'] = 'true'
+            env['ENABLE_SP_QUANT'] = '1'
             
             # Run the test script (LUT quantization already disabled in test_hf_model.sh)
             cmd = [
@@ -100,7 +100,7 @@ def run_qwen25_tests():
             ]
             
             print(f"Running: {' '.join(cmd)}")
-            print(f"  with ENABLE_SP_QUANT=true")
+            print(f"  with ENABLE_SP_QUANT=1")
             print(f"  with LUT quantization disabled (--lut1=\"\" --lut2=\"\" --lut3=\"\")")
             result = subprocess.run(cmd, check=True, cwd=project_root, env=env)
             

@@ -115,7 +115,10 @@ if [ "$SKIP_CHECK" = false ]; then
         # Also check the old quantization field for backward compatibility
         QUANTIZATION_PRESENT=$(jq -e '.quantization | length > 0' "$MODEL_DIR/config.json" 2>/dev/null)
         
-        if [ ! -z "$QUANTIZATION_CONFIG" ] || [ "$QUANTIZATION_PRESENT" = "true" ]; then
+        # Check if per-tensor quantization is enabled (allow quantized models in this case)
+        ENABLE_SP_QUANT="${ENABLE_SP_QUANT:-false}"
+        
+        if ([ ! -z "$QUANTIZATION_CONFIG" ] || [ "$QUANTIZATION_PRESENT" = "true" ]) && [ "$ENABLE_SP_QUANT" != "true" ]; then
             echo ""
             echo "⚠️  ERROR: Quantized model detected!"
             echo ""
@@ -159,6 +162,12 @@ if [ "$SKIP_CHECK" = false ]; then
             echo ""
             echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
             exit 1
+        elif [ ! -z "$QUANTIZATION_CONFIG" ] || [ "$QUANTIZATION_PRESENT" = "true" ]; then
+            # Quantized model detected but SP_QUANT is enabled
+            echo ""
+            echo "✓ Quantized model detected with ENABLE_SP_QUANT=true"
+            echo "  Per-tensor quantization support is enabled."
+            echo ""
         fi
         
         # Also check filename for quantization hints
