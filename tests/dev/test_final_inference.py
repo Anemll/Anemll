@@ -210,16 +210,138 @@ def test_final_inference():
     print(f"------------------------------------------------")
 
     print(f"Transformers: {hf_response}")
-    print(f"ANEMLL:       {response}")
+    print(f"------------------------------------------------")
+    print(f"ANEMLL:       {response}")    
+    print(f"----------------------ANALISYS-----------------------")
+
+    # Calculate divergence percentage
+    def calculate_divergence(text1, text2):
+        """Calculate divergence percentage between two texts."""
+        if text1 == text2:
+            return 0.0
+        
+        # Check for repetition in ANEMLL output (text2)
+        def detect_repetition(text, min_repeat_length=3):
+            """Detect if text contains repetitive patterns."""
+            if len(text) < min_repeat_length * 2:
+                return False
+            
+            # Look for repeating patterns of different lengths
+            for pattern_length in range(min_repeat_length, len(text) // 2 + 1):
+                for start_pos in range(len(text) - pattern_length * 2 + 1):
+                    pattern = text[start_pos:start_pos + pattern_length]
+                    next_pos = start_pos + pattern_length
+                    
+                    # Check if pattern repeats immediately
+                    if (next_pos + pattern_length <= len(text) and 
+                        text[next_pos:next_pos + pattern_length] == pattern):
+                        return True
+                    
+                    # Check for pattern repetition with small gaps
+                    for gap in range(1, min(5, len(text) - next_pos - pattern_length + 1)):
+                        if (next_pos + gap + pattern_length <= len(text) and 
+                            text[next_pos + gap:next_pos + gap + pattern_length] == pattern):
+                            return True
+            
+            return False
+        
+        # Check for repetition in ANEMLL output
+        has_repetition = detect_repetition(text2)
+        
+        # Use Levenshtein distance for character-level comparison
+        from difflib import SequenceMatcher
+        
+        # Calculate similarity ratio (0.0 to 1.0)
+        similarity = SequenceMatcher(None, text1, text2).ratio()
+        
+        # Convert to divergence percentage
+        divergence = (1.0 - similarity) * 100
+        
+        # If ANEMLL is repeating, add significant penalty to divergence
+        if has_repetition:
+            print(f"⚠️  REPETITION DETECTED in ANEMLL output!")
+            print(f"   ANEMLL text: {text2}")
+            # Add 50% penalty for repetition (making it more likely to fail)
+            divergence += 50.0
+        
+        return divergence
+    
+    # Calculate divergence
+    divergence_pct = calculate_divergence(hf_response, response)
+    
+    print(f"\n{'='*60}")
+    print("DIVERGENCE ANALYSIS")
+    print(f"{'='*60}")
+    print(f"Divergence: {divergence_pct:.2f}%")
+    
+    # Additional repetition analysis
+    def analyze_repetition_patterns(text):
+        """Analyze and report repetition patterns in text."""
+        patterns = []
+        for pattern_length in range(3, min(10, len(text) // 2 + 1)):
+            for start_pos in range(len(text) - pattern_length * 2 + 1):
+                pattern = text[start_pos:start_pos + pattern_length]
+                next_pos = start_pos + pattern_length
+                
+                # Check immediate repetition
+                if (next_pos + pattern_length <= len(text) and 
+                    text[next_pos:next_pos + pattern_length] == pattern):
+                    patterns.append(f"'{pattern}' (immediate repeat at pos {start_pos})")
+                
+                # Check repetition with gaps
+                for gap in range(1, min(5, len(text) - next_pos - pattern_length + 1)):
+                    if (next_pos + gap + pattern_length <= len(text) and 
+                        text[next_pos + gap:next_pos + gap + pattern_length] == pattern):
+                        patterns.append(f"'{pattern}' (repeat with {gap} char gap at pos {start_pos})")
+        
+        return patterns
+    
+    repetition_patterns = analyze_repetition_patterns(response)
+    if repetition_patterns:
+        print(f"\nRepetition Analysis:")
+        print(f"Found {len(repetition_patterns)} repetition pattern(s):")
+        for i, pattern in enumerate(repetition_patterns[:5], 1):  # Show first 5 patterns
+            print(f"  {i}. {pattern}")
+        if len(repetition_patterns) > 5:
+            print(f"  ... and {len(repetition_patterns) - 5} more patterns")
+    
+    # Determine test result
+    if divergence_pct > 80.0:
+        print(f"\n❌ FAILED: Divergence ({divergence_pct:.2f}%) exceeds 80% threshold")
+        print("ANEMLL output is significantly different from Transformers baseline")
+        return False
+    elif divergence_pct > 50.0:
+        print(f"\n⚠️  WARNING: High divergence ({divergence_pct:.2f}%) - investigate further")
+        print("ANEMLL output shows substantial differences from Transformers")
+        return False
+    elif divergence_pct > 20.0:
+        print(f"\n⚠️  CAUTION: Moderate divergence ({divergence_pct:.2f}%)")
+        print("ANEMLL output shows some differences from Transformers")
+        return True
+    else:
+        print(f"\n✅ PASSED: Low divergence ({divergence_pct:.2f}%)")
+        print("ANEMLL output is reasonably close to Transformers baseline")
+        return True
     
     # Check if they match
+
+    '''
     if response == hf_response:
         print("\n🎉 SUCCESS: ANEMLL matches transformers exactly!")
     elif response.startswith(hf_response[:10]):  # At least same start
         print("\n✅ GOOD: ANEMLL output is coherent and similar to transformers")
     else:
         print("\n❌ ISSUE: ANEMLL still produces different output")
-
+    '''
 
 if __name__ == "__main__":
-    test_final_inference()
+    success = test_final_inference()
+    
+    print(f"\n{'='*80}")
+    print("FINAL TEST RESULT")
+    print(f"{'='*80}")
+    if success:
+        print("🎉 TEST PASSED: ANEMLL inference is working correctly")
+    else:
+        print("❌ TEST FAILED: ANEMLL inference needs investigation")
+        exit(1)
