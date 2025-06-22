@@ -42,6 +42,7 @@ ENABLE_LOGITS2 = bool(1)    # Return separate logits arrays for CoreML
 ENABLE_COREML = bool(0)     # CoreML-specific returns
 ENABLE_SP_QUANT = bool(1) #bool(int(os.environ.get('ENABLE_SP_QUANT', '0')))   # Enable per-tensor quantization from environment
 SKIP_SP_FORWARD = bool(0)  # Skip quantization in forward pass for debugging
+SIMPLE_SCALE_TEST = bool(0)  # Set all scales to balanced values for testing
 
 def snap_to_codebook(x: torch.Tensor, cb: torch.Tensor) -> torch.Tensor:
     """
@@ -89,10 +90,11 @@ def defuse_quantization_scales(weight: torch.Tensor, input_scale: torch.Tensor, 
     
     # De-fuse both scales: weight = stored_weight / (input_scale * output_scale) - element-wise
     result = weight / (input_scale * output_scale)
+    #result = weight
     
     # Apply codebook quantization if provided
-    if codebook is not None:
-        result = snap_to_codebook(result, codebook.to(MODEL_DTYPE))        
+    #if codebook is not None:
+    #    result = snap_to_codebook(result, codebook.to(MODEL_DTYPE))        
     
     return result.to(MODEL_DTYPE)
 
@@ -1121,9 +1123,12 @@ class Qwen25Model(nn.Module):
                             scale = scale.squeeze(-1)
 
                         
-                        #bias_tensor = (v / scale).to(MODEL_DTYPE)
+                        bias_tensor = (v / scale).to(MODEL_DTYPE)
                         # should not scale, scaled on export for SmoothQuant?
-                        bias_tensor = (v).to(MODEL_DTYPE)
+                        #bias_tensor = (v).to(MODEL_DTYPE)
+
+                        #if new_k in ["mlp.up_proj.bias", "mlp.down_proj.bias", "mlp.gate_proj.bias"]:
+                        #    bias_tensor = (v / scale).to(MODEL_DTYPE)
 
                         print(f"De-scaled bias for {new_k}: stored_bias shape {v.shape}, output_scale shape {output_scale.shape}")
                     else:
@@ -1144,8 +1149,14 @@ class Qwen25Model(nn.Module):
                     # Convert key format from .input_scales to _input_scale
                     new_k = new_k.replace(".input_scales", "_input_scale")
                     # Keep original scale tensor shapes for element-wise operations
-                    conv_state[new_k] = v.to(MODEL_DTYPE)
-                    print(f"Loading input scale: {new_k} with shape {v.shape}")
+                    if SIMPLE_SCALE_TEST:
+                        # TEST: Set all input scales to 0.3 to test balanced scaling
+                        scale_tensor = torch.full_like(v, 1.0).to(MODEL_DTYPE)
+                        conv_state[new_k] = scale_tensor
+                        print(f"Loading input scale: {new_k} with shape {v.shape} (SET TO 0.3 FOR TEST)")
+                    else:
+                        conv_state[new_k] = v.to(MODEL_DTYPE)
+                        print(f"Loading input scale: {new_k} with shape {v.shape}")
             
             # Load output scales - preserve original tensor shapes for element-wise operations
             if output_scales:
@@ -1154,8 +1165,14 @@ class Qwen25Model(nn.Module):
                     # Convert key format from .output_scales to _output_scale
                     new_k = new_k.replace(".output_scales", "_output_scale")
                     # Keep original scale tensor shapes for element-wise operations
-                    conv_state[new_k] = v.to(MODEL_DTYPE)
-                    print(f"Loading output scale: {new_k} with shape {v.shape}")
+                    if SIMPLE_SCALE_TEST:
+                        # TEST: Set all output scales to 1/0.3 ≈ 3.33 to test balanced scaling
+                        scale_tensor = torch.full_like(v, 1.0/1.0).to(MODEL_DTYPE)
+                        conv_state[new_k] = scale_tensor
+                        print(f"Loading output scale: {new_k} with shape {v.shape} (SET TO 3.33 FOR TEST)")
+                    else:
+                        conv_state[new_k] = v.to(MODEL_DTYPE)
+                        print(f"Loading output scale: {new_k} with shape {v.shape}")
             else:
                 print("Warning: No output scales found in quantized model")
 
@@ -1189,6 +1206,47 @@ class Qwen25Model(nn.Module):
             print(f"ERROR: Unexpected weights detected: {len(unexpected)} total")
             print("HARD STOP: Cannot proceed with unexpected weights!")
           #  raise RuntimeError(f"Unexpected weights: {unexpected[:10]}")
+        
+        # Bias verification check for debugging quantization issues
+        if ENABLE_SP_QUANT:
+            print("\n🔍 Bias Verification Check:")
+            bias_stats = {}
+            for name, module in self.named_modules():
+                if hasattr(module, 'bias') and module.bias is not None:
+                    bias_tensor = module.bias
+                    is_zero = torch.allclose(bias_tensor, torch.zeros_like(bias_tensor), atol=1e-8)
+                    bias_magnitude = bias_tensor.abs().max().item()
+                    bias_stats[name] = {
+                        'is_zero': is_zero,
+                        'max_magnitude': bias_magnitude,
+                        'shape': list(bias_tensor.shape)
+                    }
+                    
+                    # Print details for key projections
+                    if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']):
+                        status = "✅ ZERO" if is_zero else f"⚠️  NON-ZERO (max: {bias_magnitude:.6f})"
+                        print(f"  {name}.bias: {status} {bias_tensor.shape}")
+            
+            # Summary statistics
+            total_biases = len(bias_stats)
+            zero_biases = sum(1 for stats in bias_stats.values() if stats['is_zero'])
+            nonzero_biases = total_biases - zero_biases
+            
+            print(f"\n📊 Bias Summary:")
+            print(f"  Total biases: {total_biases}")
+            print(f"  Zero biases: {zero_biases}")
+            print(f"  Non-zero biases: {nonzero_biases}")
+            
+            if nonzero_biases > 0:
+                max_nonzero = max(stats['max_magnitude'] for stats in bias_stats.values() if not stats['is_zero'])
+                print(f"  Max non-zero magnitude: {max_nonzero:.6f}")
+                
+                # List layers with non-zero bias for debugging
+                nonzero_layers = [name for name, stats in bias_stats.items() if not stats['is_zero']]
+                if len(nonzero_layers) <= 10:
+                    print(f"  Non-zero bias layers: {nonzero_layers}")
+                else:
+                    print(f"  Non-zero bias layers (first 10): {nonzero_layers[:10]}")
         
         return True
 

@@ -13,16 +13,22 @@ import sys
 import os
 import json
 import torch
+import argparse
 
-def setup_model_path(model_id):
-    """Download model and prepare for testing"""
+def setup_model_path(model_id_or_path):
+    """Download model or prepare local path for testing"""
     try:
-        from huggingface_hub import snapshot_download
-        
-        # Download the model if not cached
-        print(f"Downloading model {model_id}...")
-        model_path = snapshot_download(repo_id=model_id)
-        print(f"Model downloaded to: {model_path}")
+        # Check if it's a local path
+        if os.path.exists(model_id_or_path):
+            print(f"Using local model path: {model_id_or_path}")
+            model_path = model_id_or_path
+        else:
+            # Download from HuggingFace
+            from huggingface_hub import snapshot_download
+            
+            print(f"Downloading model {model_id_or_path}...")
+            model_path = snapshot_download(repo_id=model_id_or_path)
+            print(f"Model downloaded to: {model_path}")
         
         # Clean quantization config if present
         config_file = os.path.join(model_path, "config.json")
@@ -323,7 +329,7 @@ def test_quantized_model(model_id, model_path):
         traceback.print_exc()
         return False
 
-def run_sp_quant_tests():
+def run_sp_quant_tests(custom_models=None, skip_default=False):
     """Run SP quantization tests for Qwen 2.5 models"""
     
     print("===========================================")
@@ -335,14 +341,33 @@ def run_sp_quant_tests():
     os.environ['ENABLE_SP_QUANT'] = '1'
     print(f"✓ ENABLE_SP_QUANT=1 (SP quantization enabled)")
     
-    # Test models
-    test_models = [
-        {
-            "name": "Qwen2.5-0.5B-4bit-PerTensor",
-            "model_id": "smpanaro/Qwen2.5-0.5B-4bit-PerTensor",
-            "description": "Small 0.5B model with 4-bit per-tensor quantization"
-        }
-    ]
+    # Initialize test models based on skip_default flag
+    if skip_default:
+        test_models = []
+    else:
+        # Default test models
+        test_models = [
+            {
+                "name": "Qwen2.5-0.5B-4bit-PerTensor",
+                "model_id": "smpanaro/Qwen2.5-0.5B-4bit-PerTensor",
+                "description": "Small 0.5B model with 4-bit per-tensor quantization"
+            }
+        ]
+    
+    # Add custom models if provided
+    if custom_models:
+        for custom_model in custom_models:
+            if isinstance(custom_model, str):
+                # Simple path string
+                model_name = os.path.basename(custom_model.rstrip('/'))
+                test_models.append({
+                    "name": f"Custom-{model_name}",
+                    "model_id": custom_model,
+                    "description": f"Custom quantized model at {custom_model}"
+                })
+            elif isinstance(custom_model, dict):
+                # Full model specification
+                test_models.append(custom_model)
     
     results = []
     
@@ -403,5 +428,65 @@ def run_sp_quant_tests():
         print(f"\n❌ {failed} test(s) FAILED")
         return 1
 
+def main():
+    """Main function with command-line argument support."""
+    parser = argparse.ArgumentParser(
+        description='Test SP per-tensor quantized Qwen 2.5 models',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Test default models only
+  python test_qwen25_sp_quant.py
+  
+  # Test custom local model
+  python test_qwen25_sp_quant.py --model /tmp/qwen25_quarot_fused_w4
+  
+  # Test multiple models
+  python test_qwen25_sp_quant.py --model /tmp/model1 --model /tmp/model2
+  
+  # Test with custom name and description
+  python test_qwen25_sp_quant.py --model /tmp/qwen25_quarot_fused_w4 --name "QuaRot-Fused" --description "Custom QuaRot fusion + per-tensor quantization"
+        """)
+    
+    parser.add_argument('--model', action='append', dest='models',
+                       help='Path to custom model directory (can be used multiple times)')
+    
+    parser.add_argument('--name', 
+                       help='Custom name for the model (only used with single --model)')
+    
+    parser.add_argument('--description',
+                       help='Custom description for the model (only used with single --model)')
+    
+    parser.add_argument('--skip-default', action='store_true',
+                       help='Skip testing default models, only test custom ones')
+    
+    args = parser.parse_args()
+    
+    custom_models = []
+    
+    if args.models:
+        if len(args.models) == 1 and (args.name or args.description):
+            # Single model with custom name/description
+            custom_models.append({
+                "name": args.name or f"Custom-{os.path.basename(args.models[0].rstrip('/'))}",
+                "model_id": args.models[0],
+                "description": args.description or f"Custom quantized model at {args.models[0]}"
+            })
+        else:
+            # Multiple models or single model without custom info
+            custom_models.extend(args.models)
+    
+    # If custom models are specified, use them instead of defaults (unless explicitly asking for both)
+    if custom_models and args.skip_default:
+        # Only test custom models
+        return run_sp_quant_tests(custom_models, skip_default=True)
+    elif custom_models:
+        # If --model specified without --skip-default, still use only custom models (more intuitive)
+        return run_sp_quant_tests(custom_models, skip_default=True)
+    else:
+        # No custom models specified, test defaults
+        return run_sp_quant_tests()
+
+
 if __name__ == "__main__":
-    sys.exit(run_sp_quant_tests())
+    sys.exit(main())
