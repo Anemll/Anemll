@@ -7,14 +7,27 @@ import os
 
 # CRITICAL: Set environment variables BEFORE importing
 os.environ['ENABLE_SP_QUANT'] = '1'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Disable tokenizer parallelism to avoid fork warning
 if 'SKIP_SP_FORWARD' in os.environ:
     del os.environ['SKIP_SP_FORWARD']
+use_single_token_prefill = True  # Option to use single token prefill
+
+model_name = "smpanaro/Qwen2.5-0.5B-4bit-PerTensor"
+#model_name = "Qwen/Qwen2.5-0.5B"
+#model_name = "Qwen/Qwen2.5-0.5B-Instruct" # os.environ['ENABLE_SP_QUANT'] = '0' = required
+
+max_tokens = 20
+
+# Test inference
+#prompt = "Who are you?"
+prompt = "What is Apple Neural Engine?"
+
 
 import torch
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from anemll.models.qwen2_5_model import Qwen25ForCausalLM, Qwen25Config
+from anemll.models.qwen2_5_model import Qwen25ForCausalLM, Qwen25Config, ENABLE_SP_QUANT
 from transformers import AutoTokenizer
 from huggingface_hub import snapshot_download
 
@@ -25,7 +38,7 @@ def test_final_inference():
     print("FINAL TEST: ANEMLL with Properly Enabled SP Quantization")
     print("="*80)
     
-    model_name = "smpanaro/Qwen2.5-0.5B-4bit-PerTensor"
+
     model_path = snapshot_download(model_name)
     
     # Create and load model
@@ -36,73 +49,126 @@ def test_final_inference():
     
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     
-    # Test inference
-    prompt = "Who are you?"
+
     print(f"Prompt: '{prompt}'")
     
     # Tokenize
     inputs = tokenizer(prompt, return_tensors="pt")
     input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
     print(f"Token IDs: {input_ids.tolist()}")
     
-    # Generate tokens
+    # Generate tokens using correct ANEMLL pattern
     print("\nGenerating response...")
     generated_ids = input_ids[0].tolist()
-    current_pos = len(generated_ids) - 1
     
-    # Initialize position IDs and masks
-    seq_len = len(generated_ids)
-    position_ids = torch.arange(seq_len, dtype=torch.long)
+    # ANEMLL uses FIXED context size - get from config
+    context_length = config.context_length  # Usually 256
     
-    # Create causal mask
-    causal_mask = torch.zeros((1, 1, seq_len, seq_len), dtype=torch.float16)
-    for i in range(seq_len):
-        causal_mask[:, :, i, i+1:] = float('-inf')
+    # ANEMLL uses FIXED position IDs (0 to context_length-1) created as needed
     
-    # Generate tokens
-    for i in range(20):  # Generate more tokens to see if it's coherent
-        with torch.no_grad():
-            # Prepare inputs
-            input_tensor = torch.tensor([generated_ids], dtype=torch.long)
-            update_mask = torch.zeros(1, dtype=torch.long)
+    # Create FIXED causal mask for full context (using correct ANEMLL pattern)
+    import numpy as np
+    def make_causal_mask(length, start):
+        """Create causal attention mask."""
+        mask = np.full((1, 1, length, length), -np.inf, dtype=np.float16)
+        row_indices = np.arange(length).reshape(length, 1)
+        col_indices = np.arange(length).reshape(1, length)
+        mask[:, :, col_indices <= (row_indices + start)] = 0
+        return mask
+    
+    causal_mask_data = make_causal_mask(context_length, 0)
+    causal_mask = torch.tensor(causal_mask_data, dtype=torch.float16)
+    
+    # Step 1: Prefill KV cache - option for single token prefill
+    prompt_length = len(generated_ids)
+    
+    with torch.no_grad():
+        if use_single_token_prefill:
+            print(f"Single token prefill: processing {prompt_length} prompt tokens one by one...")
             
-            # Forward pass with quantization
+            # Process each prompt token individually
+            for i, token_id in enumerate(generated_ids):
+                single_token = torch.tensor([[token_id]], dtype=torch.long)
+                
+                # Single token generation (same as regular generation)
+                outputs = model(
+                    single_token,  # input_ids
+                    torch.zeros(1, 1), # update_mask (not used in prefill)
+                    torch.tensor([i], dtype=torch.long),  # position_ids
+                    causal_mask[:, :, i:i+1, :],  # causal_mask - single row
+                    torch.tensor(i, dtype=torch.long),  # current_pos
+                    IN_PREFILL=True
+                )
+                # We don't need the outputs during prefill, just populating KV cache
+                
+        else:
+            print(f"Batch prefill: processing {prompt_length} prompt tokens at once...")
+            
+            # Use the original prompt for prefill (batch mode)
+            prefill_position_ids = torch.arange(prompt_length, dtype=torch.long)
+            
+            # Create causal mask for prefill: only within prompt length
+            prefill_causal_mask = torch.zeros((1, 1, prompt_length, context_length), dtype=torch.float16)
+            
+            # Apply causal mask: token i can attend to tokens 0 through i, -inf for future positions
+            for i in range(prompt_length):
+                prefill_causal_mask[:, :, i, i+1:context_length] = float('-inf')
+            
+            # Run prefill to populate KV cache
+            model(
+                input_ids,  # input_ids
+                torch.zeros(1, prompt_length),  # update_mask
+                prefill_position_ids,  # position_ids
+                prefill_causal_mask,   # causal_mask
+                torch.tensor(0, dtype=torch.long),  # current_pos
+                IN_PREFILL=True
+            )
+    
+    # Step 2: Generate tokens one by one
+    current_pos = prompt_length  # Start generating at position after prompt
+    
+    for i in range(max_tokens):  # Generate tokens
+        with torch.no_grad():
+            # Get the last generated token (or last prompt token for first generation)
+            if len(generated_ids) > prompt_length:
+                # Use last generated token
+                last_token = torch.tensor([[generated_ids[-1]]], dtype=torch.long)
+            else:
+                # Use last prompt token for first generation
+                last_token = torch.tensor([[generated_ids[-1]]], dtype=torch.long)
+            
+            # Single token generation
+            # Create update mask for single token at current position
+            update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
+            update_mask[0, 0, current_pos, 0] = 1.0
+            
             outputs = model(
-                input_tensor,
-                update_mask,
-                position_ids[:len(generated_ids)],
-                causal_mask[:, :, :len(generated_ids), :len(generated_ids)],
-                torch.tensor(current_pos, dtype=torch.long)
+                last_token,  # input_ids
+                update_mask,  # update_mask
+                torch.tensor([current_pos], dtype=torch.long),  # position_ids
+                causal_mask[:, :, current_pos:current_pos+1, :],  # causal_mask - single row
+                torch.tensor(current_pos, dtype=torch.long),  # current_pos
+                IN_PREFILL=False
             )
             
-            # Get next token
+            # Get next token (outputs is the tensor directly)
             next_token_logits = outputs[0, -1, :]
             next_token_id = torch.argmax(next_token_logits).item()
             
-            # Add to generated sequence
+            # Add to generated sequence and update position
             generated_ids.append(next_token_id)
             current_pos += 1
-            
-            # Update position IDs and mask
-            new_position = torch.tensor([current_pos], dtype=torch.long)
-            position_ids = torch.cat([position_ids, new_position])
-            
-            # Expand causal mask
-            new_seq_len = len(generated_ids)
-            new_causal_mask = torch.zeros((1, 1, new_seq_len, new_seq_len), dtype=torch.float16)
-            new_causal_mask[:, :, :seq_len, :seq_len] = causal_mask
-            for j in range(new_seq_len):
-                new_causal_mask[:, :, j, j+1:] = float('-inf')
-            causal_mask = new_causal_mask
-            seq_len = new_seq_len
             
             # Show token
             token = tokenizer.decode([next_token_id])
             print(f"Token {i+1}: '{token}' (ID: {next_token_id})")
             
-            # Stop if EOS
-            if next_token_id == tokenizer.eos_token_id:
+            # Stop if EOS or exceed context
+            if next_token_id == tokenizer.eos_token_id or current_pos >= context_length:
                 break
     
     # Decode full response
@@ -128,11 +194,22 @@ def test_final_inference():
     with torch.no_grad():
         hf_outputs = hf_model.generate(
             input_ids,
-            max_new_tokens=20,
-            do_sample=False
+            attention_mask=attention_mask,
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+            top_k=None
         )
     
     hf_response = tokenizer.decode(hf_outputs[0], skip_special_tokens=True)
+    print(f"------------------------------------------------")
+    print(f"Model: {model_name}")
+    print(f"ENABLE_SP_QUANT: {ENABLE_SP_QUANT}")
+    print(f"Prompt: {tokenizer.decode(input_ids[0], skip_special_tokens=True)}")
+    print(f"Max tokens: {max_tokens}")
+    print(f"------------------------------------------------")
+
     print(f"Transformers: {hf_response}")
     print(f"ANEMLL:       {response}")
     

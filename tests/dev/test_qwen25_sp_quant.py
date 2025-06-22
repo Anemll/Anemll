@@ -13,6 +13,23 @@ import sys
 import os
 import json
 import torch
+import numpy as np
+
+# CRITICAL: Set environment variables BEFORE importing
+os.environ['ENABLE_SP_QUANT'] = '1'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Disable tokenizer parallelism to avoid fork warning
+test_text = "What is Apple Neural Engine?"
+#test_text = "Who are you?"
+max_tokens = 20
+
+# Test models
+test_models = [
+    {
+        "name": "Qwen2.5-0.5B-4bit-PerTensor",
+        "model_id": "smpanaro/Qwen2.5-0.5B-4bit-PerTensor",
+        "description": "Small 0.5B model with 4-bit per-tensor quantization"
+    }
+]
 
 def setup_model_path(model_id):
     """Download model and prepare for testing"""
@@ -70,27 +87,83 @@ def test_quantized_model(model_id, model_path):
         if not success:
             print("⚠️  Weight loading reported issues, attempting inference test...")
         
-        # Test basic inference
-        print("\n--- Basic Inference Test ---")
-        test_input = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
-        position_ids = torch.arange(5, dtype=torch.long)
-        causal_mask = torch.zeros((1, 1, 5, 5), dtype=torch.float16)
-        # Create causal mask
-        for i in range(5):
-            causal_mask[:, :, i, i+1:] = float('-inf')
-        current_pos = torch.tensor(4, dtype=torch.long)
-        update_mask = torch.zeros(1, dtype=torch.long)
+        # Test basic inference using CORRECT ANEMLL pattern
+        print("\n--- Basic Inference Test (Fixed Context Pattern) ---")
+        
+        # Use FIXED context size from config
+        context_length = config.context_length  # Usually 256
+        print(f"Using fixed context length: {context_length}")
+        
+        # Test with simple token sequence
+        test_tokens = [1, 2, 3, 4, 5]
+        prompt_length = len(test_tokens)
+        
+        # Create FIXED causal mask for full context (using correct ANEMLL pattern)
+        def make_causal_mask(length, start):
+            """Create causal attention mask."""
+            mask = np.full((1, 1, length, length), -np.inf, dtype=np.float16)
+            row_indices = np.arange(length).reshape(length, 1)
+            col_indices = np.arange(length).reshape(1, length)
+            mask[:, :, col_indices <= (row_indices + start)] = 0
+            return mask
+        
+        causal_mask_data = make_causal_mask(context_length, 0)
+        causal_mask = torch.tensor(causal_mask_data, dtype=torch.float16)
         
         try:
             with torch.no_grad():
-                output = model(test_input, update_mask, position_ids, causal_mask, current_pos)
-                print(f"✓ Forward pass successful!")
+                # Step 1: Prefill KV cache with test tokens
+                test_input = torch.tensor([test_tokens], dtype=torch.long)
+                
+                # Create causal mask for prefill: only within prompt length
+                prefill_causal_mask = torch.zeros((1, 1, prompt_length, context_length), dtype=torch.float16)
+                
+                # Apply causal mask: token i can attend to tokens 0 through i, -inf for future positions
+                for i in range(prompt_length):
+                    prefill_causal_mask[:, :, i, i+1:context_length] = float('-inf')
+                
+                # Prefill position IDs
+                prefill_position_ids = torch.arange(prompt_length, dtype=torch.long)
+                
+                # Run prefill to populate KV cache
+                output = model(
+                    test_input,  # input_ids
+                    torch.zeros(1, prompt_length),  # update_mask
+                    prefill_position_ids,  # position_ids
+                    prefill_causal_mask,   # causal_mask
+                    torch.tensor(0, dtype=torch.long),  # current_pos
+                    IN_PREFILL=True
+                )
+                
+                print(f"✓ Prefill successful!")
                 print(f"  Output shape: {output.shape}")
                 print(f"  Output dtype: {output.dtype}")
                 print(f"  Output range: [{output.min().item():.4f}, {output.max().item():.4f}]")
                 
+                # Step 2: Generate one token
+                current_pos = prompt_length
+                last_token = torch.tensor([[test_tokens[-1]]], dtype=torch.long)
+                
+                # Create update mask for single token at current position
+                update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
+                update_mask[0, 0, current_pos, 0] = 1.0
+                
+                next_output = model(
+                    last_token,  # input_ids
+                    update_mask,  # update_mask
+                    torch.tensor([current_pos], dtype=torch.long),  # position_ids
+                    causal_mask[:, :, current_pos:current_pos+1, :],  # causal_mask - single row
+                    torch.tensor(current_pos, dtype=torch.long),  # current_pos
+                    IN_PREFILL=False
+                )
+                
+                print(f"✓ Generation successful!")
+                print(f"  Next token logits shape: {next_output.shape}")
+                
         except Exception as e:
             print(f"✗ Forward pass failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
         
         # Check quantization scales with detailed layer debugging
@@ -241,72 +314,102 @@ def test_quantized_model(model_id, model_path):
             if 'SKIP_SP_FORWARD' in os.environ:
                 del os.environ['SKIP_SP_FORWARD']
         
-        # Test with actual text if tokenizer available
+        # Test with actual text using CORRECT ANEMLL pattern
         try:
             from transformers import AutoTokenizer
-            print("\n--- Text Generation Test ---")
+            print("\n--- Text Generation Test (Fixed Context Pattern) ---")
             
             tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
             
-            # Test 1: Simple prediction with "Who are you?"
-            test_text = "Who are you?"
-            input_ids = tokenizer(test_text, return_tensors="pt").input_ids
+            # Test prompt
+            inputs = tokenizer(test_text, return_tensors="pt")
+            input_ids = inputs["input_ids"]
             
             print(f"Input text: '{test_text}'")
             print(f"Token IDs: {input_ids.tolist()}")
             
-            # Generate next token
+            # Generate tokens using correct ANEMLL pattern
+            generated_ids = input_ids[0].tolist()
+            
+            # ANEMLL uses FIXED context size
+            context_length = config.context_length
+            
+            # Create FIXED causal mask for full context
+            causal_mask_data = make_causal_mask(context_length, 0)
+            causal_mask = torch.tensor(causal_mask_data, dtype=torch.float16)
             with torch.no_grad():
-                seq_len = input_ids.shape[1]
-                position_ids = torch.arange(seq_len, dtype=torch.long)
-                causal_mask = torch.zeros((1, 1, seq_len, seq_len), dtype=torch.float16)
-                for i in range(seq_len):
-                    causal_mask[:, :, i, i+1:] = float('-inf')
-                current_pos = torch.tensor(seq_len - 1, dtype=torch.long)
-                update_mask = torch.zeros(1, dtype=torch.long)
+                # Step 1: Prefill KV cache
+                prompt_length = len(generated_ids)
+                print(f"Batch prefill: processing {prompt_length} prompt tokens at once...")
                 
-                logits = model(input_ids, update_mask, position_ids, causal_mask, current_pos)
-                next_token_logits = logits[0, -1, :]
-                next_token_id = torch.argmax(next_token_logits).item()
-                next_token = tokenizer.decode([next_token_id])
+                # Use the original prompt for prefill (batch mode)
+                prefill_position_ids = torch.arange(prompt_length, dtype=torch.long)
                 
-                print(f"✓ Generated next token: '{next_token}' (ID: {next_token_id})")
+                # Create causal mask for prefill: only within prompt length
+                prefill_causal_mask = torch.zeros((1, 1, prompt_length, context_length), dtype=torch.float16)
                 
-                # Generate full response until EOS or 50 tokens
-                print(f"\n--- Full Response Generation: '{test_text}' ---")
-                generated_text = test_text
-                current_ids = input_ids.clone()
-                max_tokens = 50
+                # Apply causal mask: token i can attend to tokens 0 through i, -inf for future positions
+                for i in range(prompt_length):
+                    prefill_causal_mask[:, :, i, i+1:context_length] = float('-inf')
                 
-                for step in range(max_tokens):
-                    seq_len = current_ids.shape[1]
-                    position_ids = torch.arange(seq_len, dtype=torch.long)
-                    causal_mask = torch.zeros((1, 1, seq_len, seq_len), dtype=torch.float16)
-                    for i in range(seq_len):
-                        causal_mask[:, :, i, i+1:] = float('-inf')
-                    current_pos = torch.tensor(seq_len - 1, dtype=torch.long)
-                    update_mask = torch.zeros(1, dtype=torch.long)
+                # Run prefill to populate KV cache
+                model(
+                    input_ids,  # input_ids
+                    torch.zeros(1, prompt_length),  # update_mask
+                    prefill_position_ids,  # position_ids
+                    prefill_causal_mask,   # causal_mask
+                    torch.tensor(0, dtype=torch.long),  # current_pos
+                    IN_PREFILL=True
+                )
+                
+                # Step 2: Generate tokens one by one
+                current_pos = prompt_length  # Start generating at position after prompt
+                
+                for i in range(max_tokens):  # Generate tokens
+                    # Get the last generated token (or last prompt token for first generation)
+                    if len(generated_ids) > prompt_length:
+                        # Use last generated token
+                        last_token = torch.tensor([[generated_ids[-1]]], dtype=torch.long)
+                    else:
+                        # Use last prompt token for first generation
+                        last_token = torch.tensor([[generated_ids[-1]]], dtype=torch.long)
                     
-                    logits = model(current_ids, update_mask, position_ids, causal_mask, current_pos)
-                    next_token_logits = logits[0, -1, :]
+                    # Single token generation
+                    # Create update mask for single token at current position
+                    update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
+                    update_mask[0, 0, current_pos, 0] = 1.0
+                    
+                    outputs = model(
+                        last_token,  # input_ids
+                        update_mask,  # update_mask
+                        torch.tensor([current_pos], dtype=torch.long),  # position_ids
+                        causal_mask[:, :, current_pos:current_pos+1, :],  # causal_mask - single row
+                        torch.tensor(current_pos, dtype=torch.long),  # current_pos
+                        IN_PREFILL=False
+                    )
+                    
+                    # Get next token (outputs is the tensor directly)
+                    next_token_logits = outputs[0, -1, :]
                     next_token_id = torch.argmax(next_token_logits).item()
-                    next_token = tokenizer.decode([next_token_id])
                     
-                    # Append the new token
-                    current_ids = torch.cat([current_ids, torch.tensor([[next_token_id]])], dim=1)
-                    generated_text += next_token
+                    # Add to generated sequence and update position
+                    generated_ids.append(next_token_id)
+                    current_pos += 1
                     
-                    # Print progress every 5 tokens or on last token
-                    if (step + 1) % 5 == 0 or step == 0:
-                        print(f"  Step {step+1}: '{generated_text}'")
+                    # Show token
+                    token = tokenizer.decode([next_token_id])
+                    print(f"Token {i+1}: '{token}' (ID: {next_token_id})")
                     
-                    # Stop if we hit end token
-                    if next_token_id == tokenizer.eos_token_id:
-                        print(f"  → EOS token reached at step {step+1}")
+                    # Stop if EOS or exceed context
+                    if next_token_id == tokenizer.eos_token_id or current_pos >= context_length:
                         break
                 
-                print(f"✓ Final response ({len(current_ids[0]) - len(input_ids[0])} tokens generated):")
-                print(f"  '{generated_text}'")
+                # Decode full response
+                response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                print(f"\n✓ Final response ({len(generated_ids) - len(input_ids[0])} tokens generated):")
+                print(f"  '{response}'")
                 
         except ImportError:
             print("\n⚠️  Transformers not available, skipping text generation test")
@@ -331,18 +434,10 @@ def run_sp_quant_tests():
     print("===========================================")
     print("Testing SP per-tensor quantized models in PyTorch")
     
-    # Set environment variable for SP quantization
-    os.environ['ENABLE_SP_QUANT'] = '1'
+    # Environment variable already set at top of file
     print(f"✓ ENABLE_SP_QUANT=1 (SP quantization enabled)")
     
-    # Test models
-    test_models = [
-        {
-            "name": "Qwen2.5-0.5B-4bit-PerTensor",
-            "model_id": "smpanaro/Qwen2.5-0.5B-4bit-PerTensor",
-            "description": "Small 0.5B model with 4-bit per-tensor quantization"
-        }
-    ]
+
     
     results = []
     
