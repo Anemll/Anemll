@@ -40,3 +40,15 @@ xcuserdata/
 *.xcuserstate
 *.xcworkspacexcuserdata/
 =*
+
+# QuaRot experiment files to ignore
+QuaRot/
+calib.json
+tests/dev/calib_test.json
+tests/dev/qwen25_quarot_test/
+
+# VS Code settings
+.vscode/
+
+# Claude settings
+.claude/settings.local.json

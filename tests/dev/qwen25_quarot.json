@@ -1,0 +1,22 @@
+{
+  "name": "quarot",
+  "override_dtype": "fp32",
+  "online-had": false,
+  "codebook_bits": 4,
+  "block_size": 64,
+  "search_iters": 100,
+  "lr": 1e-4,
+  "grad_clip": 5.0,
+  "ortho_loss_weight": 0.1,
+  "backbone": "model",
+  "model_decoder_layers": "model.layers",
+  "q_proj": "self_attn.q_proj",
+  "k_proj": "self_attn.k_proj",
+  "v_proj": "self_attn.v_proj",
+  "o_proj": "self_attn.o_proj",
+  "gate_proj": "mlp.gate_proj",
+  "up_proj": "mlp.up_proj",
+  "down_proj": "mlp.down_proj",
+  "self_attn": "self_attn",
+  "mlp": "mlp"
+}
