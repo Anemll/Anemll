@@ -12,15 +12,16 @@ if 'SKIP_SP_FORWARD' in os.environ:
     del os.environ['SKIP_SP_FORWARD']
 use_single_token_prefill = True  # Option to use single token prefill
 
-model_name = "smpanaro/Qwen2.5-0.5B-4bit-PerTensor"
+#model_name = "smpanaro/Qwen2.5-0.5B-4bit-PerTensor"
 #model_name = "Qwen/Qwen2.5-0.5B"
-#model_name = "Qwen/Qwen2.5-0.5B-Instruct" # os.environ['ENABLE_SP_QUANT'] = '0' = required
+model_name = "Qwen/Qwen2.5-0.5B-Instruct" # os.environ['ENABLE_SP_QUANT'] = '0' = required
 
 max_tokens = 20
 
 # Test inference
 #prompt = "Who are you?"
-prompt = "What is Apple Neural Engine?"
+#prompt = "What is Apple Neural Engine?"
+prompt = "What is GPTQ?"
 
 
 import torch
@@ -187,7 +188,8 @@ def test_final_inference():
     
     hf_model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16,
+        #torch_dtype=torch.float32,
         device_map="cpu"
     )
     

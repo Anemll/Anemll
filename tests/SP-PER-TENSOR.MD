@@ -95,6 +95,16 @@ python tests/dev/test_final_inference.py
 
 # TEST CONVERT ONLY  FFN ONLY (part5_)
 python tests/dev/test_ffn_sp_qwen2_5_model.py 
+
+
+Pytorch test:
+ENABLE_SP_QUANT=1 python tests/dev/test_qwen25_sp_quant.py
+
+vs Transformers:
+ENABLE_SP_QUANT=1 python tests/dev/test_final_inference.py
+
+
+
 ```
 
 Both tests will download the quantized model from HuggingFace if not cached locally and verify that quantization scales are properly loaded and applied during inference.

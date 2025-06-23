@@ -172,6 +172,9 @@ struct AnemllCLI: AsyncParsableCommand {
     @Flag(name: .long, help: "Show detailed model loading progress")
     var showLoadingProgress = false
     
+    @Flag(name: .long, help: "Use raw input without chat template formatting")
+    var noTemplate = false
+    
     // Update thinking prompt to use actual tokens
     private static let THINKING_PROMPT = """
     You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem.
@@ -349,17 +352,27 @@ struct AnemllCLI: AsyncParsableCommand {
             // Single prompt mode
             print("\nProcessing prompt: \"\(prompt)\"")
             
-            var messages: [Tokenizer.ChatMessage] = []
-            if let system = system {
-                messages.append(Tokenizer.ChatMessage.assistant("I am an AI assistant. \(system)"))
+            let tokens: [Int]
+            if noTemplate {
+                // Use raw input without chat template formatting
+                tokens = tokenizer.tokenize(prompt)
+                if debugLevel >= 1 {
+                    print("Using raw input without chat template")
+                }
+            } else {
+                // Use chat template formatting
+                var messages: [Tokenizer.ChatMessage] = []
+                if let system = system {
+                    messages.append(Tokenizer.ChatMessage.assistant("I am an AI assistant. \(system)"))
+                }
+                messages.append(Tokenizer.ChatMessage.user(prompt))
+                
+                // Tokenize with template
+                tokens = tokenizer.applyChatTemplate(
+                    input: messages, 
+                    addGenerationPrompt: !noGenerationPrompt
+                )
             }
-            messages.append(Tokenizer.ChatMessage.user(prompt))
-            
-            // Tokenize with template
-            let tokens = tokenizer.applyChatTemplate(
-                input: messages, 
-                addGenerationPrompt: !noGenerationPrompt
-            )
             if debugLevel >= 1 {
                 print("Raw prompt:", prompt)
                 print("Tokenized prompt:", tokenizer.decode(tokens: tokens))
@@ -505,22 +518,35 @@ struct AnemllCLI: AsyncParsableCommand {
                     }
                 }
                 
-                // Apply final template with thinking mode if enabled
-                var messages = conversation
-                if thinkingMode {
-                    messages.insert(.assistant(Self.THINKING_PROMPT), at: 0)
+                // Apply final template with thinking mode if enabled or use raw input
+                let tokens: [Int]
+                var messages = conversation  // Declare at outer scope
+                if noTemplate {
+                    // Use raw input without chat template formatting
+                    tokens = tokenizer.tokenize(input)
+                    if debugLevel >= 1 {
+                        print("Using raw input without chat template")
+                        print("Raw input tokens:", tokens)
+                        print("Raw input decoded:", tokenizer.decode(tokens: tokens))
+                    }
+                } else {
+                    if thinkingMode {
+                        messages.insert(.assistant(Self.THINKING_PROMPT), at: 0)
+                    }
+                    
+                    tokens = tokenizer.applyChatTemplate(
+                        input: messages,
+                        addGenerationPrompt: !noGenerationPrompt
+                    )
                 }
-                
-                let tokens = tokenizer.applyChatTemplate(
-                    input: messages,
-                    addGenerationPrompt: !noGenerationPrompt
-                )
                 
                 if debugLevel >= 1 {
                     print("\nContext before generation:")
                     print("Total tokens:", tokens.count)
                     print("Context length limit:", config.contextLength)
-                    print("Messages count:", messages.count)
+                    if !noTemplate {
+                        print("Messages count:", messages.count)
+                    }
                 }
                 
                 // Before generating response
