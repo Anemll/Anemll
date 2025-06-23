@@ -12,16 +12,17 @@ if 'SKIP_SP_FORWARD' in os.environ:
     del os.environ['SKIP_SP_FORWARD']
 use_single_token_prefill = True  # Option to use single token prefill
 
-#model_name = "smpanaro/Qwen2.5-0.5B-4bit-PerTensor"
+model_name = "smpanaro/Qwen2.5-0.5B-4bit-PerTensor"
 #model_name = "Qwen/Qwen2.5-0.5B"
-model_name = "Qwen/Qwen2.5-0.5B-Instruct" # os.environ['ENABLE_SP_QUANT'] = '0' = required
+#model_name = "Qwen/Qwen2.5-0.5B-Instruct" # os.environ['ENABLE_SP_QUANT'] = '0' = required
 
-max_tokens = 20
+max_tokens = 200
 
 # Test inference
 #prompt = "Who are you?"
 #prompt = "What is Apple Neural Engine?"
 prompt = "What is GPTQ?"
+prompt = "Apple Neural Engine (ANE), explained in one sentence:"
 
 
 import torch
@@ -53,6 +54,9 @@ def test_final_inference():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+
+    print(f"BOS token: {tokenizer.bos_token!r} (ID: {tokenizer.bos_token_id})")
+    print(f"EOS token: {tokenizer.eos_token!r} (ID: {tokenizer.eos_token_id})")
 
     print(f"Prompt: '{prompt}'")
     
@@ -201,7 +205,8 @@ def test_final_inference():
             do_sample=False,
             temperature=None,
             top_p=None,
-            top_k=None
+            top_k=None,
+            pad_token_id=tokenizer.eos_token_id
         )
     
     hf_response = tokenizer.decode(hf_outputs[0], skip_special_tokens=True)
@@ -212,8 +217,11 @@ def test_final_inference():
     print(f"Max tokens: {max_tokens}")
     print(f"------------------------------------------------")
 
-    print(f"Transformers: {hf_response}")
+    print(f"Transformers *Base Generation*: {hf_response}")
+    print(f"------------------------------------------------")
+
     print(f"ANEMLL:       {response}")
+    print(f"------------------------------------------------")
     
     # Check if they match
     if response == hf_response:
