@@ -571,7 +571,7 @@ def create_unified_state(ffn_models, context_length):
         print("\nCreated unified transformer state")
         return state
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False):
     """Interactive chat loop."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
@@ -615,8 +615,17 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
             if not user_input:
                 continue
             
-            # Format prompt based on tokenizer capabilities
-            if has_chat_template:
+            # Format prompt based on no_template flag and tokenizer capabilities
+            if no_template:
+                # Use raw input without any chat template formatting
+                input_ids = tokenizer(
+                    user_input,
+                    return_tensors="pt",
+                    add_special_tokens=True
+                ).input_ids.to(torch.int32)
+                if not warmup:
+                    print("Using raw input without chat template")
+            elif has_chat_template:
                 messages = [{"role": "user", "content": user_input}]
                 input_ids = tokenizer.apply_chat_template(
                     messages,
@@ -806,6 +815,10 @@ def parse_args():
     parser.add_argument('--nw', action='store_true',
                        help='Skip warmup phase')
     
+    # Add no-template flag  
+    parser.add_argument('--no-template', action='store_true',
+                       help='Prefill the question itself and start inference directly without chat template')
+    
     # Model configuration
     parser.add_argument('--context-length', type=int,
                        help='Context length for the model (default: 512), if not provided, it will be detected from the model directory name ctxNUMBER')
@@ -974,7 +987,8 @@ def main():
                     state=state,
                     causal_mask=causal_mask,  # Pass the causal mask
                     warmup=True,
-                    auto_prompt="who are you?"
+                    auto_prompt="who are you?",
+                    no_template=args.no_template
                 )
         
         # Main run
@@ -988,7 +1002,9 @@ def main():
             causal_mask=causal_mask,  # Pass the causal mask
             warmup=False,
             auto_prompt=args.prompt,
-            save_file=args.save
+            save_file=args.save,
+            max_tokens=args.max_tokens,
+            no_template=args.no_template
         )
         
     except Exception as e:
