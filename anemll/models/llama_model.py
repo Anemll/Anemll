@@ -165,7 +165,10 @@ class LlamaRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq)
 
         # Cache cos and sin values for positions
-        t = torch.arange(self.max_position_embeddings, device=TEST_DEVICE).type_as(self.inv_freq)
+        #t = torch.arange(self.max_position_embeddings, device=TEST_DEVICE).type_as(self.inv_freq)
+        t = torch.arange(CONTEXT_LENGTH*2, device=TEST_DEVICE).type_as(self.inv_freq)
+        # optimization, sinced our position does not exceed CONTEXT_LENGTH!
+        # TODO: w could initial cache one and pass refernce to each layer !
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         

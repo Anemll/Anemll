@@ -40,7 +40,7 @@ ENABLE_VACAB_SPLIT8 = bool(0)  # Split vocab into 8 parts
 ENABLE_VACAB_SPLIT16 = bool(1)  # Split vocab into 16 parts
 ENABLE_LOGITS2 = bool(1)    # Return separate logits arrays for CoreML
 ENABLE_COREML = bool(0)     # CoreML-specific returns
-ENABLE_SP_QUANT = bool(1) #bool(int(os.environ.get('ENABLE_SP_QUANT', '0')))   # Enable per-tensor quantization from environment
+ENABLE_SP_QUANT = False # bool(int(os.environ.get('ENABLE_SP_QUANT', '0')))   # Enable per-tensor quantization from environment
 SKIP_SP_FORWARD = bool(0)  # Skip quantization in forward pass for debugging
 
 def snap_to_codebook(x: torch.Tensor, cb: torch.Tensor) -> torch.Tensor:
@@ -95,6 +95,39 @@ def defuse_quantization_scales(weight: torch.Tensor, input_scale: torch.Tensor, 
         result = snap_to_codebook(result, codebook.to(MODEL_DTYPE))        
     
     return result.to(MODEL_DTYPE)
+def ane_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Custom softmax implementation optimized for fp16 numerical stability.
+    
+    Args:
+        x: Input tensor
+        dim: Dimension along which to compute softmax
+        
+    Returns:
+        Softmax output tensor with MODEL_DTYPE
+    """
+    #return F.softmax(x, dim=dim)
+
+    # Convert to fp32 for numerical stability during computation
+    x_fp32 = x.float()
+    
+    # Stable softmax: subtract max before exponential
+    x_max = torch.max(x_fp32, dim=dim, keepdim=True)[0]
+    x_shifted = x_fp32 - x_max
+    
+    # Clamp shifted values to prevent extreme exponentials
+    # After shifting by max, values are in range (-inf, 0]
+    # Clamp to -50 to prevent underflow (exp(-50) ≈ 1.9e-22)
+    x_shifted = x_shifted.clamp(min=-50)
+    
+    # Compute exponential and normalize
+    exp_x = torch.exp(x_shifted)
+    sum_exp = torch.sum(exp_x, dim=dim, keepdim=True)
+    
+    # Add small epsilon to denominator for numerical stability
+    softmax = exp_x / (sum_exp + 1e-10)
+    
+    # Convert back to model dtype
+    return softmax.to(MODEL_DTYPE)
 
 class Qwen25Config:
     def __init__(self, **kwargs):
@@ -152,7 +185,13 @@ def get_kv_cache_idx(layer_idx, num_layers, num_groups=1):
 # -----------------------------------------------------------------------------
 # Qwen 2.5 building blocks
 # -----------------------------------------------------------------------------
-
+def stable_l2_norm(x, eps):
+    max_val = x.abs().max(axis=-1, keepdim=True).values
+    max_val = torch.clamp(max_val, min=eps)
+    xscaled = x / max_val
+    #scaled_norm = torch.acos(xscaled)
+    scaled_norm = torch.linalg.norm(xscaled, dim=-1, keepdim=True)
+    return x / torch.clamp(scaled_norm, min=eps), max_val
 
 class Qwen25RMSNorm(nn.Module):
     """RMSNorm used in Qwen 2.5 models - ANE-aware implementation with mean subtraction."""
@@ -166,9 +205,29 @@ class Qwen25RMSNorm(nn.Module):
         # Following ANEMLL requirements: always subtract mean first, then use F.layer_norm()
         # This is required for ANE compatibility
 
-        mean = hidden_states.mean(-1, keepdim=True)
-        hidden_states = hidden_states - mean
-        return F.layer_norm(hidden_states, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
+        if False:
+            mean = hidden_states.mean(-1, keepdim=True)
+            hidden_states = hidden_states - mean
+            return F.layer_norm(hidden_states, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
+
+        # Stable RMS normalization for fp16
+        # First compute in fp32 for numerical stability
+        hidden_fp32 = hidden_states.float()
+        norm = torch.linalg.norm(hidden_fp32, dim=-1, keepdim=True)
+        rms = norm * (hidden_fp32.size(-1) ** -0.5)
+        hidden_states = hidden_fp32 / torch.clamp(rms, min=self.eps)
+        
+        # Apply weight and convert back to model dtype
+        hidden_states = hidden_states * self.weight
+        return hidden_states.to(MODEL_DTYPE)
+
+        #hidden_states = x * (x.size(-1) ** 0.5 / max_val) * self.weight
+        #return hidden_states.to(MODEL_DTYPE)
+
+        # OLD
+        #mean = hidden_states.mean(-1, keepdim=True)
+        #hidden_states = hidden_states - mean
+        #return F.layer_norm(hidden_states, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
 
 
 class Qwen25RotaryEmbedding(nn.Module):
@@ -190,7 +249,10 @@ class Qwen25RotaryEmbedding(nn.Module):
         )
 
         self.register_buffer("inv_freq", inv_freq)
-        t = torch.arange(config.max_position_embeddings, device=TEST_DEVICE).type_as(self.inv_freq)
+        #t = torch.arange(config.max_position_embeddings, device=TEST_DEVICE).type_as(self.inv_freq)
+        t = torch.arange(CONTEXT_LENGTH*2, device=TEST_DEVICE).type_as(self.inv_freq)
+        # optimization, sinced our position does not exceed CONTEXT_LENGTH!
+        # TODO: w could initial cache one and pass refernce to each layer !
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.cos_cached = emb.cos().unsqueeze(0)
@@ -525,7 +587,7 @@ class Qwen25Attention(nn.Module):
             # Slice causal mask to match seq_len x seq_len for attention weights
             causal_mask_slice = causal_mask[:, :, :seq_len, :seq_len]
             attn_weights = attn_weights + causal_mask_slice.to(attn_weights.dtype)
-        attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_weights = ane_softmax(attn_weights, dim=-1)
         attn_output = torch.matmul(attn_weights, value_states).to(MODEL_DTYPE)
         attn_output = (
             attn_output.permute(0, 2, 1, 3).contiguous().view(bsz, seq_len, -1)
@@ -565,7 +627,7 @@ class Qwen25Attention(nn.Module):
             attn_weights = attn_weights + causal_mask.to(MODEL_DTYPE)[:, :, :q_seq_len, :k_seq_len]
 
         # Optimized softmax for batch_size=1
-        attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_weights = ane_softmax(attn_weights, dim=-1)
         
         # Compute attention output directly without einsum
         attn_output = torch.matmul(attn_weights, value_states.to(MODEL_DTYPE))
@@ -610,7 +672,7 @@ class Qwen25Attention(nn.Module):
             mask_slice = causal_mask.to(MODEL_DTYPE)[:, :, :q_seq_len, :k_seq_len]
             attn_weights = attn_weights + mask_slice
         
-        attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_weights = ane_softmax(attn_weights, dim=-1)
         attn_output = torch.einsum('bhqk,bhkd->bhqd', attn_weights, value_states.to(MODEL_DTYPE))
         
         # Reshape before projecting: [batch, heads, actual_seq_len, head_dim] -> [batch, actual_seq_len, heads*head_dim]
@@ -1121,9 +1183,9 @@ class Qwen25Model(nn.Module):
                             scale = scale.squeeze(-1)
 
                         
-                        #bias_tensor = (v / scale).to(MODEL_DTYPE)
+                        bias_tensor = (v / scale).to(MODEL_DTYPE)
                         # should not scale, scaled on export for SmoothQuant?
-                        bias_tensor = (v).to(MODEL_DTYPE)
+                        #bias_tensor = (v).to(MODEL_DTYPE)
 
                         print(f"De-scaled bias for {new_k}: stored_bias shape {v.shape}, output_scale shape {output_scale.shape}")
                     else:
