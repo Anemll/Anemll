@@ -35,6 +35,14 @@ import copy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+# Set offline mode BEFORE any other imports to prevent network calls
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_DATASETS_OFFLINE"] = "0"
+os.environ["TRANSFORMERS_OFFLINE"] = "0" 
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.expanduser("~/.cache/huggingface")
+os.environ["HF_DATASETS_CACHE"] = os.path.expanduser("~/.cache/huggingface/datasets")
+
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -71,7 +79,7 @@ try:
     from lm_eval.api.registry import register_model
 except ImportError:
     print("Error: lm-evaluation-harness not found. Please install it using:")
-    print("pip install lm-evaluation-harness")
+    print(" pip install lm-eval")
     sys.exit(1)
 
 try:
@@ -133,6 +141,7 @@ class ANELM(LM):
         model_path: str,
         max_tokens: Optional[int] = None,
         use_chat_template: Optional[bool] = None,
+        verbose_output: bool = False,
         **kwargs
     ) -> None:
         """Initialize the ANE model evaluator.
@@ -169,10 +178,15 @@ class ANELM(LM):
             print(f"The CoreML model requires inputs padded to batch_size={self.metadata['batch_size']}")
             print(f"This is handled internally - DO NOT change metadata['batch_size']")
         
-        # Chat template settings
-        self.use_chat_template = use_chat_template
-        if use_chat_template is None:
-            self.use_chat_template = hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template is not None
+        # Chat template settings - match chat.py behavior more closely
+        # If not explicitly requested, default to False to match --no-template behavior
+        self.use_chat_template = use_chat_template if use_chat_template is not None else False
+        
+        # Store verbose output flag
+        self.verbose_output = verbose_output
+        
+        if verbose_output:
+            print(f"[DEBUG] use_chat_template={self.use_chat_template}, original param={use_chat_template}")
             
         # Print important configuration info
         print(f"\nANE Configuration:")
@@ -191,6 +205,7 @@ class ANELM(LM):
         # Parse arguments for metadata loading
         args = argparse.Namespace()
         args.model = str(self.model_path)
+        args.d = str(self.model_path)  # Add the 'd' attribute that load_metadata expects
         args.context_length = None
         args.batch_size = None
         
@@ -279,20 +294,53 @@ class ANELM(LM):
         
         print(f"Loaded {len(self.ffn_models)} FFN models successfully")
         
-        # Load metadata
-        try:
-            self.metadata = load_metadata(self.embedding_model, args)
-        except Exception as e:
-            print(f"Error loading metadata from model: {str(e)}")
-            print("Using default metadata values")
-            # Default metadata values
-            self.metadata = {
-                'context_length': 1024,
-                'state_length': 1024,
-                'batch_size': 64,
-                'lut_bits': 0,
-                'num_chunks': len(ffn_paths)
-            }
+        # Load metadata - try from meta.yaml first, then from model
+        meta_yaml_path = self.model_path / "meta.yaml"
+        if meta_yaml_path.exists():
+            try:
+                import yaml
+                with open(meta_yaml_path, 'r') as f:
+                    meta_data = yaml.safe_load(f)
+                
+                params = meta_data.get('model_info', {}).get('parameters', {})
+                self.metadata = {
+                    'context_length': params.get('context_length', 1024),
+                    'state_length': params.get('context_length', 1024),  # Usually same as context_length
+                    'batch_size': params.get('batch_size', 64),
+                    'lut_bits': 4 if params.get('lut_ffn') == '4' else 0,  # Check for LUT quantization
+                    'num_chunks': params.get('num_chunks', len(ffn_paths)),
+                    'split_lm_head': params.get('split_lm_head', 1)
+                }
+                print(f"Loaded metadata from {meta_yaml_path}")
+            except Exception as e:
+                print(f"Error loading meta.yaml: {str(e)}")
+                # Fall back to loading from model
+                try:
+                    self.metadata = load_metadata(self.embedding_model, args)
+                except Exception as e2:
+                    print(f"Error loading metadata from model: {str(e2)}")
+                    print("Using default metadata values")
+                    self.metadata = {
+                        'context_length': 1024,
+                        'state_length': 1024,
+                        'batch_size': 64,
+                        'lut_bits': 0,
+                        'num_chunks': len(ffn_paths)
+                    }
+        else:
+            # Try loading from model metadata
+            try:
+                self.metadata = load_metadata(self.embedding_model, args)
+            except Exception as e:
+                print(f"Error loading metadata from model: {str(e)}")
+                print("Using default metadata values")
+                self.metadata = {
+                    'context_length': 1024,
+                    'state_length': 1024,
+                    'batch_size': 64,
+                    'lut_bits': 0,
+                    'num_chunks': len(ffn_paths)
+                }
         
         print("\nModel metadata:")
         for key, value in self.metadata.items():
@@ -395,10 +443,11 @@ class ANELM(LM):
                     self.ffn_models,
                     self.lm_head_model,
                     inputs[b:b+1, :i+1],
-                    item_pos,
+                    item_pos + 1,  # Convert from 0-based to 1-based position
                     self.metadata['context_length'],
-                    item_cache,
-                    self.causal_mask,
+                    self.metadata,  # Pass full metadata dict
+                    state=item_cache,
+                    causal_mask=self.causal_mask,
                     temperature=0.0  # Use greedy generation
                 )
                 
@@ -424,62 +473,99 @@ class ANELM(LM):
     
     def _process_prompt(self, prompt, step_size: int = 1024):
         """Process the prompt and return logprobs."""
-        # Ensure prompt is a numpy array first, then convert to torch tensor
+        if self.verbose_output:
+            print(f"[DEBUG] _process_prompt: received prompt type {type(prompt)}, length {len(prompt) if hasattr(prompt, '__len__') else 'N/A'}")
+        
+        # Convert prompt to proper torch tensor format [1, sequence_length] with int32 dtype
         if isinstance(prompt, torch.Tensor):
-            prompt_numpy = prompt.numpy()
+            if prompt.dim() == 1:
+                prompt = prompt.unsqueeze(0)  # Add batch dimension
+            prompt = prompt.to(torch.int32)
         else:
-            prompt_numpy = np.array(prompt)
-            
-        prompt = torch.tensor(prompt_numpy)[None]
+            # Convert list/array to tensor with proper shape and dtype
+            prompt_array = np.array(prompt, dtype=np.int32)
+            if prompt_array.ndim == 1:
+                prompt = torch.tensor(prompt_array, dtype=torch.int32).unsqueeze(0)
+            else:
+                prompt = torch.tensor(prompt_array, dtype=torch.int32)
         
-        # Use the shared state
-        cache = self.state
+        if self.verbose_output:
+            print(f"[DEBUG] _process_prompt: converted to tensor shape {prompt.shape}")
         
-        # Process the prompt in chunks to avoid OOM
-        current_pos = 0  # Start at position 0
-        for i in range(0, prompt.shape[1], step_size):
-            chunk = prompt[:, i : i + step_size]
-            
-            # Pass the current position for proper tracking
-            current_pos = run_prefill(
-                self.embedding_model,
-                self.ffn_models,
-                chunk,
-                current_pos,  # Pass the current position instead of prompt.shape[1]
-                self.metadata['context_length'],
-                self.metadata.get('batch_size', 64),
-                cache,
-                self.causal_mask
-            )
+        # Create a completely fresh state for each request to match chat.py behavior exactly
+        # This ensures zero state contamination
+        cache = create_unified_state(self.ffn_models, self.metadata['context_length'], eval_mode=True)
         
-        # The generate_next_token function doesn't support return_logits directly,
-        # so we'll manually run a greedy prediction and create our own distribution
+        if self.verbose_output:
+            print(f"[DEBUG] Created fresh cache for this prompt")
+        
+        # Step 1: Pad prompt to match model's expected context length
+        prompt_length = prompt.shape[1]
+        context_length = self.metadata['context_length']
+        
+        if prompt_length > context_length:
+            # Truncate if too long
+            prompt = prompt[:, -context_length:]
+            prompt_length = context_length
+        else:
+            # Pad to context length
+            import torch.nn.functional as F
+            prompt = F.pad(prompt, (0, context_length - prompt_length), value=0)
+        
+        # Step 2: Run prefill using original run_prefill function but with un-padded input
+        # The run_prefill function will handle the batching internally
+        if self.verbose_output:
+            print(f"[DEBUG] _process_prompt: calling run_prefill with prompt_length={prompt_length}")
+        pos_result = run_prefill(
+            self.embedding_model,
+            self.ffn_models,
+            prompt[:, :prompt_length],  # Use only the actual prompt length, not padded
+            prompt_length, 
+            self.metadata['context_length'],
+            self.metadata.get('batch_size', 64),
+            cache,
+            self.causal_mask
+        )
+        if self.verbose_output:
+            print(f"[DEBUG] _process_prompt: run_prefill completed")
+        
+        # Step 3: Use chat.py's exact generate_next_token function instead of replicating the logic
         try:
-            # As suggested by the user, instead of returning full logits distribution,
-            # we'll just use a single sample and create a one-hot distribution
-            next_token = generate_next_token(
+            generation_pos = prompt_length  # This is like 'pos' parameter in chat.py
+            
+            # Use the original unpadded input_ids, just like chat.py does
+            original_input_ids = prompt[:, :prompt_length]  # Unpadded input tensor
+            
+            # Use the exact generate_next_token function from chat.py
+            predicted_token = generate_next_token(
                 self.embedding_model,
                 self.ffn_models,
                 self.lm_head_model,
-                prompt,
-                current_pos,
+                original_input_ids,  # Use unpadded input_ids like chat.py
+                generation_pos,  # Position to generate at
                 self.metadata['context_length'],
-                cache,
-                self.causal_mask,
-                temperature=0.0  # Use greedy sampling
+                self.metadata,  # Pass full metadata dict
+                state=cache,
+                causal_mask=self.causal_mask,
+                temperature=0.0  # Use greedy generation to get most likely token
             )
             
-            # Create one-hot distribution for the token
+            # Create a realistic probability distribution to avoid numerical issues
+            # Set predicted token to high probability, others to low probability
             vocab_size = len(self.tokenizer)
-            log_probs = torch.full((1, vocab_size), -30.0)  # Very low log prob for all tokens
-            log_probs[0, next_token] = 0.0  # Log prob of 1.0 for the predicted token
+            log_probs = torch.full((1, vocab_size), -10.0)  # Low probability for all tokens
+            log_probs[0, predicted_token] = 0.0  # Set predicted token to highest probability
+            
+            return log_probs, cache
+            
         except Exception as e:
-            print(f"Error in generate_next_token: {str(e)}")
-            # Fallback to a uniform distribution
+            print(f"Error in _process_prompt: {e}")
+            print(f"Debug info - prompt shape: {prompt.shape}, prompt_length: {prompt_length}")
+            print(f"Debug info - metadata: {self.metadata}")
+            # Return uniform distribution as fallback
             vocab_size = len(self.tokenizer)
             log_probs = torch.full((1, vocab_size), -np.log(vocab_size))
-            
-        return log_probs, cache
+            return log_probs, cache
         
     def _score_fn(self, inputs, cache: Optional[Any] = None, step_size: int = 1024):
         """Score the inputs and return log probabilities and greedy indicators."""
@@ -510,22 +596,57 @@ class ANELM(LM):
                         tokenize=False,
                         add_generation_prompt=True
                     )
-                    result.append(self.tokenizer.encode(chat_text))
+                    result.append(self.tokenizer.encode(chat_text, add_special_tokens=True))
                 except Exception as e:
                     print(f"Error applying chat template: {str(e)}. Falling back to standard tokenization.")
-                    result.append(self.tokenizer.encode(t, add_special_tokens=False))
+                    result.append(self.tokenizer.encode(t, add_special_tokens=True))
             else:
-                # The harness already decides where BOS/EOS go
-                result.append(self.tokenizer.encode(t, add_special_tokens=False))
+                # Check if the text already contains chat template tokens (BoolQ forces this)
+                tokens = self.tokenizer.encode(t, add_special_tokens=True)
+                
+                # If we detect chat template tokens, strip them to match chat.py --no-template behavior
+                if len(tokens) > 0 and tokens[0] == 151644:  # <|im_start|> token
+                    if self.verbose_output:
+                        print(f"[DEBUG] Detected chat template formatting, attempting to extract raw content")
+                    
+                    # Try to extract just the content between system and assistant parts
+                    decoded_text = self.tokenizer.decode(tokens)
+                    
+                    # Look for the actual content after system prompt and before assistant
+                    if '<|im_start|>user\n' in decoded_text and '<|im_end|>\n<|im_start|>assistant\n' in decoded_text:
+                        # Extract content between user tags
+                        start_marker = '<|im_start|>user\n'
+                        end_marker = '<|im_end|>\n<|im_start|>assistant\n'
+                        start_idx = decoded_text.find(start_marker)
+                        if start_idx != -1:
+                            start_idx += len(start_marker)
+                            end_idx = decoded_text.find(end_marker, start_idx)
+                            if end_idx != -1:
+                                raw_content = decoded_text[start_idx:end_idx]
+                                # Re-tokenize just the raw content
+                                tokens = self.tokenizer.encode(raw_content, add_special_tokens=True)
+                                if self.verbose_output:
+                                    print(f"[DEBUG] Extracted raw content: {repr(raw_content[:100])}...")
+                                    print(f"[DEBUG] Extracted raw content, new token count: {len(tokens)}")
+                                    print(f"[DEBUG] New first 5 tokens: {tokens[:5] if len(tokens) >= 5 else tokens}")
+                
+                result.append(tokens)
         return result
 
     def loglikelihood(self, requests) -> list[tuple[float, bool]]:
         """Compute log-likelihood of generating a continuation from a context."""
+        print(f"[ANELM] loglikelihood called with {len(requests)} requests")
+        if self.verbose_output:
+            print(f"[VERBOSE] Processing {len(requests)} total requests")
         logging.info("Estimating loglikelihood for %d pairs." % len(requests))
         
         # Updated to handle both old and new LM-Eval harness API
+        if self.verbose_output:
+            print("[ANELM] Processing requests...")
         group_reqs = collections.defaultdict(list)
         for idx, req in enumerate(requests):
+            if self.verbose_output and idx % 100 == 0:
+                print(f"[ANELM] Processing request {idx+1}/{len(requests)}")
             if hasattr(req, 'args') and len(req.args) >= 2:
                 # Old-style API with req.args
                 context, continuation = req.args[0], req.args[1]
@@ -548,10 +669,24 @@ class ANELM(LM):
             responses.append(resp)
         
         scores, is_greedy = [], []
-        for q, rs in tqdm(zip(questions, responses), total=len(questions)):
+        if self.verbose_output:
+            print(f"[ANELM] Processing {len(questions)} question groups...")
+        for q_idx, (q, rs) in enumerate(tqdm(zip(questions, responses), total=len(questions))):
+            if self.verbose_output:
+                print(f"[ANELM] Question {q_idx+1}/{len(questions)}: tokenizing...")
+                print(f"[DEBUG] Raw context text (first 200 chars): {repr(q[:200])}...")
+                print(f"[DEBUG] Raw context text (last 200 chars): {repr(q[-200:])}...")
+                print(f"[DEBUG] Full context length: {len(q)} characters")
+                
+                # Save the exact prompt to a file for testing
+                with open('/tmp/boolq_exact_prompt.txt', 'w') as f:
+                    f.write(q)
+                print(f"[DEBUG] Saved exact prompt to /tmp/boolq_exact_prompt.txt")
             prefix = self._tokenize([q])[0]
             full_sequences = [self._tokenize([q + r])[0] for r in rs]
             max_completed_l = max(len(s) for s in full_sequences)
+            if self.verbose_output:
+                print(f"[ANELM] Question {q_idx+1}: prefix={len(prefix)} tokens, max_seq={max_completed_l} tokens")
             
             # Handle truncation if needed
             if max_completed_l > self._max_tokens:
@@ -566,8 +701,23 @@ class ANELM(LM):
                     continue
             
             # Get log probabilities for the prefix
+            if self.verbose_output:
+                print(f"[ANELM] Question {q_idx+1}: calling _process_prompt...")
             logprobs, cache = self._process_prompt(prefix)
+            if self.verbose_output:
+                print(f"[ANELM] Question {q_idx+1}: _process_prompt completed, logprobs shape: {logprobs.shape}")
             max_idx = torch.argmax(logprobs, dim=-1).item()
+            
+            # Print verbose output if requested
+            if self.verbose_output:
+                print(f"\n[VERBOSE] Question {q_idx+1}:")
+                print(f"  Context: {repr(q)}")
+                print(f"  Tokenized prefix length: {len(prefix)} tokens")
+                print(f"  First 5 tokens: {prefix[:5]}")
+                print(f"  Last 5 tokens: {prefix[-5:]}")
+                predicted_token_text = self.tokenizer.decode([max_idx])
+                print(f"  Predicted next token (highest prob): '{predicted_token_text}' (ID: {max_idx})")
+                print(f"  Expected continuations: {rs}")
             
             for s in full_sequences:
                 continuation_tokens = s[len(prefix):]
@@ -648,7 +798,7 @@ class ANELM(LM):
         contexts, options = zip(*contexts_and_options)
         completions = []
         
-        for context, opt in tqdm(zip(contexts, options), total=len(contexts)):
+        for idx, (context, opt) in enumerate(tqdm(zip(contexts, options), total=len(contexts))):
             # Extract stopping sequences and other generation parameters
             until = opt.get("until", ["\n\n"])
             if not isinstance(until, list):
@@ -659,10 +809,17 @@ class ANELM(LM):
                 self.metadata.get('context_length', 2048) - 10  # Reserve some space
             )
             temperature = opt.get("temperature", 0.0)
+            
+            # Print verbose input if requested
+            if self.verbose_output:
+                print(f"\n[VERBOSE] Generation {idx+1}:")
+                print(f"  Context: {repr(context)}")
+                print(f"  Until: {until}")
+                print(f"  Max tokens: {max_gen_tokens}")
                 
-            # Tokenize context
+            # Tokenize context - always use add_special_tokens=True to match chat.py behavior
             context_tokens = self.tokenizer.encode(
-                context, add_special_tokens=not self.use_chat_template
+                context, add_special_tokens=True
             )
             
             # Check if context exceeds max context length
@@ -702,10 +859,11 @@ class ANELM(LM):
                     self.ffn_models,
                     self.lm_head_model,
                     input_ids,
-                    current_pos,
+                    current_pos + 1,  # Convert from 0-based to 1-based position
                     self.metadata['context_length'],
-                    cache,
-                    self.causal_mask,
+                    self.metadata,  # Pass full metadata dict
+                    state=cache,
+                    causal_mask=self.causal_mask,
                     temperature=temperature
                 )
                 
@@ -741,8 +899,16 @@ class ANELM(LM):
                 if any(u in final_text for u in until):
                     final_text = _rstrip_until(final_text, until)
                 completions.append(final_text)
+                
+                # Print verbose output if requested
+                if self.verbose_output:
+                    print(f"  Generated response: {repr(final_text)}")
+                    print(f"  Tokens generated: {len(generated_tokens)}")
             else:
                 completions.append("")
+                if self.verbose_output:
+                    print(f"  Generated response: (empty)")
+                    print(f"  Tokens generated: 0")
         
         return completions
 
@@ -768,14 +934,20 @@ def main():
     parser.add_argument("--apply-chat-template", action=argparse.BooleanOptionalAction,
                         help="Specifies whether to apply a chat template to the prompt",
                         default=None)
+    parser.add_argument("--verbose-output", action="store_true",
+                        help="Print questions and responses (detokenized highest prob token) during evaluation")
     
     args = parser.parse_args()
+    
+    # Handle comma-separated tasks (e.g., "boolq,hellaswag,arc_easy")
+    if len(args.tasks) == 1 and ',' in args.tasks[0]:
+        args.tasks = [task.strip() for task in args.tasks[0].split(',')]
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Silence tokenizer warnings
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    # Environment variables already set at top of file
+    print("Using offline mode to prevent rate limits and network issues")
     
     # Set random seed
     np.random.seed(args.seed)
@@ -787,10 +959,14 @@ def main():
         args.model,
         max_tokens=args.max_tokens,
         use_chat_template=args.apply_chat_template,
+        verbose_output=args.verbose_output,
     )
+    print("ANE model initialization complete")
     
     # Run evaluation with processes=0 to ensure single-threaded execution
     print("Running evaluation in single-threaded mode")
+    print(f"About to evaluate tasks: {args.tasks}")
+    print(f"Limit: {args.limit}, Batch size: {args.batch_size}")
     
     # Check if the simple_evaluate function supports the processes parameter
     try:
@@ -823,7 +999,74 @@ def main():
         # to ensure serial execution
     
     # Run evaluation
-    results = lm_eval.simple_evaluate(**eval_args)
+    print("Calling lm_eval.simple_evaluate...")
+    print(f"Eval args: {list(eval_args.keys())}")
+    try:
+        results = lm_eval.simple_evaluate(**eval_args)
+        print("Evaluation completed successfully")
+    except KeyboardInterrupt:
+        print("Evaluation interrupted by user")
+        raise
+    except ConnectionError as e:
+        print(f"Error during evaluation: {e}")
+        
+        # Check if this is an offline mode error for dataset downloading
+        if "OfflineModeIsEnabled" in str(e) or "Couldn't reach" in str(e):
+            print("\n" + "="*60)
+            print("DATASET DOWNLOAD ERROR - OFFLINE MODE DETECTED")
+            print("="*60)
+            print("\nThe evaluation harness needs to download dataset(s) but is in offline mode.")
+            print("\nTo fix this, you have two options:")
+            print("\n1. Enable online mode and run again:")
+            print("   export HF_DATASETS_OFFLINE=0")
+            print("   export TRANSFORMERS_OFFLINE=0")
+            print("\n2. Pre-download the required dataset(s):")
+            
+            # Extract dataset name from error if possible
+            error_str = str(e).lower()
+            if "super_glue" in error_str:
+                if "boolq" in error_str or "boolq" in args.tasks:
+                    print("   python -c \"from datasets import load_dataset; load_dataset('super_glue', 'boolq')\"")
+                elif "copa" in error_str or "copa" in args.tasks:
+                    print("   python -c \"from datasets import load_dataset; load_dataset('super_glue', 'copa')\"")
+                elif "multirc" in error_str or "multirc" in args.tasks:
+                    print("   python -c \"from datasets import load_dataset; load_dataset('super_glue', 'multirc')\"")
+                else:
+                    print("   python -c \"from datasets import load_dataset; load_dataset('super_glue', '<task_name>')\"")
+            elif "glue" in error_str:
+                print("   python -c \"from datasets import load_dataset; load_dataset('glue', '<task_name>')\"")
+            elif "wikitext" in error_str:
+                print("   python -c \"from datasets import load_dataset; load_dataset('wikitext', 'wikitext-103-raw-v1')\"")
+            elif "lambada" in error_str:
+                print("   python -c \"from datasets import load_dataset; load_dataset('lambada')\"")
+            elif "hellaswag" in error_str:
+                print("   python -c \"from datasets import load_dataset; load_dataset('hellaswag')\"")
+            elif "piqa" in error_str:
+                print("   python -c \"from datasets import load_dataset; load_dataset('piqa')\"")
+            elif "arc" in error_str:
+                print("   python -c \"from datasets import load_dataset; load_dataset('ai2_arc', 'ARC-Easy')\"")
+                print("   python -c \"from datasets import load_dataset; load_dataset('ai2_arc', 'ARC-Challenge')\"")
+            else:
+                print("   python -c \"from datasets import load_dataset; load_dataset('<dataset_name>')\"")
+                print("\n   Common datasets:")
+                print("   - BoolQ: load_dataset('super_glue', 'boolq')")
+                print("   - HellaSwag: load_dataset('hellaswag')")
+                print("   - PIQA: load_dataset('piqa')")
+                print("   - ARC: load_dataset('ai2_arc', 'ARC-Easy')")
+                print("   - WikiText: load_dataset('wikitext', 'wikitext-103-raw-v1')")
+            
+            print("\nAfter downloading, you can run the evaluation in offline mode.")
+            print("="*60 + "\n")
+        
+        # Exit cleanly without showing the full traceback
+        import sys
+        sys.exit(1)
+    except Exception as e:
+        # For other exceptions, show the full traceback
+        print(f"Error during evaluation: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
     
     # Save results
     filename = f"eval_{Path(args.model).name}_{args.num_shots or 0}shot_{'_'.join(args.tasks)}.json"
