@@ -58,7 +58,7 @@ class TokenPrinter:
             self.token_queue.put(token_id)
             self.token_count += 1
 
-    def drain_buffer(self):
+    def drain_buffer(self, eval_mode=False):
         """Decode token IDs from decoding_buffer in the main thread."""
         if not self.decoding_buffer:
             return
@@ -70,6 +70,10 @@ class TokenPrinter:
         # Store the text in buffer for later saving to file
         with self.lock:
             self.buffer += token_str
+
+        # Skip printing in eval mode
+        if eval_mode:
+            return
 
         # Color-handling logic
         if self.thinking and "</think>" in token_str:
@@ -99,7 +103,7 @@ class TokenPrinter:
                 print(f"\nError: Token printer error: {str(e)}")
                 break
 
-    def stop(self):
+    def stop(self, eval_mode=False):
         """Stop the printer thread."""
         if self.thread and self.thread.is_alive():
             # Ensure any remaining tokens are processed
@@ -109,13 +113,14 @@ class TokenPrinter:
                 self.thread.join(timeout=1.0)
             except Exception:
                 pass
-            # Calculate and print tokens/s with shorter format in blue
-            elapsed = time.time() - self.start_time
-            if elapsed > 0 and self.token_count > 0:
-                tokens_per_sec = self.token_count / elapsed
-                print(f"\n{DARK_BLUE}{tokens_per_sec:.1f} t/s{RESET_COLOR}")
-            else:
-                print(RESET_COLOR)  # Reset color at the end
+            # Calculate and print tokens/s with shorter format in blue (unless in eval mode)
+            if not eval_mode:
+                elapsed = time.time() - self.start_time
+                if elapsed > 0 and self.token_count > 0:
+                    tokens_per_sec = self.token_count / elapsed
+                    print(f"\n{DARK_BLUE}{tokens_per_sec:.1f} t/s{RESET_COLOR}")
+                else:
+                    print(RESET_COLOR)  # Reset color at the end
         return self.buffer
 
 def parse_model_path(path):
@@ -138,7 +143,6 @@ def parse_model_path(path):
     # Try all possible paths
     for candidate in candidates:
         if candidate.exists():
-            print(f"Found model at: {candidate}")
             return str(candidate)
     
     # If embeddings with LUT suffix not found, try without LUT suffix
@@ -159,7 +163,6 @@ def parse_model_path(path):
         
         for candidate in candidates_no_lut:
             if candidate.exists():
-                print(f"Found model at: {candidate}")
                 return str(candidate)
         
         # Add no-LUT candidates to the list for error reporting
@@ -231,44 +234,46 @@ def load_metadata(model,args):
         metadata['lut_bits'] = int(meta.get('com.anemll.lut_bits', 0))
         metadata['num_chunks'] = int(meta.get('com.anemll.num_chunks', 1))
         
-        print("\nExtracted Parameters:")
-        print(f"  Context Length: {metadata['context_length']}")
-        print(f"  State Length: {metadata['state_length']}")
-        print(f"  Prefill Batch Size: {metadata['batch_size']}")
-        print(f"  LUT Bits: {metadata['lut_bits']}")
-        print(f"  Number of Chunks: {metadata['num_chunks']}")
-        
-        # Print model info
-        print("\nModel Info:")
-        if 'com.anemll.info' in meta:
-            print(f"  {meta['com.anemll.info']}")
-        if 'com.github.apple.coremltools.version' in meta:
-            print(f"  CoreML Tools: {meta['com.github.apple.coremltools.version']}")
-        
-        # Print model input/output shapes
-        print("\nModel Shapes:")
-        if hasattr(model, 'input_description'):
-            print("  Inputs:")
-            try:
-                if hasattr(model.input_description, 'items'):
-                    for name, desc in model.input_description.items():
-                        print(f"    {name}: {desc}")
-                else:
-                    print(f"    {model.input_description}")
-            except:
-                print(f"    Input description: {type(model.input_description)}")
-        if hasattr(model, 'output_description'):
-            print("  Outputs:")
-            try:
-                if hasattr(model.output_description, 'items'):
-                    for name, desc in model.output_description.items():
-                        print(f"    {name}: {desc}")
-                else:
-                    print(f"    {model.output_description}")
-            except:
-                print(f"    Output description: {type(model.output_description)}")
+        if not args.eval:
+            print("\nExtracted Parameters:")
+            print(f"  Context Length: {metadata['context_length']}")
+            print(f"  State Length: {metadata['state_length']}")
+            print(f"  Prefill Batch Size: {metadata['batch_size']}")
+            print(f"  LUT Bits: {metadata['lut_bits']}")
+            print(f"  Number of Chunks: {metadata['num_chunks']}")
+            
+            # Print model info
+            print("\nModel Info:")
+            if 'com.anemll.info' in meta:
+                print(f"  {meta['com.anemll.info']}")
+            if 'com.github.apple.coremltools.version' in meta:
+                print(f"  CoreML Tools: {meta['com.github.apple.coremltools.version']}")
+            
+            # Print model input/output shapes
+            print("\nModel Shapes:")
+            if hasattr(model, 'input_description'):
+                print("  Inputs:")
+                try:
+                    if hasattr(model.input_description, 'items'):
+                        for name, desc in model.input_description.items():
+                            print(f"    {name}: {desc}")
+                    else:
+                        print(f"    {model.input_description}")
+                except:
+                    print(f"    Input description: {type(model.input_description)}")
+            if hasattr(model, 'output_description'):
+                print("  Outputs:")
+                try:
+                    if hasattr(model.output_description, 'items'):
+                        for name, desc in model.output_description.items():
+                            print(f"    {name}: {desc}")
+                    else:
+                        print(f"    {model.output_description}")
+                except:
+                    print(f"    Output description: {type(model.output_description)}")
     else:
-        print("\nWarning: No metadata found in model")
+        if not args.eval:
+            print("\nWarning: No metadata found in model")
 
         # Check if model directory name contains context length pattern (ctxXXX)
         ctx_len = 512
@@ -292,76 +297,93 @@ def load_metadata(model,args):
         metadata['batch_size'] = getattr(args, 'batch_size', 64)
         metadata['lut_bits'] = 4
         metadata['num_chunks'] = getattr(args, 'num_chunks', 4)
-        print("\nUsing parameters:")
-        print(f"  Context Length: {metadata['context_length']}")
-        print(f"  State Length: {metadata['state_length']}")
-        print(f"  Prefill Batch Size: {metadata['batch_size']}")
-        print(f"  LUT Bits: {metadata['lut_bits']}")
-        print(f"  Number of Chunks: {metadata['num_chunks']}")
+        if not args.eval:
+            print("\nUsing parameters:")
+            print(f"  Context Length: {metadata['context_length']}")
+            print(f"  State Length: {metadata['state_length']}")
+            print(f"  Prefill Batch Size: {metadata['batch_size']}")
+            print(f"  LUT Bits: {metadata['lut_bits']}")
+            print(f"  Number of Chunks: {metadata['num_chunks']}")
 
     # Override with values from args if they exist
     if hasattr(args, 'batch_size') and args.batch_size is not None:
         metadata['batch_size'] = args.batch_size
-        print(f"\nOverriding batch size from args: {args.batch_size}")
+        if not args.eval:
+            print(f"\nOverriding batch size from args: {args.batch_size}")
     if hasattr(args, 'num_chunks') and args.num_chunks is not None:
         metadata['num_chunks'] = args.num_chunks
-        print(f"\nOverriding num chunks from args: {args.num_chunks}")
+        if not args.eval:
+            print(f"\nOverriding num chunks from args: {args.num_chunks}")
     
     return metadata
     
 def load_models(args,metadata):
     """Load all required models and extract metadata."""
-    print("\nLoading models...")
+    if not args.eval:
+        print("\nLoading models...")
     
     try:
         # Load embeddings model
-        print("\nLoading embeddings model...")
+        if not args.eval:
+            print("\nLoading embeddings model...")
         embed_path = parse_model_path(args.embed)
-        print(f"Loading from: {embed_path}")
+        if not args.eval:
+            print(f"Loading from: {embed_path}")
         embed_model = load_model(embed_path)
-        print("Embeddings model loaded successfully")
+        if not args.eval:
+            print("Embeddings model loaded successfully")
         metadata = load_metadata(embed_model,args)
         
 
         
         # Load LM head model
-        print("\nLoading LM head model...")
+        if not args.eval:
+            print("\nLoading LM head model...")
         lmhead_path = parse_model_path(args.lmhead)
-        print(f"Loading from: {lmhead_path}")
+        if not args.eval:
+            print(f"Loading from: {lmhead_path}")
         lmhead_model = load_model(lmhead_path)
-        print("LM head model loaded successfully")
+        if not args.eval:
+            print("LM head model loaded successfully")
         
         # Parse FFN path and find chunks if needed
-        print("\nLoading FFN+PREFILL model(s)...")
+        if not args.eval:
+            print("\nLoading FFN+PREFILL model(s)...")
         ffn_path = parse_model_path(args.ffn)
         chunk_no, total_chunks = parse_ffn_filename(ffn_path)
         
         ffn_models = []
         if chunk_no and total_chunks:
-            print(f"\nDetected chunked FFN+PREFILL model ({total_chunks} chunks)")
+            if not args.eval:
+                print(f"\nDetected chunked FFN+PREFILL model ({total_chunks} chunks)")
             # Find and load all chunks
             chunk_paths = find_all_chunks(ffn_path)
             if len(chunk_paths) != total_chunks:
                 raise ValueError(f"Found {len(chunk_paths)} chunks but filename indicates {total_chunks} chunks")
                 
             for chunk_path in chunk_paths:
-                print(f"\nLoading FFN+PREFILL chunk: {Path(chunk_path).name}")
+                if not args.eval:
+                    print(f"\nLoading FFN+PREFILL chunk: {Path(chunk_path).name}")
                 try:
                     # For chunked models, we need both infer and prefill functions
                     ffn_models.append({
                         'infer': load_model(chunk_path, function_name='infer'),
                         'prefill': load_model(chunk_path, function_name='prefill')
                     })
-                    print("Chunk loaded successfully")
+                    if not args.eval:
+                        print("Chunk loaded successfully")
                 except Exception as e:
-                    print(f"Error loading chunk {chunk_path}: {str(e)}")
+                    if not args.eval:
+                        print(f"Error loading chunk {chunk_path}: {str(e)}")
                     raise
             metadata = load_metadata(ffn_models[0],args)
 
         else:
-            print("\nLoading single FFN model...")
+            if not args.eval:
+                print("\nLoading single FFN model...")
             ffn_models.append(load_model(ffn_path))
-            print("FFN model loaded successfully")
+            if not args.eval:
+                print("FFN model loaded successfully")
         
         return embed_model, ffn_models, lmhead_model, metadata
         
@@ -376,7 +398,7 @@ def load_models(args,metadata):
 
 # At the top of the file, make this a default path
 
-def initialize_tokenizer(model_path=None):
+def initialize_tokenizer(model_path=None, eval_mode=False):
     """Initialize and configure the tokenizer."""
     try:
 
@@ -387,24 +409,27 @@ def initialize_tokenizer(model_path=None):
             trust_remote_code=True
         )
         
-        print("\nTokenizer Configuration:")
-        print(f"Tokenizer type: {type(tokenizer)}")
-        print(f"Tokenizer name: {tokenizer.__class__.__name__}")
-        print(f"Vocabulary size: {len(tokenizer)}")
-        print(f"Model max length: {tokenizer.model_max_length}")
+        if not eval_mode:
+            print("\nTokenizer Configuration:")
+            print(f"Tokenizer type: {type(tokenizer)}")
+            print(f"Tokenizer name: {tokenizer.__class__.__name__}")
+            print(f"Vocabulary size: {len(tokenizer)}")
+            print(f"Model max length: {tokenizer.model_max_length}")
 
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
-            print("Set PAD token to EOS token")
+            if not eval_mode:
+                print("Set PAD token to EOS token")
         
         tokenizer.padding_side = "left"
         
-        print(f"\nSpecial Tokens:")
-        print(f"PAD token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
-        print(f"EOS token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
-        print(f"BOS token: '{tokenizer.bos_token}' (ID: {tokenizer.bos_token_id})")
-        print(f"UNK token: '{tokenizer.unk_token}' (ID: {tokenizer.unk_token_id})")
+        if not eval_mode:
+            print(f"\nSpecial Tokens:")
+            print(f"PAD token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
+            print(f"EOS token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
+            print(f"BOS token: '{tokenizer.bos_token}' (ID: {tokenizer.bos_token_id})")
+            print(f"UNK token: '{tokenizer.unk_token}' (ID: {tokenizer.unk_token_id})")
 
         return tokenizer
         
@@ -435,11 +460,12 @@ def make_causal_mask(length, start):
     mask[:, :, col_indices <= (row_indices + start)] = 0
     return mask
 
-def initialize_causal_mask(context_length):
+def initialize_causal_mask(context_length, eval_mode=False):
     """Initialize causal mask for transformer attention."""
     causal_mask = make_causal_mask(context_length, 0)
     causal_mask = torch.tensor(causal_mask, dtype=torch.float16)
-    print(f"\nInitialized causal mask for context length {context_length}")
+    if not eval_mode:
+        print(f"\nInitialized causal mask for context length {context_length}")
     return causal_mask
 
 def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None, causal_mask=None):
@@ -472,7 +498,7 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
         # Run embeddings
         hidden_states = torch.from_numpy(
             embed_model.predict({
-                'input_ids': batch_input.numpy()
+                'input_ids': batch_input.numpy().astype(np.int32)
             })['hidden_states']
         )
         
@@ -480,9 +506,9 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
         for ffn_model in ffn_models:
             if isinstance(ffn_model, dict):
                 inputs = {
-                    'hidden_states': hidden_states.numpy(),  # [1, 64, hidden_size]
-                    'position_ids': position_ids.numpy(),    # [64]
-                    'causal_mask': batch_causal_mask.numpy(), # [1, 1, 64, context_length]
+                    'hidden_states': hidden_states.numpy().astype(np.float16),  # [1, 64, hidden_size]
+                    'position_ids': position_ids.numpy().astype(np.int32),    # [64]
+                    'causal_mask': batch_causal_mask.numpy().astype(np.float16), # [1, 1, 64, context_length]
                     'current_pos': np.array([batch_pos], dtype=np.int32)  # [1]
                 }
                 output = ffn_model['prefill'].predict(inputs, state)
@@ -497,9 +523,12 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     # Get current token
     current_token = input_ids[:, pos-1:pos]  # [1, 1]
     
+    # Ensure proper data type for CoreML
+    current_token_array = current_token.numpy().astype(np.int32)
+    
     # Run embeddings
     hidden_states = torch.from_numpy(
-        embed_model.predict({'input_ids': current_token.numpy()})['hidden_states']
+        embed_model.predict({'input_ids': current_token_array})['hidden_states']
     )  # [1, 1, hidden_size]
     
     # Create masks
@@ -518,17 +547,17 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     for ffn_model in ffn_models:
         if isinstance(ffn_model, dict):
             inputs = {
-                'hidden_states': hidden_states.numpy(),
-                'update_mask': update_mask.numpy(),
-                'position_ids': position_ids.numpy(),
-                'causal_mask': single_causal_mask.numpy(),
-                'current_pos': position_ids.numpy()
+                'hidden_states': hidden_states.numpy().astype(np.float16),
+                'update_mask': update_mask.numpy().astype(np.float16),
+                'position_ids': position_ids.numpy().astype(np.int32),
+                'causal_mask': single_causal_mask.numpy().astype(np.float16),
+                'current_pos': position_ids.numpy().astype(np.int32)
             }
             output = ffn_model['infer'].predict(inputs, state)
             hidden_states = torch.from_numpy(output['output_hidden_states'])
     
     # Run LM head
-    lm_output = lmhead_model.predict({'hidden_states': hidden_states.numpy()})
+    lm_output = lmhead_model.predict({'hidden_states': hidden_states.numpy().astype(np.float16)})
     # Debug print
     #print("\nLM Head output keys:", list(lm_output.keys()))
     
@@ -559,24 +588,26 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     
     return next_token
 
-def create_unified_state(ffn_models, context_length):
+def create_unified_state(ffn_models, context_length, eval_mode=False):
     """Create unified KV cache state for transformer."""
     if isinstance(ffn_models[0], dict):
         # Use first FFN model's prefill function to create state
         state = ffn_models[0]['prefill'].make_state()
-        print(f"\nCreated unified transformer state for {len(ffn_models)} chunks")
+        if not eval_mode:
+            print(f"\nCreated unified transformer state for {len(ffn_models)} chunks")
         return state
     else:
         state = ffn_models[0].make_state()
-        print("\nCreated unified transformer state")
+        if not eval_mode:
+            print("\nCreated unified transformer state")
         return state
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False):
     """Interactive chat loop."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
     
-    if not warmup:
+    if not warmup and not eval_mode:
         print(f"\nUsing context length: {context_length}")
         print("\nStarting chat session. Press Ctrl+D to exit.")
         print("Type your message and press Enter to chat.")
@@ -588,10 +619,10 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
         test_messages = [{"role": "user", "content": "test"}]
         tokenizer.apply_chat_template(test_messages, return_tensors="pt")
         has_chat_template = True
-        if not warmup:
+        if not warmup and not eval_mode:
             print("\nUsing chat template for prompts")
     except:
-        if not warmup:
+        if not warmup and not eval_mode:
             print("\nUsing manual formatting for prompts")
     
     conversation = []
@@ -599,24 +630,33 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
     try:
         while True:
             try:
-                if not warmup:
+                if not warmup and not eval_mode:
                     print(f"\n{LIGHT_GREEN}You:{RESET_COLOR}", end=' ', flush=True)
                 if auto_prompt is not None:
                     user_input = auto_prompt
-                    if not warmup:
+                    if not warmup and not eval_mode:
                         print(user_input)
                 else:
                     user_input = input().strip()
             except EOFError:
-                if not warmup:
+                if not warmup and not eval_mode:
                     print("\nExiting chat...")
                 break
                 
             if not user_input:
                 continue
             
-            # Format prompt based on tokenizer capabilities
-            if has_chat_template:
+            # Format prompt based on no_template flag and tokenizer capabilities
+            if no_template:
+                # Use raw input without any chat template formatting
+                input_ids = tokenizer(
+                    user_input,
+                    return_tensors="pt",
+                    add_special_tokens=True
+                ).input_ids.to(torch.int32)
+                if not warmup and not eval_mode:
+                    print("Using raw input without chat template")
+            elif has_chat_template:
                 messages = [{"role": "user", "content": user_input}]
                 input_ids = tokenizer.apply_chat_template(
                     messages,
@@ -634,7 +674,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
             
             context_pos = input_ids.size(1)
             
-            if not warmup:
+            if not warmup and not eval_mode:
                 print(f"\n{LIGHT_BLUE}Assistant:{RESET_COLOR}", end=' ', flush=True)
             
             # Initialize token printer
@@ -649,7 +689,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 # Ensure batch_size is not None
                 if batch_size is None:
                     batch_size = 64
-                    print(f"Warning: batch_size was None, using default: {batch_size}")
+                    if not eval_mode:
+                        print(f"Warning: batch_size was None, using default: {batch_size}")
                 
                 _ = run_prefill(
                     embed_model,
@@ -699,7 +740,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     # Add to printer only if not in warmup
                     if not warmup:
                         token_printer.add_token(next_token)
-                        token_printer.drain_buffer()
+                        token_printer.drain_buffer(eval_mode)
                     
                     pos += 1
                     tokens_generated += 1
@@ -728,16 +769,20 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 
                 # Get final response and add to conversation
                 if not warmup:
-                    response = token_printer.stop()
-                    # Print timing stats
-                    prefill_ms = prefill_time * 1000  # Convert to milliseconds
-                    print(f"\nPrefill: {prefill_ms:.1f}ms ({prefill_tokens_per_sec:.1f} t/s)")
-                    print(f"Inference: {inference_tokens_per_sec:.1f} t/s")
-                    print(f"Total: Generated {tokens_generated} tokens in {prefill_time + inference_time:.2f}s")
+                    response = token_printer.stop(eval_mode)
+                    if eval_mode:
+                        # In eval mode, only print the model response
+                        print(response, end='')
+                    else:
+                        # Print timing stats
+                        prefill_ms = prefill_time * 1000  # Convert to milliseconds
+                        print(f"\nPrefill: {prefill_ms:.1f}ms ({prefill_tokens_per_sec:.1f} t/s)")
+                        print(f"Inference: {inference_tokens_per_sec:.1f} t/s")
+                        print(f"Total: Generated {tokens_generated} tokens in {prefill_time + inference_time:.2f}s")
                     conversation.append({"role": "assistant", "content": response})
                     
                     # Save response to file if requested
-                    if save_file:
+                    if save_file and not eval_mode:
                         try:
                             # Add small delay to ensure all tokens are processed
                             time.sleep(0.5)
@@ -756,15 +801,16 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                         except Exception as e:
                             print(f"\n{DARK_BLUE}Error saving to file: {str(e)}{RESET_COLOR}")
                 else:
-                    token_printer.stop()  # Clean up without printing stats
+                    token_printer.stop(eval_mode)  # Clean up without printing stats
                 
                 # Exit after one response in auto_prompt mode
                 if auto_prompt is not None:
                     break
                 
             except KeyboardInterrupt:
-                print("\nGeneration interrupted")
-                token_printer.stop()
+                if not eval_mode:
+                    print("\nGeneration interrupted")
+                token_printer.stop(eval_mode)
                 continue
                 
     except Exception as e:
@@ -805,6 +851,14 @@ def parse_args():
     # Add no-warmup flag
     parser.add_argument('--nw', action='store_true',
                        help='Skip warmup phase')
+    
+    # Add no-template flag  
+    parser.add_argument('--no-template', action='store_true',
+                       help='Prefill the question itself and start inference directly without chat template')
+    
+    # Add eval mode flag
+    parser.add_argument('--eval', action='store_true',
+                       help='Evaluation mode: suppress all output except model response')
     
     # Model configuration
     parser.add_argument('--context-length', type=int,
@@ -867,16 +921,17 @@ def parse_args():
             else:
                 args.split_lm_head = 8  # Default value for backward compatibility
             
-            print(f"\nLoaded parameters from {args.meta}:")
-            print(f"  Context Length: {args.context_length}")
-            print(f"  Batch Size: {args.batch_size}")
-            print(f"  Num Chunks: {args.num_chunks}")
-            print(f"  Num Logits: {args.num_logits}")
-            print(f"  Split LM Head: {args.split_lm_head}")
-            print(f"  Models Directory: {args.d}")
-            print(f"  Embeddings: {args.embed}")
-            print(f"  LM Head: {args.lmhead}")
-            print(f"  FFN: {args.ffn}")
+            if not args.eval:
+                print(f"\nLoaded parameters from {args.meta}:")
+                print(f"  Context Length: {args.context_length}")
+                print(f"  Batch Size: {args.batch_size}")
+                print(f"  Num Chunks: {args.num_chunks}")
+                print(f"  Num Logits: {args.num_logits}")
+                print(f"  Split LM Head: {args.split_lm_head}")
+                print(f"  Models Directory: {args.d}")
+                print(f"  Embeddings: {args.embed}")
+                print(f"  LM Head: {args.lmhead}")
+                print(f"  FFN: {args.ffn}")
             
         except Exception as e:
             print(f"\nError loading meta.yaml: {str(e)}")
@@ -894,11 +949,13 @@ def main():
     # Convert directory to absolute path
     model_dir = Path(args.d).resolve()
     if not model_dir.exists():
-        print(f"\nError: Model directory not found: {model_dir}")
+        if not args.eval:
+            print(f"\nError: Model directory not found: {model_dir}")
         return 1
         
-    print(f"\nUsing model directory: {model_dir}")
-    print(f"Context length: {args.context_length}")
+    if not args.eval:
+        print(f"\nUsing model directory: {model_dir}")
+        print(f"Context length: {args.context_length}")
     
     try:
         # Update paths to be relative to model directory
@@ -913,14 +970,15 @@ def main():
         # Check if tokenizer directory exists and has required files
         tokenizer_path = Path(args.tokenizer)
         if not tokenizer_path.exists():
-            print(f"\nError: Tokenizer directory not found: {args.tokenizer}")
+            if not args.eval:
+                print(f"\nError: Tokenizer directory not found: {args.tokenizer}")
             return 1
         
         # Check if tokenizer has the required files
         required_files = ['tokenizer.json', 'tokenizer_config.json']
         missing_files = [f for f in required_files if not (tokenizer_path / f).exists()]
         
-        if missing_files:
+        if missing_files and not args.eval:
             print(f"\nWarning: Tokenizer directory missing required files: {missing_files}")
             print(f"Current tokenizer path: {args.tokenizer}")
             print("\nFor Qwen models, you may need to specify the original model directory:")
@@ -928,19 +986,22 @@ def main():
             print("\nOr add 'tokenizer_path' to your meta.yaml file.")
     
         args.tokenizer = str(Path(args.tokenizer).resolve())  # Convert to absolute path
-        print(f"Using tokenizer path: {args.tokenizer}")
+        if not args.eval:
+            print(f"Using tokenizer path: {args.tokenizer}")
         
         metadata = {}
         # Load models and extract metadata
         embed_model, ffn_models, lmhead_model, metadata = load_models(args,metadata)
         
-        print(f"\nMetadata befor args.context_length: {metadata}")
+        if not args.eval:
+            print(f"\nMetadata befor args.context_length: {metadata}")
 
         # Override context length from command line if provided
         if args.context_length is not None:
             metadata['context_length'] = args.context_length
             metadata['state_length'] = args.context_length  # Also update state_length
-            print(f"\nOverriding context length from command line: {args.context_length}")
+            if not args.eval:
+                print(f"\nOverriding context length from command line: {args.context_length}")
         
         # Add num_logits to metadata (legacy support)
         metadata['num_logits'] = getattr(args, 'num_logits', 8)
@@ -948,22 +1009,23 @@ def main():
         # Add split_lm_head to metadata (preferred)
         metadata['split_lm_head'] = getattr(args, 'split_lm_head', getattr(args, 'num_logits', 8))
         
-        print(f"\nMetadata after load_models: {metadata}")
-        print(f"Using split_lm_head value: {metadata.get('split_lm_head', 8)}")
+        if not args.eval:
+            print(f"\nMetadata after load_models: {metadata}")
+            print(f"Using split_lm_head value: {metadata.get('split_lm_head', 8)}")
         
         # Load tokenizer with resolved path
-        tokenizer = initialize_tokenizer(args.tokenizer)
+        tokenizer = initialize_tokenizer(args.tokenizer, args.eval)
         if tokenizer is None:
             raise RuntimeError("Failed to initialize tokenizer")
         
         # Create unified state once
-        state = create_unified_state(ffn_models, metadata['context_length'])
+        state = create_unified_state(ffn_models, metadata['context_length'], args.eval)
         
         # Initialize causal mask once
-        causal_mask = initialize_causal_mask(metadata['context_length'])
+        causal_mask = initialize_causal_mask(metadata['context_length'], args.eval)
         
         # Warmup runs to prevent Python GIL issues with CoreML !
-        if not args.nw:
+        if not args.nw and not args.eval:
             for _ in range(2):
                 chat_loop(
                     embed_model=embed_model,
@@ -974,7 +1036,9 @@ def main():
                     state=state,
                     causal_mask=causal_mask,  # Pass the causal mask
                     warmup=True,
-                    auto_prompt="who are you?"
+                    auto_prompt="who are you?",
+                    no_template=args.no_template,
+                    eval_mode=args.eval
                 )
         
         # Main run
@@ -988,13 +1052,17 @@ def main():
             causal_mask=causal_mask,  # Pass the causal mask
             warmup=False,
             auto_prompt=args.prompt,
-            save_file=args.save
+            save_file=args.save,
+            max_tokens=args.max_tokens,
+            no_template=args.no_template,
+            eval_mode=args.eval
         )
         
     except Exception as e:
-        print(f"\nError: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        if not args.eval:
+            print(f"\nError: {str(e)}")
+            import traceback
+            traceback.print_exc()
         return 1
     
     return 0
