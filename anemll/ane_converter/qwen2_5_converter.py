@@ -27,6 +27,11 @@ from ..models.qwen2_5_model import (
     CONTEXT_LENGTH,
 )
 
+MODEL_PRECISON=ct.precision.FLOAT16 
+#MODEL_PRECISON=ct.precision.FLOAT32 
+
+
+QWEN2_5_CONVERTER_DTYPE = np.float16  # Change this constant to adjust dtype globally
 
 class Qwen25Converter(BaseConverter):
     """Handle conversion of Qwen 2.5 models to Core ML."""
@@ -289,7 +294,7 @@ class Qwen25Converter(BaseConverter):
                 ct.TensorType(name="logits16", dtype=np.float16),
             ],
             states=self.GetTransformerStates(model, part=None, prefix="model.model."),
-            compute_precision=ct.precision.FLOAT16,
+            compute_precision=MODEL_PRECISON,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
             convert_to="mlprogram",
@@ -396,7 +401,7 @@ class Qwen25Converter(BaseConverter):
                 )
             ],
             outputs=outputs,
-            compute_precision=ct.precision.FLOAT16,
+            compute_precision=MODEL_PRECISON,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
             convert_to="mlprogram",
@@ -480,7 +485,7 @@ class Qwen25Converter(BaseConverter):
             ],
             outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
             states=self.GetTransformerStates(model, part=None, prefix="model.model."),
-            compute_precision=ct.precision.FLOAT16,
+            compute_precision=MODEL_PRECISON,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
             convert_to="mlprogram",
@@ -587,7 +592,7 @@ class Qwen25Converter(BaseConverter):
             ],
             outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
             states=wrapper.states,
-            compute_precision=ct.precision.FLOAT16,
+            compute_precision=MODEL_PRECISON,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
             convert_to="mlprogram",
@@ -709,7 +714,7 @@ class Qwen25Converter(BaseConverter):
                 ),  # Only output hidden states, no logits
             ],
             states=self.GetTransformerStates(model, part=None, prefix="model.model."),
-            compute_precision=ct.precision.FLOAT16,
+            compute_precision=MODEL_PRECISON,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
             convert_to="mlprogram",
@@ -778,7 +783,7 @@ class Qwen25Converter(BaseConverter):
                 )
             ],
             outputs=[ct.TensorType(name="hidden_states", dtype=np.float16)],
-            compute_precision=ct.precision.FLOAT16,
+            compute_precision=MODEL_PRECISON,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
             convert_to="mlprogram",

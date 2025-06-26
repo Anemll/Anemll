@@ -39,7 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_DATASETS_OFFLINE"] = "0"
 os.environ["TRANSFORMERS_OFFLINE"] = "0" 
-os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "0"
 os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.expanduser("~/.cache/huggingface")
 os.environ["HF_DATASETS_CACHE"] = os.path.expanduser("~/.cache/huggingface/datasets")
 
@@ -375,102 +375,215 @@ class ANELM(LM):
         """
         # Just use the existing state
         return self.state
-        
-    def _score_batch(self, token_batch, step_size: int = 1024):
-        """Efficiently score a batch of tokens using vectorized operations.
-        Uses the shared state for inference.
+    
+
+    ########################################################
+    # score one sequence  (shape  [ℓ]  after padding trim) #
+    ########################################################
+    def _score_sequence(self, tokens_1d: torch.Tensor
+                        ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        # Use the shared state
-        kv_cache = self.state
-        
-        # Split into input tokens and target tokens to score
-        inputs, targets = token_batch[:, :-1], token_batch[:, 1:]
-        
-        # Process full input sequence once
-        seq_len = inputs.shape[1]
-        current_pos = 0
-        
-        # Process in chunks to avoid OOM
-        for i in range(0, seq_len, step_size):
-            chunk = inputs[:, i:i+step_size]
-            
-            # IMPORTANT: This calls .predict() in a strictly serial manner
-            current_pos = run_prefill(
-                self.embedding_model, 
+        Parameters
+        ----------
+        tokens_1d : 1-D LongTensor, length ℓ  (prompt + answer)
+
+        Returns
+        -------
+        logp_vec   : FloatTensor [ℓ-1]   log p(t_k | t_<k)  for k = 1 … ℓ-1
+        greedy_vec : BoolTensor  [ℓ-1]   top-1 == gold at every position
+        """
+        ℓ       = tokens_1d.size(0)
+        ctx_len = self.metadata["context_length"]
+
+        # fresh empty KV-cache
+        kv = create_unified_state(self.ffn_models, ctx_len, eval_mode=True)
+
+        # 1️⃣  prefill the prompt (t₀ … t_{ℓ-2})
+        prefill = tokens_1d[:-1].unsqueeze(0)                # [1, ℓ-1]
+        run_prefill(self.embedding_model,
+                    self.ffn_models,
+                    prefill,
+                    0,                                       # start_pos
+                    ctx_len,
+                    self.metadata.get("batch_size", 64),
+                    kv,
+                    self.causal_mask)
+
+        # 2️⃣  walk through answer tokens   a₁ … a_{ℓ-1}
+        logps, greedy = [], []
+        prev = tokens_1d[-2].item()          # last prompt token  (t_{ℓ-2})
+        pos  = ℓ - 1                         # logits will correspond to a₁
+
+        for gold_tok in tokens_1d[-1:]:      # iterate a₁ … a_{ℓ-1}
+            # current prefix = everything up to *prev*
+            curr_seq = tokens_1d[:pos].unsqueeze(0)          # [1, pos]
+
+            nxt_tok, logp_vec = self._generate_next_token_with_logits(
+                self.embedding_model,
                 self.ffn_models,
-                chunk,
-                current_pos,  # Pass the current position in the sequence
-                self.metadata['context_length'],
-                self.metadata.get('batch_size', 64),
-                kv_cache,
-                self.causal_mask
-            )
-        
-        # For implementations without return_logits, we need to score each position individually
-        # This is slower, but handles the API limitations properly
-        batch_size = inputs.shape[0]
-        all_scores = []
-        all_is_greedy = []
-        
-        for i in range(seq_len):
-            # For each position in the sequence, we'll need to:
-            # 1. Prefill up to position i
-            # 2. Generate the next token
-            # 3. Check if it matches the target
-            
-            position_scores = []
-            position_is_greedy = []
-            
-            for b in range(batch_size):
-                # Use the shared state
-                item_cache = self.state
-                
-                # Prefill up to position i
-                item_pos = run_prefill(
-                    self.embedding_model,
+                self.lm_head_model,
+                curr_seq,
+                pos,                 # 0-based index of *next* position
+                ctx_len,
+                self.metadata,
+                state       = kv,
+                causal_mask = self.causal_mask,
+                temperature = 0.0)
+
+            # record statistics
+            logps.append(logp_vec[gold_tok].unsqueeze(0))
+            greedy.append(torch.tensor(nxt_tok == gold_tok))
+
+            # teacher-force: insert gold token so cache is ready for next step
+            run_prefill(self.embedding_model,
+                        self.ffn_models,
+                        torch.tensor([[gold_tok]], dtype=torch.int32),
+                        pos,              # start_pos = position of gold_tok
+                        ctx_len,
+                        self.metadata.get("batch_size", 64),
+                        kv,
+                        self.causal_mask)
+
+            prev = gold_tok
+            pos += 1                      # move to next position
+
+        return torch.cat(logps), torch.stack(greedy)
+
+
+    # --------------------------------------------------------------
+    #  Helper: feed *gold* token, get logits for that position
+    # --------------------------------------------------------------
+    def _predict_token_with_logits(self,
+                                gold_tok_id: int,
+                                kv,
+                                pos: int):
+        """
+        Parameters
+        ----------
+        gold_tok_id : int              token to insert at position `pos`
+        kv          : inplace KV-cache
+        pos         : int (0-based)    position of `gold_tok_id`
+
+        Returns
+        -------
+        greedy_id   : int              arg-max next-token prediction
+        log_probs   : FloatTensor [vocab]
+        """
+        # 1. create 1×1 tensor [[gold_tok]]
+        tok_tensor = torch.tensor([[gold_tok_id]], dtype=torch.int32)
+
+        # 2. embed + update cache + run LM-head
+        lm_out = self.lm_head_model.predict(
+            {'hidden_states':
+                self.embedding_model
+                    .predict({'input_ids': tok_tensor.numpy()})['hidden_states']
+            })
+
+        # 2.a update KV for *all* FFN chunks
+        for ffn in self.ffn_models:
+            if isinstance(ffn, dict) and 'prefill' in ffn:
+                ffn['prefill'].predict(
+                    {
+                        'hidden_states': lm_out['hidden_states'],
+                        'update_mask':   np.array([[[[1.]]]], dtype=np.float16),
+                        'position_ids':  np.array([pos],  dtype=np.int32),
+                        'causal_mask':   self.causal_mask[:, :, pos:pos+1, :],
+                        'current_pos':   np.array([pos],  dtype=np.int32)
+                    },
+                    kv)
+
+        # 3. concatenate logits parts (split-LM-head models)
+        num_parts  = self.metadata.get('split_lm_head',
+                                    self.metadata.get('num_logits', 8))
+        if 'logits1' in lm_out:  # split head
+            logits = torch.cat([torch.from_numpy(lm_out[f'logits{i}'])
+                                for i in range(1, num_parts + 1)], dim=-1)
+        else:                    # single tensor
+            logits = torch.from_numpy(lm_out.get('output_logits'))
+
+        # 4. last dimension → vocab
+        if logits.dim() == 3:
+            logits = logits[0, -1]          # [vocab]
+        elif logits.dim() == 2:
+            logits = logits[-1]             # [vocab]
+
+        log_probs = torch.log_softmax(logits, dim=-1)
+        greedy_id = torch.argmax(log_probs).item()
+        return greedy_id, log_probs
+
+
+    # --------------------------------------------------------------
+    #  Score one sequence  ( prompt + answer )   –  NO extra prefill
+    # --------------------------------------------------------------
+    def _score_sequence(self, tokens_1d: torch.Tensor):
+        """
+        Returns log-probs and greedy-correct flags for every token
+        except the very first one.
+        """
+        ℓ       = tokens_1d.size(0)
+        ctx_len = self.metadata['context_length']
+        kv      = create_unified_state(self.ffn_models, ctx_len, eval_mode=True)
+
+        # prefill the *first* token only (t₀) – no logits needed yet
+        run_prefill(self.embedding_model,
                     self.ffn_models,
-                    inputs[b:b+1, :i+1],
-                    0,  # Start from position 0
-                    self.metadata['context_length'],
+                    tokens_1d[:1].unsqueeze(0),   # [[t₀]]
+                    0,
+                    ctx_len,
                     self.metadata.get('batch_size', 64),
-                    item_cache,
-                    self.causal_mask
-                )
-                
-                # Generate next token
-                predicted_token = generate_next_token(
-                    self.embedding_model,
-                    self.ffn_models,
-                    self.lm_head_model,
-                    inputs[b:b+1, :i+1],
-                    item_pos + 1,  # Convert from 0-based to 1-based position
-                    self.metadata['context_length'],
-                    self.metadata,  # Pass full metadata dict
-                    state=item_cache,
-                    causal_mask=self.causal_mask,
-                    temperature=0.0  # Use greedy generation
-                )
-                
-                # Check if predicted token matches target
-                target_token = targets[b, i].item()
-                is_greedy = (predicted_token == target_token)
-                
-                # Assign scores based on match or mismatch
-                # Note: This is a binary scoring approach
-                score = 0.0 if is_greedy else -10.0  # Log probability estimate
-                
-                position_scores.append(score)
-                position_is_greedy.append(is_greedy)
-            
-            all_scores.append(torch.tensor(position_scores))
-            all_is_greedy.append(torch.tensor(position_is_greedy))
-        
-        # Stack scores and is_greedy
-        scores = torch.stack(all_scores, dim=1)
-        is_greedy = torch.stack(all_is_greedy, dim=1)
-        
+                    kv,
+                    self.causal_mask)
+
+        logps, greedy = [], []
+        pos = 1                                    # position of t₁
+
+        for gold_tok in tokens_1d[1:]:             # t₁ … t_{ℓ-1}
+            g_id, lp_vec = self._predict_token_with_logits(
+                int(gold_tok), kv, pos)
+
+            logps.append(lp_vec[gold_tok].unsqueeze(0))
+            greedy.append(torch.tensor(g_id == gold_tok))
+            pos += 1                               # KV already advanced inside
+
+        return torch.cat(logps), torch.stack(greedy)
+
+
+    # --------------------------------------------------------------
+    #  Batch wrapper – pads to rectangular [B, L-1]
+    # --------------------------------------------------------------
+    def _score_batch(self, token_batch: torch.Tensor):
+        """
+        token_batch : LongTensor [B, L]  (right-padded with 0)
+        """
+        B, L = token_batch.shape
+        seq_scores, seq_greedy = [], []
+
+        for b in range(B):
+            seq = token_batch[b]
+            true_len = (seq != 0).sum().item()
+            if true_len < 2:
+                seq_scores.append(torch.empty(0))
+                seq_greedy.append(torch.empty(0, dtype=torch.bool))
+                continue
+
+            lp_vec, gd_vec = self._score_sequence(seq[:true_len])
+            seq_scores.append(lp_vec)
+            seq_greedy.append(gd_vec)
+
+        max_T = max(v.size(0) for v in seq_scores)  # ≤ L-1
+
+        def pad(v, fill):
+            return torch.cat([v,
+                            v.new_full((max_T - v.size(0),),
+                                        fill,
+                                        dtype=v.dtype,
+                                        device=v.device)])
+        scores    = torch.stack([pad(v, 0.0)   for v in seq_scores])   # [B, max_T]
+        is_greedy = torch.stack([pad(v, False) for v in seq_greedy])   # [B, max_T]
+
         return scores, is_greedy
     
+
     def _process_prompt(self, prompt, step_size: int = 1024):
         """Process the prompt and return logprobs."""
         if self.verbose_output:
@@ -536,25 +649,90 @@ class ANELM(LM):
             # Use the original unpadded input_ids, just like chat.py does
             original_input_ids = prompt[:, :prompt_length]  # Unpadded input tensor
             
-            # Use the exact generate_next_token function from chat.py
-            predicted_token = generate_next_token(
-                self.embedding_model,
-                self.ffn_models,
-                self.lm_head_model,
-                original_input_ids,  # Use unpadded input_ids like chat.py
-                generation_pos,  # Position to generate at
-                self.metadata['context_length'],
-                self.metadata,  # Pass full metadata dict
-                state=cache,
-                causal_mask=self.causal_mask,
-                temperature=0.0  # Use greedy generation to get most likely token
-            )
+            # Instead of using generate_next_token which only returns token ID,
+            # we need to get the actual logits from the model
             
-            # Create a realistic probability distribution to avoid numerical issues
-            # Set predicted token to high probability, others to low probability
-            vocab_size = len(self.tokenizer)
-            log_probs = torch.full((1, vocab_size), -10.0)  # Low probability for all tokens
-            log_probs[0, predicted_token] = 0.0  # Set predicted token to highest probability
+            # Get current token
+            current_token = original_input_ids[:, generation_pos-1:generation_pos]  # [1, 1]
+            
+            # Ensure proper data type for CoreML
+            current_token_array = current_token.numpy().astype(np.int32)
+            
+            # Run embeddings
+            hidden_states = torch.from_numpy(
+                self.embedding_model.predict({'input_ids': current_token_array})['hidden_states']
+            )  # [1, 1, hidden_size]
+            
+            # Create masks
+            update_mask = torch.zeros((1, 1, self.metadata['context_length'], 1), dtype=torch.float16)
+            update_mask[0, 0, generation_pos-1, 0] = 1.0
+            position_ids = torch.tensor([generation_pos-1], dtype=torch.int32)  # [1]
+            
+            # Extract single position causal mask
+            single_causal_mask = self.causal_mask[:, :, generation_pos-1:generation_pos, :]  # [1, num_heads, 1, seq_len]
+            
+            # Run through FFN models (same logic as generate_next_token)
+            for ffn_model in self.ffn_models:
+                if isinstance(ffn_model, dict) and 'infer' in ffn_model:
+                    # Chunked model with infer function
+                    inputs = {
+                        'hidden_states': hidden_states.numpy().astype(np.float16),
+                        'update_mask': update_mask.numpy().astype(np.float16),
+                        'position_ids': position_ids.numpy().astype(np.int32),
+                        'causal_mask': single_causal_mask.numpy().astype(np.float16),
+                        'current_pos': position_ids.numpy().astype(np.int32)
+                    }
+                    output = ffn_model['infer'].predict(inputs, cache)
+                    hidden_states = torch.from_numpy(output['output_hidden_states'])
+                else:
+                    # Non-chunked model or fallback
+                    print(f"[WARNING] FFN model is not a chunked model with 'infer' function")
+            
+            # Run LM head to get logits
+            lm_output = self.lm_head_model.predict({'hidden_states': hidden_states.numpy().astype(np.float16)})
+            
+            # Get number of logits from metadata
+            num_logits = self.metadata.get('split_lm_head', self.metadata.get('num_logits', 8))
+            
+            # Combine logits1-N if they exist
+            if 'logits1' in lm_output:
+                # Concatenate all logits parts
+                logits_parts = []
+                for i in range(1, num_logits + 1):
+                    key = f'logits{i}'
+                    if key in lm_output:
+                        logits_parts.append(torch.from_numpy(lm_output[key]))
+                if self.verbose_output:
+                    print(f"[DEBUG] LM head: {len(logits_parts)} logit parts found, each shape {lm_output['logits1'].shape}")
+                logits = torch.cat(logits_parts, dim=-1)  # Concatenate along vocab dimension
+            elif 'output_logits' in lm_output:
+                # Try output_logits as fallback
+                logits = torch.from_numpy(lm_output['output_logits'])
+                if self.verbose_output:
+                    print(f"[DEBUG] output_logits shape: {lm_output['output_logits'].shape}")
+            else:
+                raise ValueError(f"No logits found in lm_head output. Keys: {list(lm_output.keys())}")
+            
+            # Extract logits for the last position and convert to log probabilities
+            # The logits shape should be [batch_size, seq_len, vocab_size]
+            # We want the last token's logits
+            if logits.dim() == 3:
+                logits = logits[0, -1, :]  # Shape: [vocab_size]
+            elif logits.dim() == 2:
+                logits = logits[-1, :]  # Already [seq_len, vocab_size], take last
+            elif logits.dim() == 1:
+                pass  # Already [vocab_size]
+            else:
+                print(f"[WARNING] Unexpected logits shape: {logits.shape}")
+                
+            # Add debug logging to check logits
+            if self.verbose_output:
+                print(f"[DEBUG] Logits shape after extraction: {logits.shape}")
+                print(f"[DEBUG] Logits min: {logits.min().item():.3f}, max: {logits.max().item():.3f}")
+                print(f"[DEBUG] Top 5 logit values: {torch.topk(logits, 5).values.tolist()}")
+                print(f"[DEBUG] Top 5 token IDs: {torch.topk(logits, 5).indices.tolist()}")
+                
+            log_probs = torch.log_softmax(logits, dim=-1).unsqueeze(0)  # Shape: [1, vocab_size]
             
             return log_probs, cache
             
@@ -582,6 +760,225 @@ class ANELM(LM):
         is_greedy = torch.where(mask, is_greedy, torch.zeros_like(is_greedy, dtype=torch.bool))
         
         return scores, lengths, is_greedy
+    
+    def _generate_next_token_with_logits(self, embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, metadata, state=None, causal_mask=None, temperature=0.0):
+        """Modified version of generate_next_token that returns both token and log probabilities.
+        
+        This is an unrolled version of generate_next_token from chat.py that returns
+        the full log probability distribution along with the selected token.
+        
+        Returns:
+            tuple: (next_token, log_probs) where log_probs is the full vocabulary log probability distribution
+        """
+        # Get current token for embedding
+        # Ensure we're within bounds
+        if pos <= 0 or pos > input_ids.shape[1]:
+            raise ValueError(f"Invalid position {pos} for sequence length {input_ids.shape[1]}")
+        
+        current_token = input_ids[:, pos-1:pos]  # [1, 1]
+        
+        if current_token.shape[1] == 0:
+            raise ValueError(f"Empty token at position {pos-1}")
+        
+        # Run embeddings
+        hidden_states = torch.from_numpy(
+            embed_model.predict({'input_ids': current_token.numpy().astype(np.int32)})['hidden_states']
+        )
+        
+        # Create masks for single position inference
+        update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
+        update_mask[0, 0, pos-1, 0] = 1.0
+        position_ids = torch.tensor([pos-1], dtype=torch.int32)
+        
+        # Extract single position causal mask
+        if causal_mask is not None:
+            single_causal_mask = causal_mask[:, :, pos-1:pos, :]
+        else:
+            # Create causal mask if not provided
+            from chat import make_causal_mask
+            full_mask = make_causal_mask(context_length, 0)
+            single_causal_mask = torch.tensor(full_mask[:, :, pos-1:pos, :], dtype=torch.float16)
+        
+        # Run through FFN models (chunked)
+        for ffn_model in ffn_models:
+            if isinstance(ffn_model, dict) and 'infer' in ffn_model:
+                inputs = {
+                    'hidden_states': hidden_states.numpy().astype(np.float16),
+                    'update_mask': update_mask.numpy().astype(np.float16),
+                    'position_ids': position_ids.numpy().astype(np.int32),
+                    'causal_mask': single_causal_mask.numpy().astype(np.float16),
+                    'current_pos': position_ids.numpy().astype(np.int32)
+                }
+                output = ffn_model['infer'].predict(inputs, state)
+                hidden_states = torch.from_numpy(output['output_hidden_states'])
+        
+        # Run LM head
+        lm_output = lmhead_model.predict({'hidden_states': hidden_states.numpy().astype(np.float16)})
+        
+        # Get number of logits from metadata
+        num_logits = metadata.get('split_lm_head', metadata.get('num_logits', 8))
+        
+        # Combine logits1-N if they exist
+        if 'logits1' in lm_output:
+            # Concatenate all logits parts
+            logits_parts = []
+            for i in range(1, num_logits + 1):
+                key = f'logits{i}'
+                if key in lm_output:
+                    logits_parts.append(torch.from_numpy(lm_output[key]))
+            logits = torch.cat(logits_parts, dim=-1)  # Concatenate along vocab dimension
+        elif 'output_logits' in lm_output:
+            # Try output_logits as fallback
+            logits = torch.from_numpy(lm_output['output_logits'])
+        else:
+            raise ValueError("No logits found in lm_head output")
+        
+        # Extract logits for the current position
+        if logits.dim() == 3:
+            logits = logits[0, -1, :]  # [vocab_size]
+        elif logits.dim() == 2:
+            logits = logits[-1, :]  # [vocab_size]
+        
+        # Get log probabilities
+        log_probs = torch.log_softmax(logits, dim=-1)
+        
+        # Apply temperature and get next token
+        if temperature > 0:
+            logits = logits / temperature
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).item()
+        else:
+            next_token = torch.argmax(logits).item()
+        
+        return next_token, log_probs
+    
+    def _score_one_choice(self, prefix_tokens, answer_tokens):
+        """Score a single answer choice using teacher forcing.
+        
+        Following the exact pattern:
+        1. Prefill prompt[:-1] tokens
+        2. Keep last prompt token as 'prev'
+        3. For each answer token, use generate_next_token with current sequence
+        
+        Args:
+            prefix_tokens: List of token IDs for the context/prompt
+            answer_tokens: List of token IDs for the answer to score
+            
+        Returns:
+            total_logprob: Sum of log probabilities for all answer tokens
+        """
+        if self.verbose_output:
+            answer_text = self.tokenizer.decode(answer_tokens)
+            print(f"\n[VERBOSE] Scoring answer: '{answer_text}' ({len(answer_tokens)} tokens)")
+            
+        # Create fresh KV cache state
+        kv = create_unified_state(self.ffn_models, self.metadata['context_length'], eval_mode=True)
+        
+        # Convert prefix tokens to tensor
+        prefix_tensor = torch.tensor(prefix_tokens, dtype=torch.int32).unsqueeze(0)  # [1, seq_len]
+        
+        # Truncate if needed
+        if len(prefix_tokens) > self.metadata['context_length']:
+            prefix_tensor = prefix_tensor[:, -self.metadata['context_length']:]
+            prefix_tokens = prefix_tokens[-self.metadata['context_length']:]
+        
+        #################################
+        #  Stage A – prefill P-1 tokens #
+        #################################
+        if len(prefix_tokens) > 1:
+            prefill_tokens = prefix_tensor[:, :-1]  # t₀ … t_{P-2}
+            # The second parameter is the number of tokens to prefill, not the starting position
+            num_tokens_to_prefill = len(prefix_tokens) - 1
+            pos = run_prefill(
+                self.embedding_model,
+                self.ffn_models,
+                prefill_tokens,
+                num_tokens_to_prefill,  # This is correct - it's the length to prefill
+                self.metadata['context_length'],
+                self.metadata.get('batch_size', 64),
+                kv,
+                self.causal_mask
+            )
+        else:
+            # Edge case: single token prompt
+            pos = 0
+        
+        # Convert pos to integer if it's a tensor
+        if isinstance(pos, torch.Tensor):
+            pos = pos.item()
+            
+        prev = prefix_tokens[-1]  # t_{P-1} (the *last* prompt token)
+        
+        if self.verbose_output:
+            print(f"  Prefilled {len(prefix_tokens)-1} tokens, pos={pos}")
+            print(f"  Last prompt token (prev): {prev} = '{self.tokenizer.decode([prev])}'")
+        
+        #################################
+        #  Stage B – walk through answer#
+        #################################
+        logp_total = 0.0
+        
+        # Start with the sequence up to P-1, will add tokens as we go
+        sequence_so_far = prefix_tensor[:, :-1].clone() if len(prefix_tokens) > 1 else torch.tensor([[]], dtype=torch.int32)
+        
+        for i, tok in enumerate(answer_tokens):
+            # Append prev token to sequence to form input for generate_next_token
+            current_sequence = torch.cat([sequence_so_far, torch.tensor([[prev]], dtype=torch.int32)], dim=1)
+            
+            if self.verbose_output:
+                print(f"\n  Iteration {i+1}: prev={prev}, target={tok}")
+                print(f"    Current sequence length: {current_sequence.shape[1]}")
+            
+            # Get logits using generate_next_token pattern
+            # The key insight: generate_next_token expects the full sequence including current token
+            # and returns prediction for NEXT position
+            next_token = generate_next_token(
+                self.embedding_model,
+                self.ffn_models,
+                self.lm_head_model,
+                current_sequence,
+                pos + 1,  # Convert from 0-based to 1-based position
+                self.metadata['context_length'],
+                self.metadata,
+                state=kv,
+                causal_mask=self.causal_mask,
+                temperature=0.0
+            )
+            
+            # Also get log probabilities using our custom function
+            _, log_probs = self._generate_next_token_with_logits(
+                self.embedding_model,
+                self.ffn_models,
+                self.lm_head_model,
+                current_sequence,
+                pos + 1,
+                self.metadata['context_length'],
+                self.metadata,
+                state=kv,
+                causal_mask=self.causal_mask,
+                temperature=0.0
+            )
+            
+            # Score the actual answer token
+            logprob = log_probs[tok].item()
+            logp_total += logprob
+            
+            if self.verbose_output:
+                token_text = self.tokenizer.decode([tok])
+                predicted_text = self.tokenizer.decode([next_token])
+                print(f"    Target token: '{token_text}' (ID: {tok}) -> log prob: {logprob:.4f}")
+                if next_token != tok:
+                    print(f"    (Model predicted: '{predicted_text}' (ID: {next_token}))")
+            
+            # Teacher forcing: the true token becomes "prev" for next iteration
+            sequence_so_far = current_sequence  # Include the prev token we just processed
+            prev = tok
+            pos += 1
+        
+        if self.verbose_output:
+            print(f"\n  Total log probability: {logp_total:.4f}")
+        
+        return logp_total
 
     def _tokenize(self, texts):
         """Tokenize texts using the model's tokenizer."""
@@ -719,28 +1116,20 @@ class ANELM(LM):
                 print(f"  Predicted next token (highest prob): '{predicted_token_text}' (ID: {max_idx})")
                 print(f"  Expected continuations: {rs}")
             
-            for s in full_sequences:
+            for answer_idx, s in enumerate(full_sequences):
                 continuation_tokens = s[len(prefix):]
                 
                 if len(continuation_tokens) > 0:
-                    # Score the first token using the prefix logprobs
-                    first_token_score = logprobs[0, continuation_tokens[0]].item()
-                    first_token_is_greedy = (continuation_tokens[0] == max_idx)
+                    # For multi-token continuations, use the dedicated scoring method
+                    if self.verbose_output and len(continuation_tokens) > 1:
+                        print(f"  Using multi-token scoring for {len(continuation_tokens)} tokens")
                     
-                    if len(continuation_tokens) > 1:
-                        # Score the rest of the continuation
-                        continuation_tensor = torch.tensor(continuation_tokens)[None, :]
-                        rest_scores, rest_lengths, rest_is_greedy = self._score_fn(
-                            continuation_tensor, 
-                            cache=self._clone_state(cache)
-                        )
-                        
-                        # Combine the scores
-                        total_score = first_token_score + torch.sum(rest_scores).item()
-                        is_all_greedy = first_token_is_greedy and torch.all(rest_is_greedy).item()
-                    else:
-                        total_score = first_token_score
-                        is_all_greedy = first_token_is_greedy
+                    # Score this answer choice using teacher forcing
+                    total_score = self._score_one_choice(prefix, continuation_tokens)
+                    
+                    # For is_greedy, we just check if first token matches
+                    # (This is less important than getting correct scores)
+                    is_all_greedy = (continuation_tokens[0] == max_idx) if len(continuation_tokens) > 0 else True
                 else:
                     # Empty continuation
                     total_score = 0.0
@@ -748,6 +1137,15 @@ class ANELM(LM):
                     
                 scores.append(total_score)
                 is_greedy.append(is_all_greedy)
+            
+            # After scoring all answers, log which one was selected
+            if self.verbose_output and len(scores) > 0:
+                # Find the answer with the highest score (least negative log probability)
+                selected_idx = max(range(len(scores)), key=lambda i: scores[i])
+                selected_answer = rs[selected_idx]
+                selected_score = scores[selected_idx]
+                print(f"\n[SELECTED] Answer {selected_idx + 1}/{len(rs)}: '{selected_answer}' (score: {selected_score:.4f})")
+                print(f"  All scores: {[f'{s:.4f}' for s in scores]}")
         
         # Reorder results to match original request order
         inv_sort = torch.argsort(torch.tensor(indices))
@@ -1007,62 +1405,7 @@ def main():
     except KeyboardInterrupt:
         print("Evaluation interrupted by user")
         raise
-    except ConnectionError as e:
-        print(f"Error during evaluation: {e}")
-        
-        # Check if this is an offline mode error for dataset downloading
-        if "OfflineModeIsEnabled" in str(e) or "Couldn't reach" in str(e):
-            print("\n" + "="*60)
-            print("DATASET DOWNLOAD ERROR - OFFLINE MODE DETECTED")
-            print("="*60)
-            print("\nThe evaluation harness needs to download dataset(s) but is in offline mode.")
-            print("\nTo fix this, you have two options:")
-            print("\n1. Enable online mode and run again:")
-            print("   export HF_DATASETS_OFFLINE=0")
-            print("   export TRANSFORMERS_OFFLINE=0")
-            print("\n2. Pre-download the required dataset(s):")
-            
-            # Extract dataset name from error if possible
-            error_str = str(e).lower()
-            if "super_glue" in error_str:
-                if "boolq" in error_str or "boolq" in args.tasks:
-                    print("   python -c \"from datasets import load_dataset; load_dataset('super_glue', 'boolq')\"")
-                elif "copa" in error_str or "copa" in args.tasks:
-                    print("   python -c \"from datasets import load_dataset; load_dataset('super_glue', 'copa')\"")
-                elif "multirc" in error_str or "multirc" in args.tasks:
-                    print("   python -c \"from datasets import load_dataset; load_dataset('super_glue', 'multirc')\"")
-                else:
-                    print("   python -c \"from datasets import load_dataset; load_dataset('super_glue', '<task_name>')\"")
-            elif "glue" in error_str:
-                print("   python -c \"from datasets import load_dataset; load_dataset('glue', '<task_name>')\"")
-            elif "wikitext" in error_str:
-                print("   python -c \"from datasets import load_dataset; load_dataset('wikitext', 'wikitext-103-raw-v1')\"")
-            elif "lambada" in error_str:
-                print("   python -c \"from datasets import load_dataset; load_dataset('lambada')\"")
-            elif "hellaswag" in error_str:
-                print("   python -c \"from datasets import load_dataset; load_dataset('hellaswag')\"")
-            elif "piqa" in error_str:
-                print("   python -c \"from datasets import load_dataset; load_dataset('piqa')\"")
-            elif "arc" in error_str:
-                print("   python -c \"from datasets import load_dataset; load_dataset('ai2_arc', 'ARC-Easy')\"")
-                print("   python -c \"from datasets import load_dataset; load_dataset('ai2_arc', 'ARC-Challenge')\"")
-            else:
-                print("   python -c \"from datasets import load_dataset; load_dataset('<dataset_name>')\"")
-                print("\n   Common datasets:")
-                print("   - BoolQ: load_dataset('super_glue', 'boolq')")
-                print("   - HellaSwag: load_dataset('hellaswag')")
-                print("   - PIQA: load_dataset('piqa')")
-                print("   - ARC: load_dataset('ai2_arc', 'ARC-Easy')")
-                print("   - WikiText: load_dataset('wikitext', 'wikitext-103-raw-v1')")
-            
-            print("\nAfter downloading, you can run the evaluation in offline mode.")
-            print("="*60 + "\n")
-        
-        # Exit cleanly without showing the full traceback
-        import sys
-        sys.exit(1)
     except Exception as e:
-        # For other exceptions, show the full traceback
         print(f"Error during evaluation: {e}")
         import traceback
         traceback.print_exc()
