@@ -65,10 +65,8 @@ Our solution:
 - `--num-shots N`: Number of few-shot examples (default: 0)
 - `--batch-size N`: Batch size for evaluation (default: 1, recommended for ANE)
 - `--output-dir DIR`: Directory to save results (default: results)
-- `--limit N`: Limit number of examples per task
-- `--max-tokens N`: Maximum number of tokens to generate
-- `--seed N`: Random seed (default: 123)
-- `--apply-chat-template`: Apply chat template to prompts
+- `--skip N`: Skip the first N examples (requires --limit)
+- `--output-path PATH`: Path to save the results JSON file (overrides default naming)
 
 ## Recommended Model Directory Structure
 
@@ -84,6 +82,19 @@ If you encounter "value type not convertible" errors:
 1. Ensure you're using batch_size=1 for the harness
 2. Verify that CoreML single-threading environment variables are set
 3. Check that your model's compiled batch size matches what's in the model's metadata
+
+## Batch BoolQ Segmentation Script
+
+The `batch_boolq_segments.sh` script automates running BoolQ evaluation in fixed-size windows (default 100 examples) and identifies the worst-performing segments by accuracy.
+
+```bash
+./batch_boolq_segments.sh --model /path/to/your/model [--output-dir results] [--step 100] [--worst 5] [--total N]
+```
+
+After completion, you will find:
+- A TSV summary at `results/boolq_segments_summary.tsv` listing start,end,accuracy for each window
+- A combined JSON at `results/eval_<model>_<shots>shot_boolq.json` containing per-window results keyed by `"<start>_to_<end>"`
+- A terminal printout of the `--worst` segments with lowest accuracy
 
 ## Credits
 
