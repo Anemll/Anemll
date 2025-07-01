@@ -109,11 +109,30 @@ class Qwen25RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Following ANEMLL requirements: always subtract mean first, then use F.layer_norm()
-        # This is required for ANE compatibility
-        mean = hidden_states.mean(-1, keepdim=True)
-        hidden_states = hidden_states - mean
-        return F.layer_norm(hidden_states, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
+
+        x = hidden_states
+
+        # ❶ Make the last‑dimension mean zero.
+        doubled = torch.cat([x, -x], dim=-1)
+
+        hidden_size =  hidden_states.shape[-1]
+        # ❷ Run the highly‑optimised LayerNorm kernel on the doubled tensor.
+        normed = F.layer_norm(
+            doubled,
+            normalized_shape=(2 * hidden_size,),
+            weight=None,          # no affine factors here
+            bias=None,
+            eps=float(self.eps)
+        )
+
+        # ❸ Drop the mirror half → correct RMS‑normed activations.
+        normed = normed[..., : hidden_size]
+
+        # ❹ Apply the learnable gain (γ) and cast / move exactly once.
+        return (normed * self.weight
+                       .to(normed.dtype, copy=False)
+                       .to(normed.device, copy=False))
+    
 
 
 class Qwen25RotaryEmbedding(nn.Module):
