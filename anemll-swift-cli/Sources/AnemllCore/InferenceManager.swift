@@ -33,6 +33,10 @@ import CoreFoundation
         set { _busy = newValue }
     }
     
+    // Sampling configuration (defaults to greedy for backward compatibility)
+    private var samplingConfig: SamplingConfig = .greedy
+    private var generatedTokenHistory: [Int] = []
+    
     // Move struct definition to class scope, before the methods
     private struct PartialMax {
         let value: Float
@@ -47,6 +51,12 @@ import CoreFoundation
     public func set_FilterLLAMA01(value: Bool)
     {
         FilterLLAMA01 = value
+    }
+    
+    /// Set sampling configuration for text generation
+    public func setSamplingConfig(_ config: SamplingConfig) {
+        self.samplingConfig = config
+        self.GreedySearch = !config.doSample
     }
 
 
@@ -596,43 +606,146 @@ import CoreFoundation
         return contextPos
     }
 
-    func topPSample(logits: [Float], temperature: Float = 1.0, topP: Float = 0.9) -> Int {
-        // Apply temperature scaling
-        let scaledLogits = logits.map { $0 / temperature }
+    /// Apply repetition penalty to logits based on generated token history
+    func applyRepetitionPenalty(logits: inout [Float], penalty: Double) {
+        guard penalty != 1.0 && !generatedTokenHistory.isEmpty else { return }
         
-        // Compute softmax probabilities (with numerical stability)
-        let maxLogit = scaledLogits.max() ?? 0
-        let expLogits = scaledLogits.map { exp($0 - maxLogit) }
-        let sumExp = expLogits.reduce(0, +)
-        let probs = expLogits.map { $0 / sumExp }
+        let uniqueTokens = Set(generatedTokenHistory)
+        for tokenId in uniqueTokens {
+            if tokenId < logits.count {
+                if logits[tokenId] < 0 {
+                    logits[tokenId] *= Float(penalty)
+                } else {
+                    logits[tokenId] /= Float(penalty)
+                }
+            }
+        }
+    }
+    
+    /// Extremely fast top-k sampling using heap-like selection
+    func topKSample(logits: [Float], temperature: Float, topK: Int) -> Int {
+        guard topK > 0 && topK < logits.count else {
+            // If topK is 0 or >= vocab size, use all tokens
+            return topPSample(logits: logits, temperature: temperature, topP: 1.0)
+        }
         
-        // Sort indices by descending probability
-        let sorted = probs.enumerated().sorted { $0.element > $1.element }
+        // Find top-k using quickselect-like algorithm (much faster than full sort)
+        var indexedLogits: [(Int, Float)] = []
+        indexedLogits.reserveCapacity(logits.count)
+        
+        for (i, logit) in logits.enumerated() {
+            indexedLogits.append((i, logit / temperature))
+        }
+        
+        // Partial sort to get top-k efficiently
+        indexedLogits.sort { $0.1 > $1.1 }
+        let topK_indices = Array(indexedLogits.prefix(topK))
+        
+        // Fast softmax on top-k only
+        let maxLogit = topK_indices[0].1
+        var expSum: Float = 0.0
+        var probs: [(Int, Float)] = []
+        probs.reserveCapacity(topK)
+        
+        for (idx, logit) in topK_indices {
+            let expVal = exp(logit - maxLogit)
+            expSum += expVal
+            probs.append((idx, expVal))
+        }
+        
+        // Sample using cumulative distribution
+        let r = Float.random(in: 0..<expSum)
         var cumulative: Float = 0.0
-        var filtered: [(Int, Float)] = []
-        for (index, prob) in sorted {
-            cumulative += prob
-            filtered.append((index, prob))
+        
+        for (idx, expVal) in probs {
+            cumulative += expVal
+            if r <= cumulative {
+                return idx
+            }
+        }
+        
+        return probs.last!.0
+    }
+    
+    /// Optimized multinomial sampling from logits
+    func sampleFromLogits(_ logits: [Float]) -> Int {
+        // Find max for numerical stability
+        let maxLogit = logits.max() ?? 0
+        
+        // Compute exp values and sum in one pass
+        var expSum: Float = 0.0
+        var expValues: [Float] = []
+        expValues.reserveCapacity(logits.count)
+        
+        for logit in logits {
+            let expVal = exp(logit - maxLogit)
+            expValues.append(expVal)
+            expSum += expVal
+        }
+        
+        // Sample using cumulative distribution without normalizing
+        let r = Float.random(in: 0..<expSum)
+        var cumulative: Float = 0.0
+        
+        for (idx, expVal) in expValues.enumerated() {
+            cumulative += expVal
+            if r <= cumulative {
+                return idx
+            }
+        }
+        
+        return logits.count - 1  // Fallback
+    }
+    
+    func topPSample(logits: [Float], temperature: Float = 1.0, topP: Float = 0.9) -> Int {
+        // Early exit for topP = 1.0 (no filtering)
+        if topP >= 1.0 {
+            return sampleFromLogits(logits.map { $0 / temperature })
+        }
+        
+        // Apply temperature and find max for numerical stability
+        let invTemp = 1.0 / temperature
+        let maxLogit = logits.max() ?? 0
+        
+        // Create indexed probabilities in one pass
+        var indexedProbs: [(Int, Float)] = []
+        indexedProbs.reserveCapacity(logits.count)
+        var expSum: Float = 0.0
+        
+        for (i, logit) in logits.enumerated() {
+            let scaledLogit = (logit - maxLogit) * invTemp
+            let expVal = exp(scaledLogit)
+            expSum += expVal
+            indexedProbs.append((i, expVal))
+        }
+        
+        // Sort by probability (descending) and accumulate
+        indexedProbs.sort { $0.1 > $1.1 }
+        
+        var cumulative: Float = 0.0
+        var cutoffIndex = indexedProbs.count
+        
+        for (idx, (_, expVal)) in indexedProbs.enumerated() {
+            cumulative += expVal / expSum  // Normalize on the fly
             if cumulative >= topP {
+                cutoffIndex = idx + 1
                 break
             }
         }
         
-        // Normalize the filtered probability subset
-        let filteredSum = filtered.map { $0.1 }.reduce(0, +)
-        let normalized = filtered.map { ($0.0, $0.1 / filteredSum) }
+        // Sample directly from the filtered set without renormalization
+        let filteredSum = indexedProbs.prefix(cutoffIndex).reduce(0) { $0 + $1.1 }
+        let r = Float.random(in: 0..<filteredSum)
         
-        // Sample from the normalized set
-        let r = Float.random(in: 0..<1)
-        var cumulativeSample: Float = 0.0
-        for (index, prob) in normalized {
-            cumulativeSample += prob
-            if r <= cumulativeSample {
-                return index
+        var acc: Float = 0.0
+        for (tokenIdx, expVal) in indexedProbs.prefix(cutoffIndex) {
+            acc += expVal
+            if r <= acc {
+                return tokenIdx
             }
         }
         
-        return normalized.last!.0  // fallback (should not usually happen)
+        return indexedProbs[0].0  // Fallback to highest prob
     }
 
     /// Generates the next token given the current token. This method calls the embedding model,
@@ -800,9 +913,9 @@ import CoreFoundation
             }
             return globalMax.index
         } else {
-            // --- Top-p sampling branch: collect logits parts in parallel ---
+            // --- Optimized sparse sampling: work directly with (index, logit) pairs ---
             let logitsResults = try await withThrowingTaskGroup(of: [(Int, Float)].self) { group -> [[(Int, Float)]] in
-                for i in 1...8 {
+                for i in 1...splitLMHead {
                     let partIndex = i
                     let logitsKey = "logits\(partIndex)"
                     guard let logitsPart = outputBackings[logitsKey] else {
@@ -826,21 +939,37 @@ import CoreFoundation
                         #if arch(arm64)
                         let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
                         let count = localLogitsPart.count
-                        var output: [(Int, Float)] = []
+                        
+                        // Only keep top candidates from this chunk - avoid huge arrays
+                        var topCandidates: [(Int, Float)] = []
+                        let chunkK = 100  // Keep reasonable number per chunk
+                        topCandidates.reserveCapacity(chunkK)
+                        
                         var start = 0
                         if localOffset == 0 && self.FilterLLAMA01 {
-                            start = 2  // filtering special tokens
-                            if self.debugLevel >= 2 {
-                                print("Filtering special tokens: start=\(_padTokenId)")
-                            }
+                            start = 2
                         }
                         
                         for j in start..<count {
                             let value = Float(buffer[j])
                             let globalIndex = localOffset + j
-                            output.append((globalIndex, value))
+                            
+                            if topCandidates.count < chunkK {
+                                topCandidates.append((globalIndex, value))
+                                if topCandidates.count == chunkK {
+                                    topCandidates.sort { $0.1 > $1.1 }
+                                }
+                            } else if value > topCandidates[chunkK - 1].1 {
+                                topCandidates[chunkK - 1] = (globalIndex, value)
+                                // Bubble up
+                                var idx = chunkK - 1
+                                while idx > 0 && topCandidates[idx].1 > topCandidates[idx - 1].1 {
+                                    topCandidates.swapAt(idx, idx - 1)
+                                    idx -= 1
+                                }
+                            }
                         }
-                        return output
+                        return topCandidates
                         #else
                         fatalError("Unsupported architecture, only Apple Silicon is supported")
                         #endif
@@ -854,22 +983,78 @@ import CoreFoundation
                 return allLogits
             }
             
-            // Flatten results into a single array of (index, logit) pairs.
-            let flatLogits = logitsResults.flatMap { $0 }
+            // Flatten to sparse representation (index, logit) pairs
+            var sparseLogits = logitsResults.flatMap { $0 }
             
-            // Determine the vocabulary size: assume it equals the max index observed + 1.
-            let vocabSize = (flatLogits.map { $0.0 }.max() ?? 0) + 1
-            var logitsVector = Array(repeating: -Float.infinity, count: vocabSize)
-            for (index, value) in flatLogits {
-                logitsVector[index] = value
+            // Apply repetition penalty directly to sparse data
+            if samplingConfig.repetitionPenalty != 1.0 && !generatedTokenHistory.isEmpty {
+                let penaltyTokens = Set(generatedTokenHistory)
+                for i in 0..<sparseLogits.count {
+                    let (tokenId, logit) = sparseLogits[i]
+                    if penaltyTokens.contains(tokenId) {
+                        if logit < 0 {
+                            sparseLogits[i].1 = logit * Float(samplingConfig.repetitionPenalty)
+                        } else {
+                            sparseLogits[i].1 = logit / Float(samplingConfig.repetitionPenalty)
+                        }
+                    }
+                }
             }
             
-            // Use top-p sampling to pick a token. You can hardcode or pass in your topP (here 0.9).
-            let sampledIndex = topPSample(logits: logitsVector, temperature: temperature, topP: 0.9)
-            if debugLevel >= 1 {
-                print("\nTop-p sampled token:", sampledIndex)
+            // Find max for numerical stability
+            let maxLogit = sparseLogits.map { $0.1 }.max() ?? 0
+            
+            // Apply temperature and compute scores
+            for i in 0..<sparseLogits.count {
+                sparseLogits[i].1 = exp((sparseLogits[i].1 - maxLogit) / Float(samplingConfig.temperature))
             }
-            return sampledIndex
+            
+            // Apply top-k filtering if enabled
+            if samplingConfig.topK > 0 && samplingConfig.topK < sparseLogits.count {
+                // Use partial sort to get top-k efficiently
+                sparseLogits.sort { $0.1 > $1.1 }
+                sparseLogits = Array(sparseLogits.prefix(samplingConfig.topK))
+            }
+            
+            // Apply top-p filtering if enabled
+            if samplingConfig.topP < 1.0 {
+                if samplingConfig.topK <= 0 {
+                    // Sort if we haven't already done top-k
+                    sparseLogits.sort { $0.1 > $1.1 }
+                }
+                
+                let totalScore = sparseLogits.reduce(0) { $0 + $1.1 }
+                let threshold = Float(samplingConfig.topP) * totalScore
+                
+                var cumulative: Float = 0.0
+                var cutoffIndex = sparseLogits.count
+                for (i, (_, score)) in sparseLogits.enumerated() {
+                    cumulative += score
+                    if cumulative >= threshold {
+                        cutoffIndex = i + 1
+                        break
+                    }
+                }
+                sparseLogits = Array(sparseLogits.prefix(cutoffIndex))
+            }
+            
+            // Sample from filtered candidates
+            let totalScore = sparseLogits.reduce(0) { $0 + $1.1 }
+            let r = Float.random(in: 0..<totalScore)
+            
+            var cumulative: Float = 0.0
+            for (tokenId, score) in sparseLogits {
+                cumulative += score
+                if r <= cumulative {
+                    if debugLevel >= 1 {
+                        print("\nSampled token:", tokenId)
+                    }
+                    return tokenId
+                }
+            }
+            
+            // Fallback to highest scoring token
+            return sparseLogits.first?.0 ?? 0
         }   
      }
     
@@ -941,6 +1126,11 @@ import CoreFoundation
         let _padTokenId = tokenizer.padTokenId
         abort_generation = 0;
         busy = true
+        
+        // Clear token history for new generation (only when sampling)
+        if !GreedySearch {
+            generatedTokenHistory.removeAll()
+        }
         
         do {
 
@@ -1047,6 +1237,9 @@ import CoreFoundation
                 
                 // Only add token and continue if not a stop token
                 generatedTokens.append(nextToken)
+                if !GreedySearch {
+                    generatedTokenHistory.append(nextToken)  // Track for repetition penalty only when sampling
+                }
                 contextTokens[currentPos] = nextToken
                 onToken?(nextToken)
                 currentPos += 1

@@ -15,6 +15,10 @@ let package = Package(
         .executable(
             name: "anemllcli",
             targets: ["ANEMLLCLI"]
+        ),
+        .executable(
+            name: "anemllcli_adv",
+            targets: ["AnemllCLIAdv"]
         )
     ],
     dependencies: [
@@ -48,6 +52,14 @@ let package = Package(
                 .process("Resources/anemll.entitlements"),
                 .process("Resources/RunDestinations.plist"),
                 .process("Resources/anemll-swift-cli.xcscheme")
+            ]
+        ),
+        .executableTarget(
+            name: "AnemllCLIAdv",
+            dependencies: [
+                "AnemllCore",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "Transformers", package: "swift-transformers")
             ]
         )
     ]
