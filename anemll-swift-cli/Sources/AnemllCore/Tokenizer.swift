@@ -273,10 +273,14 @@ public final class Tokenizer: @unchecked Sendable {
 
     // Consolidated applyChatTemplate method
     public func applyChatTemplate(input: Any, addGenerationPrompt: Bool = true) -> [Int] {
-        // Skip template when addGenerationPrompt is false
+        // When addGenerationPrompt is false, tokenize the raw content without template
         if !addGenerationPrompt {
             if let text = input as? String {
-                return tokenize("" + text)
+                return tokenize(text)
+            } else if let messages = input as? [ChatMessage] {
+                // Concatenate all message contents and tokenize
+                let combinedText = messages.map { $0.content }.joined(separator: " ")
+                return tokenize(combinedText)
             }
             return []
         }
