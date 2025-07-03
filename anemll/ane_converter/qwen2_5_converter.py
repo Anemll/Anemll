@@ -964,7 +964,7 @@ def test_conversion(
         if part in ["full", "all", "123"]:
             fname += ""
         if part not in ["2", "2_prefill"]:
-            if lut_bits is not None and part != "1":
+            if lut_bits is not None:
                 fname += f"_lut{lut_bits}"
             fname += ".mlpackage"
         else:
