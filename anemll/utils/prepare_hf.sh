@@ -177,7 +177,7 @@ prepare_common_files() {
     fi
     
     # Generate new config.json
-    python -m anemll.ane_converter.create_config_json --output "$target_dir/config.json" --model-type "$MODEL_TYPE" --tokenizer-class "$TOKENIZER_CLASS"
+    python3 -m anemll.ane_converter.create_config_json --output "$target_dir/config.json" --model-type "$MODEL_TYPE" --tokenizer-class "$TOKENIZER_CLASS"
     
     # Verify config.json was created
     if [ ! -f "$target_dir/config.json" ]; then
@@ -229,6 +229,29 @@ get_model_filename() {
     fi
 }
 
+# Function to get model filename with fallback for embeddings LUT naming
+get_model_filename_with_fallback() {
+    local prefix=$1
+    local type=$2
+    local lut=$3
+    local chunk_info=$4
+    local input_dir=$5
+    
+    # Get the primary filename
+    local primary_name=$(get_model_filename "$prefix" "$type" "$lut" "$chunk_info")
+    
+    # For embeddings with LUT, check if primary name exists, otherwise fallback to no-LUT version
+    if [ "$type" = "embeddings" ] && [ "$lut" != "none" ] && [ -n "$lut" ]; then
+        if [ ! -d "$input_dir/${primary_name}.mlmodelc" ]; then
+            echo "Warning: ${primary_name}.mlmodelc not found, falling back to ${prefix}_${type}${chunk_info}.mlmodelc" >&2
+            echo "${prefix}_${type}${chunk_info}"
+            return
+        fi
+    fi
+    
+    echo "$primary_name"
+}
+
 # Determine which distribution to prepare based on flags
 if [ "$PREPARE_IOS" = true ]; then
     # Prepare iOS version only
@@ -239,7 +262,7 @@ if [ "$PREPARE_IOS" = true ]; then
     prepare_common_files "$OUTPUT_DIR/ios"
     
     # Copy all mlmodelc files uncompressed for iOS
-    embeddings_file=$(get_model_filename "$MODEL_PREFIX" "embeddings" "$LUT_EMBEDDINGS")
+    embeddings_file=$(get_model_filename_with_fallback "$MODEL_PREFIX" "embeddings" "$LUT_EMBEDDINGS" "" "$INPUT_DIR")
     copy_mlmodelc "$embeddings_file" "$OUTPUT_DIR/ios"
     
     lmhead_file=$(get_model_filename "$MODEL_PREFIX" "lm_head" "$LUT_LMHEAD")
@@ -263,7 +286,7 @@ else
     prepare_common_files "$OUTPUT_DIR/standard"
     
     # Compress all mlmodelc files for standard distribution
-    embeddings_file=$(get_model_filename "$MODEL_PREFIX" "embeddings" "$LUT_EMBEDDINGS")
+    embeddings_file=$(get_model_filename_with_fallback "$MODEL_PREFIX" "embeddings" "$LUT_EMBEDDINGS" "" "$INPUT_DIR")
     compress_mlmodelc "$embeddings_file" "$OUTPUT_DIR/standard"
     
     lmhead_file=$(get_model_filename "$MODEL_PREFIX" "lm_head" "$LUT_LMHEAD")

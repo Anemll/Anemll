@@ -354,64 +354,11 @@ EOF_CONFIG
             fi
         fi && \
         
-        # Create meta.yaml
-        python3 - \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
+        # Create meta.yaml with correct LUT values based on actual file existence
+        python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
+            \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
-            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR/meta.yaml\" <<'EOF_PY'
-import sys
-MODEL_NAME = sys.argv[1]
-CONTEXT = sys.argv[2]
-BATCH = sys.argv[3]
-LUT_EMB = sys.argv[4]
-LUT_FFN = sys.argv[5]
-LUT_LMH = sys.argv[6]
-NUM_CHUNKS = sys.argv[7]
-PREFIX = sys.argv[8]
-ARCH = sys.argv[9]
-OUTFILE = sys.argv[10]
-
-# Construct model names with LUT suffixes if specified
-embeddings_name = f'{PREFIX}_embeddings' + (f'_lut{LUT_EMB}' if LUT_EMB != 'none' else '')
-lmhead_name = f'{PREFIX}_lm_head' + (f'_lut{LUT_LMH}' if LUT_LMH != 'none' else '')
-ffn_base = f'{PREFIX}_FFN_PF' + (f'_lut{LUT_FFN}' if LUT_FFN != 'none' else '')
-
-# Add .mlmodelc extension to model paths
-embeddings_path = f'{embeddings_name}.mlmodelc'
-lmhead_path = f'{lmhead_name}.mlmodelc'
-ffn_path = f'{ffn_base}.mlmodelc'
-
-# Set split_lm_head based on architecture
-split_lm_head = 16 if ARCH.startswith('qwen') else 8
-
-meta = f'''model_info:
-  name: anemll-{MODEL_NAME}-ctx{CONTEXT}
-  version: 0.3.3
-  description: |
-    Demonstarates running {MODEL_NAME} on Apple Neural Engine
-    Context length: {CONTEXT}
-    Batch size: {BATCH}
-    Chunks: {NUM_CHUNKS}
-  license: MIT
-  author: Anemll
-  framework: Core ML
-  language: Python
-  architecture: {ARCH}
-  parameters:
-    context_length: {CONTEXT}
-    batch_size: {BATCH}
-    lut_embeddings: {LUT_EMB}
-    lut_ffn: {LUT_FFN}
-    lut_lmhead: {LUT_LMH}
-    num_chunks: {NUM_CHUNKS}
-    model_prefix: {PREFIX}
-    embeddings: {embeddings_path}
-    lm_head: {lmhead_path}
-    ffn: {ffn_path}
-    split_lm_head: {split_lm_head}
-'''
-with open(OUTFILE, 'w') as f:
-    f.write(meta)
-EOF_PY
+            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\"
     "
 fi
 
