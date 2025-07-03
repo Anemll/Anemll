@@ -92,36 +92,46 @@ class LlamaConfig:
         return "\n".join(f"{key}: {value}" for key, value in self.__dict__.items())
 
 class LlamaRMSNorm(nn.Module):
+    """ANE optimized RMSNorm implementation. We use layer_norm and avoid the mean subtraction.
+    This give us the best quality for Boolq and other benchmarks."""
+
     def __init__(self, hidden_size, eps=1e-6):
-        """
-        LlamaRMSNorm is equivalent to T5LayerNorm
-        """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.hidden_size = hidden_size
-        #self.bias = nn.Parameter(torch.zeros(hidden_size))
-        self.eps = eps
+        self.variance_epsilon = eps
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    
+        # ──────────────────────────────────────────────────────────────────────
+        # Compatibility path for PyTorch 1.x / 2.0–2.3                           .
+        # We build a tensor whose mean is *exactly* zero so that LayerNorm's
+        # mean‑subtraction becomes a no‑op and we recover RMS statistics:
+        #
+        #     concat([x, ‑x])  →  μ = 0,
+        #                        σ² = ½(‖x‖²) = mean(x²)
+        # ──────────────────────────────────────────────────────────────────────
+        x = hidden_states
 
-        if ENABLE_DEBUG:
-            print(f"LlamaRMSNorm forward - self.weight.dtype: {self.weight.dtype}")
-        mean = hidden_states.mean(-1, keepdim=True)
-        hidden_states = hidden_states - mean
+        # ❶ Make the last‑dimension mean zero.
+        doubled = torch.cat([x, -x], dim=-1)
 
-        return F.layer_norm(hidden_states, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
-        #Convert to 4D tensor
-        #hidden_states = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], 1, hidden_states.shape[2])
-        input_dtype = hidden_states.dtype
-        #hidden_states = hidden_states.to(MODEL_DTYPE)
-        mean = hidden_states.mean(-1, keepdim=True)
-        hidden_states = hidden_states - mean
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)         
-        #variance = torch.clamp(variance, max=5e2)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        hidden_states=(self.weight * hidden_states).to(input_dtype)
-        #hidden_states = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], hidden_states.shape[3])
-        return hidden_states.to(MODEL_DTYPE)
+        hidden_size = hidden_states.shape[-1]
+        # ❷ Run the highly‑optimised LayerNorm kernel on the doubled tensor.
+        normed = F.layer_norm(
+            doubled,
+            normalized_shape=(2 * hidden_size,),
+            weight=None,          # no affine factors here
+            bias=None,
+            eps=float(self.variance_epsilon)
+        )
+
+        # ❸ Drop the mirror half → correct RMS‑normed activations.
+        normed = normed[..., : hidden_size]
+
+        # ❹ Apply the learnable gain (γ) and cast / move exactly once.
+        return (normed * self.weight
+                       .to(normed.dtype, copy=False)
+                       .to(normed.device, copy=False))
         
 class NA_LayerNormANE(nn.Module):
     """ LayerNorm optimized for Apple Neural Engine (ANE) execution
@@ -165,13 +175,16 @@ class LlamaRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq)
 
         # Cache cos and sin values for positions
-        t = torch.arange(self.max_position_embeddings, device=TEST_DEVICE).type_as(self.inv_freq)
+        # TODO: This is a hack to ensure the rotary embeddings are long enough for the context length
+        # ANE tensors dimension size is limited to 16384    
+        t = torch.arange(max(config.context_length, config.state_length)*2, device=TEST_DEVICE).type_as(self.inv_freq)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         
         # Shape: [1, max_pos, head_dim] - consistent for both single token and batched
-        self.cos_cached = emb.cos().view(1, self.max_position_embeddings, self.dim)
-        self.sin_cached = emb.sin().view(1, self.max_position_embeddings, self.dim)
+        max_len = max(config.context_length, config.state_length)*2
+        self.cos_cached = emb.cos().view(1, max_len, self.dim)
+        self.sin_cached = emb.sin().view(1, max_len, self.dim)
         
         if ENABLE_DEBUG2:
             print(f"\n[TRACE] LlamaRotaryEmbedding initialized:")

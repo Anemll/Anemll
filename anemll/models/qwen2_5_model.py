@@ -154,9 +154,9 @@ class Qwen25RotaryEmbedding(nn.Module):
         )
 
         self.register_buffer("inv_freq", inv_freq)
-        # Use context length * 2 , context length should work but old code might exeed it
-        # Note, we create it for each layer, however COREML will de-duplicate identical weights
-        t = torch.arange(CONTEXT_LENGTH*2, device=TEST_DEVICE).type_as(self.inv_freq)        
+        # TODO: This is a hack to ensure the rotary embeddings are long enough for the context length
+        # ANE tensors dimension size is limited to 16384    
+        t = torch.arange(max(config.context_length, config.state_length)*2, device=TEST_DEVICE).type_as(self.inv_freq)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.cos_cached = emb.cos().unsqueeze(0)

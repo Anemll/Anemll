@@ -99,19 +99,46 @@ def get_kv_cache_idx(layer_idx, num_layers, num_groups=1):
 
 
 class QwenRMSNorm(nn.Module):
-    """RMSNorm used in Qwen models - Using true RMSNorm without mean subtraction."""
+    """ANE optimized RMSNorm implementation. We use layer_norm and avoid the mean subtraction.
+    This give us the best quality for Boolq and other benchmarks."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
+        self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Following ANEMLL requirements: always subtract mean first, then use F.layer_norm()
-        mean = hidden_states.mean(-1, keepdim=True)
-        hidden_states = hidden_states - mean
-        return F.layer_norm(hidden_states, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
+    
+    # ──────────────────────────────────────────────────────────────────────
+        # Compatibility path for PyTorch 1.x / 2.0–2.3                           .
+        # We build a tensor whose mean is *exactly* zero so that LayerNorm’s
+        # mean‑subtraction becomes a no‑op and we recover RMS statistics:
+        #
+        #     concat([x, ‑x])  →  μ = 0,
+        #                        σ² = ½(‖x‖²) = mean(x²)
+        # ──────────────────────────────────────────────────────────────────────
+        x = hidden_states
 
+        # ❶ Make the last‑dimension mean zero.
+        doubled = torch.cat([x, -x], dim=-1)
+
+        hidden_size =  hidden_states.shape[-1]
+        # ❷ Run the highly‑optimised LayerNorm kernel on the doubled tensor.
+        normed = F.layer_norm(
+            doubled,
+            normalized_shape=(2 * hidden_size,),
+            weight=None,          # no affine factors here
+            bias=None,
+            eps=float(self.variance_epsilon)
+        )
+
+        # ❸ Drop the mirror half → correct RMS‑normed activations.
+        normed = normed[..., : hidden_size]
+
+        # ❹ Apply the learnable gain (γ) and cast / move exactly once.
+        return (normed * self.weight
+                       .to(normed.dtype, copy=False)
+                       .to(normed.device, copy=False))
 
 class QwenHeadNorm(nn.Module):
     """Per-head RMSNorm for query and key projections - Using true RMSNorm without mean subtraction."""
@@ -147,7 +174,9 @@ class QwenRotaryEmbedding(nn.Module):
         )
 
         self.register_buffer("inv_freq", inv_freq)
-        t = torch.arange(config.max_position_embeddings, device=TEST_DEVICE).type_as(self.inv_freq)
+        # TODO: This is a hack to ensure the rotary embeddings are long enough for the context length
+        # ANE tensors dimension size is limited to 16384    
+        t = torch.arange(max(config.context_length, config.state_length)*2, device=TEST_DEVICE).type_as(self.inv_freq)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.cos_cached = emb.cos().unsqueeze(0)
