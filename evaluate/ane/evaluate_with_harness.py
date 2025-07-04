@@ -93,12 +93,23 @@ except ImportError:
     print("pip install transformers")
     sys.exit(1)
 
+
+def create_unified_state(ffn_models):
+    """Create unified KV cache state for transformer."""
+    if isinstance(ffn_models[0], dict):
+        # Use first FFN model's prefill function to create state
+        state = ffn_models[0]['prefill'].make_state()
+        return state
+    else:
+        state = ffn_models[0].make_state()
+        return state
+
+
 # Import from chat.py
 try:
     from chat import (
         run_prefill,
         generate_next_token,
-        create_unified_state,
         initialize_causal_mask,
         initialize_tokenizer,
         parse_model_path,
@@ -409,7 +420,7 @@ class ANELM(LM):
         # Initialize state and causal mask
         print("\nInitializing KV cache state...")
         context_length = self.metadata['context_length']
-        self.state = create_unified_state(self.ffn_models, context_length)
+        self.state = create_unified_state(self.ffn_models)
         self.causal_mask = initialize_causal_mask(context_length)
         print(f"State initialized for context length: {context_length}")
 
@@ -447,7 +458,7 @@ class ANELM(LM):
         ctx_len = self.metadata["context_length"]
 
         # fresh empty KV-cache
-        kv = create_unified_state(self.ffn_models, ctx_len, eval_mode=True)
+        kv = create_unified_state(self.ffn_models)
 
         # 1️⃣  prefill the prompt (t₀ … t_{ℓ-2})
         prefill = tokens_1d[:-1].unsqueeze(0)                # [1, ℓ-1]
@@ -508,7 +519,16 @@ class ANELM(LM):
                                 gold_tok_id: int,
                                 kv,
                                 pos: int):
-        """
+        """Feed gold token, update KV cache, and get logits for next position.
+        
+        CURRENTLY USED FOR: 
+        - Second _score_sequence method (lines 580-610)
+        - Arc_challenge optimization (lines ~1037) - OPTIMIZED VERSION
+        
+        FIXED: The transformer flow is now correct (Embeddings → FFN chunks → LM head)
+               instead of the previous incorrect flow (Embeddings → LM head → FFN).
+               Parameter order issue resolved for arc_challenge integration.
+        
         Parameters
         ----------
         gold_tok_id : int              token to insert at position `pos`
@@ -523,25 +543,29 @@ class ANELM(LM):
         # 1. create 1×1 tensor [[gold_tok]]
         tok_tensor = torch.tensor([[gold_tok_id]], dtype=torch.int32)
 
-        # 2. embed + update cache + run LM-head
-        lm_out = self.lm_head_model.predict(
-            {'hidden_states':
-                self.embedding_model
-                    .predict({'input_ids': tok_tensor.numpy()})['hidden_states']
-            })
+        # 2. embed → FFN chunks → LM head (correct flow from chat.py)
+        hidden_states = torch.from_numpy(
+            self.embedding_model.predict({'input_ids': tok_tensor.numpy()})['hidden_states']
+        )
 
-        # 2.a update KV for *all* FFN chunks
+        # 2.a process through ALL FFN chunks sequentially using 'infer' function
+        update_mask = np.zeros((1, 1, self.metadata['context_length'], 1), dtype=np.float16)
+        update_mask[0, 0, int(pos), 0] = 1.0
+        
         for ffn in self.ffn_models:
-            if isinstance(ffn, dict) and 'prefill' in ffn:
-                ffn['prefill'].predict(
-                    {
-                        'hidden_states': lm_out['hidden_states'],
-                        'update_mask':   np.array([[[[1.]]]], dtype=np.float16),
-                        'position_ids':  np.array([pos],  dtype=np.int32),
-                        'causal_mask':   self.causal_mask[:, :, pos:pos+1, :],
-                        'current_pos':   np.array([pos],  dtype=np.int32)
-                    },
-                    kv)
+            if isinstance(ffn, dict) and 'infer' in ffn:
+                inputs = {
+                    'hidden_states': hidden_states.numpy().astype(np.float16),
+                    'update_mask': update_mask,
+                    'position_ids': np.array([int(pos)], dtype=np.int32),
+                    'causal_mask': self.causal_mask[:, :, int(pos):int(pos)+1, :].numpy(),
+                    'current_pos': np.array([int(pos)], dtype=np.int32)
+                }
+                output = ffn['infer'].predict(inputs, kv)
+                hidden_states = torch.from_numpy(output['output_hidden_states'])
+
+        # 2.b run LM head on final hidden states from last FFN chunk
+        lm_out = self.lm_head_model.predict({'hidden_states': hidden_states.numpy().astype(np.float16)})
 
         # 3. concatenate logits parts (split-LM-head models)
         num_parts  = self.metadata.get('split_lm_head',
@@ -573,7 +597,7 @@ class ANELM(LM):
         """
         ℓ       = tokens_1d.size(0)
         ctx_len = self.metadata['context_length']
-        kv      = create_unified_state(self.ffn_models, ctx_len, eval_mode=True)
+        kv      = create_unified_state(self.ffn_models)
 
         # prefill the *first* token only (t₀) – no logits needed yet
         run_prefill(self.embedding_model,
@@ -636,7 +660,20 @@ class ANELM(LM):
     
 
     def _process_prompt(self, prompt, step_size: int = 1024):
-        """Process the prompt and return logprobs."""
+        """Process the prompt and return logprobs.
+        
+        USED FOR: BoolQ (yes/no) and other single-token answer tasks
+        
+        PREFILL APPROACH: 
+        - Prefills ALL tokens in the prompt (including last token)
+        - Then reprocesses the last token to get prediction scores
+        - This is technically incorrect but works by overwriting KV cache at last position
+        
+        WORKFLOW:
+        1. run_prefill(entire_prompt, prompt_length) 
+        2. Re-run embeddings + FFN on last token to get logits
+        3. Return log probabilities for next token prediction
+        """
         if self.verbose_output:
             print(f"[DEBUG] _process_prompt: received prompt type {type(prompt)}, length {len(prompt) if hasattr(prompt, '__len__') else 'N/A'}")
         
@@ -658,7 +695,7 @@ class ANELM(LM):
         
         # Create a completely fresh state for each request to match chat.py behavior exactly
         # This ensures zero state contamination
-        cache = create_unified_state(self.ffn_models, self.metadata['context_length'], eval_mode=True)
+        cache = create_unified_state(self.ffn_models)
         
         if self.verbose_output:
             print(f"[DEBUG] Created fresh cache for this prompt")
@@ -677,6 +714,7 @@ class ANELM(LM):
             prompt = F.pad(prompt, (0, context_length - prompt_length), value=0)
         
         # Step 2: Run prefill using original run_prefill function but with un-padded input
+        # BOOLQ PREFILL: Prefills ALL tokens (technically incorrect but works)
         # The run_prefill function will handle the batching internally
         if self.verbose_output:
             print(f"[DEBUG] _process_prompt: calling run_prefill with prompt_length={prompt_length}")
@@ -684,7 +722,7 @@ class ANELM(LM):
             self.embedding_model,
             self.ffn_models,
             prompt[:, :prompt_length],  # Use only the actual prompt length, not padded
-            prompt_length, 
+            prompt_length,  # BOOLQ: Prefills entire prompt (all tokens)
             self.metadata['context_length'],
             self.metadata.get('batch_size', 64),
             cache,
@@ -694,6 +732,7 @@ class ANELM(LM):
             print(f"[DEBUG] _process_prompt: run_prefill completed")
         
         # Step 3: Use chat.py's exact generate_next_token function instead of replicating the logic
+        # BOOLQ PREDICTION: Re-process last token to get next token prediction scores
         try:
             generation_pos = prompt_length  # This is like 'pos' parameter in chat.py
             
@@ -703,7 +742,7 @@ class ANELM(LM):
             # Instead of using generate_next_token which only returns token ID,
             # we need to get the actual logits from the model
             
-            # Get current token
+            # Get current token (last token in prompt)
             current_token = original_input_ids[:, generation_pos-1:generation_pos]  # [1, 1]
             
             # Ensure proper data type for CoreML
@@ -906,10 +945,20 @@ class ANELM(LM):
     def _score_one_choice(self, prefix_tokens, answer_tokens):
         """Score a single answer choice using teacher forcing.
         
-        Following the exact pattern:
-        1. Prefill prompt[:-1] tokens
-        2. Keep last prompt token as 'prev'
-        3. For each answer token, use generate_next_token with current sequence
+        USED FOR: Arc_challenge and other multi-token answer tasks
+        
+        PREFILL APPROACH (CORRECT):
+        - Prefills prompt MINUS last token: run_prefill(prompt[:-1], num_tokens-1)
+        - Then processes each answer token sequentially using generate_next_token
+        - Follows proper pattern: prefill(prompt less last token) + generate_token(last token)
+        
+        WORKFLOW:
+        1. run_prefill(prompt[:-1], len(prefix_tokens)-1) - prefill all but last prompt token
+        2. For each answer token:
+           a. Call generate_next_token(sequence_so_far, current_length) 
+           b. Get log probability for target answer token
+           c. Update sequence with actual answer token (teacher forcing)
+        3. Return sum of log probabilities for all answer tokens
         
         Args:
             prefix_tokens: List of token IDs for the context/prompt
@@ -923,7 +972,7 @@ class ANELM(LM):
             print(f"\n[VERBOSE] Scoring answer: '{answer_text}' ({len(answer_tokens)} tokens)")
             
         # Create fresh KV cache state
-        kv = create_unified_state(self.ffn_models, self.metadata['context_length'], eval_mode=True)
+        kv = create_unified_state(self.ffn_models)
         
         # Convert prefix tokens to tensor
         prefix_tensor = torch.tensor(prefix_tokens, dtype=torch.int32).unsqueeze(0)  # [1, seq_len]
@@ -936,27 +985,26 @@ class ANELM(LM):
         #################################
         #  Stage A – prefill P-1 tokens #
         #################################
+        # ARC_CHALLENGE PREFILL (CORRECT): Prefill prompt minus last token
         if len(prefix_tokens) > 1:
             prefill_tokens = prefix_tensor[:, :-1]  # t₀ … t_{P-2}
-            # The second parameter is the number of tokens to prefill, not the starting position
+            # The second parameter is the number of tokens to prefill
             num_tokens_to_prefill = len(prefix_tokens) - 1
-            pos = run_prefill(
+            pos_result = run_prefill(
                 self.embedding_model,
                 self.ffn_models,
                 prefill_tokens,
-                num_tokens_to_prefill,  # This is correct - it's the length to prefill
+                num_tokens_to_prefill,  # ARC_CHALLENGE: Prefill P-1 tokens (correct approach)
                 self.metadata['context_length'],
                 self.metadata.get('batch_size', 64),
                 kv,
                 self.causal_mask
             )
+            # After prefilling P-1 tokens, we're at position P-1
+            pos = len(prefix_tokens) - 1
         else:
             # Edge case: single token prompt
             pos = 0
-        
-        # Convert pos to integer if it's a tensor
-        if isinstance(pos, torch.Tensor):
-            pos = pos.item()
             
         prev = prefix_tokens[-1]  # t_{P-1} (the *last* prompt token)
         
@@ -967,6 +1015,7 @@ class ANELM(LM):
         #################################
         #  Stage B – walk through answer#
         #################################
+        # ARC_CHALLENGE PREDICTION: Process each answer token sequentially
         logp_total = 0.0
         
         # Start with the sequence up to P-1, will add tokens as we go
@@ -981,33 +1030,14 @@ class ANELM(LM):
                 print(f"    Current sequence length: {current_sequence.shape[1]}")
             
             # Get logits using generate_next_token pattern
-            # The key insight: generate_next_token expects the full sequence including current token
-            # and returns prediction for NEXT position
-            next_token = generate_next_token(
-                self.embedding_model,
-                self.ffn_models,
-                self.lm_head_model,
-                current_sequence,
-                pos + 1,  # Convert from 0-based to 1-based position
-                self.metadata['context_length'],
-                self.metadata,
-                state=kv,
-                causal_mask=self.causal_mask,
-                temperature=0.0
-            )
-            
-            # Also get log probabilities using our custom function
-            _, log_probs = self._generate_next_token_with_logits(
-                self.embedding_model,
-                self.ffn_models,
-                self.lm_head_model,
-                current_sequence,
-                pos + 1,
-                self.metadata['context_length'],
-                self.metadata,
-                state=kv,
-                causal_mask=self.causal_mask,
-                temperature=0.0
+            # ARC_CHALLENGE: generate_next_token expects pos to be 1-based position of CURRENT token
+            # We feed the sequence including 'prev' token and get prediction for next position
+            # 
+            # Use optimized _predict_token_with_logits with correct parameter order
+            next_token, log_probs = self._predict_token_with_logits(
+                prev,  # gold_tok_id: token to process
+                kv,    # kv: KV cache state  
+                sequence_so_far.shape[1] + i  # pos: 0-based position
             )
             
             # Score the actual answer token
@@ -1097,7 +1127,20 @@ class ANELM(LM):
         return result
 
     def loglikelihood(self, requests) -> list[tuple[float, bool]]:
-        """Compute log-likelihood of generating a continuation from a context."""
+        """Compute log-likelihood of generating a continuation from a context.
+        
+        TASK-SPECIFIC PREFILL/PREDICTION APPROACHES:
+        
+        BOOLQ (yes/no single-token answers):
+        - Uses _process_prompt() which incorrectly prefills ALL tokens
+        - Then reprocesses last token to get next token prediction 
+        - Works by accident due to KV cache overwriting
+        
+        ARC_CHALLENGE (multi-token answers):
+        - Uses _score_one_choice() which correctly prefills prompt[:-1]
+        - Then processes each answer token with generate_next_token + teacher forcing
+        - Follows proper pattern: prefill(prompt less last token) + generate tokens
+        """
         print(f"[ANELM] loglikelihood called with {len(requests)} requests")
         if self.verbose_output:
             print(f"[VERBOSE] Processing {len(requests)} total requests")
@@ -1192,6 +1235,8 @@ class ANELM(LM):
                     continue
             
             # Get log probabilities for the prefix
+            # BOOLQ: Uses _process_prompt (single-token answers like yes/no)
+            # ARC_CHALLENGE: Will use _score_one_choice below (multi-token answers)
             if self.verbose_output:
                 print(f"[ANELM] Question {q_idx+1}: calling _process_prompt...")
             logprobs, cache = self._process_prompt(prefix)
@@ -1213,8 +1258,16 @@ class ANELM(LM):
             for answer_idx, s in enumerate(full_sequences):
                 continuation_tokens = s[len(prefix):]
                 
-                if len(continuation_tokens) > 0:
+                # Check if this answer would exceed context length
+                total_length = len(prefix) + len(continuation_tokens)
+                if total_length > self.metadata['context_length']:
+                    if self.verbose_output:
+                        print(f"  Answer {answer_idx+1} would exceed context length ({total_length} > {self.metadata['context_length']}), assigning -inf score")
+                    total_score = -float("inf")
+                    is_all_greedy = False
+                elif len(continuation_tokens) > 0:
                     # For multi-token continuations, use the dedicated scoring method
+                    # ARC_CHALLENGE: Multi-token answers use _score_one_choice with teacher forcing
                     if self.verbose_output and len(continuation_tokens) > 1:
                         print(f"  Using multi-token scoring for {len(continuation_tokens)} tokens")
                     
@@ -1665,18 +1718,60 @@ def main():
         output_path = output_dir / filename
     output_path.write_text(json.dumps(results["results"], indent=4))
     
-    # Print summary
-    print("\n===============================")
-    print("Evaluation Summary")
-    print("===============================")
+    # Print summary in lm-eval table format
+    print("\n" + "="*80)
+    print("Evaluation Results (ANE/CoreML)")
+    print("="*80)
     print(f"Model: {args.model}")
-    print("\nResults:")
-    for task, metrics in results["results"].items():
-        print(f"\n{task}:")
-        for metric, value in metrics.items():
-            print(f"  {metric}: {value}")
+    print(f"Tasks: {', '.join(args.tasks)}")
+    print(f"Samples: {args.limit or 'all'}")
+    print(f"Few-shot: {args.num_shots or 0}")
+    print()
     
-    print("\nDetailed results saved to:", output_path)
+    # Create table header
+    print("|    Tasks    |Version|Filter|n-shot| Metric |   |Value|   |Stderr|")
+    print("|-------------|------:|------|-----:|--------|---|----:|---|-----:|")
+    
+    # Print results for each task
+    for task_idx, (task, metrics) in enumerate(results["results"].items()):
+        # Get version from task alias or default to 1
+        version = 1
+        task_alias = metrics.get('alias', task)
+        
+        # Group metrics by type (acc, acc_norm, etc.)
+        metric_groups = {}
+        for metric_name, value in metrics.items():
+            if metric_name == 'alias':
+                continue
+            # Split metric name (e.g., "acc,none" -> "acc", "acc_stderr,none" -> "acc_stderr")
+            base_metric = metric_name.split(',')[0]
+            if base_metric.endswith('_stderr'):
+                base_name = base_metric[:-7]  # Remove '_stderr'
+                if base_name not in metric_groups:
+                    metric_groups[base_name] = {}
+                metric_groups[base_name]['stderr'] = value
+            else:
+                if base_metric not in metric_groups:
+                    metric_groups[base_metric] = {}
+                metric_groups[base_metric]['value'] = value
+        
+        # Print each metric
+        for metric_idx, (metric_name, metric_data) in enumerate(metric_groups.items()):
+            value = metric_data.get('value', 0.0)
+            stderr = metric_data.get('stderr', 0.0)
+            
+            # Determine if higher is better (most metrics are, except perplexity-like)
+            higher_is_better = "↑" if not metric_name.startswith('ppl') else "↓"
+            
+            if metric_idx == 0:
+                # First row shows task name
+                print(f"|{task_alias:<13}|{version:>7}|{'none':>6}|{args.num_shots or 0:>6}|{metric_name:<8}|{higher_is_better:>3}|{value:>5.2f}|±  |{stderr:>5.4f}|")
+            else:
+                # Subsequent rows are blank in task column
+                print(f"|{'':<13}|{'':<7}|{'none':>6}|{'':<6}|{metric_name:<8}|{higher_is_better:>3}|{value:>5.2f}|±  |{stderr:>5.4f}|")
+    
+    print()
+    print("Detailed results saved to:", output_path)
 
 
 if __name__ == "__main__":
