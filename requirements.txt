@@ -3,6 +3,7 @@ coremltools>=8.2    # Required for Apple Neural Engine support
 torch==2.5.0        # Deep learning framework
 transformers>=4.39.0  # Hugging Face Transformers library
 scikit-learn<=1.5.1  # Required for LUT quantization in CoreML (max version 1.5.1)
+lm-evaluation-harness>=0.4.9  # Required for model evaluation with standard benchmarks
 
 # ⚠️ Development Dependencies (optional for users, required for developers)
 black>=23.12.0      # Code formatting
