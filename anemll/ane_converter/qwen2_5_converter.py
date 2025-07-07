@@ -1,7 +1,7 @@
-"""Converter for Qwen 3 models.
+"""Converter for Qwen 2.5 models.
 
 This module provides a lightweight converter that mirrors the
-:class:`LlamaConverter` behaviour for Qwen models without inheriting from
+:class:`QwenConverter` behaviour for Qwen 2.5 models without inheriting from
 it. Only the pieces required for the unit tests are implemented."""
 
 from __future__ import annotations
@@ -19,23 +19,23 @@ from .environment import require_coreml
 
 from .base_converter import BaseConverter
 from .metadata import AddMetadata, ModelPart
-from ..models.qwen_model import (
-    QwenForCausalLM,
-    QwenConfig,
+from ..models.qwen2_5_model import (
+    Qwen25ForCausalLM,
+    Qwen25Config,
     MODEL_DTYPE,
     TEST_DEVICE,
     CONTEXT_LENGTH,
 )
 
 
-class QwenConverter(BaseConverter):
-    """Handle conversion of Qwen 3 models to Core ML."""
+class Qwen25Converter(BaseConverter):
+    """Handle conversion of Qwen 2.5 models to Core ML."""
 
-    model_cls = QwenForCausalLM
+    model_cls = Qwen25ForCausalLM
 
     def __init__(
         self,
-        model: QwenForCausalLM,
+        model: Qwen25ForCausalLM,
         context_length: int = CONTEXT_LENGTH,
         batch_size: int = 64,
         lut_bits: int | None = 4,
@@ -140,7 +140,7 @@ class QwenConverter(BaseConverter):
         Returns:
             ct.models.MLModel: Converted model
         """
-        print(f"QwenConverter.convert() called with part={part}")
+        print(f"Qwen25Converter.convert() called with part={part}")
         require_coreml()
         print("Calling preprocess()...")
         self.preprocess()
@@ -177,16 +177,16 @@ class QwenConverter(BaseConverter):
 
         print("Calling postprocess()...")
         self.postprocess()
-        print("QwenConverter.convert() completed")
+        print("Qwen25Converter.convert() completed")
         return mlmodel
 
-    def convert_to_coreml(self, model: QwenForCausalLM) -> ct.models.MLModel:
+    def convert_to_coreml(self, model: Qwen25ForCausalLM) -> ct.models.MLModel:
         """Convert the entire model to CoreML."""
         require_coreml()
         print("Creating wrapper model...")
 
         class Wrapper(torch.nn.Module):
-            def __init__(self, model: QwenForCausalLM, context_length: int) -> None:
+            def __init__(self, model: Qwen25ForCausalLM, context_length: int) -> None:
                 super().__init__()
                 self.model = model
                 self.context_length = context_length
@@ -307,17 +307,17 @@ class QwenConverter(BaseConverter):
     # --------------------------------------------------------------
     # Part-based conversion helpers
     # --------------------------------------------------------------
-    def convert_part_1(self, model: QwenForCausalLM) -> ct.models.MLModel:
+    def convert_part_1(self, model: Qwen25ForCausalLM) -> ct.models.MLModel:
         """Convert embeddings layer only."""
         require_coreml()
         return self.convert_embeddings(model)
 
-    def convert_part_3(self, model: QwenForCausalLM) -> ct.models.MLModel:
+    def convert_part_3(self, model: Qwen25ForCausalLM) -> ct.models.MLModel:
         """Convert LM head only."""
         require_coreml()
 
         class LMHeadWrapper(torch.nn.Module):
-            def __init__(self, model: QwenForCausalLM) -> None:
+            def __init__(self, model: Qwen25ForCausalLM) -> None:
                 super().__init__()
                 if hasattr(model, "lm_head16_1"):
                     self.heads = [
@@ -410,7 +410,7 @@ class QwenConverter(BaseConverter):
         return mlmodel
 
     def convert_part_2(
-        self, model: QwenForCausalLM, chunk_idx: int = 0, total_chunks: int = 1
+        self, model: Qwen25ForCausalLM, chunk_idx: int = 0, total_chunks: int = 1
     ) -> ct.models.MLModel:
         """Convert transformer layers for generation (FFN)."""
         require_coreml()
@@ -424,10 +424,10 @@ class QwenConverter(BaseConverter):
             end_layer = None
 
         class FFNWrapper(torch.nn.Module):
-            def __init__(self, model: QwenForCausalLM) -> None:
+            def __init__(self, model: Qwen25ForCausalLM) -> None:
                 super().__init__()
-                self.model = model  # Use QwenForCausalLM as root
-                self.states = QwenConverter.GetTransformerStates(
+                self.model = model  # Use Qwen25ForCausalLM as root
+                self.states = Qwen25Converter.GetTransformerStates(
                     model, part="2", prefix="model.model."
                 )
 
@@ -499,7 +499,7 @@ class QwenConverter(BaseConverter):
         return mlmodel
 
     def convert_part_2_prefill(
-        self, model: QwenForCausalLM, chunk_idx: int = 0, total_chunks: int = 1
+        self, model: Qwen25ForCausalLM, chunk_idx: int = 0, total_chunks: int = 1
     ) -> ct.models.MLModel:
         """Convert transformer layers for prefill mode."""
         require_coreml()
@@ -513,12 +513,12 @@ class QwenConverter(BaseConverter):
             end_layer = None
 
         class PrefillWrapper(torch.nn.Module):
-            def __init__(self, model: QwenForCausalLM, start_layer=0, end_layer=None):
+            def __init__(self, model: Qwen25ForCausalLM, start_layer=0, end_layer=None):
                 super().__init__()
-                self.model = model  # Use QwenForCausalLM as root
+                self.model = model  # Use Qwen25ForCausalLM as root
                 self.start_layer = start_layer
                 self.end_layer = end_layer
-                self.states = QwenConverter.GetTransformerStates(
+                self.states = Qwen25Converter.GetTransformerStates(
                     model, part="2_prefill", prefix="model.model."
                 )
 
@@ -605,21 +605,21 @@ class QwenConverter(BaseConverter):
 
         return mlmodel
 
-    def convert_prefill(self, model: QwenForCausalLM) -> ct.models.MLModel:
-        """Convert Qwen model to CoreML format for prefill mode.
+    def convert_prefill(self, model: Qwen25ForCausalLM) -> ct.models.MLModel:
+        """Convert Qwen 2.5 model to CoreML format for prefill mode.
 
         Args:
-            model: The Qwen model to convert
+            model: The Qwen 2.5 model to convert
 
         Returns:
             ct.models.MLModel: Converted model for prefill processing
         """
         require_coreml()
-        print("Converting Qwen model for prefill mode...")
+        print("Converting Qwen 2.5 model for prefill mode...")
 
         class PrefillWrapper(torch.nn.Module):
             def __init__(
-                self, model: QwenForCausalLM, context_length: int, batch_size: int
+                self, model: Qwen25ForCausalLM, context_length: int, batch_size: int
             ) -> None:
                 super().__init__()
                 self.model = model
@@ -724,17 +724,17 @@ class QwenConverter(BaseConverter):
 
         return mlmodel
 
-    def convert_embeddings(self, model: QwenForCausalLM) -> ct.models.MLModel:
+    def convert_embeddings(self, model: Qwen25ForCausalLM) -> ct.models.MLModel:
         """Convert embeddings layer to CoreML format.
 
         Args:
-            model: The Qwen model containing embeddings
+            model: The Qwen 2.5 model containing embeddings
 
         Returns:
             ct.models.MLModel: Converted CoreML model for embeddings
         """
         require_coreml()
-        print("\nConverting Qwen embeddings layer...")
+        print("\nConverting Qwen 2.5 embeddings layer...")
 
         class EmbeddingsWrapper(torch.nn.Module):
             def __init__(self, model):
@@ -798,17 +798,17 @@ class QwenConverter(BaseConverter):
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments for the converter."""
 
-    parser = argparse.ArgumentParser(description="Convert Qwen model to CoreML format")
+    parser = argparse.ArgumentParser(description="Convert Qwen 2.5 model to CoreML format")
 
     parser.add_argument(
         "--model",
         type=str,
-        help="Path to model directory (default: Qwen/Qwen3-0.6B)",
+        help="Path to model directory (default: Qwen/Qwen2.5-0.5B-Instruct)",
     )
     parser.add_argument(
         "--prefix",
         type=str,
-        default="qwen",
+        default="qwen25",
         help="Prefix for output filenames",
     )
     parser.add_argument(
@@ -853,9 +853,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def test_conversion(
-    model: Optional[QwenForCausalLM] = None,
+    model: Optional[Qwen25ForCausalLM] = None,
     model_path: Optional[str] = None,
-    prefix: str = "qwen",
+    prefix: str = "qwen25",
     context_length: int = CONTEXT_LENGTH,
     lut_bits: Optional[int] = None,
     batch_size: int = 64,
@@ -863,10 +863,10 @@ def test_conversion(
     part: str = "full",
     num_chunks: int = 1,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
-    """Convert a Qwen model and save the result.
+    """Convert a Qwen 2.5 model and save the result.
 
     Args:
-        model: Pre-loaded Qwen model (optional)
+        model: Pre-loaded Qwen 2.5 model (optional)
         model_path: Path to model directory
         prefix: Model name prefix
         context_length: Context length for conversion
@@ -889,7 +889,7 @@ def test_conversion(
             raise ValueError(f"Config file not found at {config_path}")
 
         print("Loading config...")
-        config = QwenConfig.from_json(config_path)
+        config = Qwen25Config.from_json(config_path)
         print(
             f"Config loaded: hidden_size={config.hidden_size}, vocab_size={config.vocab_size}"
         )
@@ -904,7 +904,7 @@ def test_conversion(
         )
 
         print("Creating model...")
-        model = QwenForCausalLM(config, enable_coreml=True)
+        model = Qwen25ForCausalLM(config, enable_coreml=True)
         print("Loading pretrained weights...")
         model.load_pretrained_weights(model_path)
         print("Model loaded successfully!")
@@ -916,7 +916,7 @@ def test_conversion(
         print("Model set to eval mode and gradients disabled")
 
     print("Creating converter...")
-    converter = QwenConverter(
+    converter = Qwen25Converter(
         model=model,
         context_length=context_length,
         batch_size=batch_size,
@@ -977,11 +977,11 @@ def test_conversion(
 
 
 def main() -> None:
-    print("Starting qwen_converter main()...")
+    print("Starting qwen2_5_converter main()...")
     args = parse_args()
     print(f"Parsed args: {args}")
 
-    model_path = args.model if args.model else "Qwen/Qwen3-0.6B"
+    model_path = args.model if args.model else "Qwen/Qwen2.5-0.5B-Instruct"
 
     print(f"\nConverting model from: {model_path}")
     print(f"Output filename prefix: {args.prefix}")

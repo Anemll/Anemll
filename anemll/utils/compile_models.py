@@ -144,9 +144,16 @@ def main():
     
     # Construct input filename based on part and parameters
     if args.part == '1':
-        # Add LUT suffix for embeddings if specified
-        lut_suffix = f'_lut{args.lut}' if args.lut else ''
-        input_name = f'{args.prefix}_embeddings{lut_suffix}.mlpackage'
+        # Try both naming patterns for embeddings (with and without LUT suffix)
+        if args.lut:
+            input_name = f'{args.prefix}_embeddings_lut{args.lut}.mlpackage'
+            input_path = os.path.join(args.input, input_name)
+            if not os.path.exists(input_path):
+                # Fallback to old naming pattern (without LUT suffix)
+                input_name = f'{args.prefix}_embeddings.mlpackage'
+                print(f"Warning: {input_name} not found, trying fallback naming pattern")
+        else:
+            input_name = f'{args.prefix}_embeddings.mlpackage'
     elif args.part == '3':
         # Make LUT optional for part 3
         lut_suffix = f'_lut{args.lut}' if args.lut else ''
@@ -168,6 +175,9 @@ def main():
         return 1
     
     input_path = os.path.join(args.input, input_name)
+    if not os.path.exists(input_path):
+        print(f"Error: Model file not found: {input_path}")
+        return 1
     compile_model(input_path, output_dir)
     return 0
 

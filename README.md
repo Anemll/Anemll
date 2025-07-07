@@ -2,13 +2,28 @@
 
 ANEMLL (pronounced like "animal") is an open-source project focused on accelerating the porting of Large Language Models (LLMs) to tensor processors, starting with the Apple Neural Engine (ANE).
 
-## 🚀 Version 0.3.3 Alpha Release - Initial Support for QWEN 3 Architecture
+## 🚀 Version 0.3.4 Alpha Release - Enhanced Evaluation & Quality Improved Stability
 
-### 🆕 **New Features**
-- **QWEN 3 Architecture Support**: Added support for Qwen3-0.6B and Qwen3-4B models with custom converter optimizations
-- **Streamlined Installation**: One-command setup with automatic virtual environment detection
-- **Automated Testing Framework**: End-to-end validation scripts for conversion and inference workflows
-- **Enhanced Developer Experience**: Improved error handling, better feedback, and simplified testing
+### 🔄 **What's New in 0.3.4**
+- **📊 lm-evaluation-harness Support** - Model evaluation with standard benchmarks (BoolQ, ARC Challenge, etc.) - [Documentation](./evaluate/ane/README.md)
+- **🎯 New RMSN-orm Implementation** - Precise calculation with ANE hardware ops
+- **🐛 Fixed RoPE Tensor Size Bug** - Resolved random overflows (existing pre-0.3.4 models should be re-converted)
+
+####Example ANE vs HF on MPS backend 
+
+| Task        | HF-FP16 | ANEMLL-FP16 | DIFF % |
+|-------------|---------|--------------|--------|
+| arc_challenge | 31.66%  | 30.97%       | -0.69% |
+| arc_easy      | 60.65%  | 60.94%       | +0.29% |
+| boolq         | 63.91%  | 64.68%       | +0.77% |
+| piqa          | 66.81%  | 67.74%       | +0.93% |
+| winogrande    | 56.43%  | 56.67%       | +0.24% |
+| **Average**   | **55.89%** | **56.60%**     | **+0.71%** 
+
+✅ DIFF = ANEMLL-FP16 - HF-FP16, where positive values indicate ANEMLL outperforms HuggingFace on that metric.
+
+🆕 New 0.3.4.models with benchmarks are [here](https://huggingface.co/collections/anemll/anemll-034-686c21c2cb05c715eb3f6a26)
+
 
 ### 📦 **Quick Start (New Simplified Workflow)**
 ```bash
@@ -19,7 +34,8 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 ./install_dependencies.sh
 
 # 3. Test conversion pipeline
-python tests/test_qwen_model.py     # Test Qwen models
+python tests/test_qwen_model.py     # Test Qwen 3 models
+python tests/test_qwen2.5_model.py  # Test Qwen 2.5 models
 python tests/test_llama_model.py    # Test LLaMA models
 
 # 4. Convert your own models
@@ -35,9 +51,9 @@ python tests/test_llama_model.py    # Test LLaMA models
 > - Provide flexible and easy to use library/framework to port LLMs to ANE directly from Hugging Face models
 > - Provide on-device examples for iOS and macOS swift or C/C++ Applications
 
-See update [Roadmap.md](./docs/Roadmap.md) for more details
+See update [Roadmap.md](./Roadmap.MD) for more details
 
-## Main Components in 0.3.3 Alpha Release
+## Main Components in 0.3.4 Alpha Release
 
 ANEMLL provides five main components for Apple Neural Engine inference development:
 
@@ -68,6 +84,7 @@ ANEMLL provides five main components for Apple Neural Engine inference developme
 We provide sample converted models ready for use:
 - **LLAMA 3.1/3.2** (1B and B variants) including iOS "friendly builds"
 - **🆕 Qwen 3** (0.6B and 4B) - **New in 0.3.3!** Initial support with custom converter
+- **🆕 Qwen 2.5** (0.5B-Instruct) - **New in 0.3.3!** Initial support with custom converter
 - **DeepSeek** distilled models
 - **DeepHermes** distilled models
 
@@ -79,7 +96,8 @@ We provide sample converted models ready for use:
 #### Quick Model Testing
 - **Generic HF Model Testing**: `./tests/conv/test_hf_model.sh [model_name] [output_dir] [chunks]`
 - **LLaMA Testing**: `python tests/test_llama_model.py`
-- **Qwen Testing**: `python tests/test_qwen_model.py`
+- **Qwen 3 Testing**: `python tests/test_qwen_model.py`
+- **Qwen 2.5 Testing**: `python tests/test_qwen2.5_model.py`
 
 #### Test Any HuggingFace Model
 ```bash
@@ -105,22 +123,17 @@ We provide sample converted models ready for use:
 Visit our [Hugging Face repository](https://huggingface.co/anemll) for the latest converted models.
 
 ### ⚠️ **Important Alpha Release Notes**
-> This is **Alpha Release 0.3.3** - **QWEN 3 support is experimental**
+> This is **Alpha Release 0.3.3** - **QWEN 3 & QWEN 2.5 support is experimental**
 > - **Breaking Change**: `install_dependencies.sh` moved to project root
 > - **Enhanced Python Support**: Now supports Python 3.9-3.13 (recommended: 3.9-3.11)
-> - **New Architecture**: Initial Qwen 3 support with custom converter optimizations
+> - **New Architecture**: Initial Qwen 3 and Qwen 2.5 support with custom converter optimizations
 > - **Improved Testing**: Automated validation scripts for conversion workflows
 > 
 > Please visit https://huggingface.co/anemll for pre-converted models and follow [@anemll](https://x.com/anemll) for updates
 > 
 > ⭐ **Please star this repo to support the project!**
 
-### 🔄 **What's New in 0.3.3**
-- **🆕 Qwen 3 Architecture Support** - Initial implementation with custom converter
-- **📦 Streamlined Installation** - Auto-detecting virtual environment setup
-- **🧪 Automated Testing** - End-to-end validation scripts
-- **🛠 Enhanced Developer Experience** - Better error handling and feedback
-- **🔧 Bug Fixes** - Resolved Swift CLI tensor shape mismatches
+
 
 
 ### Sample iOS/macOS Applications
@@ -277,6 +290,7 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 
 **🆕 Qwen Family (Alpha - New in 0.3.3!)**
 - **Qwen 3** (0.6B, 1.7B, 4B) - Initial support with custom converter
+- **Qwen 2.5** (0.5B-Instruct, 1.5B, 3B, 7B) - Initial support with custom converter
 - **Architecture**: Transformer with RMSNorm, SwiGLU, and RoPE
 - **Context lengths**: Up to 32K (512-2048 recommended for ANE, 4K verified)
 - **Status**: Experimental - please report issues, needs TopK and Temperature support
@@ -289,6 +303,7 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 | DeepSeek R1 | 8B | 512-1024 | ✅ Yes | 🟢 Stable |
 | DeepHermes | 3B, 8B | 512-1024 | ✅ Yes | 🟢 Stable |
 | Qwen 3 | 0.6B, 4B | 512-2048 | ⚠️ Experimental | 🟡 Alpha |
+| Qwen 2.5 | 0.5B, 1.5B, 3B, 7B | 512-2048 | ⚠️ Experimental | 🟡 Alpha |
 
 ### 🎯 **ANE Performance Notes**
 - **Recommended context**: 512-1024 tokens for best performance
@@ -297,7 +312,7 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 - **Chunking**: Automatic chunking for large models to fit ANE constraints
 
 ### 🚀 **Coming Soon**
-- **Additional Qwen variants** (1.5B, 3B)
+- **Additional Qwen 2.5 variants** (14B, 32B)
 - **Mistral family** support
 - **Gemma models**
 - **Enhanced quantization** (GPTQ, SpinQuant integration)

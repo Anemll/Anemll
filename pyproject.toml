@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "anemll"
-version = "0.3.3"
+version = "0.3.4"
 description = "Open-source pipeline for accelerating LLMs on Apple Neural Engine (ANE)"
 readme = "README.md"
 authors = [{name = "ANEMLL Team", email = "realanemll@gmail.com"}]

@@ -1,6 +1,6 @@
-"""Qwen 3 model implementation for ANEMLL.
+"""Qwen 2.5 model implementation for ANEMLL.
 
-This module provides a lightweight implementation of the Qwen 3 architecture
+This module provides a lightweight implementation of the Qwen 2.5 architecture
 adapted to the Apple Neural Engine restrictions.  All dense layers are expressed
 as ``nn.Conv2d`` with ``kernel_size=1`` and weights are loaded from Hugging Face
 checkpoints with the correct reshaping.  Only the pieces required for the unit
@@ -20,20 +20,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
-# Qwen 3 model implementation adapted from llama_model.py
+# Qwen 2.5 model implementation adapted from qwen_model.py
 # ---------------------------------------------------------------------------
 
 MODEL_DTYPE = torch.float16
 TEST_DEVICE = "cpu"
 CONTEXT_LENGTH = 256
 
-# Cache configuration constants (following llama_model.py pattern)
+# Cache configuration constants (following qwen_model.py pattern)
 FORCE_UNIFIED_CACHE = True  # Force using a single unified KV cache
 ENABLE_UNIFIED_CACHE = True  # Enable unified KV cache by default
 STATE_LENGTH = 256   # KV cache state length
 DISABLE_KV_CACHE = False  # Disable KV cache for simple testing
 
-# LM head configuration constants (following llama_model.py pattern)
+# LM head configuration constants (following qwen_model.py pattern)
 ENABLE_CONV2D = bool(1)      # Use Conv2d for LM head
 ENABLE_VACAB_SPLIT = bool(1)  # Split vocab into 2 parts
 ENABLE_VACAB_SPLIT8 = bool(0)  # Split vocab into 8 parts
@@ -42,41 +42,43 @@ ENABLE_LOGITS2 = bool(1)    # Return separate logits arrays for CoreML
 ENABLE_COREML = bool(0)     # CoreML-specific returns
 
 
-class QwenConfig:
+class Qwen25Config:
     def __init__(self, **kwargs):
-        self.architectures = kwargs.get("architectures", ["QwenForCausalLM"])
-        self.attention_bias = kwargs.get("attention_bias", False)
+        self.architectures = kwargs.get("architectures", ["Qwen2ForCausalLM"])
+        self.attention_bias = kwargs.get("attention_bias", True)  # Qwen 2.5 uses attention bias
         self.attention_dropout = kwargs.get("attention_dropout", 0.0)
-        self.bos_token_id = kwargs.get("bos_token_id", 128000)
-        self.eos_token_id = kwargs.get("eos_token_id", 128001)
+        self.bos_token_id = kwargs.get("bos_token_id", 151643)
+        self.eos_token_id = kwargs.get("eos_token_id", 151645)
         self.hidden_act = kwargs.get("hidden_act", "silu")
-        self.hidden_size = kwargs.get("hidden_size", 4096)
+        self.hidden_size = kwargs.get("hidden_size", 896)
         self.initializer_range = kwargs.get("initializer_range", 0.02)
-        self.intermediate_size = kwargs.get("intermediate_size", 14336)
-        self.max_position_embeddings = kwargs.get("max_position_embeddings", 8192)
-        self.model_type = kwargs.get("model_type", "qwen3")
-        self.num_attention_heads = kwargs.get("num_attention_heads", 32)
-        self.num_hidden_layers = kwargs.get("num_hidden_layers", 32)
-        self.num_key_value_heads = kwargs.get("num_key_value_heads", 8)
+        self.intermediate_size = kwargs.get("intermediate_size", 4864)
+        self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
+        self.model_type = kwargs.get("model_type", "qwen2")
+        self.num_attention_heads = kwargs.get("num_attention_heads", 14)
+        self.num_hidden_layers = kwargs.get("num_hidden_layers", 24)
+        self.num_key_value_heads = kwargs.get("num_key_value_heads", 2)
         self.head_dim = kwargs.get(
             "head_dim",
             self.hidden_size // max(1, self.num_attention_heads),
         )
-        # Note: For Qwen, head_dim may not equal hidden_size // num_attention_heads
-        # The model architecture uses a different relationship
+        # Note: For Qwen 2.5, head_dim equals hidden_size // num_attention_heads (896 // 14 = 64)
         self.pretraining_tp = kwargs.get("pretraining_tp", 1)
-        self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-05)
+        self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-06)
         self.rope_scaling = kwargs.get("rope_scaling", None)
         if self.rope_scaling:
-            self.rope_scaling["rope_type"] = self.rope_scaling.get("rope_type", "qwen3")
-        self.rope_theta = kwargs.get("rope_theta", 500000.0)
-        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", False)
+            self.rope_scaling["rope_type"] = self.rope_scaling.get("rope_type", "default")
+        self.rope_theta = kwargs.get("rope_theta", 1000000.0)
+        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", True)
         self.torch_required = kwargs.get("torch_dtype", "bfloat16")
-        self.transformers_version = kwargs.get("transformers_version", "4.40.0.dev0")
+        self.transformers_version = kwargs.get("transformers_version", "4.37.0")
         self.use_cache = kwargs.get("use_cache", True)
-        self.vocab_size = kwargs.get("vocab_size", 128257)
+        self.vocab_size = kwargs.get("vocab_size", 151936)
         self.context_length = kwargs.get("context_length", CONTEXT_LENGTH)
         self.state_length = kwargs.get("state_length", STATE_LENGTH)
+        self.use_sliding_window = kwargs.get("use_sliding_window", False)
+        self.sliding_window = kwargs.get("sliding_window", 32768)
+        self.max_window_layers = kwargs.get("max_window_layers", 28)
 
     @classmethod
     def from_json(cls, json_file):
@@ -94,111 +96,67 @@ def get_kv_cache_idx(layer_idx, num_layers, num_groups=1):
 
 
 # -----------------------------------------------------------------------------
-# Qwen building blocks
+# Qwen 2.5 building blocks
 # -----------------------------------------------------------------------------
 
 
-class QwenRMSNorm(nn.Module):
-    """ANE optimized RMSNorm implementation. We use layer_norm and avoid the mean subtraction.
-    This give us the best quality for Boolq and other benchmarks."""
+class Qwen25RMSNorm(nn.Module):
+    """RMSNorm used in Qwen 2.5 models - ANE-aware implementation with mean subtraction."""
 
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    
-        # ──────────────────────────────────────────────────────────────────────
-        # Compatibility path for PyTorch 1.x / 2.0–2.3                           .
-        # We build a tensor whose mean is *exactly* zero so that LayerNorm's
-        # mean‑subtraction becomes a no‑op and we recover RMS statistics:
-        #
-        #     concat([x, ‑x])  →  μ = 0,
-        #                        σ² = ½(‖x‖²) = mean(x²)
-        # ──────────────────────────────────────────────────────────────────────
+
         x = hidden_states
 
-        # ❶ Make the last‑dimension mean zero.
+        # ❶ Make the last‑dimension mean zero.
         doubled = torch.cat([x, -x], dim=-1)
 
-        hidden_size = hidden_states.shape[-1]
-        # ❷ Run the highly‑optimised LayerNorm kernel on the doubled tensor.
+        hidden_size =  hidden_states.shape[-1]
+        # ❷ Run the highly‑optimised LayerNorm kernel on the doubled tensor.
         normed = F.layer_norm(
             doubled,
             normalized_shape=(2 * hidden_size,),
             weight=None,          # no affine factors here
             bias=None,
-            eps=float(self.variance_epsilon)
+            eps=float(self.eps)
         )
 
-        # ❸ Drop the mirror half → correct RMS‑normed activations.
+        # ❸ Drop the mirror half → correct RMS‑normed activations.
         normed = normed[..., : hidden_size]
 
-        # ❹ Apply the learnable gain (γ) and cast / move exactly once.
+        # ❹ Apply the learnable gain (γ) and cast / move exactly once.
         return (normed * self.weight
                        .to(normed.dtype, copy=False)
                        .to(normed.device, copy=False))
-
-class QwenHeadNorm(nn.Module):
-
-    """ANE optimized RMSNorm implementation. We use layer_norm and avoid the mean subtraction.
-    This give us the best quality for Boolq and other benchmarks."""
-
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     
-        # ──────────────────────────────────────────────────────────────────────
-        # Compatibility path for PyTorch 1.x / 2.0–2.3                           .
-        # We build a tensor whose mean is *exactly* zero so that LayerNorm's
-        # mean‑subtraction becomes a no‑op and we recover RMS statistics:
-        #
-        #     concat([x, ‑x])  →  μ = 0,
-        #                        σ² = ½(‖x‖²) = mean(x²)
-        # ──────────────────────────────────────────────────────────────────────
-        x = hidden_states
 
-        # ❶ Make the last‑dimension mean zero.
-        doubled = torch.cat([x, -x], dim=-1)
 
-        hidden_size = hidden_states.shape[-1]
-        # ❷ Run the highly‑optimised LayerNorm kernel on the doubled tensor.
-        normed = F.layer_norm(
-            doubled,
-            normalized_shape=(2 * hidden_size,),
-            weight=None,          # no affine factors here
-            bias=None,
-            eps=float(self.variance_epsilon)
-        )
+class Qwen25RotaryEmbedding(nn.Module):
+    """Simple rotary positional embedding for Qwen 2.5."""
 
-        # ❸ Drop the mirror half → correct RMS‑normed activations.
-        normed = normed[..., : hidden_size]
-
-        # ❹ Apply the learnable gain (γ) and cast / move exactly once.
-        return (normed * self.weight
-                       .to(normed.dtype, copy=False)
-                       .to(normed.device, copy=False))
-
-class QwenRotaryEmbedding(nn.Module):
-    """Simple rotary positional embedding."""
-
-    def __init__(self, config: QwenConfig) -> None:
+    def __init__(self, config: Qwen25Config) -> None:
         super().__init__()
         self.dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
+        
+        # Apply rope_scaling factor if present
+        self.base = config.rope_theta
+        if hasattr(config, 'rope_scaling') and config.rope_scaling and 'factor' in config.rope_scaling:
+            self.base = config.rope_theta * config.rope_scaling['factor']
+        
         inv_freq = 1.0 / (
-            config.rope_theta ** (torch.arange(0, self.dim, 2).float().to(TEST_DEVICE) / self.dim)
+            self.base ** (torch.arange(0, self.dim, 2).float().to(TEST_DEVICE) / self.dim)
         )
-        #inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(TEST_DEVICE) / self.dim))
 
         self.register_buffer("inv_freq", inv_freq)
+        # TODO: This is a hack to ensure the rotary embeddings are long enough for the context length
+        # ANE tensors dimension size is limited to 16384    
         t = torch.arange(max(config.context_length, config.state_length)*2, device=TEST_DEVICE).type_as(self.inv_freq)
-      
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.cos_cached = emb.cos().unsqueeze(0)
@@ -269,14 +227,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.view(bsz, n_kv * n_rep, seq_len, head_dim)
 
 
-class QwenMLP(nn.Module):
-    def __init__(self, config: QwenConfig) -> None:
+class Qwen25MLP(nn.Module):
+    def __init__(self, config: Qwen25Config) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
 
-        # Use single Conv2d layers (no splitting for Qwen for now)
+        # Use single Conv2d layers (no splitting for Qwen 2.5 for now)
         self.gate_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
         self.up_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
         self.down_proj = nn.Conv2d(self.intermediate_size, self.hidden_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
@@ -284,10 +242,10 @@ class QwenMLP(nn.Module):
         self.act_fn = F.silu
 
     def forward(self, x):
-        # Use identical step-by-step computation to LlamaMLP to prevent numerical explosion
+        # Use identical step-by-step computation to QwenMLP to prevent numerical explosion
         x = x.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)  # Ensure proper dtype and shape
         
-        # Step-by-step computation for numerical stability (like LlamaMLP)
+        # Step-by-step computation for numerical stability (like QwenMLP)
         a = self.gate_proj(x)      # gate projection
         b = self.up_proj(x)        # up projection
         c = self.act_fn(a)         # activation on gate
@@ -297,44 +255,44 @@ class QwenMLP(nn.Module):
         return e.squeeze(2).permute(0, 2, 1)  # Final output shape: [bsz, seq_len, hidden_size]
 
 
-class QwenAttention(nn.Module):
-    def __init__(self, config: QwenConfig) -> None:
+class Qwen25Attention(nn.Module):
+    def __init__(self, config: Qwen25Config) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
-        if not hasattr(QwenAttention, '_config_printed'):
-            print(f"QwenAttention using head_dim={self.head_dim} (from config: {getattr(config, 'head_dim', 'not set')})")
-            print(f"QwenAttention projection dims: Q={self.num_heads * self.head_dim}, K/V={self.num_kv_heads * self.head_dim}")
-            QwenAttention._config_printed = True
+        if not hasattr(Qwen25Attention, '_config_printed'):
+            print(f"Qwen25Attention using head_dim={self.head_dim} (from config: {getattr(config, 'head_dim', 'not set')})")
+            print(f"Qwen25Attention projection dims: Q={self.num_heads * self.head_dim}, K/V={self.num_kv_heads * self.head_dim}")
+            Qwen25Attention._config_printed = True
             
-        self.rotary_emb = QwenRotaryEmbedding(config)
+        self.rotary_emb = Qwen25RotaryEmbedding(config)
 
         # Calculate correct projection dimensions
-        q_proj_dim = self.num_heads * self.head_dim  # 16 * 128 = 2048
-        kv_proj_dim = self.num_kv_heads * self.head_dim  # 8 * 128 = 1024
+        q_proj_dim = self.num_heads * self.head_dim  # 14 * 64 = 896
+        kv_proj_dim = self.num_kv_heads * self.head_dim  # 2 * 64 = 128
         
         self.q_proj = nn.Conv2d(
             self.hidden_size,
             q_proj_dim,
             1,
-            bias=False,
+            bias=True,  # Qwen 2.5 uses bias
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE)
         self.k_proj = nn.Conv2d(
             self.hidden_size,
             kv_proj_dim,
             1,
-            bias=False,
+            bias=True,  # Qwen 2.5 uses bias
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE)
         self.v_proj = nn.Conv2d(
             self.hidden_size,
             kv_proj_dim,
             1,
-            bias=False,
+            bias=True,  # Qwen 2.5 uses bias
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE)
         self.o_proj = nn.Conv2d(
@@ -344,8 +302,7 @@ class QwenAttention(nn.Module):
             bias=False,
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE)
-        self.q_norm = QwenHeadNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = QwenHeadNorm(self.head_dim, eps=config.rms_norm_eps)
+        # Note: Qwen 2.5 does not use per-head normalization
         self.scale = 1 / math.sqrt(self.head_dim)
 
     def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -372,9 +329,7 @@ class QwenAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
         value_states = self.v_proj(hidden_states).view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
         
-        # Apply query and key normalization (critical for Qwen!)
-        query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
+        # Note: Qwen 2.5 does not use query and key normalization
         
         # Use provided rotary embeddings (single token version)
         cos, sin = rotary_emb
@@ -400,9 +355,7 @@ class QwenAttention(nn.Module):
         key_states = key_states.view(1, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)  # [1, num_kv_heads, seq_len, head_dim]
         value_states = value_states.view(1, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)  # [1, num_kv_heads, seq_len, head_dim]
 
-        # Apply query and key normalization (critical for Qwen!)
-        query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
+        # Note: Qwen 2.5 does not use query and key normalization
 
         # Get rotary embeddings for all positions at once
         cos, sin = rotary_emb
@@ -443,8 +396,7 @@ class QwenAttention(nn.Module):
         key_states = self.repeat_kv(key_states.squeeze(0), n_rep)
         value_states = self.repeat_kv(value_states.squeeze(0), n_rep)
 
-        query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
+        # Note: Qwen 2.5 does not use query and key normalization
 
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(
@@ -546,13 +498,13 @@ class QwenAttention(nn.Module):
         return attn_output.squeeze(2).permute(0, 2, 1)
 
 
-class QwenDecoderLayer(nn.Module):
-    def __init__(self, config: QwenConfig) -> None:
+class Qwen25DecoderLayer(nn.Module):
+    def __init__(self, config: Qwen25Config) -> None:
         super().__init__()
-        self.self_attn = QwenAttention(config)
-        self.mlp = QwenMLP(config)
-        self.input_layernorm = QwenRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = QwenRMSNorm(
+        self.self_attn = Qwen25Attention(config)
+        self.mlp = Qwen25MLP(config)
+        self.input_layernorm = Qwen25RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen25RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -577,8 +529,8 @@ class QwenDecoderLayer(nn.Module):
         return hidden_states
 
 
-class QwenModel(nn.Module):
-    def __init__(self, config: QwenConfig) -> None:
+class Qwen25Model(nn.Module):
+    def __init__(self, config: Qwen25Config) -> None:
         super().__init__()
         self.config = config
         self.disable_kv_cache = False  # Will be set by parent model
@@ -586,15 +538,15 @@ class QwenModel(nn.Module):
             TEST_DEVICE
         )
         self.layers = nn.ModuleList(
-            [QwenDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [Qwen25DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        self.norm = QwenRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen25RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Initialize KV cache with MODEL_DTYPE (following llama_model.py pattern)  
+        # Initialize KV cache with MODEL_DTYPE (following qwen_model.py pattern)  
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        if not hasattr(QwenModel, '_config_printed'):
-            print(f"QwenModel using head_dim={self.head_dim} for KV cache (config has: {getattr(config, 'head_dim', 'not set')})")
-            QwenModel._config_printed = True
+        if not hasattr(Qwen25Model, '_config_printed'):
+            print(f"Qwen25Model using head_dim={self.head_dim} for KV cache (config has: {getattr(config, 'head_dim', 'not set')})")
+            Qwen25Model._config_printed = True
         
         if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
             cache_size = (
@@ -604,9 +556,9 @@ class QwenModel(nn.Module):
                 self.head_dim
             )
             self.register_buffer("kv_cache_0", torch.zeros(cache_size, dtype=MODEL_DTYPE, device=TEST_DEVICE))
-            if not hasattr(QwenModel, '_cache_init_printed'):
+            if not hasattr(Qwen25Model, '_cache_init_printed'):
                 print(f"Initialized unified KV kv_cache_0 with shape: {self.kv_cache_0.shape}")
-                QwenModel._cache_init_printed = True
+                Qwen25Model._cache_init_printed = True
         else:
             layers_per_group = config.num_hidden_layers
             for i in range(config.num_hidden_layers):
@@ -958,6 +910,17 @@ class QwenModel(nn.Module):
                 ]
             ):
                 conv_state[new_k] = v.view(v.shape[0], v.shape[1], 1, 1)
+            elif any(
+                proj in new_k
+                for proj in [
+                    "q_proj.bias",
+                    "k_proj.bias",
+                    "v_proj.bias",
+                    "o_proj.bias",
+                ]
+            ):
+                # Handle bias tensors for QKV projections
+                conv_state[new_k] = v
             else:
                 conv_state[new_k] = v
 
@@ -972,10 +935,10 @@ class QwenModel(nn.Module):
         return not missing and not unexpected
 
 
-class QwenForCausalLM(nn.Module):
-    config_class = QwenConfig
+class Qwen25ForCausalLM(nn.Module):
+    config_class = Qwen25Config
 
-    def __init__(self, config: QwenConfig, enable_coreml=False, disable_kv_cache=False, **kwargs) -> None:
+    def __init__(self, config: Qwen25Config, enable_coreml=False, disable_kv_cache=False, **kwargs) -> None:
         super().__init__()
         self.config = config
         self.enable_coreml = enable_coreml
@@ -987,11 +950,11 @@ class QwenForCausalLM(nn.Module):
             ENABLE_COREML = True
             print(f"Set global ENABLE_COREML = {ENABLE_COREML} for CoreML conversion")
         
-        self.model = QwenModel(config)
+        self.model = Qwen25Model(config)
         # Set the disable_kv_cache flag on the model
         self.model.disable_kv_cache = self.disable_kv_cache
         
-        # Initialize lm_head as Conv2d for ANE optimization following llama_model.py pattern
+        # Initialize lm_head as Conv2d for ANE optimization following qwen_model.py pattern
         if ENABLE_CONV2D:
             if ENABLE_VACAB_SPLIT16:
                 vocab_split = config.vocab_size // 16
@@ -1001,9 +964,9 @@ class QwenForCausalLM(nn.Module):
                     split_size = vocab_split + (1 if i < vocab_remainder else 0)
                     setattr(self, f"lm_head16_{i+1}", 
                            nn.Conv2d(config.hidden_size, split_size, 1, bias=False, dtype=MODEL_DTYPE).to(TEST_DEVICE))
-                if not hasattr(QwenForCausalLM, '_lm_head_printed'):
+                if not hasattr(Qwen25ForCausalLM, '_lm_head_printed'):
                     print("Created lm_head16_1 through lm_head16_16")
-                    QwenForCausalLM._lm_head_printed = True
+                    Qwen25ForCausalLM._lm_head_printed = True
             elif ENABLE_VACAB_SPLIT8:
                 vocab_split = config.vocab_size // 8
                 vocab_remainder = config.vocab_size % 8
@@ -1196,7 +1159,7 @@ class QwenForCausalLM(nn.Module):
                     safetensors.torch.load_file(os.path.join(model_path, file))
                 )
         
-        # Handle lm_head weight (following llama_model.py pattern)
+        # Handle lm_head weight (following qwen_model.py pattern)
         lm_head_present = False
         embed_tokens_key = None
         for k, v in state_dict.items():
@@ -1204,9 +1167,10 @@ class QwenForCausalLM(nn.Module):
                 lm_head_present = True
             if "embed_tokens.weight" in k:
                 embed_tokens_key = k
-
-        if not lm_head_present:
-            print("lm_head.weight not found in the model file dictionary")
+        
+        # For Qwen 2.5, lm_head might be tied with embed_tokens
+        if not lm_head_present and self.config.tie_word_embeddings:
+            print("lm_head.weight not found in the model file dictionary (tie_word_embeddings=True)")
             if embed_tokens_key:
                 print(f"Using {embed_tokens_key} for lm_head.weight")
                 state_dict['lm_head.weight'] = state_dict[embed_tokens_key].clone()
