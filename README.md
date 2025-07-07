@@ -2,14 +2,28 @@
 
 ANEMLL (pronounced like "animal") is an open-source project focused on accelerating the porting of Large Language Models (LLMs) to tensor processors, starting with the Apple Neural Engine (ANE).
 
-## 🚀 Version 0.3.3 Alpha Release - Initial Support for QWEN 3 & QWEN 2.5 Architecture
+## 🚀 Version 0.3.4 Alpha Release - Enhanced Evaluation & Quality Improved Stability
 
-### 🆕 **New Features**
-- **QWEN 3 Architecture Support**: Added support for Qwen3-0.6B and Qwen3-4B models with custom converter optimizations
-- **QWEN 2.5 Architecture Support**: Added support for Qwen2.5-0.5B-Instruct and other Qwen 2.5 variants
-- **Streamlined Installation**: One-command setup with automatic virtual environment detection
-- **Automated Testing Framework**: End-to-end validation scripts for conversion and inference workflows
-- **Enhanced Developer Experience**: Improved error handling, better feedback, and simplified testing
+### 🔄 **What's New in 0.3.4**
+- **📊 lm-evaluation-harness Support** - Model evaluation with standard benchmarks (BoolQ, ARC Challenge, etc.) - [Documentation](./evaluate/ane/README.md)
+- **🎯 New RMSN-orm Implementation** - Precise calculation with ANE hardware ops
+- **🐛 Fixed RoPE Tensor Size Bug** - Resolved random overflows (existing pre-0.3.4 models should be re-converted)
+
+####Example ANE vs HF on MPS backend 
+
+| Task        | HF-FP16 | ANEMLL-FP16 | DIFF % |
+|-------------|---------|--------------|--------|
+| arc_challenge | 31.66%  | 30.97%       | -0.69% |
+| arc_easy      | 60.65%  | 60.94%       | +0.29% |
+| boolq         | 63.91%  | 64.68%       | +0.77% |
+| piqa          | 66.81%  | 67.74%       | +0.93% |
+| winogrande    | 56.43%  | 56.67%       | +0.24% |
+| **Average**   | **55.89%** | **56.60%**     | **+0.71%** 
+
+✅ DIFF = ANEMLL-FP16 – HF-FP16, positive means ANEMLL is better than HuggingFace.
+
+🆕 New 0.3.4.models with benchmarks are [here](https://huggingface.co/collections/anemll/anemll-034-686c21c2cb05c715eb3f6a26)
+
 
 ### 📦 **Quick Start (New Simplified Workflow)**
 ```bash
@@ -37,9 +51,9 @@ python tests/test_llama_model.py    # Test LLaMA models
 > - Provide flexible and easy to use library/framework to port LLMs to ANE directly from Hugging Face models
 > - Provide on-device examples for iOS and macOS swift or C/C++ Applications
 
-See update [Roadmap.md](./docs/Roadmap.md) for more details
+See update [Roadmap.md](./Roadmap.MD) for more details
 
-## Main Components in 0.3.3 Alpha Release
+## Main Components in 0.3.4 Alpha Release
 
 ANEMLL provides five main components for Apple Neural Engine inference development:
 
@@ -119,13 +133,7 @@ Visit our [Hugging Face repository](https://huggingface.co/anemll) for the lates
 > 
 > ⭐ **Please star this repo to support the project!**
 
-### 🔄 **What's New in 0.3.3**
-- **🆕 Qwen 3 Architecture Support** - Initial implementation with custom converter
-- **🆕 Qwen 2.5 Architecture Support** - Initial implementation with custom converter
-- **📦 Streamlined Installation** - Auto-detecting virtual environment setup
-- **🧪 Automated Testing** - End-to-end validation scripts
-- **🛠 Enhanced Developer Experience** - Better error handling and feedback
-- **🔧 Bug Fixes** - Resolved Swift CLI tensor shape mismatches
+
 
 
 ### Sample iOS/macOS Applications
