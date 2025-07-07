@@ -7,9 +7,9 @@
 - [x] Swift Sample Code
 - [x] iOS/SwiftUI Sample Application
 - [x] Qwen Architecture Support
+- [X] Model Quality testing  (/eval)
 
 ## In Progress Milestones 🚧
-- [ ] Model Quality testing  (/eval)
 - [ ] Re-add monolithic model support ( export_coreml)
 - [ ] SpinQuant and other Quantizatio workflows Implementation
 
