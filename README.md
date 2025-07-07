@@ -20,7 +20,7 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 | winogrande    | 56.43%  | 56.67%       | +0.24% |
 | **Average**   | **55.89%** | **56.60%**     | **+0.71%** 
 
-✅ DIFF = ANEMLL-FP16 – HF-FP16, positive means ANEMLL is better than HuggingFace.
+✅ DIFF = ANEMLL-FP16 - HF-FP16, where positive values indicate ANEMLL outperforms HuggingFace on that metric.
 
 🆕 New 0.3.4.models with benchmarks are [here](https://huggingface.co/collections/anemll/anemll-034-686c21c2cb05c715eb3f6a26)
 
