@@ -92,47 +92,54 @@ class LlamaConfig:
         return "\n".join(f"{key}: {value}" for key, value in self.__dict__.items())
 
 class LlamaRMSNorm(nn.Module):
-    """ANE optimized RMSNorm implementation. We use layer_norm and avoid the mean subtraction.
+    """optimized RMSNorm implementation. We use layer_norm and avoid the mean subtraction.
     This give us the best quality for Boolq and other benchmarks."""
 
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
+        #self.weight = nn.Parameter(torch.ones(hidden_size))
+        #self.variance_epsilon = eps
+
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        self.eps = eps
+        self.dim = hidden_size
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    
-        # ──────────────────────────────────────────────────────────────────────
-        # Compatibility path for PyTorch 1.x / 2.0–2.3                           .
-        # We build a tensor whose mean is *exactly* zero so that LayerNorm's
-        # mean‑subtraction becomes a no‑op and we recover RMS statistics:
-        #
-        #     concat([x, ‑x])  →  μ = 0,
-        #                        σ² = ½(‖x‖²) = mean(x²)
-        # ──────────────────────────────────────────────────────────────────────
-        x = hidden_states
-
-        # ❶ Make the last‑dimension mean zero.
-        doubled = torch.cat([x, -x], dim=-1)
-
-        hidden_size = hidden_states.shape[-1]
-        # ❷ Run the highly‑optimised LayerNorm kernel on the doubled tensor.
-        normed = F.layer_norm(
-            doubled,
-            normalized_shape=(2 * hidden_size,),
-            weight=None,          # no affine factors here
-            bias=None,
-            eps=float(self.variance_epsilon)
-        )
-
-        # ❸ Drop the mirror half → correct RMS‑normed activations.
-        normed = normed[..., : hidden_size]
-
-        # ❹ Apply the learnable gain (γ) and cast / move exactly once.
-        return (normed * self.weight
-                       .to(normed.dtype, copy=False)
-                       .to(normed.device, copy=False))
+        # Handle both 3D (batch, seq_len, hidden_size) and 4D (batch, num_heads, seq_len, head_dim) tensors
+        dtype = hidden_states.dtype
+        x = hidden_states.float()
         
+        if x.dim() == 3:
+            # 3D tensor: (batch, seq_len, hidden_size)
+            batch_size, seq_len, hidden_size = x.shape
+            x = x.reshape(batch_size * seq_len, hidden_size, 1, 1)
+            reshape_back = True
+            target_shape = (batch_size, seq_len, hidden_size)
+            norm_dim = hidden_size
+        else:
+            # 4D tensor: (batch, num_heads, seq_len, head_dim)
+            # Need to reshape to (batch * num_heads * seq_len, head_dim, 1, 1)
+            batch_size, num_heads, seq_len, head_dim = x.shape
+            x = x.reshape(batch_size * num_heads * seq_len, head_dim, 1, 1)
+            reshape_back = True
+            target_shape = (batch_size, num_heads, seq_len, head_dim)
+            norm_dim = head_dim
+        
+        # Create epsilon channel - using the actual dimension being normalized
+        eps_chan = torch.ones((x.size(0), 1, x.size(2), x.size(3))) * ((self.eps * norm_dim) ** 0.5)
+        x_eps = torch.cat((x, eps_chan), dim=1)
+        
+        # Compute norm using linalg.norm
+        norm_x = torch.linalg.norm(x_eps, dim=1, keepdim=True)
+        x_normed = x / norm_x
+        x_normed = x_normed * math.sqrt(norm_dim)
+        
+        # Reshape back and apply weight
+        if reshape_back:
+            x_normed = x_normed.reshape(target_shape)
+        x_normed = x_normed.to(dtype=dtype)
+        return x_normed * self.weight
+
 class NA_LayerNormANE(nn.Module):
     """ LayerNorm optimized for Apple Neural Engine (ANE) execution
     """

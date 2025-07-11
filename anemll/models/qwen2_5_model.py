@@ -98,7 +98,39 @@ def get_kv_cache_idx(layer_idx, num_layers, num_groups=1):
 # -----------------------------------------------------------------------------
 # Qwen 2.5 building blocks
 # -----------------------------------------------------------------------------
+def ane_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Custom softmax implementation optimized for fp16 numerical stability.
+    
+    Args:
+        x: Input tensor
+        dim: Dimension along which to compute softmax
+        
+    Returns:
+        Softmax output tensor with MODEL_DTYPE
+    """
+    return F.softmax(x, dim=dim)
 
+    # Convert to fp32 for numerical stability during computation
+    x_fp32 = x.float()
+    
+    # Stable softmax: subtract max before exponential
+    x_max = torch.max(x_fp32, dim=dim, keepdim=True)[0]
+    x_shifted = x_fp32 - x_max
+    
+    # Clamp shifted values to prevent extreme exponentials
+    # After shifting by max, values are in range (-inf, 0]
+    # Clamp to -50 to prevent underflow (exp(-50) ≈ 1.9e-22)
+    x_shifted = x_shifted.clamp(min=-18)
+    
+    # Compute exponential and normalize
+    exp_x = torch.exp(x_shifted)
+    sum_exp = torch.sum(exp_x, dim=dim, keepdim=True)
+    
+    # Add small epsilon to denominator for numerical stability
+    softmax = exp_x / (sum_exp + 1e-10)
+    
+    # Convert back to model dtype
+    return softmax.to(MODEL_DTYPE)
 
 class Qwen25RMSNorm(nn.Module):
     """RMSNorm used in Qwen 2.5 models - ANE-aware implementation with mean subtraction."""
@@ -132,9 +164,6 @@ class Qwen25RMSNorm(nn.Module):
         return (normed * self.weight
                        .to(normed.dtype, copy=False)
                        .to(normed.device, copy=False))
-    
-
-
 class Qwen25RotaryEmbedding(nn.Module):
     """Simple rotary positional embedding for Qwen 2.5."""
 
@@ -410,7 +439,7 @@ class Qwen25Attention(nn.Module):
             # Slice causal mask to match seq_len x seq_len for attention weights
             causal_mask_slice = causal_mask[:, :, :seq_len, :seq_len]
             attn_weights = attn_weights + causal_mask_slice.to(attn_weights.dtype)
-        attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_weights = ane_softmax(attn_weights, dim=-1)
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = (
             attn_output.permute(0, 2, 1, 3).contiguous().view(bsz, seq_len, -1)
@@ -445,7 +474,7 @@ class Qwen25Attention(nn.Module):
             attn_weights = attn_weights + causal_mask.to(MODEL_DTYPE)[:, :, :q_seq_len, :k_seq_len]
 
         # Optimized softmax for batch_size=1
-        attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_weights = ane_softmax(attn_weights, dim=-1)
         
         # Compute attention output directly without einsum
         attn_output = torch.matmul(attn_weights, value_states.to(MODEL_DTYPE))
@@ -484,7 +513,7 @@ class Qwen25Attention(nn.Module):
             mask_slice = causal_mask.to(MODEL_DTYPE)[:, :, :q_seq_len, :k_seq_len]
             attn_weights = attn_weights + mask_slice
         
-        attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_weights = ane_softmax(attn_weights, dim=-1)
         attn_output = torch.einsum('bhqk,bhkd->bhqd', attn_weights, value_states.to(MODEL_DTYPE))
         
         # Reshape before projecting: [batch, heads, actual_seq_len, head_dim] -> [batch, actual_seq_len, heads*head_dim]
