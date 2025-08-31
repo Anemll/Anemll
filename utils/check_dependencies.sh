@@ -1,8 +1,5 @@
 #!/bin/bash
 
-echo "=== ANEMLL DEBUG MARKER ==="
-echo "RUNNING CHECK_DEPENDENCIES.SH FROM: $0"
-
 # check_dependencies.sh
 # This script checks for necessary dependencies before running convert_model.sh
 
@@ -55,7 +52,7 @@ if [ "$SKIP_CHECK" = false ]; then
     fi
 
     echo "Checking if Python is installed..."
-    command -v python >/dev/null 2>&1 || { echo >&2 "Python is required but it's not installed. Aborting. (Issue #1)"; echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."; exit 1; }
+    command -v python3 >/dev/null 2>&1 || { echo >&2 "Python is required but it's not installed. Aborting. (Issue #1)"; echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."; exit 1; }
 
     echo "Checking if pip is installed..."
     command -v pip >/dev/null 2>&1 || { echo >&2 "pip is required but it's not installed. Aborting. (Issue #2)"; echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."; exit 1; }
@@ -151,9 +148,11 @@ if [ "$SKIP_CHECK" = false ]; then
             echo "Alternatively, you can convert this quantized model to unquantized FP16/BF16:"
             echo ""
             echo "  Option 1: Download the original unquantized model from Hugging Face"
-            echo "  Option 2: Use the dequantization script (if available):"
+            echo "  Option 2: Use the HuggingFace dequantization script:"
             echo "           python utils/dequantize_model.py --input $MODEL_DIR --output ./dequantized_model"
-            echo "  Option 3: In Python, load and save as FP16:"
+            echo "  Option 3: Use MLX dequantization (for MLX-compatible models):"
+            echo "           python utils/dequantize_mlx.py --model $MODEL_DIR --save-path ./mlx_dequantized --de-quantize"
+            echo "  Option 4: In Python, load and save as FP16:"
             echo "           from transformers import AutoModelForCausalLM"
             echo "           model = AutoModelForCausalLM.from_pretrained('$MODEL_DIR', device_map='cpu')"
             echo "           model.save_pretrained('./unquantized_model', torch_dtype='float16')"
@@ -173,27 +172,24 @@ if [ "$SKIP_CHECK" = false ]; then
 
         # Check for supported architectures in config.json
         echo "Checking for supported architectures in config.json..."
-        echo "DEBUG: config.json contents:"
-        cat "$MODEL_DIR/config.json"
-
-        CONFIG_ARCH=$(jq -r '.architectures[0] // empty' "$MODEL_DIR/config.json" 2>/dev/null)
-        CONFIG_MODEL_TYPE=$(jq -r '.model_type // empty' "$MODEL_DIR/config.json" 2>/dev/null)
+        SUPPORTED_ARCHS=("llama" "qwen" "gemma3")
+        CONFIG_ARCH=$(jq -r '.architectures[]' "$MODEL_DIR/config.json" 2>/dev/null)
+        CONFIG_MODEL_TYPE=$(jq -r '.model_type' "$MODEL_DIR/config.json" 2>/dev/null)
 
         CONFIG_ARCH_LOWER=$(echo "$CONFIG_ARCH" | tr '[:upper:]' '[:lower:]')
         CONFIG_MODEL_TYPE_LOWER=$(echo "$CONFIG_MODEL_TYPE" | tr '[:upper:]' '[:lower:]')
 
-        echo "DEBUG: CONFIG_ARCH='$CONFIG_ARCH', CONFIG_MODEL_TYPE='$CONFIG_MODEL_TYPE', CONFIG_ARCH_LOWER='$CONFIG_ARCH_LOWER', CONFIG_MODEL_TYPE_LOWER='$CONFIG_MODEL_TYPE_LOWER'"
-
-        if [[ -z "$CONFIG_ARCH_LOWER" && -z "$CONFIG_MODEL_TYPE_LOWER" ]]; then
-            echo "Could not detect architecture or model_type in config.json. Aborting."
-            exit 1
-        fi
-
-        if [[ "$CONFIG_ARCH_LOWER" != *llama* && "$CONFIG_ARCH_LOWER" != *qwen* && "$CONFIG_MODEL_TYPE_LOWER" != *llama* && "$CONFIG_MODEL_TYPE_LOWER" != *qwen* ]]; then
-            echo "Unsupported architecture or model type in config.json. Supported types: llama, qwen. Aborting. (Issue #7)"
-            echo "Detected architectures: $CONFIG_ARCH"
-            echo "Detected model_type: $CONFIG_MODEL_TYPE"
-            echo "(Lowercased: architectures='$CONFIG_ARCH_LOWER', model_type='$CONFIG_MODEL_TYPE_LOWER')"
+        # Check if architecture contains any supported pattern
+        ARCH_SUPPORTED=false
+        for arch in "${SUPPORTED_ARCHS[@]}"; do
+            if [[ "$CONFIG_ARCH_LOWER" == *"$arch"* ]] || [[ "$CONFIG_MODEL_TYPE_LOWER" == *"$arch"* ]]; then
+                ARCH_SUPPORTED=true
+                break
+            fi
+        done
+        
+        if [ "$ARCH_SUPPORTED" = false ]; then
+            echo "Unsupported architecture or model type in config.json. Supported types: ${SUPPORTED_ARCHS[@]}. Aborting. (Issue #7)"
             echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
             exit 1
         fi

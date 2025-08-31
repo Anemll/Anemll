@@ -20,11 +20,11 @@ MODEL_PATH=""
 OUTPUT_DIR=""
 NUM_CHUNKS=2   # Default number of chunks
 
-# Converter command, determined later
-CONVERTER="python3 -m anemll.ane_converter.llama_converter"
-
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
+
+# Default converter; may be overridden after parsing config.json
+CONVERTER="python3 -m anemll.ane_converter.llama_converter"
 
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
@@ -140,17 +140,31 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)" || {
     OUTPUT_DIR="$(cd "$(dirname "$OUTPUT_DIR")" && pwd)/$(basename "$OUTPUT_DIR")"
 }
 
-# Detect architecture from config.json to choose converter
+# Detect architecture from config.json
 CONFIG_FILE="$MODEL_PATH/config.json"
 if [ -f "$CONFIG_FILE" ]; then
     ARCH=$(jq -r '.model_type // (.architectures[0] // "")' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
-    if [[ "$ARCH" == *qwen* ]]; then
+    # Check for Qwen2 (which is Qwen 2.5) or Qwen2ForCausalLM architecture
+    if [[ "$ARCH" == "qwen2" ]] || [[ "$ARCH" == *"qwen2forcausallm"* ]]; then
+        CONVERTER="python3 -m anemll.ane_converter.qwen2_5_converter"
+        # Use "qwen25" as default prefix for Qwen 2.5 models unless explicitly set
+        if [ "$PREFIX" = "llama" ]; then
+            PREFIX="qwen25"
+        fi
+    elif [[ "$ARCH" == qwen* ]]; then
         CONVERTER="python3 -m anemll.ane_converter.qwen_converter"
-    elif [[ "$ARCH" == *llama* ]]; then
-        CONVERTER="python3 -m anemll.ane_converter.llama_converter"
+        # Use "qwen" as default prefix for Qwen models unless explicitly set
+        if [ "$PREFIX" = "llama" ]; then
+            PREFIX="qwen"
+        fi
+    elif [[ "$ARCH" == gemma3* ]]; then
+        CONVERTER="python3 -m anemll.ane_converter.gemma3_converter"
+        
+        if [ "$PREFIX" = "llama" ]; then
+            PREFIX="gemma3"
+        fi
     else
-        echo "Unsupported architecture or model type in config.json. Supported types: llama, qwen. Aborting. (Issue #7)"
-        exit 1
+        CONVERTER="python3 -m anemll.ane_converter.llama_converter"
     fi
 fi
 
@@ -306,7 +320,15 @@ fi
 
 # Step 7: Copy tokenizer files and create meta.yaml
 if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
-    MODEL_NAME=$(basename "$MODEL_PATH")
+    # Detect HuggingFace cache path and extract proper model name
+    if [[ "$MODEL_PATH" =~ \.cache/huggingface/hub/models--([^/]+)--([^/]+)/snapshots/ ]]; then
+        # Extract org and model name from HF cache path
+        HF_ORG="${BASH_REMATCH[1]}"
+        HF_MODEL="${BASH_REMATCH[2]}"
+        MODEL_NAME="${HF_ORG}-${HF_MODEL}"
+    else
+        MODEL_NAME=$(basename "$MODEL_PATH")
+    fi
     run_step 7 "Copying tokenizer files and creating meta.yaml" "
         # Copy tokenizer files if they exist
         (cp \"$MODEL_PATH/tokenizer.json\" \"$OUTPUT_DIR/\" || true) && \
@@ -317,7 +339,15 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
         # Create config.json if it doesn't exist
         if [ ! -f \"$OUTPUT_DIR/config.json\" ]; then
             echo \"Creating config.json for iOS tokenizer...\" && \
-            if [[ \"$ARCH\" == qwen* ]]; then
+            if [[ \"$ARCH\" == \"qwen2\" ]] || [[ \"$ARCH\" == *\"qwen2forcausallm\"* ]]; then
+                # Create Qwen 2.5-specific config.json
+                cat > \"$OUTPUT_DIR/config.json\" <<'EOF_CONFIG'
+{
+  \"tokenizer_class\": \"Qwen2Tokenizer\",
+  \"model_type\": \"qwen2\"
+}
+EOF_CONFIG
+            elif [[ \"$ARCH\" == qwen* ]]; then
                 # Create Qwen-specific config.json
                 cat > \"$OUTPUT_DIR/config.json\" <<'EOF_CONFIG'
 {
@@ -330,63 +360,11 @@ EOF_CONFIG
             fi
         fi && \
         
-        # Create meta.yaml
-        python3 - \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
+        # Create meta.yaml with correct LUT values based on actual file existence
+        python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
+            \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
-            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR/meta.yaml\" <<'EOF_PY'
-import sys
-MODEL_NAME = sys.argv[1]
-CONTEXT = sys.argv[2]
-BATCH = sys.argv[3]
-LUT_EMB = sys.argv[4]
-LUT_FFN = sys.argv[5]
-LUT_LMH = sys.argv[6]
-NUM_CHUNKS = sys.argv[7]
-PREFIX = sys.argv[8]
-ARCH = sys.argv[9]
-OUTFILE = sys.argv[10]
-
-# Construct model names with LUT suffixes if specified
-embeddings_name = f'{PREFIX}_embeddings' + (f'_lut{LUT_EMB}' if LUT_EMB != 'none' else '')
-lmhead_name = f'{PREFIX}_lm_head' + (f'_lut{LUT_LMH}' if LUT_LMH != 'none' else '')
-ffn_base = f'{PREFIX}_FFN_PF' + (f'_lut{LUT_FFN}' if LUT_FFN != 'none' else '')
-
-# Add .mlmodelc extension to model paths
-embeddings_path = f'{embeddings_name}.mlmodelc'
-lmhead_path = f'{lmhead_name}.mlmodelc'
-ffn_path = f'{ffn_base}.mlmodelc'
-
-# Set split_lm_head based on architecture
-split_lm_head = 16 if ARCH.startswith('qwen') else 8
-
-meta = f'''model_info:
-  name: anemll-{MODEL_NAME}-ctx{CONTEXT}
-  version: 0.3.0
-  description: |
-    Demonstarates running {MODEL_NAME} on Apple Neural Engine
-    Context length: {CONTEXT}
-    Batch size: {BATCH}
-    Chunks: {NUM_CHUNKS}
-  license: MIT
-  author: Anemll
-  framework: Core ML
-  language: Python
-  parameters:
-    context_length: {CONTEXT}
-    batch_size: {BATCH}
-    lut_embeddings: {LUT_EMB}
-    lut_ffn: {LUT_FFN}
-    lut_lmhead: {LUT_LMH}
-    num_chunks: {NUM_CHUNKS}
-    model_prefix: {PREFIX}
-    embeddings: {embeddings_path}
-    lm_head: {lmhead_path}
-    ffn: {ffn_path}
-    split_lm_head: {split_lm_head}
-'''
-with open(OUTFILE, 'w') as f:
-    f.write(meta)
-EOF_PY
+            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\"
     "
 fi
 
@@ -394,7 +372,8 @@ fi
 # Step 8: Test with chat.py
 run_step 8 "Testing with chat.py" "python3 \"$PROJECT_ROOT/tests/chat.py\" \
     --meta \"$OUTPUT_DIR/meta.yaml\" \
-    --prompt \"Who are you ?\""
+    --prompt \"Who are you ?\" \
+    --max-tokens 100"
 
 # Print chat.py command for reference
 echo -e "\nTo chat with the model, use:"
@@ -418,4 +397,15 @@ echo "    --tokenizer \"$OUTPUT_DIR\" \\"
 echo "    --context-length $CONTEXT_LENGTH \\"
 echo "    --d \"$OUTPUT_DIR\""
 
-echo "Conversion completed successfully!" 
+echo -e "\nOption 3 - Using Swift CLI (requires building anemll-swift-cli):"
+echo "cd $PROJECT_ROOT/anemll-swift-cli && swift run anemllcli \\"
+echo "    --meta \"$OUTPUT_DIR/meta.yaml\""
+
+echo -e "\nTo prepare model for HuggingFace upload:"
+echo "# For standard distribution:"
+echo "./anemll/utils/prepare_hf.sh --input \"$OUTPUT_DIR\""
+echo ""
+echo "# For iOS-ready version (with unzipped MLMODELC files):"
+echo "./anemll/utils/prepare_hf.sh --input \"$OUTPUT_DIR\" --ios"
+
+echo -e "\nConversion completed successfully!"
