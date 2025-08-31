@@ -12,8 +12,7 @@
 ## In Progress Milestones 🚧
 - [ ] Re-add monolithic model support ( export_coreml)
 - [ ] SpinQuant and other Quantizatio workflows Implementation
-
-
+- [ ] Gemma Architecture Support
 ## Upcoming Milestones 🚧
 - [ ] Add Int4 Linear Quantization
 - [ ] Gemma Architecture Support
