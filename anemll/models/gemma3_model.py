@@ -220,12 +220,24 @@ class Gemma3RotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     #@dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
-    def forward(self, x, position_ids):
+    def forward(
+        self,
+        x,
+        position_ids,
+        seq_len: Optional[int] = None, 
+    ):
         # Ensure position_ids is 2D for consistent processing
         if position_ids.dim() == 1:
             position_ids = position_ids.unsqueeze(0)
 
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        # Truncate or extend inv_freq based on seq_len if provided
+        if seq_len is not None:
+            seq_len = max(seq_len, position_ids.shape[-1])
+            inv_freq = self.inv_freq[:seq_len]
+        else:
+            inv_freq = self.inv_freq
+
+        inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
@@ -235,6 +247,7 @@ class Gemma3RotaryEmbedding(nn.Module):
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
 
+        
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
