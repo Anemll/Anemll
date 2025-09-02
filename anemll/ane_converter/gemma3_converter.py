@@ -527,37 +527,37 @@ class Gemma3Converter(BaseConverter):
             start_layer = 0
             end_layer = None
 
-        class PrefillWrapper(torch.nn.Module):
-            def __init__(self, model: Gemma3ForCausalLM, start_layer=0, end_layer=None):
-                super().__init__()
-                self.model = model  # Use Gemma3ForCausalLM as root
-                self.start_layer = start_layer
-                self.end_layer = end_layer
-                self.states = Gemma3Converter.GetTransformerStates(
-                    model, part="2_prefill", prefix="model.model."
-                )
+class PrefillWrapper(torch.nn.Module):
 
-            def forward(self, hidden_states, position_ids, causal_mask, current_pos):
-                rotary = self.model.model.get_rotary_embedding_prefill(position_ids)
-                out = self.model.model.process_layers(
-                    hidden_states,
-                    position_ids,
-                    causal_mask,
-                    current_pos,
-                    rotary,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                    IN_PREFILL=True,
-                )
+    def __init__(self, model: Gemma3ForCausalLM, start_layer=0, end_layer=None):
+        super().__init__()
+        self.model = model
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        self.layers = nn.ModuleList([
+            model.model.layers[i] for i in range(start_layer, end_layer)
+        ])
+    
+    def forward(self, hidden_states, position_ids, causal_mask, current_pos):
+        cos_global, sin_global, cos_local, sin_local = self.model.model.get_rotary_embedding_prefill(position_ids)
 
-                # Skip normalization for prefill - data not used, only KV cache is updated!
-                # This follows the LLAMA pattern and avoids unnecessary computation
-                if self.end_layer is None or self.end_layer == len(self.model.model.layers):
-                    print("Skipping final normalization for prefill, data not used!")
-                    # Return only first token to minimize memory usage
-                    return out[:, 0:1, :]
-                
-                return out
+        for decoder_layer in self.layers:
+            if decoder_layer.self_attn.is_sliding:
+                position_embeddings = (cos_local, sin_local)
+            else:
+                position_embeddings = (cos_global, sin_global)
+
+            layer_outputs = decoder_layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                use_cache=True,
+                cache_position=current_pos,
+            )
+            hidden_states = layer_outputs[0]
+
+        return hidden_states, self.model.model.get_transformer_states()
 
         wrapper = PrefillWrapper(model, start_layer, end_layer)
         wrapper.eval()
@@ -601,7 +601,8 @@ class Gemma3Converter(BaseConverter):
                 ),
             ],
             outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
-            states=wrapper.states,
+            #states=wrapper.states,
+            states=self.GetTransformerStates(model, part="2_prefill", prefix="model.model."),
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
