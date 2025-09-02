@@ -45,7 +45,7 @@ CONTEXT_LENGTH = 1024
 FORCE_UNIFIED_CACHE = True  # Force using a single unified KV cache
 ENABLE_UNIFIED_CACHE = True  # Enable unified KV cache by default
 STATE_LENGTH = 512   # KV cache state length
-DISABLE_KV_CACHE = True  # Disable KV cache for simple testing
+DISABLE_KV_CACHE = False  # Disable KV cache for simple testing
 
 # LM head configuration constants (following llama_model.py pattern)
 ENABLE_CONV2D = bool(1)      # Use Conv2d for LM head
@@ -502,6 +502,15 @@ class Gemma3TextModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
+    
+    def get_rotary_embedding_prefill(self, position_ids: torch.LongTensor):
+        
+        cos_global, sin_global = self.rotary_emb(None, position_ids, seq_len=position_ids.shape[1])
+      
+        cos_local, sin_local = self.rotary_emb_local(None, position_ids, seq_len=position_ids.shape[1])
+
+        
+        return (cos_global, sin_global, cos_local, sin_local)
 
 
 class Gemma3Attention(nn.Module):
