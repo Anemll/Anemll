@@ -525,8 +525,126 @@ class Gemma3Converter(BaseConverter):
             end_layer = min((chunk_idx + 1) * layers_per_chunk, total_layers)
         else:
             start_layer = 0
-            end_layer = None
+            end_layer = total_layers
 
+        print(f"Converting prefill part {chunk_idx+1}/{total_chunks} "
+              f"({start_layer}-{end_layer})")
+
+        class PrefillWrapper(torch.nn.Module):
+            def __init__(self, model: Gemma3ForCausalLM, start_layer: int, end_layer: int) -> None:
+                super().__init__()
+                self.layers = nn.ModuleList([
+                    model.model.layers[i] for i in range(start_layer, end_layer)
+                ])
+                self.rotary_emb_local = model.model.rotary_emb_local
+                self.rotary_emb_global = model.model.rotary_emb
+            
+            def forward(
+                self,
+                hidden_states: torch.Tensor,
+                position_ids: torch.Tensor,
+                causal_mask: torch.Tensor,
+                current_pos: torch.Tensor,
+            ):
+                cos_global, sin_global = self.rotary_emb_global(
+                    hidden_states, position_ids, seq_len=position_ids.shape[1]
+                )
+                cos_local, sin_local = self.rotary_emb_local(
+                    hidden_states, position_ids, seq_len=position_ids.shape[1]
+                )
+                
+                for decoder_layer in self.layers:
+                    if decoder_layer.self_attn.is_sliding:
+                        position_embeddings = (cos_local, sin_local)
+                    else:
+                        position_embeddings = (cos_global, sin_global)
+                    
+                    # Passing KV cache to the layer
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        position_embeddings=position_embeddings,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        use_cache=True,
+                        cache_position=current_pos,
+                    )
+                    hidden_states = layer_outputs[0]
+
+                # The Prefill wrapper MUST return a tuple of (output, state)
+                return hidden_states, tuple(
+                    layer_outputs[1].split(
+                        model.model.config.hidden_size, dim=-1
+                    )
+                    for layer_outputs in hidden_states.shape[0]
+                )
+
+
+        wrapper = PrefillWrapper(model, start_layer, end_layer)
+        wrapper.eval()
+
+        sample_hidden_states = torch.zeros(
+            (1, self.context_length, model.config.hidden_size),
+            dtype=torch.float16,
+            device=TEST_DEVICE,
+        )
+        sample_position_ids = torch.zeros(
+            (1, self.context_length), dtype=torch.int32, device=TEST_DEVICE
+        )
+        sample_causal_mask = torch.zeros(
+            (1, 1, self.context_length, self.context_length),
+            dtype=torch.float16,
+            device=TEST_DEVICE,
+        )
+        sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
+
+        traced = torch.jit.trace(
+            wrapper,
+            (
+                sample_hidden_states,
+                sample_position_ids,
+                sample_causal_mask,
+                sample_current_pos,
+            ),
+        )
+
+        mlmodel = ct.convert(
+            traced,
+            inputs=[
+                ct.TensorType(
+                    name="hidden_states", shape=sample_hidden_states.shape, dtype=np.float16
+                ),
+                ct.TensorType(
+                    name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
+                ),
+                ct.TensorType(
+                    name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
+                ),
+                ct.TensorType(
+                    name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
+                ),
+            ],
+            outputs=[
+                ct.TensorType(name="output_hidden_states", dtype=np.float16),
+                ct.TensorType(
+                    name="kv_cache_output",
+                    shape=(
+                        2 * model.config.num_hidden_layers,
+                        self.context_length,
+                        model.config.num_key_value_heads,
+                        model.config.head_dim
+                    ),
+                    dtype=np.float16,
+                ),
+            ],
+            states=self.GetTransformerStates(model, part="2_prefill", prefix="model.model."),
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram",
+        )
+        
+        return mlmodel
+    
 class PrefillWrapper(torch.nn.Module):
 
     def __init__(self, model: Gemma3ForCausalLM, start_layer=0, end_layer=None):
