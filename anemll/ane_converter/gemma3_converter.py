@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import coremltools as ct
 import coremltools.optimize as cto
+import torch.nn as nn
 
 from .environment import require_coreml
 
@@ -177,7 +178,7 @@ class Gemma3Converter(BaseConverter):
 
         print("Calling postprocess()...")
         self.postprocess()
-        print("QwenConverter.convert() completed")
+        print("Gemma3Converter.convert() completed")
         return mlmodel
 
     def convert_to_coreml(self, model: Gemma3ForCausalLM) -> ct.models.MLModel:
@@ -424,44 +425,43 @@ class Gemma3Converter(BaseConverter):
             end_layer = total_layers
 
         class FFNWrapper(torch.nn.Module):
-            def __init__(self, model: Gemma3ForCausalLM) -> None:
+            def __init__(self, model: Gemma3ForCausalLM, start_layer, end_layer) -> None:
                 super().__init__()
-                self.model = model.model  # Use the inner Gemma3TextModel
-                self.states = Gemma3Converter.GetTransformerStates(
-                    model, part="2", prefix="model.model."
-                )
-                self.layers_to_process = self.model.layers[start_layer:end_layer]
-                # Only apply final norm on the last chunk
-                self.final_norm = self.model.norm if end_layer == total_layers else None
+                self.model = model
+                self.layers = nn.ModuleList([
+                    model.model.layers[i] for i in range(start_layer, end_layer)
+                ])
+                self.norm = model.model.norm
+                #self.layers_to_process = self.model.layers[start_layer:end_layer]
+                self.rotary_emb_local = model.model.rotary_emb_local 
+                self.rotary_emb_global = model.model.rotary_emb  
 
             def forward(self, hidden_states, position_ids, causal_mask, current_pos):
-                # For single-token generation, position_ids is a single value
-                # We need to get embeddings for this specific position
-                position_embeddings_global = self.model.rotary_emb(hidden_states, position_ids)
-                position_embeddings_local = self.model.rotary_emb_local(hidden_states, position_ids)
-
-                for decoder_layer in self.layers_to_process:
-                    # Determine which position embeddings to use based on the layer's attention type
+                position_embeddings_global = self.rotary_emb_global(hidden_states, position_ids)
+                position_embeddings_local = self.rotary_emb_local(hidden_states, position_ids)
+                
+                for decoder_layer in self.layers:
                     if decoder_layer.self_attn.is_sliding:
                         position_embeddings = position_embeddings_local
                     else:
                         position_embeddings = position_embeddings_global
-                    
-                    # Call the decoder layer with the required positional arguments first
+
                     layer_outputs = decoder_layer(
                         hidden_states,
-                        position_embeddings,
+                        position_embeddings=position_embeddings,
                         attention_mask=causal_mask,
                         position_ids=position_ids,
+                        use_cache=True,
+                        cache_position=current_pos,
                     )
                     hidden_states = layer_outputs[0]
 
-                if self.final_norm:
-                    hidden_states = self.final_norm(hidden_states)
+                hidden_states = self.norm(hidden_states)
 
                 return hidden_states
 
-        wrapper = FFNWrapper(model)
+
+        wrapper = FFNWrapper(model, start_layer, end_layer)
         wrapper.eval()
 
         hidden_states = torch.zeros(
@@ -494,7 +494,7 @@ class Gemma3Converter(BaseConverter):
                 ),
             ],
             outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
-            states=self.GetTransformerStates(model, part=None, prefix="model.model."),
+            #states=self.GetTransformerStates(model, part=None, prefix="model.model."),
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
@@ -923,6 +923,9 @@ def test_conversion(
         print("Loading pretrained weights...")
         model.load_pretrained_weights(model_path)
         print("Model loaded successfully!")
+
+        model.to(MODEL_DTYPE)
+        print("Model has been converted to MODEL_DTYPE for CoreML conversion.")
         
         # Ensure model is in eval mode and gradients are disabled
         model.eval()
@@ -1035,4 +1038,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
