@@ -8,10 +8,11 @@ checkpoints with the correct reshaping.  Only the pieces required for the unit
 """
 
 from __future__ import annotations
+from linecache import cache
 import os
 import json
 import math
-from typing import Dict
+from typing import Dict, Optional
 import copy
 
 import safetensors.torch
@@ -44,7 +45,7 @@ CONTEXT_LENGTH = 1024
 FORCE_UNIFIED_CACHE = True  # Force using a single unified KV cache
 ENABLE_UNIFIED_CACHE = True  # Enable unified KV cache by default
 STATE_LENGTH = 512   # KV cache state length
-DISABLE_KV_CACHE = False  # Disable KV cache for simple testing
+DISABLE_KV_CACHE = True  # Disable KV cache for simple testing
 
 # LM head configuration constants (following llama_model.py pattern)
 ENABLE_CONV2D = bool(1)      # Use Conv2d for LM head
@@ -63,7 +64,8 @@ class Gemma3Config:
         self.bos_token_id = kwargs.get("bos_token_id", 2)
         self.eos_token_id = kwargs.get("eos_token_id", 1)
         self.hidden_act = kwargs.get("hidden_act", "gelu_pytorch_tanh")
-        self.hidden_size = kwargs.get("hidden_size", 2304)
+        #self.hidden_size = kwargs.get("hidden_size", 2304)
+        self.hidden_size = kwargs.get("hidden_size", 2048)
         self.initializer_range = kwargs.get("initializer_range", 0.02)
         self.intermediate_size = kwargs.get("intermediate_size", 9216)
         self.max_position_embeddings = kwargs.get("max_position_embeddings", 131072)
@@ -337,7 +339,7 @@ class Gemma3DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask:torch.Tensor = None,
         position_ids: torch.LongTensor = None,
         past_key_values: [Cache] = None, # type: ignore
@@ -346,8 +348,18 @@ class Gemma3DecoderLayer(nn.Module):
         cache_position: [torch.LongTensor] = None, # type: ignore
         **kwargs,
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        # This is the standard Transformer block structure.
         
+        hidden_states = hidden_states.to(MODEL_DTYPE)
+        
+       
+        position_embeddings_global, position_embeddings_local = position_embeddings
+        position_embeddings_global = position_embeddings_global.to(MODEL_DTYPE)
+        position_embeddings_local = position_embeddings_local.to(MODEL_DTYPE)
+        position_embeddings = (position_embeddings_global, position_embeddings_local)
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(MODEL_DTYPE)
+
         # 1. Self-Attention block
         residual = hidden_states
         normed_hidden_states = self.input_layernorm(hidden_states)
@@ -523,25 +535,39 @@ class Gemma3Attention(nn.Module):
 
         self.q_norm = Gemma3RMSNorm(hidden_size=config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma3RMSNorm(hidden_size=config.head_dim, eps=config.rms_norm_eps)
+        
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        # Remove unused arguments from transformers-style forward
-        # past_key_values: Optional[Cache] = None,
-        # cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[cache] = None, # type: ignore
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> tuple[torch.FloatTensor, Optional[torch.FloatTensor]]:
+        
+        # Ensure all inputs are on the correct dtype
+        hidden_states = hidden_states.to(MODEL_DTYPE)
+        cos, sin = position_embeddings
+        cos = cos.to(MODEL_DTYPE)
+        sin = sin.to(MODEL_DTYPE)
+        position_embeddings = (cos, sin)
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(MODEL_DTYPE)
+
         bsz, q_len, _ = hidden_states.size()
 
         # Reshape for Conv2d: [batch, seq_len, hidden_size] -> [batch, hidden_size, seq_len, 1]
         hidden_states_conv = hidden_states.transpose(1, 2).unsqueeze(-1)
-
-        query_states = self.q_proj(hidden_states_conv).squeeze(-1).transpose(1, 2)
-        key_states = self.k_proj(hidden_states_conv).squeeze(-1).transpose(1, 2)
-        value_states = self.v_proj(hidden_states_conv).squeeze(-1).transpose(1, 2)
+        
+        
+        query_states = self.q_proj(hidden_states_conv).squeeze(-1).transpose(1, 2).to(MODEL_DTYPE)
+        key_states = self.k_proj(hidden_states_conv).squeeze(-1).transpose(1, 2).to(MODEL_DTYPE)
+        value_states = self.v_proj(hidden_states_conv).squeeze(-1).transpose(1, 2).to(MODEL_DTYPE)
 
         query_states = query_states.view(bsz, q_len, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -550,17 +576,8 @@ class Gemma3Attention(nn.Module):
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
-        # Ensure the output of norm layers is in the correct dtype before RoPE
-        query_states = query_states.to(MODEL_DTYPE)
-        key_states = key_states.to(MODEL_DTYPE)
-
-        cos, sin = position_embeddings
+        # Apply rotary embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        # KV Cache is handled by the converter/runner, not in the model forward pass for this implementation
-        # if past_key_values is not None:
-        #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        #     key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         # Repeat KV heads if using GQA
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -578,19 +595,23 @@ class Gemma3Attention(nn.Module):
                 attention_mask = attention_mask[:, :, :q_len, :key_states.shape[-2]]
             attn_weights = attn_weights + attention_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=False)
+        
         attn_output = torch.matmul(attn_weights, value_states)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.config.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, self.config.num_attention_heads * self.head_dim)
 
         # Reshape for o_proj Conv2d
         attn_output_conv = attn_output.transpose(1, 2).unsqueeze(-1)
         attn_output = self.o_proj(attn_output_conv).squeeze(-1).transpose(1, 2)
 
         return attn_output, attn_weights
+    
+
+           
 
 
 class Gemma3ForCausalLM(nn.Module):
@@ -879,4 +900,3 @@ class Gemma3ForCausalLM(nn.Module):
             return False
         
         return True
-
