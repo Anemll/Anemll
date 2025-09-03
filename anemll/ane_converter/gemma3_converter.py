@@ -553,6 +553,9 @@ class Gemma3Converter(BaseConverter):
                     hidden_states, position_ids, seq_len=position_ids.shape[1]
                 )
                 
+                
+                key_value_cache_list = []
+
                 for decoder_layer in self.layers:
                     if decoder_layer.self_attn.is_sliding:
                         position_embeddings = (cos_local, sin_local)
@@ -569,15 +572,16 @@ class Gemma3Converter(BaseConverter):
                         cache_position=current_pos,
                     )
                     hidden_states = layer_outputs[0]
+                   
+                    key_value_cache_list.append(layer_outputs[1])
 
                 # The Prefill wrapper MUST return a tuple of (output, state)
-                return hidden_states, tuple(
-                    layer_outputs[1].split(
-                        model.model.config.hidden_size, dim=-1
-                    )
-                    for layer_outputs in hidden_states.shape[0]
-                )
+               
+                return hidden_states, tuple(key_value_cache_list)
 
+
+        wrapper = PrefillWrapper(model, start_layer, end_layer)
+        wrapper.eval()
 
         wrapper = PrefillWrapper(model, start_layer, end_layer)
         wrapper.eval()
