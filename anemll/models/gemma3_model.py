@@ -142,18 +142,22 @@ class Gemma3MLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, 1, bias=False)
-        self.up_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, 1, bias=False)
-        self.down_proj = nn.Conv2d(self.intermediate_size, self.hidden_size, 1, bias=False)
+
+       
+        self.gate_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
+        self.up_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
+        self.down_proj = nn.Conv2d(self.intermediate_size, self.hidden_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        # Reshape for Conv2d: [batch, seq_len, hidden_size] -> [batch, hidden_size, seq_len, 1]
-        x = x.transpose(1, 2).unsqueeze(-1)
+        
+        x = x.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
+        
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        # Reshape back: [batch, hidden_size, seq_len, 1] -> [batch, seq_len, hidden_size]
-        return down_proj.squeeze(-1).transpose(1, 2)
-
+        
+       
+        return down_proj.squeeze(2).permute(0, 2, 1)
+    
 class Gemma3RMSNorm(nn.Module):
     """Manual RMSNorm implementation with explicit dtype handling for JIT compatibility."""
 
@@ -376,7 +380,8 @@ class Gemma3DecoderLayer(nn.Module):
         # 1. Self-Attention block
         residual = hidden_states
         normed_hidden_states = self.input_layernorm(hidden_states)
-        attn_outputs, self_attn_weights = self.self_attn(
+
+        attn_outputs = self.self_attn(
             hidden_states=normed_hidden_states,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
@@ -387,7 +392,10 @@ class Gemma3DecoderLayer(nn.Module):
             cache_position=cache_position,
             **kwargs,
         )
-        hidden_states = residual + attn_outputs
+        #hidden_states = residual + 
+
+        attn_output = attn_outputs[0]
+        self_attn_weights = attn_outputs[1] if output_attentions else None
 
         # 2. MLP (Feed-Forward) block
         residual = hidden_states
@@ -395,10 +403,13 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states = self.mlp(normed_hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        present_key_value = attn_outputs[2] if use_cache else None
 
+        outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
+        if use_cache:
+            outputs += (present_key_value,)
 
         return outputs
         
@@ -564,12 +575,13 @@ class Gemma3Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[cache] = None, # type: ignore
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_value: Optional[tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-    ) -> tuple[torch.FloatTensor, Optional[torch.FloatTensor]]:
+        cache_position: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         
         # Ensure all inputs are on the correct dtype
         hidden_states = hidden_states.to(MODEL_DTYPE)
@@ -630,8 +642,17 @@ class Gemma3Attention(nn.Module):
         attn_output_conv = attn_output.transpose(1, 2).unsqueeze(-1)
         attn_output = self.o_proj(attn_output_conv).squeeze(-1).transpose(1, 2)
 
-        return attn_output, attn_weights
-    
+        if not use_cache:
+           
+            return attn_output, attn_weights, None 
+        else:
+            
+            present_key_value = (key_states, value_states)
+            if output_attentions:
+                return attn_output, attn_weights, present_key_value
+            else:
+                return attn_output, None, present_key_value
+
 
            
 
