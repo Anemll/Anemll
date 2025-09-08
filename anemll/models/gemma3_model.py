@@ -149,14 +149,27 @@ class Gemma3MLP(nn.Module):
         self.down_proj = nn.Conv2d(self.intermediate_size, self.hidden_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
+    #def forward(self, x):
         
-        x = x.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
+        #x = x.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
         
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        #down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         
        
-        return down_proj.squeeze(2).permute(0, 2, 1)
+        #return down_proj.squeeze(2).permute(0, 2, 1)
+
+    def forward(self, x):
+        # Use identical step-by-step computation to LlamaMLP to prevent numerical explosion
+        x = x.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)  # Ensure proper dtype and shape
+        
+        # Step-by-step computation for numerical stability (like LlamaMLP)
+        a = self.gate_proj(x)      # gate projection
+        b = self.up_proj(x)        # up projection
+        c = self.act_fn(a)         # activation on gate
+        d = c * b                  # multiply gate * up
+        e = self.down_proj(d)      # down projection
+        
+        return e.squeeze(2).permute(0, 2, 1)  # Final output shape: [bsz, seq_len, hidden_size]
     
 class Gemma3RMSNorm(nn.Module):
     """Manual RMSNorm implementation with explicit dtype handling for JIT compatibility."""
@@ -450,6 +463,8 @@ class Gemma3TextModel(nn.Module):
         config.rope_theta = config.rope_local_base_freq
         config.rope_scaling = {"rope_type": "default"}
         self.rotary_emb_local = Gemma3RotaryEmbedding(config=config)
+        for i in range(self.config.num_hidden_layers):
+            self.register_buffer(f"kv_cache_{i}", None)
 
         # Initialize weights and apply final processing
         # self.post_init() # This was causing the error and is not needed
@@ -493,6 +508,7 @@ class Gemma3TextModel(nn.Module):
             print("Missing keys in model:", missing)
             print("Unexpected keys in model:", unexpected)
         return not missing and not unexpected
+
 
     def forward(
         self,
@@ -674,7 +690,16 @@ class Gemma3ForCausalLM(nn.Module):
         
         self.model = Gemma3TextModel(config)
         # Set the disable_kv_cache flag on the model
-        self.model.disable_kv_cache = self.disable_kv_cache
+        for i in range(self.config.num_hidden_layers):
+            self.model.register_buffer(f"kv_cache_{i}", None)
+        head_dim = config.hidden_size // config.num_attention_heads
+        cache_size = (
+            2 * config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.state_length,
+            head_dim
+        )
+        self.register_buffer("kv_cache_0", torch.zeros(cache_size, dtype=MODEL_DTYPE, device=TEST_DEVICE))
         
         # Initialize lm_head as Conv2d for ANE optimization following llama_model.py pattern
         if ENABLE_CONV2D:
