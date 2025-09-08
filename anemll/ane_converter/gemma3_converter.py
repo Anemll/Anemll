@@ -84,7 +84,8 @@ class Gemma3Converter(BaseConverter):
                     ),
                     dtype=np.float16,
                 ),
-                name=f"{prefix}kv_cache_0",  # Only one group for unified cache
+                #name=f"{prefix}kv_cache_0",  # Only one group for unified cache
+                name=f"kv_cache_0"
             )
         ]
         return states
@@ -609,45 +610,38 @@ class Gemma3Converter(BaseConverter):
                 sample_causal_mask,
                 sample_current_pos,
             ),
-        )
-
-        mlmodel = ct.convert(
-            traced,
-            inputs=[
-                ct.TensorType(
-                    name="hidden_states", shape=sample_hidden_states.shape, dtype=np.float16
-                ),
-                ct.TensorType(
-                    name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
-                ),
-                ct.TensorType(
-                    name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
-                ),
-                ct.TensorType(
-                    name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
-                ),
-            ],
-            outputs=[
-                ct.TensorType(name="output_hidden_states", dtype=np.float16),
-                ct.TensorType(
-                    name="kv_cache_output",
-                    shape=(
-                        2 * model.config.num_hidden_layers,
-                        self.context_length,
-                        model.config.num_key_value_heads,
-                        model.config.head_dim
-                    ),
-                    dtype=np.float16,
-                ),
-            ],
-            states=self.GetTransformerStates(model, part="2_prefill", prefix="model.model."),
-            compute_precision=ct.precision.FLOAT16,
-            compute_units=ct.ComputeUnit.CPU_AND_NE,
-            minimum_deployment_target=ct.target.iOS18,
-            convert_to="mlprogram",
-        )
+        ) 
         
+        mlmodel = ct.convert(
+          traced,
+          inputs=[
+        ct.TensorType(
+            name="hidden_states", shape=sample_hidden_states.shape, dtype=np.float16
+        ),
+        ct.TensorType(
+            name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
+        ),
+        ct.TensorType(
+            name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
+        ),
+        ct.TensorType(
+            name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
+        ),
+        ],
+        outputs=[
+        ct.TensorType(name="output_hidden_states", dtype=np.float16),
+        ct.TensorType(name="kv_cache_output", dtype=np.float16),
+        ],
+        states=self.GetTransformerStates(model, part="2_prefill", prefix="model.model."),
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        minimum_deployment_target=ct.target.iOS18,
+        convert_to="mlprogram",
+    )
         return mlmodel
+
+
+    
     
 class PrefillWrapper(torch.nn.Module):
 
@@ -1043,6 +1037,8 @@ def test_conversion(
 
         print("Creating model...")
         model = Gemma3ForCausalLM(config, enable_coreml=True)
+        for i in range(model.config.num_hidden_layers):
+            model.register_buffer(f"kv_cache_{i}", None)
         print("Loading pretrained weights...")
         model.load_pretrained_weights(model_path)
         print("Model loaded successfully!")
