@@ -314,7 +314,7 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 ### 🚀 **Coming Soon**
 - **Additional Qwen 2.5 variants** (14B, 32B)
 - **Mistral family** support
-- **Gemma models**
+- **Gemma models** support (work in progress🔥)
 - **Enhanced quantization** (GPTQ, SpinQuant integration)
 - **Larger context lengths** (4K, 8K optimization)
 
