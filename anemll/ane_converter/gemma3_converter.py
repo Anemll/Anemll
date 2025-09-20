@@ -84,8 +84,7 @@ class Gemma3Converter(BaseConverter):
                     ),
                     dtype=np.float16,
                 ),
-                #name=f"{prefix}kv_cache_0",  # Only one group for unified cache
-                name=f"kv_cache_0"
+                name=f"{prefix}kv_cache_0",  # Only one group for unified cache
             )
         ]
         return states
@@ -532,20 +531,37 @@ class Gemma3Converter(BaseConverter):
               f"({start_layer}-{end_layer})")
 
         class PrefillWrapper(torch.nn.Module):
-            def __init__(self, model: Gemma3ForCausalLM, start_layer: int, end_layer: int) -> None:
+            def __init__(self, model: Gemma3ForCausalLM, start_layer: int, end_layer: int, context_length: int) -> None:
                 super().__init__()
                 self.layers = nn.ModuleList([
                     model.model.layers[i] for i in range(start_layer, end_layer)
                 ])
                 self.rotary_emb_local = model.model.rotary_emb_local
                 self.rotary_emb_global = model.model.rotary_emb
-            
+                self.states = []
+
+                head_dim = model.config.hidden_size // model.config.num_attention_heads
+                num_layers_in_chunk = end_layer - start_layer
+
+                for i in range(num_layers_in_chunk):
+                    layer_idx = start_layer + i
+                    # Register buffer for each state
+                    buffer_name = f"kv_cache_{layer_idx}"
+                    buffer_shape = (1, context_length, model.config.num_key_value_heads, head_dim)
+                    self.register_buffer(
+                        buffer_name,
+                        torch.zeros(buffer_shape, dtype=torch.float16)
+                    )
+                    # Append StateType with shape
+                    self.states.append(ct.StateType(name=buffer_name, wrapped_type=ct.TensorType(shape=buffer_shape)))
+
             def forward(
                 self,
                 hidden_states: torch.Tensor,
                 position_ids: torch.Tensor,
                 causal_mask: torch.Tensor,
                 current_pos: torch.Tensor,
+                *past_key_values
             ):
                 cos_global, sin_global = self.rotary_emb_global(
                     hidden_states, position_ids, seq_len=position_ids.shape[1]
@@ -557,7 +573,7 @@ class Gemma3Converter(BaseConverter):
                 
                 key_value_cache_list = []
 
-                for decoder_layer in self.layers:
+                for i, decoder_layer in enumerate(self.layers):
                     if decoder_layer.self_attn.is_sliding:
                         position_embeddings = (cos_local, sin_local)
                     else:
@@ -571,6 +587,7 @@ class Gemma3Converter(BaseConverter):
                         position_ids=position_ids,
                         use_cache=True,
                         cache_position=current_pos,
+                        past_key_value=past_key_values[i]
                     )
                     hidden_states = layer_outputs[0]
                    
@@ -578,13 +595,10 @@ class Gemma3Converter(BaseConverter):
 
                 # The Prefill wrapper MUST return a tuple of (output, state)
                
-                return hidden_states, tuple(key_value_cache_list)
+                return (hidden_states, *key_value_cache_list)
 
 
-        wrapper = PrefillWrapper(model, start_layer, end_layer)
-        wrapper.eval()
-
-        wrapper = PrefillWrapper(model, start_layer, end_layer)
+        wrapper = PrefillWrapper(model, start_layer, end_layer, self.context_length)
         wrapper.eval()
 
         sample_hidden_states = torch.zeros(
@@ -602,6 +616,17 @@ class Gemma3Converter(BaseConverter):
         )
         sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
 
+        num_layers_in_chunk = end_layer - start_layer
+        head_dim = model.config.hidden_size // model.config.num_attention_heads
+        sample_past_key_values = tuple(
+            torch.zeros(
+                (1, self.context_length, model.config.num_key_value_heads, head_dim),
+                dtype=torch.float16,
+                device=TEST_DEVICE,
+            )
+            for _ in range(num_layers_in_chunk)
+        )
+
         traced = torch.jit.trace(
             wrapper,
             (
@@ -609,134 +634,47 @@ class Gemma3Converter(BaseConverter):
                 sample_position_ids,
                 sample_causal_mask,
                 sample_current_pos,
+                *sample_past_key_values
             ),
-        ) 
-        
-        mlmodel = ct.convert(
-          traced,
-          inputs=[
-        ct.TensorType(
-            name="hidden_states", shape=sample_hidden_states.shape, dtype=np.float16
-        ),
-        ct.TensorType(
-            name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
-        ),
-        ct.TensorType(
-            name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
-        ),
-        ct.TensorType(
-            name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
-        ),
-        ],
-        outputs=[
-        ct.TensorType(name="output_hidden_states", dtype=np.float16),
-        ct.TensorType(name="kv_cache_output", dtype=np.float16),
-        ],
-        states=self.GetTransformerStates(model, part="2_prefill", prefix="model.model."),
-        compute_precision=ct.precision.FLOAT16,
-        compute_units=ct.ComputeUnit.CPU_AND_NE,
-        minimum_deployment_target=ct.target.iOS18,
-        convert_to="mlprogram",
-    )
-        return mlmodel
+        )
 
-
-    
-    
-class PrefillWrapper(torch.nn.Module):
-
-    def __init__(self, model: Gemma3ForCausalLM, start_layer=0, end_layer=None):
-        super().__init__()
-        self.model = model
-        self.start_layer = start_layer
-        self.end_layer = end_layer
-        self.layers = nn.ModuleList([
-            model.model.layers[i] for i in range(start_layer, end_layer)
+        inputs = [
+            ct.TensorType(
+                name="hidden_states", shape=sample_hidden_states.shape, dtype=np.float16
+            ),
+            ct.TensorType(
+                name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
+            ),
+            ct.TensorType(
+                name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
+            ),
+            ct.TensorType(
+                name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
+            ),
+        ]
+        inputs.extend([
+            ct.TensorType(name=f"kv_cache_{i}_in", shape=sample_past_key_values[i-start_layer].shape, dtype=np.float16)
+            for i in range(start_layer, end_layer)
         ])
-    
-    def forward(self, hidden_states, position_ids, causal_mask, current_pos):
-        cos_global, sin_global, cos_local, sin_local = self.model.model.get_rotary_embedding_prefill(position_ids)
 
-        for decoder_layer in self.layers:
-            if decoder_layer.self_attn.is_sliding:
-                position_embeddings = (cos_local, sin_local)
-            else:
-                position_embeddings = (cos_global, sin_global)
-
-            layer_outputs = decoder_layer(
-                hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                use_cache=True,
-                cache_position=current_pos,
-            )
-            hidden_states = layer_outputs[0]
-
-        return hidden_states, self.model.model.get_transformer_states()
-
-        wrapper = PrefillWrapper(model, start_layer, end_layer)
-        wrapper.eval()
-
-        # Check if this is the last chunk in a multi-chunk model
-        is_last_chunk = (chunk_idx == total_chunks - 1)
-        
-        hidden_states = torch.zeros(
-            (1, self.batch_size, model.config.hidden_size),
-            dtype=torch.float16,
-            device=TEST_DEVICE,
-        )
-        position_ids = torch.zeros(
-            (self.batch_size,), dtype=torch.int32, device=TEST_DEVICE
-        )
-        causal_mask = torch.zeros(
-            (1, 1, self.batch_size, self.context_length),
-            dtype=torch.float16,
-            device=TEST_DEVICE,
-        )
-        current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
-
-        traced = torch.jit.trace(
-            wrapper, (hidden_states, position_ids, causal_mask, current_pos)
-        )
+        outputs = [ct.TensorType(name="output_hidden_states", dtype=np.float16)]
+        for i in range(start_layer, end_layer):
+            outputs.append(ct.TensorType(name=f"key_cache_{i}_out", dtype=np.float16))
+            outputs.append(ct.TensorType(name=f"value_cache_{i}_out", dtype=np.float16))
 
         mlmodel = ct.convert(
             traced,
-            inputs=[
-                ct.TensorType(
-                    name="hidden_states", shape=hidden_states.shape, dtype=np.float16
-                ),
-                ct.TensorType(
-                    name="position_ids", shape=position_ids.shape, dtype=np.int32
-                ),
-                ct.TensorType(
-                    name="causal_mask", shape=causal_mask.shape, dtype=np.float16
-                ),
-                ct.TensorType(
-                    name="current_pos", shape=current_pos.shape, dtype=np.int32
-                ),
-            ],
-            outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
-            #states=wrapper.states,
-            states=self.GetTransformerStates(model, part="2_prefill", prefix="model.model."),
+            inputs=inputs,
+            outputs=outputs,
+            states=wrapper.states,
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
             convert_to="mlprogram",
         )
-
-        if self.lut_bits:
-            self.converted_model = mlmodel
-            # WORKAROUND: CoreMLTools has a known bug where LUT quantization fails with multiple workers
-            # when processing chunked models. The second chunk quantization fails with "Pool not running".
-            # Setting workers to None (single-threaded) avoids this issue.
-            # TODO: File bug report with Apple CoreMLTools team about multi-worker quantization failure on chunked models
-            num_workers = None if total_chunks > 1 else 8
-            self.postprocess(num_workers=num_workers)
-            mlmodel = self.converted_model
-
+        
         return mlmodel
-
+    
     def convert_prefill(self, model: Gemma3ForCausalLM) -> ct.models.MLModel:
         """Convert Gemma3 model to CoreML format for prefill mode.
 
@@ -1037,8 +975,6 @@ def test_conversion(
 
         print("Creating model...")
         model = Gemma3ForCausalLM(config, enable_coreml=True)
-        for i in range(model.config.num_hidden_layers):
-            model.register_buffer(f"kv_cache_{i}", None)
         print("Loading pretrained weights...")
         model.load_pretrained_weights(model_path)
         print("Model loaded successfully!")
