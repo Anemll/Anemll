@@ -12,7 +12,7 @@ from linecache import cache
 import os
 import json
 import math
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 import copy
 
 import safetensors.torch
@@ -44,7 +44,7 @@ CONTEXT_LENGTH = 1024
 # Cache configuration constants (following llama_model.py pattern)
 FORCE_UNIFIED_CACHE = True  # Force using a single unified KV cache
 ENABLE_UNIFIED_CACHE = True  # Enable unified KV cache by default
-STATE_LENGTH = 512   # KV cache state length
+STATE_LENGTH = CONTEXT_LENGTH  # KV cache state length
 DISABLE_KV_CACHE = False  # Disable KV cache for simple testing
 
 # LM head configuration constants (following llama_model.py pattern)
@@ -745,6 +745,9 @@ class Gemma3ForCausalLM(nn.Module):
         causal_mask: torch.Tensor,
         current_pos: torch.LongTensor,
         IN_PREFILL: bool = False,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = True
+    
     ) -> torch.Tensor:
         assert len(input_ids.shape) == 2, "input_ids must be 2D"
         if not ENABLE_COREML:
@@ -763,6 +766,7 @@ class Gemma3ForCausalLM(nn.Module):
                 causal_mask,
                 position_ids,
                 current_pos,
+                past_key_values=past_key_values,
                 IN_PREFILL=IN_PREFILL,
             )
         else:
@@ -772,6 +776,7 @@ class Gemma3ForCausalLM(nn.Module):
                 causal_mask,
                 position_ids,
                 current_pos,
+                past_key_values=past_key_values,
                 IN_PREFILL=IN_PREFILL,
             )
         
@@ -855,8 +860,8 @@ class Gemma3ForCausalLM(nn.Module):
             # Use linear head (fallback)
             logits = self.lm_head(hidden_states.permute(0, 2, 1).unsqueeze(2))
             logits = logits.squeeze(2).permute(0, 2, 1)
-        
-        return logits
+
+        return logits,past_key_values,hidden_states
 
     def prefill_kv_cache(self, input_ids, position_ids, start_pos, causal_mask):
         """
