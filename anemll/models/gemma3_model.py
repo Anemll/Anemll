@@ -416,13 +416,13 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states = self.mlp(normed_hidden_states)
         hidden_states = residual + hidden_states
 
-        present_key_value = attn_outputs[2] if use_cache else None
+        present_key_value = attn_outputs[1] if use_cache and not output_attentions else (attn_outputs[2] if use_cache else None)
 
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
         if use_cache:
-            outputs += (present_key_value,)
+            outputs += (present_key_value,) if present_key_value is not None else ()
 
         return outputs
         
@@ -659,15 +659,14 @@ class Gemma3Attention(nn.Module):
         attn_output = self.o_proj(attn_output_conv).squeeze(-1).transpose(1, 2)
 
         if not use_cache:
-           
-            return attn_output, attn_weights, None 
+            return attn_output, attn_weights
         else:
-            
-            present_key_value = (key_states, value_states)
+            # The state is returned as a tuple of (key, value)
+            present_key_value = (key_states.to(hidden_states.dtype), value_states.to(hidden_states.dtype))
             if output_attentions:
                 return attn_output, attn_weights, present_key_value
             else:
-                return attn_output, None, present_key_value
+                return attn_output, present_key_value
 
 
            
