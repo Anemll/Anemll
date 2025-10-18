@@ -591,7 +591,8 @@ class Gemma3Converter(BaseConverter):
                     )
                     hidden_states = layer_outputs[0]
                    
-                    key_value_cache_list.append(layer_outputs[1])
+                    key_value_cache_list.append(layer_outputs[1][0])
+                    key_value_cache_list.append(layer_outputs[1][1])
 
                 # The Prefill wrapper MUST return a tuple of (output, state)
                
@@ -658,15 +659,19 @@ class Gemma3Converter(BaseConverter):
         ])
 
         outputs = [ct.TensorType(name="output_hidden_states", dtype=np.float16)]
-        for i in range(start_layer, end_layer):
-            outputs.append(ct.TensorType(name=f"key_cache_{i}_out", dtype=np.float16))
-            outputs.append(ct.TensorType(name=f"value_cache_{i}_out", dtype=np.float16))
+        outputs.extend([
+            ct.TensorType(name=f"key_cache_{start_layer + i}_out", dtype=np.float16)
+            for i in range(num_layers_in_chunk)
+        ])
+        outputs.extend([
+            ct.TensorType(name=f"value_cache_{start_layer + i}_out", dtype=np.float16)
+            for i in range(num_layers_in_chunk)
+        ])
 
         mlmodel = ct.convert(
             traced,
             inputs=inputs,
             outputs=outputs,
-            states=wrapper.states,
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
