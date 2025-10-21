@@ -677,6 +677,10 @@ class Gemma3Converter(BaseConverter):
             minimum_deployment_target=ct.target.iOS18,
             convert_to="mlprogram",
         )
+        if self.lut_bits:
+            self.converted_model = mlmodel
+            self.postprocess(num_workers=8)  # Allow passing num_workers if needed
+            mlmodel = self.converted_model
         
         return mlmodel
     
