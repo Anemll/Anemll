@@ -39,7 +39,7 @@ ACT2FN = {
 
 MODEL_DTYPE = torch.float16
 TEST_DEVICE = "cpu"
-CONTEXT_LENGTH = 1024
+CONTEXT_LENGTH = 512
 
 # Cache configuration constants (following llama_model.py pattern)
 FORCE_UNIFIED_CACHE = True  # Force using a single unified KV cache
