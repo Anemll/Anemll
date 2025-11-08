@@ -837,7 +837,7 @@ class Gemma3Converter(BaseConverter):
         wrapper.eval()
 
         # Create sample input for tracing
-        sample_input = torch.zeros((1, 1), dtype=torch.int32, device=TEST_DEVICE)
+        sample_input = torch.zeros((1, 512), dtype=torch.int32, device=TEST_DEVICE)
 
         # Trace model
         print("Tracing embeddings model...")
