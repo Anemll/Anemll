@@ -846,7 +846,7 @@ class Gemma3Converter(BaseConverter):
         # Define enumerated input shapes for flexibility
         input_shape = ct.EnumeratedShapes(
             shapes=[
-                
+                [1, 1]
                 [1, self.context_length],
             ],  
             default=[1, self.context_length],  
