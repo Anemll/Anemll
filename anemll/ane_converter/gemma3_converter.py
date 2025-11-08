@@ -217,26 +217,26 @@ class Gemma3Converter(BaseConverter):
         print("Preparing model inputs for tracing...")
         # Use single token approach for KV cache compatibility
         sample_input_ids = torch.zeros(
-            (1, 1), dtype=torch.int32, device=TEST_DEVICE
-        )  # [1, 1] - single token
+            (1, 512), dtype=torch.int32, device=TEST_DEVICE
+        )  # [1, 512] - single token
         sample_position_ids = torch.zeros(
-            (1,), dtype=torch.int32, device=TEST_DEVICE
-        )  # [1] - single position
+            (1, 512), dtype=torch.int32, device=TEST_DEVICE
+        )  # [1, 512] - single position
         sample_causal_mask = torch.zeros(
-            (1, 1, 1, self.context_length), dtype=torch.float16, device=TEST_DEVICE
-        )  # [1, 1, 1, context_length]
+            (1, 1, 512, self.context_length), dtype=torch.float16, device=TEST_DEVICE
+        )  # [1, 1, 512, context_length]
         sample_current_pos = torch.zeros(
             (1,), dtype=torch.int32, device=TEST_DEVICE
         )  # [1] - current position
-        sample_update_mask = torch.zeros(
-            (1, 1, self.context_length, 1), dtype=torch.float16, device=TEST_DEVICE
-        )  # [1, 1, context_length, 1]
+        #sample_update_mask = torch.zeros(
+            #(1, 1, self.context_length, 1), dtype=torch.float16, device=TEST_DEVICE
+        #)  # [1, 1, context_length, 1]
         print("Sample inputs created (Single Token)")
         print(f"sample_input_ids shape: {sample_input_ids.shape}")
         print(f"sample_position_ids shape: {sample_position_ids.shape}")
         print(f"sample_causal_mask shape: {sample_causal_mask.shape}")
         print(f"sample_current_pos shape: {sample_current_pos.shape}")
-        print(f"sample_update_mask shape: {sample_update_mask.shape}")
+        #print(f"sample_update_mask shape: {sample_update_mask.shape}")
 
         print("Starting torch.jit.trace...")
         traced = torch.jit.trace(
@@ -246,7 +246,7 @@ class Gemma3Converter(BaseConverter):
                 sample_position_ids,
                 sample_causal_mask,
                 sample_current_pos,
-                sample_update_mask,
+                #sample_update_mask,
             ),
         )
         print("torch.jit.trace completed!")
@@ -267,9 +267,9 @@ class Gemma3Converter(BaseConverter):
                 ct.TensorType(
                     name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
                 ),
-                ct.TensorType(
-                    name="update_mask", shape=sample_update_mask.shape, dtype=np.float16
-                ),
+                #ct.TensorType(
+                    #name="update_mask", shape=sample_update_mask.shape, dtype=np.float16
+                #),
             ],
             outputs=[
                 ct.TensorType(name="logits1", dtype=np.float16),
@@ -366,7 +366,7 @@ class Gemma3Converter(BaseConverter):
             param.requires_grad = False
 
         sample_input = torch.zeros(
-            (1, 1, model.config.hidden_size), dtype=MODEL_DTYPE, device=TEST_DEVICE
+            (1, self.context_length, model.config.hidden_size), dtype=MODEL_DTYPE, device=TEST_DEVICE
         )
         
         # Trace with no_grad context
@@ -375,19 +375,27 @@ class Gemma3Converter(BaseConverter):
 
         if getattr(wrapper, "mode") == "16":
             outputs = [
-                ct.TensorType(name=f"logits{i}", dtype=np.float16) for i in range(1, 17)
+                ct.TensorType(
+                    name=f"logits{i}",
+                    shape=(1, self.context_length, model.config.vocab_size),
+                    dtype=np.float16,
+                ) for i in range(1, 17)       
             ]
         elif getattr(wrapper, "mode") == "8":
             outputs = [
-                ct.TensorType(name=f"logits{i}", dtype=np.float16) for i in range(1, 9)
+                ct.TensorType(
+                    name=f"logits{i}",
+                    shape=(1, self.context_length, model.config.vocab_size),
+                    dtype=np.float16,
+                ) for i in range(1, 9)       
             ]
         elif getattr(wrapper, "mode") == "2":
             outputs = [
-                ct.TensorType(name="logits1", dtype=np.float16),
-                ct.TensorType(name="logits2", dtype=np.float16),
+                ct.TensorType(name="logits1", shape=(1, self.context_length, model.config.vocab_size), dtype=np.float16),
+                ct.TensorType(name="logits2", shape=(1, self.context_length, model.config.vocab_size), dtype=np.float16),
             ]
         else:
-            outputs = [ct.TensorType(name="logits", dtype=np.float16)]
+            outputs = [ct.TensorType(name="logits", shape=(1, self.context_length, model.config.vocab_size), dtype=np.float16)]
 
         mlmodel = ct.convert(
             traced,
@@ -465,11 +473,11 @@ class Gemma3Converter(BaseConverter):
         wrapper.eval()
 
         hidden_states = torch.zeros(
-            (1, 1, model.config.hidden_size), dtype=torch.float16, device=TEST_DEVICE
+            (1, 512, model.config.hidden_size), dtype=torch.float16, device=TEST_DEVICE
         )
-        position_ids = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
+        position_ids = torch.zeros((1, 512), dtype=torch.int32, device=TEST_DEVICE)
         causal_mask = torch.zeros(
-            (1, 1, 1, self.context_length), dtype=torch.float16, device=TEST_DEVICE
+            (1, 1, 512, self.context_length), dtype=torch.float16, device=TEST_DEVICE
         )
         current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
 
@@ -481,16 +489,16 @@ class Gemma3Converter(BaseConverter):
             traced,
             inputs=[
                 ct.TensorType(
-                    name="hidden_states", shape=hidden_states.shape, dtype=np.float16
+                    name="hidden_states", shape=(1, 512, model.config.hidden_size), dtype=np.float16
                 ),
                 ct.TensorType(
-                    name="position_ids", shape=position_ids.shape, dtype=np.int32
+                    name="position_ids", shape=(1, 512), dtype=np.int32
                 ),
                 ct.TensorType(
-                    name="causal_mask", shape=causal_mask.shape, dtype=np.float16
+                    name="causal_mask", shape=(1, 1, 512, self.context_length), dtype=np.float16
                 ),
                 ct.TensorType(
-                    name="current_pos", shape=current_pos.shape, dtype=np.int32
+                    name="current_pos", shape=(1,), dtype=np.int32
                 ),
             ],
             outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
@@ -835,13 +843,13 @@ class Gemma3Converter(BaseConverter):
         print("Tracing embeddings model...")
         traced_model = torch.jit.trace(wrapper, sample_input)
 
-        # Define flexible input shapes for both single token and batch processing
+        # Define enumerated input shapes for flexibility
         input_shape = ct.EnumeratedShapes(
             shapes=[
-                [1, 1],
-                [1, self.batch_size],
-            ],  # Support single token and batch_size tokens
-            default=[1, 1],  # Use single token as default
+                
+                [1, self.context_length],
+            ],  
+            default=[1, self.context_length],  
         )
 
         print(f"Converting embeddings model with input shape: {input_shape}")
@@ -856,7 +864,13 @@ class Gemma3Converter(BaseConverter):
                     dtype=np.int32,
                 )
             ],
-            outputs=[ct.TensorType(name="hidden_states", dtype=np.float16)],
+            outputs=[
+                ct.TensorType(
+                    name="hidden_states",
+                    shape=(1, self.context_length, model.config.hidden_size),
+                    dtype=np.float16
+                )
+            ],
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
