@@ -122,7 +122,7 @@ class Gemma3Converter(BaseConverter):
 
             except Exception as e:
                 print(f"❌ LUT quantization failed: {str(e)}")
-                print("Continuing without quantization...")
+             
 
     # ------------------------------------------------------------------
     # Public API
@@ -343,6 +343,7 @@ class Gemma3Converter(BaseConverter):
                     hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
 
                 if self.mode == "16":
+                    # Do not specify `shape` for outputs; coremltools infers it
                     return tuple(
                         h(hidden_states).squeeze(2).transpose(1, 2) for h in self.heads
                     )
@@ -374,28 +375,19 @@ class Gemma3Converter(BaseConverter):
             traced = torch.jit.trace(wrapper, sample_input)
 
         if getattr(wrapper, "mode") == "16":
-            outputs = [
-                ct.TensorType(
-                    name=f"logits{i}",
-                    shape=(1, self.context_length, model.config.vocab_size),
-                    dtype=np.float16,
-                ) for i in range(1, 17)       
-            ]
+            # Do not specify `shape` for outputs; coremltools infers it
+            outputs = [ct.TensorType(name=f"logits{i}", dtype=np.float16) for i in range(1, 17)]
+
         elif getattr(wrapper, "mode") == "8":
-            outputs = [
-                ct.TensorType(
-                    name=f"logits{i}",
-                    shape=(1, self.context_length, model.config.vocab_size),
-                    dtype=np.float16,
-                ) for i in range(1, 9)       
-            ]
+            outputs = [ct.TensorType(name=f"logits{i}", dtype=np.float16) for i in range(1, 9)]
+
         elif getattr(wrapper, "mode") == "2":
             outputs = [
-                ct.TensorType(name="logits1", shape=(1, self.context_length, model.config.vocab_size), dtype=np.float16),
-                ct.TensorType(name="logits2", shape=(1, self.context_length, model.config.vocab_size), dtype=np.float16),
+                ct.TensorType(name="logits1", dtype=np.float16),
+                ct.TensorType(name="logits2", dtype=np.float16),
             ]
         else:
-            outputs = [ct.TensorType(name="logits", shape=(1, self.context_length, model.config.vocab_size), dtype=np.float16)]
+            outputs = [ct.TensorType(name="logits", dtype=np.float16)]
 
         mlmodel = ct.convert(
             traced,
@@ -837,8 +829,9 @@ class Gemma3Converter(BaseConverter):
         wrapper.eval()
 
         # Create sample input for tracing
-        sample_input = torch.zeros((1, 512), dtype=torch.int32, device=TEST_DEVICE)
-
+        sample_input = torch.zeros((1, self.context_length), dtype=torch.int32, device=TEST_DEVICE)
+        
+       
         # Trace model
         print("Tracing embeddings model...")
         traced_model = torch.jit.trace(wrapper, sample_input)
@@ -846,7 +839,7 @@ class Gemma3Converter(BaseConverter):
         # Define enumerated input shapes for flexibility
         input_shape = ct.EnumeratedShapes(
             shapes=[
-                [1, 1]
+                [1, 1],
                 [1, self.context_length],
             ],  
             default=[1, self.context_length],  
@@ -860,14 +853,13 @@ class Gemma3Converter(BaseConverter):
             inputs=[
                 ct.TensorType(
                     name="input_ids",
-                    shape=input_shape,  # Use enumerated shapes for flexibility
+                    shape=input_shape, 
                     dtype=np.int32,
                 )
             ],
             outputs=[
                 ct.TensorType(
                     name="hidden_states",
-                    shape=(1, self.context_length, model.config.hidden_size),
                     dtype=np.float16
                 )
             ],
