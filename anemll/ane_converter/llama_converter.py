@@ -22,7 +22,6 @@ from ..models.llama_model import (
     STATE_LENGTH,
     CONTEXT_LENGTH
 )
-import pkg_resources
 from .metadata import AddMetadata, get_anemll_version
 import argparse
 import sys

@@ -6,7 +6,6 @@
 import coremltools as ct
 import os
 import sys
-import pkg_resources
 import argparse
 from pathlib import Path
 
