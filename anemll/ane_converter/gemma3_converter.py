@@ -841,6 +841,7 @@ class Gemma3Converter(BaseConverter):
             shapes=[
                 [1, 1],
                 [1, self.context_length],
+                [1,	64],
             ],  
             default=[1, self.context_length],  
         )
