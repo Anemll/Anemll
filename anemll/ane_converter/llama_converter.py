@@ -11,6 +11,15 @@ import numpy as np
 import torch
 import os
 import gc  # Added import for garbage collection
+import warnings
+try:
+    from sklearn.exceptions import ConvergenceWarning as SklearnConvergenceWarning
+except Exception:  # pragma: no cover - sklearn optional
+    SklearnConvergenceWarning = None
+
+if SklearnConvergenceWarning is not None:
+    warnings.filterwarnings("ignore", category=SklearnConvergenceWarning)
+warnings.filterwarnings("ignore", message="Number of distinct clusters .* smaller than n_clusters")
 from ..models.llama_model import (
     LlamaModel, 
     LlamaConfig, 
@@ -395,30 +404,35 @@ class LlamaConverter(BaseConverter):
         if self.converted_model is not None and self.lut_bits is not None:
             print(f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)...")
             try:
-                # Set up quantization config
-                config = cto.coreml.OptimizationConfig(
-                    global_config=cto.coreml.OpPalettizerConfig(
-                        mode="kmeans",
-                        nbits=self.lut_bits,
-                        granularity="per_grouped_channel",
-                        group_size=self.per_channel,
-                        num_kmeans_workers=num_workers if num_workers is not None else 1  # Use provided workers or default to 1
-                    ),
-                )
-                
-                # Apply quantization in a try-except block
-                try:
-                    self.converted_model = cto.coreml.palettize_weights(self.converted_model, config)
-                    print("LUT quantization completed")
-                except ValueError as e:
-                    if "Pool not running" in str(e):
-                        print("Warning: Multiprocessing pool error, retrying with single process...")
-                        # Retry with single process
-                        config.global_config.num_kmeans_workers = 1
+                # Suppress sklearn ConvergenceWarning during quantization
+                with warnings.catch_warnings():
+                    if SklearnConvergenceWarning is not None:
+                        warnings.simplefilter('ignore', SklearnConvergenceWarning)
+                    warnings.simplefilter('ignore', UserWarning)
+                    # Set up quantization config
+                    config = cto.coreml.OptimizationConfig(
+                        global_config=cto.coreml.OpPalettizerConfig(
+                            mode="kmeans",
+                            nbits=self.lut_bits,
+                            granularity="per_grouped_channel",
+                            group_size=self.per_channel,
+                            num_kmeans_workers=num_workers if num_workers is not None else 1  # Use provided workers or default to 1
+                        ),
+                    )
+                    
+                    # Apply quantization in a try-except block
+                    try:
                         self.converted_model = cto.coreml.palettize_weights(self.converted_model, config)
-                        print("LUT quantization completed (single process)")
-                    else:
-                        raise
+                        print("LUT quantization completed")
+                    except ValueError as e:
+                        if "Pool not running" in str(e):
+                            print("Warning: Multiprocessing pool error, retrying with single process...")
+                            # Retry with single process
+                            config.global_config.num_kmeans_workers = 1
+                            self.converted_model = cto.coreml.palettize_weights(self.converted_model, config)
+                            print("LUT quantization completed (single process)")
+                        else:
+                            raise
             except Exception as e:
                 print(f"Warning: LUT quantization failed: {str(e)}")
                 print("Continuing with unquantized model...")

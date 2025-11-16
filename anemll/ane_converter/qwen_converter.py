@@ -8,6 +8,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import warnings
+try:
+    from sklearn.exceptions import ConvergenceWarning as SklearnConvergenceWarning
+except Exception:  # pragma: no cover - sklearn optional
+    SklearnConvergenceWarning = None
+
+# Globally suppress the sklearn ConvergenceWarning (applies to multiprocessing workers too)
+if SklearnConvergenceWarning is not None:
+    warnings.filterwarnings("ignore", category=SklearnConvergenceWarning)
+warnings.filterwarnings("ignore", message="Number of distinct clusters .* smaller than n_clusters")
 from typing import Optional, List
 
 import numpy as np
@@ -100,23 +110,28 @@ class QwenConverter(BaseConverter):
                 f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)..."
             )
             try:
-                # Set up quantization config
-                config = cto.coreml.OptimizationConfig(
-                    global_config=cto.coreml.OpPalettizerConfig(
-                        mode="kmeans",
-                        nbits=self.lut_bits,
-                        granularity="per_grouped_channel",
-                        group_size=self.per_channel,
-                        num_kmeans_workers=(
-                            num_workers if num_workers is not None else 1
-                        ),  # Use provided workers or default to 1
-                    ),
-                )
+                # Suppress sklearn ConvergenceWarning during quantization
+                with warnings.catch_warnings():
+                    if SklearnConvergenceWarning is not None:
+                        warnings.simplefilter('ignore', SklearnConvergenceWarning)
+                    warnings.simplefilter('ignore', UserWarning)
+                    # Set up quantization config
+                    config = cto.coreml.OptimizationConfig(
+                        global_config=cto.coreml.OpPalettizerConfig(
+                            mode="kmeans",
+                            nbits=self.lut_bits,
+                            granularity="per_grouped_channel",
+                            group_size=self.per_channel,
+                            num_kmeans_workers=(
+                                num_workers if num_workers is not None else 1
+                            ),  # Use provided workers or default to 1
+                        ),
+                    )
 
-                # Apply quantization
-                self.converted_model = cto.coreml.palettize_weights(
-                    self.converted_model, config
-                )
+                    # Apply quantization
+                    self.converted_model = cto.coreml.palettize_weights(
+                        self.converted_model, config
+                    )
                 print("✅ LUT quantization completed successfully")
 
             except Exception as e:
