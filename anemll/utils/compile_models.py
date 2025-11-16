@@ -126,10 +126,35 @@ def compile_part(part: str, lut_bits: Optional[int] = None, target_dir: str = ".
         
     return compile_model(model_path, target_dir)
 
+def parse_lut_arg(lut_value):
+    """Parse LUT argument and extract just the bits value.
+
+    Args:
+        lut_value: String value from command line (e.g., '6' or '6,4')
+
+    Returns:
+        int or None: Just the lut_bits value (per_channel is ignored for file naming)
+    """
+    if lut_value is None:
+        return None
+
+    if ',' in lut_value:
+        # Extract just the bits value, ignore per_channel for file naming
+        parts = lut_value.split(',')
+        try:
+            return int(parts[0])
+        except ValueError:
+            raise ValueError(f"Invalid LUT bits value: {parts[0]}")
+    else:
+        try:
+            return int(lut_value)
+        except ValueError:
+            raise ValueError(f"Invalid LUT bits value: {lut_value}")
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Compile models to MLModelC format')
     parser.add_argument('part', type=str, help='Model part to compile (1, 2, or 3)')
-    parser.add_argument('--lut', type=int, help='LUT bits used in quantization (optional)')
+    parser.add_argument('--lut', type=str, help='LUT bits used in quantization (optional). Format: "bits" or "bits,per_channel" (e.g., "6" or "6,4")')
     parser.add_argument('--chunk', type=int, help='Number of chunks (for part 2)')
     parser.add_argument('--prefix', type=str, default='llama', help='Model name prefix')
     parser.add_argument('--input', type=str, default='.', help='Input directory containing models')
@@ -138,6 +163,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Parse LUT argument to extract just the bits value
+    args.lut = parse_lut_arg(args.lut)
     
     # Set output dir to input dir if not specified
     output_dir = args.output if args.output else args.input

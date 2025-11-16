@@ -98,10 +98,36 @@ chunks_needed = max(1, int(quantized_ffn_bytes / (1024**3)) + 1)
 - `--lut2`: FFN/prefill layers (default: 4, recommended: 6)
 - `--lut3`: LM head (default: 6)
 
+**LUT Format:**
+
+LUT arguments accept two formats:
+
+1. **Simple format**: `--lut2 6`
+   - Specifies only quantization bits
+   - Uses default per_channel group size of 8
+
+2. **Advanced format**: `--lut2 6,4`
+   - First value: Number of quantization bits (4, 6, or 8)
+   - Second value: Per-channel group size for grouped quantization
+   - Smaller group sizes provide finer-grained quantization but may increase model size
+   - Default per_channel is 8 if not specified
+
 **LUT Bit Options:**
-- `4`: 4-bit quantization (smaller, less accurate)
-- `6`: 6-bit quantization (balanced)
-- `8`: 8-bit quantization (larger, more accurate)
+- `4`: 4-bit quantization (smallest, less accurate)
+- `6`: 6-bit quantization (balanced, recommended)
+- `8`: 8-bit quantization (largest, most accurate)
+
+**Examples:**
+```bash
+# Default group sizes
+--lut2 6 --lut3 6
+
+# Custom group sizes
+--lut2 6,4 --lut3 6,16
+
+# Mix of formats
+--lut2 4 --lut3 6,8
+```
 
 ### 5. Set Other Parameters
 

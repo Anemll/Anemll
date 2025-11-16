@@ -814,30 +814,59 @@ class LlamaConverter(BaseConverter):
             print(f"Error during prefill conversion: {str(e)}")
             raise
 
+def parse_lut_arg(lut_value):
+    """Parse LUT argument that can be either 'bits' or 'bits,per_channel'.
+
+    Args:
+        lut_value: String value from command line (e.g., '6' or '6,4')
+
+    Returns:
+        tuple: (lut_bits, per_channel) where per_channel defaults to 8 if not specified
+    """
+    if lut_value is None:
+        return None, 8
+
+    if ',' in lut_value:
+        parts = lut_value.split(',')
+        if len(parts) != 2:
+            raise ValueError(f"Invalid LUT format: {lut_value}. Expected format: 'bits' or 'bits,per_channel'")
+        try:
+            lut_bits = int(parts[0])
+            per_channel = int(parts[1])
+            return lut_bits, per_channel
+        except ValueError:
+            raise ValueError(f"Invalid LUT format: {lut_value}. Both values must be integers")
+    else:
+        try:
+            lut_bits = int(lut_value)
+            return lut_bits, 8  # Default per_channel value
+        except ValueError:
+            raise ValueError(f"Invalid LUT bits value: {lut_value}")
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Convert LLaMA model to CoreML format')
-    
+
     # Model configuration
     parser.add_argument('--model', type=str, help='Path to model directory (default: ../Meta-Llama-3.2-1B)')
     parser.add_argument('--prefix', type=str, default='llama', help='Prefix for output filenames')
-    
+
     # Conversion options
     parser.add_argument('--batch-size', type=int, default=64, help='Batch size for prefill')
     parser.add_argument('--context-length', type=int, default=512, help='Maximum context length')
-    parser.add_argument('--lut', type=int, default=None, help='Use LUT quantization with N bits')
+    parser.add_argument('--lut', type=str, default=None, help='Use LUT quantization with N bits, optionally specify per_channel as "bits,per_channel" (e.g., "6,4"). Default per_channel is 8')
     parser.add_argument('--chunk', type=int, default=None, help='Split into N chunks')
-    parser.add_argument('--part', type=str, 
-                       choices=['1', '2', '2_prefill', '3', 'all'], 
+    parser.add_argument('--part', type=str,
+                       choices=['1', '2', '2_prefill', '3', 'all'],
                        default='all',
                        help='Convert specific part (1=embeddings, 2=FFN, 2_prefill=FFN prefill mode, 3=lm_head)')
     parser.add_argument('--output', type=str, default='.',
                       help='Output directory for converted models (default: current directory)')
-    
+
     return parser.parse_args()
 
-def test_conversion(model_path=None, output_path=None, context_length=512, lut_bits=4, 
-                   model=None, skip_load_weights=False, split_part='123', 
-                   batch_size=64, num_chunks=1, prefix='llama', output_dir='.'):
+def test_conversion(model_path=None, output_path=None, context_length=512, lut_bits=4,
+                   model=None, skip_load_weights=False, split_part='123',
+                   batch_size=64, num_chunks=1, prefix='llama', output_dir='.', per_channel=8):
     """Test conversion of a LLAMA model to ANE format."""
     if model is None:
         print(f"Testing conversion with model from {model_path}")
@@ -862,13 +891,14 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
         else:
             print("\nSkipping weights loading")
     
-    # Create converter with batch_size
+    # Create converter with batch_size and per_channel
     converter = LlamaConverter(
         model=model,
         context_length=context_length,
         lut_bits=lut_bits,
         batch_size=batch_size,
-        num_chunks=num_chunks
+        num_chunks=num_chunks,
+        per_channel=per_channel
     )
     
     # Initialize converted_model as None
@@ -995,16 +1025,19 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
 
 def main():
     args = parse_args()
-    
+
+    # Parse LUT argument
+    lut_bits, per_channel = parse_lut_arg(args.lut)
+
     # Set model path
     model_path = args.model if args.model else "../Meta-Llama-3.2-1B"
-    
+
     print(f"\nConverting model from: {model_path}")
     print(f"Output filename prefix: {args.prefix}")
     print(f"Batch size: {args.batch_size}")
     print(f"Context length: {args.context_length}")
-    if args.lut:
-        print(f"LUT quantization: {args.lut} bits")
+    if lut_bits:
+        print(f"LUT quantization: {lut_bits} bits, per_channel group size: {per_channel}")
     if args.chunk:
         print(f"Splitting into {args.chunk} chunks")
     print(f"Converting part(s): {args.part}")
@@ -1043,10 +1076,11 @@ def main():
             split_part=args.part,
             prefix=args.prefix,
             context_length=args.context_length,
-            lut_bits=args.lut,
+            lut_bits=lut_bits,
             batch_size=args.batch_size,
             num_chunks=args.chunk,
-            output_dir=args.output
+            output_dir=args.output,
+            per_channel=per_channel
         )
             
     except Exception as e:

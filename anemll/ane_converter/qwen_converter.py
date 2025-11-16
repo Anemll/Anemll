@@ -795,6 +795,36 @@ class QwenConverter(BaseConverter):
         return mlmodel
 
 
+def parse_lut_arg(lut_value):
+    """Parse LUT argument that can be either 'bits' or 'bits,per_channel'.
+
+    Args:
+        lut_value: String value from command line (e.g., '6' or '6,4')
+
+    Returns:
+        tuple: (lut_bits, per_channel) where per_channel defaults to 8 if not specified
+    """
+    if lut_value is None:
+        return None, 8
+
+    if ',' in lut_value:
+        parts = lut_value.split(',')
+        if len(parts) != 2:
+            raise ValueError(f"Invalid LUT format: {lut_value}. Expected format: 'bits' or 'bits,per_channel'")
+        try:
+            lut_bits = int(parts[0])
+            per_channel = int(parts[1])
+            return lut_bits, per_channel
+        except ValueError:
+            raise ValueError(f"Invalid LUT format: {lut_value}. Both values must be integers")
+    else:
+        try:
+            lut_bits = int(lut_value)
+            return lut_bits, 8  # Default per_channel value
+        except ValueError:
+            raise ValueError(f"Invalid LUT bits value: {lut_value}")
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments for the converter."""
 
@@ -825,9 +855,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--lut",
-        type=int,
+        type=str,
         default=None,
-        help="Use LUT quantization with N bits",
+        help='Use LUT quantization with N bits, optionally specify per_channel as "bits,per_channel" (e.g., "6,4"). Default per_channel is 8',
     )
     parser.add_argument(
         "--chunk",
@@ -862,6 +892,7 @@ def test_conversion(
     output_dir: str = ".",
     part: str = "full",
     num_chunks: int = 1,
+    per_channel: int = 8,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
     """Convert a Qwen model and save the result.
 
@@ -874,6 +905,7 @@ def test_conversion(
         batch_size: Batch size for conversion
         output_dir: Output directory
         part: Part to convert ("full" or "prefill")
+        per_channel: Group size for per_grouped_channel quantization
     """
     print(
         f"test_conversion called with model_path={model_path}, prefix={prefix}, part={part}"
@@ -922,6 +954,7 @@ def test_conversion(
         batch_size=batch_size,
         lut_bits=lut_bits,
         num_chunks=num_chunks,
+        per_channel=per_channel,
     )
 
     print("Starting conversion...")
@@ -981,14 +1014,17 @@ def main() -> None:
     args = parse_args()
     print(f"Parsed args: {args}")
 
+    # Parse LUT argument
+    lut_bits, per_channel = parse_lut_arg(args.lut)
+
     model_path = args.model if args.model else "Qwen/Qwen3-0.6B"
 
     print(f"\nConverting model from: {model_path}")
     print(f"Output filename prefix: {args.prefix}")
     print(f"Batch size: {args.batch_size}")
     print(f"Context length: {args.context_length}")
-    if args.lut:
-        print(f"LUT quantization: {args.lut} bits")
+    if lut_bits:
+        print(f"LUT quantization: {lut_bits} bits, per_channel group size: {per_channel}")
     if args.chunk:
         print(f"Splitting into {args.chunk} chunks")
     print(f"Converting part(s): {args.part}")
@@ -1003,11 +1039,12 @@ def main() -> None:
             model_path=model_path,
             prefix=args.prefix,
             context_length=args.context_length,
-            lut_bits=args.lut,
+            lut_bits=lut_bits,
             batch_size=args.batch_size,
             output_dir=args.output,
             part=part,
             num_chunks=args.chunk or 1,
+            per_channel=per_channel,
         )
         print(f"Conversion completed successfully! Result: {type(result)}")
     except Exception as e:  # pragma: no cover - CLI tool

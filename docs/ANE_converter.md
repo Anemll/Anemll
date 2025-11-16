@@ -27,7 +27,11 @@ python -m anemll.ane_converter.llama_converter [OPTIONS]
   - `2_prefill`: FFN Prefill model
   - `3`: LM Head
 - `--model`: Path to the source model
-- `--lut`: LUT quantization bits (typically 6)
+- `--lut`: LUT quantization configuration
+  - Simple format: `--lut 6` (6 bits, default per_channel group size of 8)
+  - Advanced format: `--lut 6,4` (6 bits with per_channel group size of 4)
+  - First value: quantization bits (typically 4, 6, or 8)
+  - Second value (optional): per_channel group size for grouped quantization
 - `--chunk`: Number of chunks to split the FFN into
 - `--context-length`: Maximum context length (e.g., 1024, 2048, 4096)
 - `--batch-size`: Batch size for prefill operations

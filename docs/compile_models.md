@@ -24,7 +24,10 @@ python ./anemll/utils/compile_models.py PART [OPTIONS]
   - `1`: Embedding model
   - `2`: FFN model
   - `3`: LM Head model
-- `--lut`: LUT quantization bits (typically 6)
+- `--lut`: LUT quantization configuration
+  - Simple format: `--lut 6` (6 bits, uses default per_channel group size of 8)
+  - Advanced format: `--lut 6,4` (6 bits with per_channel group size of 4)
+  - Note: Only the bits value affects file naming; per_channel is used during model conversion
 - `--chunk`: Number of chunks (for FFN models)
 - `--prefix`: Model name prefix (default: 'llama')
 - `--input-dir`: (Optional) Input directory containing MLPackage files

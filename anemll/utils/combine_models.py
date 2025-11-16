@@ -205,9 +205,34 @@ def combine_chunks(num_chunks, lut_bits=None, mode=None, prefix='llama'):
         traceback.print_exc()
         return False
 
+def parse_lut_arg(lut_value):
+    """Parse LUT argument and extract just the bits value.
+
+    Args:
+        lut_value: String value from command line (e.g., '6' or '6,4')
+
+    Returns:
+        int or None: Just the lut_bits value (per_channel is ignored for file naming)
+    """
+    if lut_value is None:
+        return None
+
+    if ',' in lut_value:
+        # Extract just the bits value, ignore per_channel for file naming
+        parts = lut_value.split(',')
+        try:
+            return int(parts[0])
+        except ValueError:
+            raise ValueError(f"Invalid LUT bits value: {parts[0]}")
+    else:
+        try:
+            return int(lut_value)
+        except ValueError:
+            raise ValueError(f"Invalid LUT bits value: {lut_value}")
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Combine FFN and prefill models')
-    parser.add_argument('--lut', type=int, help='LUT bits used in quantization (optional)')
+    parser.add_argument('--lut', type=str, help='LUT bits used in quantization (optional). Format: "bits" or "bits,per_channel" (e.g., "6" or "6,4")')
     parser.add_argument('--chunk', type=int, required=True,
                       help='Number of chunks')
     parser.add_argument('--input', type=str, default='.',
@@ -251,11 +276,15 @@ def combine_models(args):
 
 def main():
     args = parse_args()
+
+    # Parse LUT argument to extract just the bits value
+    args.lut = parse_lut_arg(args.lut)
+
     try:
         # Change to input directory for processing
         orig_dir = os.getcwd()
         os.chdir(args.input)
-        
+
         # Run combination
         success = combine_models(args)
         

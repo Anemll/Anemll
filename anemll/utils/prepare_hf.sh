@@ -162,11 +162,17 @@ prepare_common_files() {
     else
         echo "Warning: vocab.json not found - may be required for tokenization"
     fi
-    
+
     if [ -f "$INPUT_DIR/merges.txt" ]; then
         cp "$INPUT_DIR/merges.txt" "$target_dir/"
     else
         echo "Warning: merges.txt not found - may be required for BPE tokenization"
+    fi
+
+    # Copy chat template if it exists
+    if [ -f "$INPUT_DIR/chat_template.jinja" ]; then
+        cp "$INPUT_DIR/chat_template.jinja" "$target_dir/"
+        echo "Copied chat_template.jinja"
     fi
     
     # Always generate new config.json for tokenizer (forcing overwrite)

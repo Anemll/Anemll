@@ -40,3 +40,7 @@ xcuserdata/
 *.xcuserstate
 *.xcworkspacexcuserdata/
 =*
+
+ane_*.log
+tests/dev/segmented_results/*
+tests/dev/segment_analysis/*

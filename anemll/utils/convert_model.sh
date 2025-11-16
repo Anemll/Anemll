@@ -38,14 +38,26 @@ print_usage() {
     echo "  --context       Context length (default: 512)"
     echo "  --batch         Batch size (default: 64)"
     echo "  --lut1          LUT bits for embeddings (default: none)"
+    echo "                  Format: 'bits' or 'bits,per_channel' (e.g., '6' or '6,4')"
+    echo "                  Default per_channel is 8 if not specified"
     echo "  --lut2          LUT bits for FFN/prefill (default: 4)"
+    echo "                  Format: 'bits' or 'bits,per_channel' (e.g., '4,8' or '6,4')"
+    echo "                  Default per_channel is 8 if not specified"
     echo "  --lut3          LUT bits for LM head (default: 6)"
+    echo "                  Format: 'bits' or 'bits,per_channel' (e.g., '6' or '6,4')"
+    echo "                  Default per_channel is 8 if not specified"
     echo "  --restart       Restart from specific step (1-8, default: 1)"
     echo "  --only          Run only specified step and exit (1-8)"
     echo "  --prefix        Prefix for model names (default: llama)"
     echo "  --chunk         Number of chunks to split FFN/prefill (default: 2)"
     echo "  --skip-check    Skip the dependency check step"
-    echo "  --skip-check    Skip the dependency check step"
+    echo ""
+    echo "Examples:"
+    echo "  # Use default per_channel (8) for all parts"
+    echo "  $0 --model ./model --output ./output --lut2 4 --lut3 6"
+    echo ""
+    echo "  # Specify custom per_channel values"
+    echo "  $0 --model ./model --output ./output --lut2 4,16 --lut3 6,4"
     exit 1
 }
 
@@ -329,6 +341,7 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
         (cp \"$MODEL_PATH/tokenizer_config.json\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/vocab.json\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/merges.txt\" \"$OUTPUT_DIR/\" || true) && \
+        (cp \"$MODEL_PATH/chat_template.jinja\" \"$OUTPUT_DIR/\" || true) && \
         
         # Create config.json if it doesn't exist
         if [ ! -f \"$OUTPUT_DIR/config.json\" ]; then

@@ -20,7 +20,10 @@ python ./anemll/utils/combine_models.py [OPTIONS]
 
 ### Command Line Arguments
 
-- `--lut`: LUT quantization bits (typically 6)
+- `--lut`: LUT quantization configuration
+  - Simple format: `--lut 6` (6 bits, uses default per_channel group size of 8)
+  - Advanced format: `--lut 6,4` (6 bits with per_channel group size of 4)
+  - Note: Only the bits value affects file naming; per_channel is used during model conversion
 - `--chunk`: Number of chunks the model is split into
 - `--input-dir`: (Optional) Input directory containing the MLPackage files
 - `--output-dir`: (Optional) Output directory for combined MLPackage files

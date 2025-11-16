@@ -35,7 +35,7 @@ You can verify the environment is active by checking:
 # Single-shot model conversion script
 ./anemll/utils/convert_model.sh --model <path_to_model> --output <output_directory>
 
-# With additional options
+# With additional options (default per_channel group size of 8)
 ./anemll/utils/convert_model.sh \
     --model ./models/llama-3.1-1b \
     --output ./converted_models \
@@ -44,6 +44,14 @@ You can verify the environment is active by checking:
     --lut2 4 \
     --lut3 6 \
     --chunk 2
+
+# With custom per_channel group sizes
+# Format: --lutX bits,per_channel (e.g., --lut2 6,4 means 6 bits with group size 4)
+./anemll/utils/convert_model.sh \
+    --model ./models/llama-3.1-1b \
+    --output ./converted_models \
+    --lut2 6,4 \
+    --lut3 6,16
 ```
 
 ### Testing and Chat Interfaces

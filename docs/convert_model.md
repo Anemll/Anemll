@@ -23,13 +23,38 @@ The `convert_model.sh` script automates the conversion of LLAMA models to CoreML
 |-----------|-------------|---------|
 | `--context` | Context length | 512 |
 | `--batch` | Batch size for prefill | 64 |
-| `--lut1` | LUT bits for embeddings | none |
-| `--lut2` | LUT bits for FFN/prefill | 4 |
-| `--lut3` | LUT bits for LM head | 6 |
+| `--lut1` | LUT bits for embeddings (see LUT Format below) | none |
+| `--lut2` | LUT bits for FFN/prefill (see LUT Format below) | 4 |
+| `--lut3` | LUT bits for LM head (see LUT Format below) | 6 |
 | `--restart` | Restart from specific step | 1 |
 | `--only` | Run only specified step and exit | none |
 | `--chunk` | Number of chunks to split FFN/prefill | 2 |
 | `--prefix` | Prefix for model names | llama |
+
+### LUT Quantization Format
+
+The `--lut1`, `--lut2`, and `--lut3` arguments support two formats:
+
+1. **Simple format**: `--lut2 6`
+   - Specifies only the number of quantization bits
+   - Uses default per_channel group size of 8
+
+2. **Advanced format**: `--lut2 6,4`
+   - First value (6): Number of quantization bits
+   - Second value (4): Per-channel group size for grouped quantization
+   - Example: `--lut2 6,4` means 6-bit quantization with group size of 4 channels
+
+**Examples:**
+```bash
+# Use default per_channel group size (8)
+--lut2 6 --lut3 6
+
+# Custom per_channel group sizes
+--lut2 6,4 --lut3 6,16
+
+# Mix of formats
+--lut2 4 --lut3 6,4
+```
 
 ## New Arguments
 
