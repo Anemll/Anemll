@@ -683,7 +683,8 @@ class Gemma3Converter(BaseConverter):
             mlmodel = self.converted_model
         
         return mlmodel
-    
+        
+    # don't use this
     def convert_prefill(self, model: Gemma3ForCausalLM) -> ct.models.MLModel:
         """Convert Gemma3 model to CoreML format for prefill mode.
 
@@ -837,14 +838,14 @@ class Gemma3Converter(BaseConverter):
         traced_model = torch.jit.trace(wrapper, sample_input)
 
         # Define enumerated input shapes for flexibility
-        input_shape = ct.EnumeratedShapes(
-            shapes=[
-                [1, 1],
-                [1, self.context_length],
-                [1,	64],
-            ],  
-            default=[1, self.context_length],  
-        )
+        #input_shape = ct.EnumeratedShapes(
+            #shapes=[
+                #[1, 1],
+                #[1, self.context_length],
+                #[1, 64],
+            #],  
+            #default=[1, self.context_length],  
+        #)
 
         print(f"Converting embeddings model with input shape: {input_shape}")
 
@@ -854,7 +855,7 @@ class Gemma3Converter(BaseConverter):
             inputs=[
                 ct.TensorType(
                     name="input_ids",
-                    shape=input_shape, 
+                    shape=sample_input.shape, 
                     dtype=np.int32,
                 )
             ],
