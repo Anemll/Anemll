@@ -367,7 +367,7 @@ class Gemma3Converter(BaseConverter):
             param.requires_grad = False
 
         sample_input = torch.zeros(
-            (1, self.context_length, model.config.hidden_size), dtype=MODEL_DTYPE, device=TEST_DEVICE
+            (1, 1, model.config.hidden_size), dtype=MODEL_DTYPE, device=TEST_DEVICE
         )
         
         # Trace with no_grad context
@@ -465,11 +465,11 @@ class Gemma3Converter(BaseConverter):
         wrapper.eval()
 
         hidden_states = torch.zeros(
-            (1, 512, model.config.hidden_size), dtype=torch.float16, device=TEST_DEVICE
+            (1, 1, model.config.hidden_size), dtype=torch.float16, device=TEST_DEVICE
         )
-        position_ids = torch.zeros((1, 512), dtype=torch.int32, device=TEST_DEVICE)
+        position_ids = torch.zeros((1, ), dtype=torch.int32, device=TEST_DEVICE)
         causal_mask = torch.zeros(
-            (1, 1, 512, self.context_length), dtype=torch.float16, device=TEST_DEVICE
+            (1, 1, 1, self.context_length), dtype=torch.float16, device=TEST_DEVICE
         )
         current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
 
@@ -481,16 +481,16 @@ class Gemma3Converter(BaseConverter):
             traced,
             inputs=[
                 ct.TensorType(
-                    name="hidden_states", shape=(1, 512, model.config.hidden_size), dtype=np.float16
+                    name="hidden_states",shape=hidden_states.shape, dtype=np.float16
                 ),
                 ct.TensorType(
-                    name="position_ids", shape=(1, 512), dtype=np.int32
+                    name="position_ids", shape=position_ids.shape, dtype=np.int32
                 ),
                 ct.TensorType(
-                    name="causal_mask", shape=(1, 1, 512, self.context_length), dtype=np.float16
+                    name="causal_mask", shape=causal_mask.shape, dtype=np.float16
                 ),
                 ct.TensorType(
-                    name="current_pos", shape=(1,), dtype=np.int32
+                    name="current_pos", shape=current_pos.shape, dtype=np.int32
                 ),
             ],
             outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
