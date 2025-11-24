@@ -467,7 +467,7 @@ class Gemma3Converter(BaseConverter):
         hidden_states = torch.zeros(
             (1, 1, model.config.hidden_size), dtype=torch.float16, device=TEST_DEVICE
         )
-        position_ids = torch.zeros((1, ), dtype=torch.int32, device=TEST_DEVICE)
+        position_ids = torch.zeros((1, 1), dtype=torch.int32, device=TEST_DEVICE)
         causal_mask = torch.zeros(
             (1, 1, 1, self.context_length), dtype=torch.float16, device=TEST_DEVICE
         )
