@@ -1,8 +1,4 @@
-"""Converter for Gemma 3 models.
-
-This module provides a lightweight converter that mirrors the
-:class:`QwenConverter` behaviour for Gemma3 models without inheriting from
-it. Only the pieces required for the unit tests are implemented."""
+"""Full converter for Gemma 3 models."""
 
 from __future__ import annotations
 
