@@ -40,7 +40,99 @@ def check_file_exists(output_dir, base_name, lut_value):
         print(f"Warning: {lut_name}.mlmodelc not found, using {base_name}.mlmodelc instead")
         return base_name, 'none', None
 
+def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch, output_dir):
+    """Generate meta.yaml for monolithic model format.
+
+    Args:
+        model_name: Name of the model
+        context: Context length
+        batch: Batch size
+        lut_bits: LUT quantization bits (or 'none')
+        prefix: Model name prefix
+        arch: Architecture type
+        output_dir: Output directory
+    """
+    # Parse LUT value
+    lut_value, lut_per_channel, _ = parse_lut_value(lut_bits)
+
+    # Build model filename
+    if lut_value != 'none':
+        model_name_file = f'{prefix}_monolithic_full_lut{lut_value}.mlmodelc'
+    else:
+        model_name_file = f'{prefix}_monolithic_full.mlmodelc'
+
+    # Check if file exists
+    model_path = os.path.join(output_dir, model_name_file)
+    if not os.path.exists(model_path):
+        print(f"Warning: Monolithic model not found: {model_path}")
+
+    # Set split_lm_head based on architecture
+    split_lm_head = 16 if arch.startswith('qwen') else 8
+
+    # Build meta.yaml content
+    meta_parts = [f'''model_info:
+  name: anemll-{model_name}-ctx{context}-monolithic
+  version: 0.3.5
+  description: |
+    Monolithic model running {model_name} on Apple Neural Engine
+    Context length: {context}
+    Batch size: {batch}
+    Type: Monolithic (single file with embed+FFN+lm_head)
+  license: MIT
+  author: Anemll
+  framework: Core ML
+  language: Python
+  architecture: {arch}
+  model_type: monolithic
+  parameters:
+    context_length: {context}
+    batch_size: {batch}
+    lut_bits: {lut_value}''']
+
+    if lut_per_channel is not None:
+        meta_parts.append(f'    lut_per_channel: {lut_per_channel}')
+
+    meta_parts.append(f'''    model_prefix: {prefix}
+    monolithic_model: {model_name_file}
+    split_lm_head: {split_lm_head}
+    functions:
+      - infer
+      - prefill
+''')
+
+    meta = '\n'.join(meta_parts)
+
+    output_file = os.path.join(output_dir, 'meta.yaml')
+    with open(output_file, 'w') as f:
+        f.write(meta)
+
+    print(f"Generated monolithic meta.yaml at: {output_file}")
+    print(f"  model: {model_name_file}")
+    print(f"  lut_bits: {lut_value}" + (f" (per_channel: {lut_per_channel})" if lut_per_channel else ""))
+
+
 def main():
+    # Check for --monolithic flag
+    is_monolithic = '--monolithic' in sys.argv
+    if is_monolithic:
+        sys.argv.remove('--monolithic')
+
+    if is_monolithic:
+        if len(sys.argv) != 11:
+            print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_bits> <lut_bits> <lut_bits> <num_chunks> <prefix> <arch> <output_dir> --monolithic")
+            sys.exit(1)
+        # For monolithic, all LUT values should be the same (use the first one)
+        generate_monolithic_meta(
+            model_name=sys.argv[1],
+            context=sys.argv[2],
+            batch=sys.argv[3],
+            lut_bits=sys.argv[4],  # Use first LUT value for all
+            prefix=sys.argv[8],
+            arch=sys.argv[9],
+            output_dir=sys.argv[10]
+        )
+        return
+
     if len(sys.argv) != 11:
         print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_emb> <lut_ffn> <lut_lmh> <num_chunks> <prefix> <arch> <output_dir>")
         sys.exit(1)

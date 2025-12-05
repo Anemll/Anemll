@@ -230,11 +230,99 @@ def parse_lut_arg(lut_value):
         except ValueError:
             raise ValueError(f"Invalid LUT bits value: {lut_value}")
 
+def combine_monolithic(lut_bits=None, prefix='qwen', input_dir='.', output_dir='.'):
+    """Combine monolithic infer and prefill models into single multi-function model.
+
+    This creates a combined model with two functions:
+    - 'infer': Single token inference
+    - 'prefill': Batch token processing for initial sequence
+
+    Args:
+        lut_bits: LUT quantization bits (or None)
+        prefix: Model name prefix
+        input_dir: Directory containing the input models
+        output_dir: Directory to save the combined model
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    import shutil
+
+    # Build file names
+    if lut_bits:
+        infer_name = f"{prefix}_monolithic_lut{lut_bits}.mlpackage"
+        prefill_name = f"{prefix}_monolithic_prefill_lut{lut_bits}.mlpackage"
+        output_name = f"{prefix}_monolithic_full_lut{lut_bits}.mlpackage"
+    else:
+        infer_name = f"{prefix}_monolithic.mlpackage"
+        prefill_name = f"{prefix}_monolithic_prefill.mlpackage"
+        output_name = f"{prefix}_monolithic_full.mlpackage"
+
+    infer_path = os.path.join(input_dir, infer_name)
+    prefill_path = os.path.join(input_dir, prefill_name)
+    output_path = os.path.join(output_dir, output_name)
+    temp_path = os.path.join(output_dir, f"temp_{output_name}")
+
+    print(f"\nCombining monolithic models:")
+    print(f"  Infer:   {infer_path}")
+    print(f"  Prefill: {prefill_path}")
+    print(f"  Output:  {output_path}")
+
+    # Check input files exist
+    if not os.path.exists(infer_path):
+        print(f"Error: Infer model not found: {infer_path}")
+        return False
+    if not os.path.exists(prefill_path):
+        print(f"Error: Prefill model not found: {prefill_path}")
+        return False
+
+    try:
+        # Load models
+        print("Loading models...")
+        infer_model = ct.models.MLModel(infer_path)
+        prefill_model = ct.models.MLModel(prefill_path)
+
+        # Create combined model
+        print("Creating multi-function model...")
+        desc = ct.utils.MultiFunctionDescriptor()
+        desc.add_function(infer_path, "main", "infer")
+        desc.add_function(prefill_path, "main", "prefill")
+        desc.default_function_name = "infer"
+
+        ct.utils.save_multifunction(desc, temp_path)
+
+        # Load and add metadata
+        print("Adding metadata...")
+        combined_model = ct.models.MLModel(temp_path)
+        AddCombinedMetadata(combined_model, [infer_model, prefill_model])
+
+        # Save final model
+        print(f"Saving to: {output_path}")
+        combined_model.save(output_path)
+
+        # Clean up temp file
+        shutil.rmtree(temp_path, ignore_errors=True)
+
+        print("Monolithic model combination complete!")
+        return True
+
+    except Exception as e:
+        print(f"Error combining monolithic models: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        # Clean up temp file on error
+        if os.path.exists(temp_path):
+            shutil.rmtree(temp_path, ignore_errors=True)
+        return False
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Combine FFN and prefill models')
     parser.add_argument('--lut', type=str, help='LUT bits used in quantization (optional). Format: "bits" or "bits,per_channel" (e.g., "6" or "6,4")')
-    parser.add_argument('--chunk', type=int, required=True,
-                      help='Number of chunks')
+    parser.add_argument('--chunk', type=int, default=None,
+                      help='Number of chunks (required for chunked mode)')
+    parser.add_argument('--monolithic', action='store_true',
+                      help='Combine monolithic infer and prefill models')
     parser.add_argument('--input', type=str, default='.',
                       help='Input directory containing model files (default: current directory)')
     parser.add_argument('--output', type=str, default=None,
@@ -281,13 +369,30 @@ def main():
     args.lut = parse_lut_arg(args.lut)
 
     try:
+        # Handle monolithic mode
+        if args.monolithic:
+            input_dir = args.input
+            output_dir = args.output if args.output else args.input
+            success = combine_monolithic(
+                lut_bits=args.lut,
+                prefix=args.prefix,
+                input_dir=input_dir,
+                output_dir=output_dir
+            )
+            sys.exit(0 if success else 1)
+
+        # Chunked mode requires --chunk
+        if args.chunk is None:
+            print("Error: --chunk is required for chunked mode (or use --monolithic)")
+            sys.exit(1)
+
         # Change to input directory for processing
         orig_dir = os.getcwd()
         os.chdir(args.input)
 
         # Run combination
         success = combine_models(args)
-        
+
         # Move files if needed
         if success and args.output and args.input != args.output:
             output_dir = Path(args.output)
@@ -295,12 +400,12 @@ def main():
                 combined_file = f"{args.prefix}_FFN_PF_lut{args.lut}_chunk_{chunk:02d}of{args.chunk:02d}.mlpackage"
                 if os.path.exists(combined_file):
                     os.rename(combined_file, output_dir / combined_file)
-        
+
         # Return to original directory
         os.chdir(orig_dir)
-        
+
         sys.exit(0 if success else 1)
-        
+
     except Exception as e:
         print(f"Error: {str(e)}")
         sys.exit(1)

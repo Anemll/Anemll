@@ -12,11 +12,15 @@ public struct YAMLConfig: Sendable {
     public let lutBits: Int
     public let numChunks: Int
     public let splitLMHead: Int
-    
+
     // Model paths
     public let embedPath: String
     public let ffnPath: String
     public let lmheadPath: String
+
+    // Monolithic model support
+    public let isMonolithic: Bool
+    public let monolithicModelPath: String?
     
     public init(from yamlString: String) throws {
         // Load YAML
@@ -49,28 +53,32 @@ public struct YAMLConfig: Sendable {
         // Extract paths from yaml
         self.embedPath = yaml["embed_path"] as? String ?? ""
         self.lmheadPath = yaml["lmhead_path"] as? String ?? ""
-        
+
+        // Monolithic model support
+        self.isMonolithic = yaml["is_monolithic"] as? Bool ?? false
+        self.monolithicModelPath = yaml["monolithic_model_path"] as? String
+
         // Get the ffn_path
         let rawFFNPath = yaml["ffn_path"] as? String ?? ""
-        
+
         // If multi-chunk model and path doesn't already have the proper format, adjust it
         if self.numChunks > 1 && !rawFFNPath.contains("_chunk_01of") {
             let directory = (rawFFNPath as NSString).deletingLastPathComponent
             let filename = (rawFFNPath as NSString).lastPathComponent
-            
+
             // Derive base name without .mlmodelc
             var baseName = filename
             if baseName.hasSuffix(".mlmodelc") {
                 baseName = String(baseName.dropLast(9)) // Remove .mlmodelc
             }
-            
+
             // Generate canonical first chunk path
             self.ffnPath = "\(directory)/\(baseName)_chunk_01of\(String(format: "%02d", self.numChunks)).mlmodelc"
             print("Generated canonical chunk path: \(self.ffnPath)")
         } else {
             self.ffnPath = rawFFNPath
         }
-        
+
         self.configVersion = yaml["version"] as? String ?? "0.3.4"
     }
     
@@ -119,7 +127,12 @@ public struct YAMLConfig: Sendable {
             // Extract parameters from modelInfo["parameters"]
             let modelPrefix = params["model_prefix"] as? String ?? "llama"
             print("Model prefix: \(modelPrefix)")
-            
+
+            // Detect monolithic model type
+            let modelType = modelInfo["model_type"] as? String ?? "chunked"
+            let isMonolithic = (modelType == "monolithic")
+            print("Model type: \(modelType), isMonolithic: \(isMonolithic)")
+
             let lutFFN = String(params["lut_ffn"] as? Int ?? -1)
             let lutLMHead = String(params["lut_lmhead"] as? Int ?? -1)
             let lutEmbeddings = String(params["lut_embeddings"] as? Int ?? -1)
@@ -130,11 +143,13 @@ public struct YAMLConfig: Sendable {
             let predefinedEmbedPath = params["embeddings"] as? String
             let predefinedLMHeadPath = params["lm_head"] as? String
             let predefinedFFNPath = params["ffn"] as? String
-            
+            let predefinedMonolithicModel = params["monolithic_model"] as? String
+
             print("Predefined paths from meta.yaml:")
             print("  - embeddings: \(predefinedEmbedPath ?? "Not defined")")
             print("  - lm_head: \(predefinedLMHeadPath ?? "Not defined")")
             print("  - ffn: \(predefinedFFNPath ?? "Not defined")")
+            print("  - monolithic_model: \(predefinedMonolithicModel ?? "Not defined")")
             
             // Build paths, preferring predefined paths if available
             let embedPath: String
@@ -190,23 +205,37 @@ public struct YAMLConfig: Sendable {
                 }
             }
             
-            print("\nModel paths (Python style):")
-            print("Raw paths before .mlmodelc:")
-            print("Embed: \(modelPrefix)_embeddings\(lutEmbeddings != "-1" ? "_lut\(lutEmbeddings)" : "")")
-            print("LMHead: \(modelPrefix)_lm_head\(lutLMHead != "-1" ? "_lut\(lutLMHead)" : "")")
-            if numChunks > 1 {
-                print("FFN: \(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "")_chunk_01of\(String(format: "%02d", numChunks))")
+            // Build monolithic model path if applicable
+            let monolithicModelPath: String?
+            if isMonolithic {
+                if let definedPath = predefinedMonolithicModel {
+                    monolithicModelPath = "\(baseDir)/\(definedPath)"
+                } else {
+                    // Fallback to constructing the path
+                    let lutSuffix = (params["lut_bits"] as? Int).map { "_lut\($0)" } ?? ""
+                    monolithicModelPath = "\(baseDir)/\(modelPrefix)_monolithic_full\(lutSuffix).mlmodelc"
+                }
+                print("\nMonolithic model path: \(monolithicModelPath!)")
             } else {
-                print("FFN: \(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "")")
+                monolithicModelPath = nil
+                print("\nModel paths (Python style):")
+                print("Raw paths before .mlmodelc:")
+                print("Embed: \(modelPrefix)_embeddings\(lutEmbeddings != "-1" ? "_lut\(lutEmbeddings)" : "")")
+                print("LMHead: \(modelPrefix)_lm_head\(lutLMHead != "-1" ? "_lut\(lutLMHead)" : "")")
+                if numChunks > 1 {
+                    print("FFN: \(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "")_chunk_01of\(String(format: "%02d", numChunks))")
+                } else {
+                    print("FFN: \(modelPrefix)_FFN_PF\(lutFFN != "-1" ? "_lut\(lutFFN)" : "")")
+                }
+                print("\nFull paths:")
+                print("Embed: \(embedPath)")
+                print("LMHead: \(lmheadPath)")
+                print("FFN: \(ffnPath)")
             }
-            print("\nFull paths:")
-            print("Embed: \(embedPath)")
-            print("LMHead: \(lmheadPath)")
-            print("FFN: \(ffnPath)")
             
             // Create YAML string for init(from:)
-            let configDict: [String: Any] = [
-                "model_path": ffnPath,
+            var configDict: [String: Any] = [
+                "model_path": isMonolithic ? (monolithicModelPath ?? "") : ffnPath,
                 "tokenizer_model": baseDir,
                 "context_length": params["context_length"] as? Int ?? 2048,
                 "batch_size": params["batch_size"] as? Int ?? 32,
@@ -221,8 +250,12 @@ public struct YAMLConfig: Sendable {
                 "embed_path": embedPath,
                 "ffn_path": ffnPath,
                 "lmhead_path": lmheadPath,
-                "split_lm_head": splitLMHead
+                "split_lm_head": splitLMHead,
+                "is_monolithic": isMonolithic
             ]
+            if let monolithicPath = monolithicModelPath {
+                configDict["monolithic_model_path"] = monolithicPath
+            }
             
             let yamlString = try Yams.dump(object: configDict)
             return try YAMLConfig(from: yamlString)
@@ -237,22 +270,24 @@ public struct YAMLConfig: Sendable {
     
     // Helper method to create YAMLConfig when an alternate chunk is found
     private static func loadFromDetectedPaths(
-        baseDir: String, 
-        embedPath: String, 
-        lmheadPath: String, 
-        ffnPath: String, 
-        params: [String: Any], 
-        modelInfo: [String: Any], 
-        modelPrefix: String, 
-        numChunks: Int, 
-        lutFFN: String, 
-        lutLMHead: String, 
+        baseDir: String,
+        embedPath: String,
+        lmheadPath: String,
+        ffnPath: String,
+        params: [String: Any],
+        modelInfo: [String: Any],
+        modelPrefix: String,
+        numChunks: Int,
+        lutFFN: String,
+        lutLMHead: String,
         lutEmbeddings: String,
-        splitLMHead: Int
+        splitLMHead: Int,
+        isMonolithic: Bool = false,
+        monolithicModelPath: String? = nil
     ) throws -> YAMLConfig {
         // Create YAML string for init(from:)
-        let configDict: [String: Any] = [
-            "model_path": ffnPath,
+        var configDict: [String: Any] = [
+            "model_path": isMonolithic ? (monolithicModelPath ?? "") : ffnPath,
             "tokenizer_model": baseDir,
             "context_length": params["context_length"] as? Int ?? 2048,
             "batch_size": params["batch_size"] as? Int ?? 32,
@@ -267,9 +302,13 @@ public struct YAMLConfig: Sendable {
             "embed_path": embedPath,
             "ffn_path": ffnPath,
             "lmhead_path": lmheadPath,
-            "split_lm_head": splitLMHead
+            "split_lm_head": splitLMHead,
+            "is_monolithic": isMonolithic
         ]
-        
+        if let monolithicPath = monolithicModelPath {
+            configDict["monolithic_model_path"] = monolithicPath
+        }
+
         let yamlString = try Yams.dump(object: configDict)
         return try YAMLConfig(from: yamlString)
     }

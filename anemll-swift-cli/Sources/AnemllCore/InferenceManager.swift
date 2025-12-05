@@ -18,6 +18,7 @@ import CoreFoundation
     private var prefillEndTime: CFAbsoluteTime?
     private var FilterLLAMA01: Bool = false
     private let splitLMHead: Int
+    private let isMonolithic: Bool  // Monolithic model support
     
     private var lmheadOutputBackings: [String: MLMultiArray]?
     private var hiddenStatesBackings_emb: [String: MLMultiArray]?  // For embed output
@@ -62,6 +63,7 @@ import CoreFoundation
 
     public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false) throws {  // Make init throwing
         self.debugLevel = debugLevel
+        self.isMonolithic = models.isMonolithic
         self.embedModel = models.embedModel
         self.lmheadModel = models.lmheadModel
         // Assume models.ffnChunks is available (see note below)
@@ -71,37 +73,52 @@ import CoreFoundation
         self.splitLMHead = splitLMHead
         self.v110 = v110 // Set the v110 flag based on the parameter
 
-        
-        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize)")
+        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic)")
         self.fullCausalMask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: contextLength)], dataType: .float16)
 
         self.initState()
 
         initFullCausalMask()
-        
+
         try initializeBackings()
-        
+
         // Debug model descriptions
-        if debugLevel >= 1 {
+        if debugLevel >= 1 && !isMonolithic {
             print("\nLM Head Model Output Description:")
-            for (name, desc) in lmheadModel.modelDescription.outputDescriptionsByName {
+            if let lmhead = lmheadModel {
+                for (name, desc) in lmhead.modelDescription.outputDescriptionsByName {
+                    print("Output \(name):")
+                    print("- Type: \(type(of: desc.type))")
+                    print("- Description: \(desc.type)")
+                }
+            }
+        }
+
+        // Debug monolithic model descriptions
+        if debugLevel >= 1 && isMonolithic {
+            print("\nMonolithic Model Output Description:")
+            for (name, desc) in ffnChunks[0].inferModel.modelDescription.outputDescriptionsByName {
                 print("Output \(name):")
                 print("- Type: \(type(of: desc.type))")
                 print("- Description: \(desc.type)")
             }
         }
-        
     }
     
     public func initializeBackings() throws {
-        // Initialize output backings for lmhead
-        try initializeLMHeadOutputBackings()
-        
-        // Initialize hidden states backings
-        try initializeHiddenStatesBackings()
+        if isMonolithic {
+            // For monolithic models, initialize logits output backings from the monolithic model
+            try initializeMonolithicOutputBackings()
+        } else {
+            // Initialize output backings for lmhead
+            try initializeLMHeadOutputBackings()
 
-        try initializePrefillBackings()
-        try initializeLastChunkBacking()
+            // Initialize hidden states backings
+            try initializeHiddenStatesBackings()
+
+            try initializePrefillBackings()
+            try initializeLastChunkBacking()
+        }
     }
     
     
@@ -319,14 +336,14 @@ import CoreFoundation
         let hiddenSize = self.hidden_states  // Adjust based on your model's hidden size
         let shape: [NSNumber] = [1, NSNumber(value: batchSize), NSNumber(value: hiddenSize)]
         let attributes: [String: Any] = [kCVPixelBufferMetalCompatibilityKey as String: true]
-        
+
         if debugLevel >= 1 {
             print("\n=== Prefill Backing Initialization ===")
             print("Hidden size:", hiddenSize)
             print("Batch size:", batchSize)
             print("Prefill backing shape:", shape.map { $0.intValue })
         }
-        
+
         // Embedding prefill backing
         var embedPixelBuffer: CVPixelBuffer?
         let embedStatus = CVPixelBufferCreate(
@@ -341,11 +358,11 @@ import CoreFoundation
             throw InferenceError.inferenceError("Failed to create embed prefill pixel buffer")
         }
         hiddenStatesBackings_emb_prefill = ["hidden_states": MLMultiArray(pixelBuffer: embedBuffer, shape: shape)]
-        
+
         if debugLevel >= 1 {
             print("Embed prefill backing created with shape:", shape.map { $0.intValue })
         }
-        
+
         // FFN prefill backing
         var ffnPixelBuffer: CVPixelBuffer?
         let ffnStatus = CVPixelBufferCreate(
@@ -360,6 +377,71 @@ import CoreFoundation
             throw InferenceError.inferenceError("Failed to create FFN prefill pixel buffer")
         }
         hiddenStatesBackings_ffn_prefill = ["output_hidden_states": MLMultiArray(pixelBuffer: ffnBuffer, shape: shape)]
+    }
+
+    private func initializeMonolithicOutputBackings() throws {
+        // For monolithic models, initialize output backings from the monolithic model's output description
+        let outputDescription = ffnChunks[0].inferModel.modelDescription.outputDescriptionsByName
+        let featureNames = (1...splitLMHead).map { i in "logits\(i)" }
+        var outputBackingsDict: [String: MLMultiArray] = [:]
+
+        if debugLevel >= 1 {
+            print("\n=== Initializing Monolithic Output Backings ===")
+            print("Available outputs: \(outputDescription.keys)")
+        }
+
+        for featureName in featureNames {
+            guard let featureDesc = outputDescription[featureName] else {
+                if debugLevel >= 1 {
+                    print("Warning: Feature \(featureName) not found in monolithic model outputs")
+                }
+                continue
+            }
+
+            // Check if it's a multiarray feature and get its constraint
+            guard featureDesc.type.rawValue == 5,
+                  let constraint = featureDesc.multiArrayConstraint else {
+                print("Feature \(featureName) is not a multiarray")
+                throw InferenceError.inferenceError("Feature \(featureName) is not a multiarray")
+            }
+
+            let shape = constraint.shape
+
+            // Calculate dimensions for pixel buffer
+            let lastDim = shape.last?.intValue ?? 1
+            let otherDims = shape.dropLast().reduce(1) { $0 * $1.intValue }
+
+            // Create IOSurface-backed pixel buffer
+            let attributes: [String: Any] = [
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ]
+
+            var pixelBuffer: CVPixelBuffer?
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                lastDim,     // Width is last dimension
+                otherDims,   // Height is product of other dimensions
+                kCVPixelFormatType_OneComponent16Half,
+                attributes as CFDictionary,
+                &pixelBuffer
+            )
+            if debugLevel >= 2 {
+                print("Creating pixel buffer for \(featureName):")
+                print("- Width (last dim): \(lastDim)")
+                print("- Height (other dims): \(otherDims)")
+                print("- Status: \(status)")
+            }
+            guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
+                throw InferenceError.inferenceError("Failed to create pixel buffer for \(featureName)")
+            }
+
+            // Create MLMultiArray from pixel buffer
+            let outputBacking = MLMultiArray(pixelBuffer: buffer, shape: shape)
+            outputBackingsDict[featureName] = outputBacking
+        }
+
+        lmheadOutputBackings = outputBackingsDict
+        print("✅ Monolithic output backings initialized for \(outputBackingsDict.count) logits outputs")
     }
     
     // Helper to get causal mask slice for current position
@@ -448,10 +530,16 @@ import CoreFoundation
             print("\n=== Starting Prefill Phase ===")
             print("Input context length:", contextPos)
             print("Configured batch size:", batchSize)
+            print("Is monolithic:", isMonolithic)
             debugTokens(Array(contextTokens.prefix(contextPos)), prefix: "Input")
         }
         guard let ffnChunks = ffnChunks else {
             throw InferenceError.inferenceError("ffnChunks was nil in runPrefill()")
+        }
+
+        // For monolithic models, use the monolithic prefill path
+        if isMonolithic {
+            return try await runMonolithicPrefill(on: &contextTokens, contextPos: contextPos, tokenizer: tokenizer)
         }
         var batchPos = 0
         while batchPos < contextPos {
@@ -602,7 +690,91 @@ import CoreFoundation
             
             batchPos = batchEnd
         }
-        
+
+        return contextPos
+    }
+
+    /// Run prefill for monolithic models - passes input_ids directly to the model
+    private func runMonolithicPrefill(
+        on contextTokens: inout [Int],
+        contextPos: Int,
+        tokenizer: Tokenizer? = nil
+    ) async throws -> Int {
+        if debugLevel >= 1 {
+            print("\n=== Running Monolithic Prefill ===")
+            print("Context position:", contextPos)
+            print("Batch size:", batchSize)
+        }
+
+        let monolithicModel = ffnChunks[0].prefillModel
+
+        var batchPos = 0
+        while batchPos < contextPos {
+            let batchEnd = min(batchPos + batchSize, contextPos)
+            let currentBatchSize = batchEnd - batchPos
+
+            if debugLevel >= 1 {
+                print("\nMonolithic prefill batch: \(batchPos) to \(batchEnd), currentBatchSize: \(currentBatchSize)")
+            }
+
+            // Create input tensor for current batch
+            let batchInput = try MLMultiArray(shape: [1, NSNumber(value: batchSize)], dataType: .int32)
+            for i in 0..<currentBatchSize {
+                batchInput[[0, i] as [NSNumber]] = NSNumber(value: contextTokens[batchPos + i])
+            }
+
+            // Generate position IDs
+            let positionIds = try MLMultiArray(shape: [NSNumber(value: batchSize)], dataType: .int32)
+            for i in 0..<batchSize {
+                positionIds[i] = NSNumber(value: batchPos + i)
+            }
+
+            // Create batch causal mask
+            let batchCausalMask = try MLMultiArray(
+                shape: [1, 1, NSNumber(value: batchSize), NSNumber(value: contextLength)],
+                dataType: .float16
+            )
+
+            // Fill with -inf by default
+            for i in 0..<batchCausalMask.count {
+                batchCausalMask[i] = NSNumber(value: Float(-Float.infinity))
+            }
+
+            // Set causal attention pattern
+            for i in 0..<batchSize {
+                for j in 0..<contextLength {
+                    if j <= (batchPos + i) {
+                        batchCausalMask[[0, 0, i, j] as [NSNumber]] = NSNumber(value: Float(0.0))
+                    }
+                }
+            }
+
+            // Create current_pos as tensor
+            let currentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
+            currentPosArray[0] = NSNumber(value: batchPos)
+
+            // Create input feature provider - monolithic takes input_ids directly
+            let prefillInput = try MLDictionaryFeatureProvider(dictionary: [
+                "input_ids": batchInput,
+                "position_ids": positionIds,
+                "causal_mask": batchCausalMask,
+                "current_pos": currentPosArray
+            ])
+
+            // Run prediction with state
+            _ = try await monolithicModel.prediction(
+                from: prefillInput,
+                using: state,
+                options: MLPredictionOptions()
+            )
+
+            if debugLevel >= 1 {
+                print("✅ Monolithic prefill batch completed")
+            }
+
+            batchPos = batchEnd
+        }
+
         return contextPos
     }
 
@@ -768,11 +940,19 @@ import CoreFoundation
                 print()
             }
         }
-        
+
         let _padTokenId = tokenizer?.padTokenId ?? 0 // Default to 0 if nil
 
-        
-        
+        // For monolithic models, use the monolithic inference path
+        if isMonolithic {
+            return try await generateNextTokenMonolithic(
+                for: lastToken,
+                currentPos: currentPos,
+                temperature: temperature,
+                tokenizer: tokenizer
+            )
+        }
+
         // Run embeddings with output backing
         let tokenArray = try MLMultiArray(shape: [1, 1], dataType: .int32)
         tokenArray[[0, 0] as [NSNumber]] = NSNumber(value: lastToken)
@@ -1055,9 +1235,160 @@ import CoreFoundation
             
             // Fallback to highest scoring token
             return sparseLogits.first?.0 ?? 0
-        }   
+        }
      }
-    
+
+    /// Generates the next token using monolithic model - takes input_ids directly
+    private func generateNextTokenMonolithic(
+        for lastToken: Int,
+        currentPos: Int,
+        temperature: Float,
+        tokenizer: Tokenizer? = nil
+    ) async throws -> Int {
+        let monolithicModel = ffnChunks[0].inferModel
+
+        // Create input tensor for single token
+        let tokenArray = try MLMultiArray(shape: [1, 1], dataType: .int32)
+        tokenArray[[0, 0] as [NSNumber]] = NSNumber(value: lastToken)
+
+        // Create position IDs
+        let positionIds = try MLMultiArray(shape: [1], dataType: .int32)
+        positionIds[0] = NSNumber(value: currentPos - 1)
+
+        // Get causal mask for single token
+        let causalMask = try getCausalMask(for: 1, at: currentPos)
+
+        // Create current_pos tensor
+        let currentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
+        currentPosArray[0] = NSNumber(value: currentPos - 1)
+
+        // Create input feature provider - monolithic takes input_ids directly
+        let inferInput = try MLDictionaryFeatureProvider(dictionary: [
+            "input_ids": tokenArray,
+            "position_ids": positionIds,
+            "causal_mask": causalMask,
+            "current_pos": currentPosArray
+        ])
+
+        // Use output backings
+        let inferOptions = MLPredictionOptions()
+        if let backings = lmheadOutputBackings {
+            inferOptions.outputBackings = backings
+        }
+
+        // Run prediction with state
+        _ = try await monolithicModel.prediction(from: inferInput, using: state, options: inferOptions)
+
+        guard let outputBackings = lmheadOutputBackings else {
+            throw InferenceError.inferenceError("Output backings not initialized for monolithic model")
+        }
+
+        // Process logits outputs (same as regular generateNextToken)
+        if GreedySearch {
+            // Argmax branch
+            let partialResults = try await withThrowingTaskGroup(of: PartialMax.self) { group -> [PartialMax] in
+                for i in 1...splitLMHead {
+                    let partIndex = i
+                    let logitsKey = "logits\(partIndex)"
+
+                    guard let logitsPart = outputBackings[logitsKey] else {
+                        throw InferenceError.inferenceError("Missing feature \(logitsKey)")
+                    }
+
+                    group.addTask { @Sendable in
+                        let localLogitsPart = logitsPart
+                        let localOffset = (partIndex - 1) * logitsPart.count
+
+                        guard let pixelBuffer = localLogitsPart.pixelBuffer else {
+                            throw InferenceError.inferenceError("Missing or invalid \(logitsKey) in output backings")
+                        }
+                        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+                        defer {
+                            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+                        }
+                        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                            throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
+                        }
+
+                        #if arch(arm64)
+                        let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
+                        let count = localLogitsPart.count
+                        var localMaxValue: Float = -Float.infinity
+                        var localMaxIndex = 0
+
+                        var start = 0
+                        if localOffset == 0 && self.FilterLLAMA01 {
+                            start = 2
+                        }
+
+                        for j in start..<count {
+                            let value = Float(buffer[j])
+                            if value > localMaxValue {
+                                localMaxValue = value
+                                localMaxIndex = localOffset + j
+                            }
+                        }
+                        return PartialMax(value: localMaxValue, index: localMaxIndex)
+                        #else
+                        fatalError("Unsupported architecture, only Apple Silicon is supported")
+                        #endif
+                    }
+                }
+
+                var results: [PartialMax] = []
+                for try await result in group {
+                    results.append(result)
+                }
+                return results
+            }
+
+            let globalMax = partialResults.reduce(PartialMax(value: -Float.infinity, index: 0)) { current, next in
+                next.value > current.value ? next : current
+            }
+
+            if debugLevel >= 1 {
+                print("\nMonolithic argmax token:", globalMax.index)
+            }
+            return globalMax.index
+        } else {
+            // Sampling branch - simplified version for monolithic
+            // Collect logits from all splits
+            var allLogits: [Float] = []
+            for i in 1...splitLMHead {
+                let logitsKey = "logits\(i)"
+                guard let logitsPart = outputBackings[logitsKey] else {
+                    throw InferenceError.inferenceError("Missing feature \(logitsKey)")
+                }
+
+                guard let pixelBuffer = logitsPart.pixelBuffer else {
+                    throw InferenceError.inferenceError("Missing pixel buffer for \(logitsKey)")
+                }
+                CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+                defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+                guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                    throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
+                }
+
+                #if arch(arm64)
+                let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
+                for j in 0..<logitsPart.count {
+                    allLogits.append(Float(buffer[j]))
+                }
+                #else
+                fatalError("Unsupported architecture")
+                #endif
+            }
+
+            // Apply top-p sampling
+            let sampledToken = topPSample(logits: allLogits, temperature: temperature, topP: Float(samplingConfig.topP))
+            if debugLevel >= 1 {
+                print("\nMonolithic sampled token:", sampledToken)
+            }
+            return sampledToken
+        }
+    }
+
     /// Shifts the context window if needed (similar to the Python code).
     public func shiftWindow(
         currentPos: Int,  

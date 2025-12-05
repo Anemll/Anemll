@@ -3,9 +3,26 @@ import Foundation
 
 /// Model collection for inference.
 public struct LoadedModels: @unchecked Sendable {
-    public let embedModel: MLModel
-    public let lmheadModel: MLModel
+    public let embedModel: MLModel?
+    public let lmheadModel: MLModel?
     public let ffnChunks: [FFNChunk]
+    public let isMonolithic: Bool
+
+    // Convenience initializer for non-monolithic models
+    public init(embedModel: MLModel, lmheadModel: MLModel, ffnChunks: [FFNChunk]) {
+        self.embedModel = embedModel
+        self.lmheadModel = lmheadModel
+        self.ffnChunks = ffnChunks
+        self.isMonolithic = false
+    }
+
+    // Initializer for monolithic models
+    public init(monolithicChunk: FFNChunk) {
+        self.embedModel = nil
+        self.lmheadModel = nil
+        self.ffnChunks = [monolithicChunk]
+        self.isMonolithic = true
+    }
 }
 
 /// Protocol for receiving model loading progress updates.
@@ -136,18 +153,27 @@ public actor ModelLoader {
         
         loadingTask = Task<LoadedModels, Error> {
             print("\nLoading Models:")
-            
+
             // Configure compute units
             let modelConfig = MLModelConfiguration()
             modelConfig.computeUnits = configurationCopy.computeUnits
-            
+
+            // Check if this is a monolithic model
+            if configCopy.isMonolithic {
+                return try await self.loadMonolithicModel(
+                    config: configCopy,
+                    modelConfig: modelConfig,
+                    progressTracker: progressTracker
+                )
+            }
+
             // Load embeddings model
             try await progressTracker.updateProgress(
                 increment: 0.0,
                 stage: "Loading Embeddings Model",
                 detail: nil
             )
-            
+
             print("\nLoading Embeddings Model:")
             let embedURL = URL(fileURLWithPath: configCopy.embedPath)
             print("Path: \(embedURL.path)")
@@ -414,6 +440,98 @@ public actor ModelLoader {
         // Since YAMLConfig is now Sendable, we can pass it directly to the actor method
         let loader = ModelLoader()
         return try await loader.loadModel(from: config, configuration: configuration)
+    }
+
+    /// Load a monolithic model (single file with infer/prefill functions)
+    private func loadMonolithicModel(
+        config: YAMLConfig,
+        modelConfig: MLModelConfiguration,
+        progressTracker: ProgressTracker
+    ) async throws -> LoadedModels {
+        guard let monolithicPath = config.monolithicModelPath else {
+            throw ModelError.invalidModelFormat("Monolithic model path not specified")
+        }
+
+        print("\n=== Loading Monolithic Model ===")
+        print("Path: \(monolithicPath)")
+
+        let fileManager = FileManager.default
+        if !fileManager.fileExists(atPath: monolithicPath) {
+            print("❌ ERROR: Monolithic model not found at path: \(monolithicPath)")
+            throw ModelError.failedToLoadModel
+        }
+
+        let monolithicURL = URL(fileURLWithPath: monolithicPath)
+
+        // Load inference model
+        try await progressTracker.updateProgress(
+            increment: 0.0,
+            stage: "Loading Monolithic Model",
+            detail: "Inference function"
+        )
+
+        print("Loading monolithic infer function...")
+        modelConfig.functionName = "infer"
+        let inferModel: MLModel
+        do {
+            inferModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
+            print("✅ Monolithic infer function loaded")
+        } catch {
+            print("❌ Error loading monolithic infer function: \(error)")
+            throw ModelError.inferenceError("Failed to load monolithic infer function: \(String(reflecting: error))")
+        }
+
+        try await progressTracker.updateProgress(
+            increment: 0.4,
+            stage: "Monolithic Infer Loaded",
+            detail: nil
+        )
+
+        // Load prefill model
+        try await progressTracker.updateProgress(
+            increment: 0.0,
+            stage: "Loading Monolithic Model",
+            detail: "Prefill function"
+        )
+
+        print("Loading monolithic prefill function...")
+        modelConfig.functionName = "prefill"
+        let prefillModel: MLModel
+        do {
+            prefillModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
+            print("✅ Monolithic prefill function loaded")
+        } catch {
+            print("❌ Error loading monolithic prefill function: \(error)")
+            throw ModelError.inferenceError("Failed to load monolithic prefill function: \(String(reflecting: error))")
+        }
+
+        try await progressTracker.updateProgress(
+            increment: 0.5,
+            stage: "Monolithic Prefill Loaded",
+            detail: nil
+        )
+
+        // Create FFNChunk with monolithic models
+        let monolithicChunk = FFNChunk(inferModel: inferModel, prefillModel: prefillModel)
+
+        // Final progress update
+        try await progressTracker.updateProgress(
+            increment: 0.1,
+            stage: "Loading Complete",
+            detail: nil
+        )
+
+        let loadedModels = LoadedModels(monolithicChunk: monolithicChunk)
+
+        let delegate = self.progressDelegate
+        if let delegate = delegate {
+            await MainActor.run {
+                delegate.loadingCompleted(models: loadedModels)
+            }
+        }
+
+        print("✅ Monolithic model loaded successfully")
+        return loadedModels
     }
 }
 

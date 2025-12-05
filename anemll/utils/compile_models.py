@@ -39,17 +39,18 @@ def compile_model(model_path: str, target_dir: str = "./") -> bool:
 
 def get_part_name(part: str) -> str:
     """Map part number to model name component.
-    
+
     Args:
-        part: Part number ("1", "2", "3")
-    
+        part: Part number ("1", "2", "3", "monolithic")
+
     Returns:
         str: Model name component
     """
     part_map = {
         "1": "embeddings",
         "2": "FFN_PF",  # For combined FFN/prefill
-        "3": "lm_head"
+        "3": "lm_head",
+        "monolithic": "monolithic_full"  # For combined monolithic model
     }
     return part_map.get(part, part)
 
@@ -166,10 +167,10 @@ def main():
 
     # Parse LUT argument to extract just the bits value
     args.lut = parse_lut_arg(args.lut)
-    
+
     # Set output dir to input dir if not specified
     output_dir = args.output if args.output else args.input
-    
+
     # Construct input filename based on part and parameters
     if args.part == '1':
         # Try both naming patterns for embeddings (with and without LUT suffix)
@@ -198,10 +199,20 @@ def main():
             input_path = os.path.join(args.input, chunk_name)
             compile_model(input_path, output_dir)
         return 0
+    elif args.part == 'monolithic':
+        # Compile monolithic combined model
+        lut_suffix = f'_lut{args.lut}' if args.lut else ''
+        input_name = f'{args.prefix}_monolithic_full{lut_suffix}.mlpackage'
+        input_path = os.path.join(args.input, input_name)
+        if not os.path.exists(input_path):
+            print(f"Error: Monolithic model not found: {input_path}")
+            return 1
+        compile_model(input_path, output_dir)
+        return 0
     else:
         print(f"Error: Invalid part {args.part}")
         return 1
-    
+
     input_path = os.path.join(args.input, input_name)
     if not os.path.exists(input_path):
         print(f"Error: Model file not found: {input_path}")

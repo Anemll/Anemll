@@ -154,6 +154,8 @@ class Qwen25Converter(BaseConverter):
                  "full" - complete model (default)
                  "prefill" - prefill mode for initial sequence processing
                  "embeddings" - embeddings only (input_ids -> hidden_states)
+                 "monolithic" - single file with embed+FFN+lmhead (inference mode)
+                 "monolithic_prefill" - single file with embed+FFN+lmhead (prefill mode)
 
         Returns:
             ct.models.MLModel: Converted model
@@ -166,6 +168,12 @@ class Qwen25Converter(BaseConverter):
         if part in ("full", "all", "123"):
             print("Converting full model...")
             mlmodel = self.convert_to_coreml(self.model)
+        elif part == "monolithic":
+            print("Converting monolithic model (embeddings + FFN + LM head)...")
+            mlmodel = self.convert_monolithic(self.model, is_prefill=False)
+        elif part == "monolithic_prefill":
+            print("Converting monolithic prefill model...")
+            mlmodel = self.convert_monolithic(self.model, is_prefill=True)
         elif part in ("embeddings", "1"):
             print("Converting embeddings...")
             mlmodel = self.convert_part_1(self.model)
@@ -812,6 +820,226 @@ class Qwen25Converter(BaseConverter):
 
         return mlmodel
 
+    def convert_monolithic(
+        self, model: Qwen25ForCausalLM, is_prefill: bool = False
+    ) -> ct.models.MLModel:
+        """Convert full model (embeddings + FFN + LM head) to single CoreML model.
+
+        This creates a monolithic model that takes input_ids and returns logits,
+        combining all components into a single file for simpler deployment.
+
+        Args:
+            model: The Qwen 2.5 model to convert
+            is_prefill: If True, convert for prefill mode (batch processing)
+                       If False, convert for inference mode (single token)
+
+        Returns:
+            ct.models.MLModel: Monolithic CoreML model
+        """
+        require_coreml()
+        mode_str = "prefill" if is_prefill else "inference"
+        print(f"\nConverting monolithic model for {mode_str} mode...")
+
+        class MonolithicWrapper(torch.nn.Module):
+            """Wrapper combining embeddings + transformer + LM head."""
+
+            def __init__(
+                self, model: Qwen25ForCausalLM, context_length: int, is_prefill: bool
+            ) -> None:
+                super().__init__()
+                self.model = model
+                self.context_length = context_length
+                self.is_prefill = is_prefill
+
+                # Determine LM head mode
+                if hasattr(model, "lm_head16_1"):
+                    self.lm_head_mode = "16"
+                    self.lm_heads = [
+                        getattr(model, f"lm_head16_{i}") for i in range(1, 17)
+                    ]
+                elif hasattr(model, "lm_head8_1"):
+                    self.lm_head_mode = "8"
+                    self.lm_heads = [
+                        getattr(model, f"lm_head8_{i}") for i in range(1, 9)
+                    ]
+                elif hasattr(model, "lm_head2_1"):
+                    self.lm_head_mode = "2"
+                    self.lm_heads = [model.lm_head2_1, model.lm_head2_2]
+                elif hasattr(model, "lm_head1"):
+                    self.lm_head_mode = "1"
+                    self.lm_head = model.lm_head1
+                else:
+                    self.lm_head_mode = "linear"
+                    self.lm_head = model.lm_head
+
+            def forward(
+                self,
+                input_ids: torch.Tensor,
+                position_ids: torch.Tensor,
+                causal_mask: torch.Tensor,
+                current_pos: torch.Tensor,
+            ) -> tuple:
+                # Step 1: Embeddings
+                hidden_states = self.model.model.embed_tokens(input_ids)
+                hidden_states = hidden_states.to(MODEL_DTYPE)
+
+                # Step 2: Transformer layers
+                if self.is_prefill:
+                    rotary = self.model.model.get_rotary_embedding_prefill(position_ids)
+                else:
+                    rotary = self.model.model.get_rotary_embeddings_s(current_pos)
+
+                hidden_states = self.model.model.process_layers(
+                    hidden_states,
+                    position_ids,
+                    causal_mask,
+                    current_pos,
+                    rotary,
+                    start_layer=0,
+                    end_layer=None,
+                    IN_PREFILL=self.is_prefill,
+                )
+
+                # Apply final layer norm
+                hidden_states = self.model.model.norm(hidden_states)
+
+                # Step 3: LM Head
+                if self.lm_head_mode != "linear":
+                    hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
+
+                if self.lm_head_mode == "16":
+                    return tuple(
+                        h(hidden_states).squeeze(2).transpose(1, 2)
+                        for h in self.lm_heads
+                    )
+                elif self.lm_head_mode == "8":
+                    return tuple(
+                        h(hidden_states).squeeze(2).transpose(1, 2)
+                        for h in self.lm_heads
+                    )
+                elif self.lm_head_mode == "2":
+                    logits1 = self.lm_heads[0](hidden_states).squeeze(2).transpose(1, 2)
+                    logits2 = self.lm_heads[1](hidden_states).squeeze(2).transpose(1, 2)
+                    return logits1, logits2
+                elif self.lm_head_mode == "1":
+                    return (self.lm_head(hidden_states).squeeze(2).transpose(1, 2),)
+                else:
+                    return (self.lm_head(hidden_states),)
+
+        wrapper = MonolithicWrapper(model, self.context_length, is_prefill)
+        wrapper.eval()
+
+        # Ensure no gradients
+        for param in wrapper.parameters():
+            param.requires_grad = False
+
+        print(f"Monolithic wrapper created (LM head mode: {wrapper.lm_head_mode})")
+
+        # Prepare inputs based on mode
+        if is_prefill:
+            # Prefill mode: batch processing
+            sample_input_ids = torch.zeros(
+                (1, self.batch_size), dtype=torch.int32, device=TEST_DEVICE
+            )
+            sample_position_ids = torch.zeros(
+                (self.batch_size,), dtype=torch.int32, device=TEST_DEVICE
+            )
+            sample_causal_mask = torch.zeros(
+                (1, 1, self.batch_size, self.context_length),
+                dtype=torch.float16,
+                device=TEST_DEVICE,
+            )
+        else:
+            # Inference mode: single token
+            sample_input_ids = torch.zeros(
+                (1, 1), dtype=torch.int32, device=TEST_DEVICE
+            )
+            sample_position_ids = torch.zeros(
+                (1,), dtype=torch.int32, device=TEST_DEVICE
+            )
+            sample_causal_mask = torch.zeros(
+                (1, 1, 1, self.context_length),
+                dtype=torch.float16,
+                device=TEST_DEVICE,
+            )
+
+        sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
+
+        print(f"Sample inputs ({mode_str} mode):")
+        print(f"  input_ids: {sample_input_ids.shape}")
+        print(f"  position_ids: {sample_position_ids.shape}")
+        print(f"  causal_mask: {sample_causal_mask.shape}")
+        print(f"  current_pos: {sample_current_pos.shape}")
+
+        # Trace model
+        print("Tracing monolithic model...")
+        with torch.no_grad():
+            traced = torch.jit.trace(
+                wrapper,
+                (
+                    sample_input_ids,
+                    sample_position_ids,
+                    sample_causal_mask,
+                    sample_current_pos,
+                ),
+            )
+        print("Tracing completed!")
+
+        # Define outputs based on LM head mode
+        if wrapper.lm_head_mode == "16":
+            outputs = [
+                ct.TensorType(name=f"logits{i}", dtype=np.float16)
+                for i in range(1, 17)
+            ]
+        elif wrapper.lm_head_mode == "8":
+            outputs = [
+                ct.TensorType(name=f"logits{i}", dtype=np.float16)
+                for i in range(1, 9)
+            ]
+        elif wrapper.lm_head_mode == "2":
+            outputs = [
+                ct.TensorType(name="logits1", dtype=np.float16),
+                ct.TensorType(name="logits2", dtype=np.float16),
+            ]
+        else:
+            outputs = [ct.TensorType(name="logits", dtype=np.float16)]
+
+        # Convert to CoreML
+        print("Starting CoreML conversion...")
+        mlmodel = ct.convert(
+            traced,
+            inputs=[
+                ct.TensorType(
+                    name="input_ids", shape=sample_input_ids.shape, dtype=np.int32
+                ),
+                ct.TensorType(
+                    name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
+                ),
+                ct.TensorType(
+                    name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
+                ),
+                ct.TensorType(
+                    name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
+                ),
+            ],
+            outputs=outputs,
+            states=self.GetTransformerStates(model, part=None, prefix="model.model."),
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram",
+        )
+        print(f"CoreML conversion for monolithic {mode_str} completed!")
+
+        # Apply LUT quantization if specified
+        if self.lut_bits:
+            print(f"Applying LUT quantization ({self.lut_bits} bits)...")
+            self.converted_model = mlmodel
+            self.postprocess(num_workers=8)
+            mlmodel = self.converted_model
+
+        return mlmodel
+
 
 def parse_lut_arg(lut_value):
     """Parse LUT argument that can be either 'bits' or 'bits,per_channel'.
@@ -886,9 +1114,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--part",
         type=str,
-        choices=["1", "2", "2_prefill", "3", "all", "full", "prefill", "embeddings"],
+        choices=["1", "2", "2_prefill", "3", "all", "full", "prefill", "embeddings", "monolithic", "monolithic_prefill"],
         default="all",
-        help="Model part to convert",
+        help="Model part to convert (monolithic = single file with embed+FFN+lmhead)",
     )
     parser.add_argument(
         "--output",
@@ -992,7 +1220,7 @@ def test_conversion(
             m,
             {
                 "context_length": context_length,
-                "batch_size": batch_size if part in ["2_prefill", "prefill"] else None,
+                "batch_size": batch_size if part in ["2_prefill", "prefill", "monolithic_prefill"] else None,
                 "lut_bits": lut_bits,
                 "num_chunks": num_chunks if part in ["2", "2_prefill"] else None,
                 "chunk_no": i + 1 if part in ["2", "2_prefill"] else None,
@@ -1006,6 +1234,10 @@ def test_conversion(
             fname += "_embeddings"
         elif part in ["3"]:
             fname += "_lm_head"
+        elif part == "monolithic":
+            fname += "_monolithic"
+        elif part == "monolithic_prefill":
+            fname += "_monolithic_prefill"
         elif part in ["2", "2_prefill"]:
             base = "FFN" if part == "2" else "prefill"
             fname += f"_{base}"

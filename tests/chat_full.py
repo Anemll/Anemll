@@ -220,10 +220,10 @@ def load_model(path, function_name=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Full Chat with CoreML LLaMA with context window shifting, gil resolved (c) 2025 Anemll')
-    
+
     # Add meta.yaml option
     parser.add_argument('--meta', type=str, help='Path to meta.yaml to load all parameters')
-    
+
     # Add existing arguments
     parser.add_argument('--d', '--dir', type=str, default='.',
                        help='Directory containing model files (default: current directory)')
@@ -235,82 +235,127 @@ def parse_args():
                        help='Path to LM head model (relative to --dir)')
     parser.add_argument('--tokenizer', type=str, required=False,
                        help='Path to tokenizer')
-    
+
     # Add new argument for auto-generation
     parser.add_argument('--prompt', type=str,
                        help='If specified, run once with this prompt and exit')
-    
+
     # Add no-warmup flag
     parser.add_argument('--nw', action='store_true',
                        help='Skip warmup phase')
-    
+
     # Add debug level
     parser.add_argument('--debug-level', type=int, default=0,
                        help='Debug level (0=none, 1=print prompts, 2=more verbose)')
-    
+
     # Model configuration
     parser.add_argument('--context-length', type=int,
                        help='Context length for the model (default: 512), if not provided, it will be detected from the model directory name ctxNUMBER')
     parser.add_argument('--batch-size', type=int,
                        help='Batch size for prefill (default: 64)')
-    
+
     args = parser.parse_args()
-    
+
     # If meta.yaml is provided, load parameters from it
     if args.meta:
         try:
             with open(args.meta, 'r') as f:
                 meta = yaml.safe_load(f)
             params = meta['model_info']['parameters']
-            
+
             # Set model directory to meta.yaml directory if not specified
             if not args.d or args.d == '.':
                 args.d = str(Path(args.meta).parent)
-            
-            # Build model paths based on parameters
-            prefix = params.get('model_prefix', 'llama')  # Default to 'llama' if not specified
-            lut_ffn = f"_lut{params['lut_ffn']}" if params['lut_ffn'] != 'none' else ''
-            lut_lmhead = f"_lut{params['lut_lmhead']}" if params['lut_lmhead'] != 'none' else ''
-            lut_embeddings = f"_lut{params['lut_embeddings']}" if params['lut_embeddings'] != 'none' else ''
-            num_chunks = int(params['num_chunks'])
-            
-            # Set model paths if not specified
-            if not args.lmhead:
-                args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
-            if not args.embed:
-                args.embed = f'{prefix}_embeddings{lut_embeddings}'  # Changed from lm_head to embeddings
-            if not args.ffn:
-                args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
-            if not args.tokenizer:
-                args.tokenizer = args.d
-            
-            # Set other parameters if not overridden by command line
-            if args.context_length is None:
-                args.context_length = int(params['context_length'])
-            if args.batch_size is None:
-                args.batch_size = int(params['batch_size'])
-            args.num_chunks = num_chunks
-            
-            # Parse split_lm_head parameter from meta.yaml
-            if 'split_lm_head' in params:
-                args.split_lm_head = int(params['split_lm_head'])
+
+            # Check if this is a monolithic model
+            model_type = meta['model_info'].get('model_type', 'chunked')
+            args.is_monolithic = (model_type == 'monolithic')
+
+            if args.is_monolithic:
+                # Monolithic model configuration
+                prefix = params.get('model_prefix', 'qwen')
+                lut_bits = params.get('lut_bits', 'none')
+                lut_suffix = f"_lut{lut_bits}" if lut_bits != 'none' else ''
+
+                # Set monolithic model path
+                args.monolithic_model = params.get('monolithic_model', f'{prefix}_monolithic_full{lut_suffix}.mlmodelc')
+
+                # Set other parameters
+                if args.context_length is None:
+                    args.context_length = int(params['context_length'])
+                if args.batch_size is None:
+                    args.batch_size = int(params['batch_size'])
+                args.num_chunks = 1  # Monolithic has no chunks
+
+                # Set split_lm_head
+                if 'split_lm_head' in params:
+                    args.split_lm_head = int(params['split_lm_head'])
+                else:
+                    args.split_lm_head = 16 if 'qwen' in prefix.lower() else 8
+
+                # Set tokenizer path
+                if not args.tokenizer:
+                    if 'tokenizer_path' in params:
+                        args.tokenizer = params['tokenizer_path']
+                    else:
+                        args.tokenizer = args.d
+
+                print(f"\nLoaded MONOLITHIC model from {args.meta}:")
+                print(f"  Model: {args.monolithic_model}")
+                print(f"  Context Length: {args.context_length}")
+                print(f"  Batch Size: {args.batch_size}")
+                print(f"  Split LM Head: {args.split_lm_head}")
+                print(f"  Models Directory: {args.d}")
             else:
-                args.split_lm_head = 8  # Default value
-            
-            print(f"\nLoaded parameters from {args.meta}:")
-            print(f"  Context Length: {args.context_length}")
-            print(f"  Batch Size: {args.batch_size}")
-            print(f"  Num Chunks: {args.num_chunks}")
-            print(f"  Split LM Head: {args.split_lm_head}")
-            print(f"  Models Directory: {args.d}")
-            print(f"  Embeddings: {args.embed}")
-            print(f"  LM Head: {args.lmhead}")
-            print(f"  FFN: {args.ffn}")
-            
+                # Standard chunked model configuration
+                args.is_monolithic = False
+                # Build model paths based on parameters
+                prefix = params.get('model_prefix', 'llama')  # Default to 'llama' if not specified
+                lut_ffn = f"_lut{params['lut_ffn']}" if params['lut_ffn'] != 'none' else ''
+                lut_lmhead = f"_lut{params['lut_lmhead']}" if params['lut_lmhead'] != 'none' else ''
+                lut_embeddings = f"_lut{params['lut_embeddings']}" if params['lut_embeddings'] != 'none' else ''
+                num_chunks = int(params['num_chunks'])
+
+                # Set model paths if not specified
+                if not args.lmhead:
+                    args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
+                if not args.embed:
+                    args.embed = f'{prefix}_embeddings{lut_embeddings}'  # Changed from lm_head to embeddings
+                if not args.ffn:
+                    args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
+                if not args.tokenizer:
+                    args.tokenizer = args.d
+
+                # Set other parameters if not overridden by command line
+                if args.context_length is None:
+                    args.context_length = int(params['context_length'])
+                if args.batch_size is None:
+                    args.batch_size = int(params['batch_size'])
+                args.num_chunks = num_chunks
+
+                # Parse split_lm_head parameter from meta.yaml
+                if 'split_lm_head' in params:
+                    args.split_lm_head = int(params['split_lm_head'])
+                else:
+                    args.split_lm_head = 8  # Default value
+
+                print(f"\nLoaded parameters from {args.meta}:")
+                print(f"  Context Length: {args.context_length}")
+                print(f"  Batch Size: {args.batch_size}")
+                print(f"  Num Chunks: {args.num_chunks}")
+                print(f"  Split LM Head: {args.split_lm_head}")
+                print(f"  Models Directory: {args.d}")
+                print(f"  Embeddings: {args.embed}")
+                print(f"  LM Head: {args.lmhead}")
+                print(f"  FFN: {args.ffn}")
+
         except Exception as e:
             print(f"\nError loading meta.yaml: {str(e)}")
             sys.exit(1)
-    
+    else:
+        # If no meta.yaml, set defaults
+        args.is_monolithic = False
+
     return args
 
 def load_metadata(model,args):
@@ -644,6 +689,326 @@ def initialize_causal_mask(context_length):
     print(f"\nInitialized causal mask for context length {context_length}")
     return causal_mask
 
+
+def load_monolithic_model(args, metadata):
+    """Load monolithic model with infer and prefill functions."""
+    print("\nLoading monolithic model...")
+
+    model_path = str(Path(args.d) / args.monolithic_model)
+    model_path = parse_model_path(model_path)
+
+    print(f"Loading from: {model_path}")
+
+    # Load both infer and prefill functions
+    infer_model = load_model(model_path, function_name='infer')
+    prefill_model = load_model(model_path, function_name='prefill')
+
+    print("Monolithic model loaded successfully (infer + prefill functions)")
+
+    # Extract metadata from model
+    metadata = load_metadata(infer_model, args)
+
+    return infer_model, prefill_model, metadata
+
+
+def run_monolithic_prefill(model, input_ids, context_pos, context_length, batch_size, state, causal_mask):
+    """Run prefill on monolithic model."""
+    batch_pos = 0
+    while batch_pos < context_pos:
+        batch_end = min(batch_pos + batch_size, context_pos)
+        current_batch_size = batch_end - batch_pos
+
+        # Get current batch
+        batch_input = input_ids[:, batch_pos:batch_end]
+
+        # Pad to full batch size
+        batch_input = F.pad(batch_input, (0, batch_size - current_batch_size), value=0)
+
+        # Generate position IDs for full batch size
+        position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
+
+        # Run monolithic prefill (input_ids -> logits directly)
+        inputs = {
+            'input_ids': batch_input.numpy().astype(np.int32),
+            'position_ids': position_ids.numpy().astype(np.int32),
+            'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+            'current_pos': np.array([batch_pos], dtype=np.int32)
+        }
+        output = model.predict(inputs, state)
+        # We don't need the output logits for prefill, just updating KV cache
+
+        batch_pos = batch_end
+
+    return torch.tensor([context_pos], dtype=torch.int32)
+
+
+def generate_next_token_monolithic(model, input_ids, pos, context_length, metadata, state, causal_mask, temperature=0.0):
+    """Generate next token using monolithic model."""
+    # Get current token
+    current_token = input_ids[:, pos-1:pos]  # [1, 1]
+
+    # Create inputs
+    position_ids = torch.tensor([pos-1], dtype=torch.int32)
+    single_causal_mask = causal_mask[:, :, pos-1:pos, :]
+
+    # Run monolithic infer
+    inputs = {
+        'input_ids': current_token.numpy().astype(np.int32),
+        'position_ids': position_ids.numpy().astype(np.int32),
+        'causal_mask': single_causal_mask.numpy().astype(np.float16),
+        'current_pos': position_ids.numpy().astype(np.int32)
+    }
+    output = model.predict(inputs, state)
+
+    # Get number of logits from metadata
+    num_logits = metadata.get('split_lm_head', metadata.get('num_logits', 8))
+
+    # Combine logits1-N if they exist
+    if 'logits1' in output:
+        logits_parts = []
+        for i in range(1, num_logits + 1):
+            key = f'logits{i}'
+            if key in output:
+                logits_parts.append(torch.from_numpy(output[key]))
+        logits = torch.cat(logits_parts, dim=-1)
+    elif 'logits' in output:
+        logits = torch.from_numpy(output['logits'])
+    else:
+        # Try other common output names
+        for key in output.keys():
+            if 'logit' in key.lower():
+                logits = torch.from_numpy(output[key])
+                break
+
+    # Apply temperature and sample
+    if temperature > 0:
+        logits = logits / temperature
+        probs = F.softmax(logits[0, -1, :], dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1).item()
+    else:
+        next_token = torch.argmax(logits[0, -1, :]).item()
+
+    return next_token
+
+
+def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state, causal_mask, auto_prompt=None, warmup=False):
+    """Chat loop for monolithic models with full conversation history."""
+    global THINKING_MODE
+    global DEBUG_LEVEL
+    context_length = metadata.get('context_length')
+    batch_size = metadata.get('batch_size', 64)
+
+    if not warmup:
+        print(f"\nUsing context length: {context_length}")
+        print("\nStarting chat session. Press Ctrl+D to exit.")
+        print("Type your message and press Enter to chat. Use /t to toggle thinking mode.")
+        print(f"Thinking mode is {'ON' if THINKING_MODE else 'OFF'}")
+
+    # Keep track of conversation history
+    conversation = []
+
+    try:
+        while True:
+            try:
+                if not warmup:
+                    print(f"\n{LIGHT_GREEN}You{' (thinking)' if THINKING_MODE else ''}:{RESET_COLOR}", end=' ', flush=True)
+                if auto_prompt is not None:
+                    user_input = auto_prompt
+                    if not warmup:
+                        print(user_input)
+                else:
+                    user_input = input().strip()
+            except EOFError:
+                if not warmup:
+                    print("\nExiting chat...")
+                break
+
+            if not user_input:
+                continue
+
+            # Handle /t command
+            if user_input == "/t":
+                THINKING_MODE = not THINKING_MODE
+                print(f"Thinking mode {'ON' if THINKING_MODE else 'OFF'}")
+                continue
+
+            # Add user message to conversation
+            conversation.append({"role": "user", "content": user_input})
+
+            # Format using chat template with full history
+            if THINKING_MODE:
+                # Add thinking prompt to system message
+                conversation_with_thinking = [{"role": "system", "content": THINKING_PROMPT}] + conversation
+                base_input_ids = tokenizer.apply_chat_template(
+                    conversation_with_thinking,
+                    return_tensors="pt",
+                    add_generation_prompt=True
+                ).to(torch.int32)
+
+                # Print full prompt if debug level >= 1
+                if DEBUG_LEVEL >= 1 and not warmup:
+                    print(f"\n{DARK_BLUE}Debug: Full prompt with thinking:{RESET_COLOR}")
+                    print(tokenizer.decode(base_input_ids[0]))
+            else:
+                base_input_ids = tokenizer.apply_chat_template(
+                    conversation,
+                    return_tensors="pt",
+                    add_generation_prompt=True
+                ).to(torch.int32)
+
+                # Print full prompt if debug level >= 1
+                if DEBUG_LEVEL >= 1 and not warmup:
+                    print(f"\n{DARK_BLUE}Debug: Full prompt:{RESET_COLOR}")
+                    print(tokenizer.decode(base_input_ids[0]))
+
+            # Check if we need to trim history
+            while base_input_ids.size(1) > context_length - 100:  # Leave room for response
+                # Remove oldest message pair (user + assistant)
+                if len(conversation) > 2:
+                    conversation = conversation[2:]  # Remove oldest pair
+                    base_input_ids = tokenizer.apply_chat_template(
+                        conversation,
+                        return_tensors="pt",
+                        add_generation_prompt=True
+                    ).to(torch.int32)
+                else:
+                    # If only current message remains and still too long, truncate
+                    base_input_ids = base_input_ids[:, -context_length//2:]
+                    break
+
+            context_pos = base_input_ids.size(1)
+
+            # Pad sequence to context_size
+            input_ids = F.pad(
+                base_input_ids,
+                (0, context_length - context_pos),
+                value=0
+            )
+
+            if not warmup:
+                print(f"\n{LIGHT_BLUE}Assistant:{RESET_COLOR}", end=' ', flush=True)
+
+            # Initialize token printer and collect response
+            token_printer = TokenPrinter(tokenizer)
+            response_tokens = []
+            generation_start_time = time.time()
+
+            try:
+                # Run prefill on entire context
+                current_pos = run_monolithic_prefill(
+                    prefill_model,
+                    input_ids,
+                    context_pos,
+                    context_length,
+                    batch_size,
+                    state,
+                    causal_mask
+                )
+
+                # Generation loop
+                pos = context_pos
+                tokens_generated = 0
+                inference_start = time.time()  # Start inference timing
+
+                while True:
+                    # Check if we need to shift window
+                    if pos >= context_length - 2:
+                        # Calculate shift to maintain full batches
+                        batch_size = metadata.get('batch_size', 64)
+                        # Calculate max batches that fit in context
+                        max_batches = context_length // batch_size
+                        desired_batches = max(1, max_batches - 2)  # Leave room for new tokens
+                        new_size = min(desired_batches * batch_size, context_length - batch_size)
+
+                        # Create shifted input_ids
+                        tmp = torch.zeros((1, context_length), dtype=torch.int32)
+                        tmp[:,0:new_size] = input_ids[:,pos-new_size:pos]
+                        input_ids = tmp
+
+                        # Reset state and run prefill
+                        current_pos = run_monolithic_prefill(
+                            prefill_model,
+                            input_ids,
+                            new_size,  # Prefill the entire shifted content
+                            context_length,
+                            batch_size,
+                            state,
+                            causal_mask
+                        )
+
+                        # Start generating from the next position
+                        pos = new_size  # Don't back up, continue from where we left off
+
+                        window_shifted = True
+
+                    # Generate next token
+                    next_token = generate_next_token_monolithic(
+                        infer_model,
+                        input_ids,
+                        pos,
+                        context_length,
+                        metadata,
+                        state,
+                        causal_mask
+                    )
+
+                    # Add token
+                    input_ids[0, pos] = next_token
+                    if not warmup:
+                        token_printer.add_token(next_token)
+                        token_printer.drain_buffer()
+                    response_tokens.append(next_token)
+
+                    pos += 1
+                    tokens_generated += 1
+
+                    # In warmup mode, limit tokens
+                    if warmup and tokens_generated >= WARMUP_TOKEN_LIMIT:
+                        break
+
+                    # Check for all possible EOS tokens
+                    eos_token_ids = tokenizer.eos_token_id
+                    if isinstance(eos_token_ids, list):
+                        if next_token in eos_token_ids:
+                            break
+                    else:
+                        if next_token == eos_token_ids:
+                            break
+
+                inference_time = time.time() - inference_start  # Calculate inference time
+
+                # Add assistant response to conversation
+                response_text = token_printer.stop()
+                conversation.append({"role": "assistant", "content": response_text})
+
+                # Print stats only if not in warmup
+                if not warmup:
+                    total_time = time.time() - generation_start_time
+                    prefill_time = total_time - inference_time
+                    inference_tokens_per_sec = len(response_tokens) / inference_time if inference_time > 0 else 0
+                    prefill_ms = prefill_time * 1000
+                    prefill_tokens_per_sec = context_pos / prefill_time if prefill_time > 0 else 0
+                    print(f"{DARK_BLUE}{inference_tokens_per_sec:.1f} t/s, "
+                          f"TTFT: {prefill_ms:.1f}ms ({prefill_tokens_per_sec:.1f} t/s), "
+                          f"{len(response_tokens)} tokens{RESET_COLOR}")
+
+                if auto_prompt is not None:
+                    break
+
+            except KeyboardInterrupt:
+                if not warmup:
+                    print("\nGeneration interrupted")
+                token_printer.stop()
+                continue
+
+    except Exception as e:
+        if not warmup:
+            print(f"\nError in chat loop: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+
 def get_user_input():
     """Get input from user, handling special key combinations."""
     global THINKING_MODE
@@ -936,95 +1301,147 @@ def main():
     args = parse_args()
     global DEBUG_LEVEL
     DEBUG_LEVEL = args.debug_level
-    
+
     # Convert directory to absolute path
     model_dir = Path(args.d).resolve()
     if not model_dir.exists():
         print(f"\nError: Model directory not found: {model_dir}")
         return 1
-        
+
     print(f"\nUsing model directory: {model_dir}")
     print(f"Context length: {args.context_length}")
-    
+
     try:
-        # Update paths to be relative to model directory
-        args.embed = str(model_dir / args.embed)
-        args.ffn = str(model_dir / args.ffn)
-        args.lmhead = str(model_dir / args.lmhead)
-        
-        # Handle tokenizer path separately since it's not relative to model_dir
+        # Handle tokenizer path
         if args.tokenizer is None:
             args.tokenizer = str(model_dir)
-        
+
         if not Path(args.tokenizer).exists():
             print(f"\nError: Tokenizer directory not found: {args.tokenizer}")
             return 1
-    
+
         args.tokenizer = str(Path(args.tokenizer).resolve())  # Convert to absolute path
         print(f"Using tokenizer path: {args.tokenizer}")
-        
-        metadata = {}
-        # Load models and extract metadata
-        embed_model, ffn_models, lmhead_model, metadata = load_models(args,metadata)
-        
-        print(f"\nMetadata befor args.context_length: {metadata}")
 
-        # Override context length from command line if provided
-        if args.context_length is not None:
-            metadata['context_length'] = args.context_length
-            metadata['state_length'] = args.context_length  # Also update state_length
-            print(f"\nOverriding context length from command line: {args.context_length}")
-        
-        print(f"\nMetadata after load_models: {metadata}")
-        
         # Load tokenizer with resolved path
         tokenizer = initialize_tokenizer(args.tokenizer)
         if tokenizer is None:
             raise RuntimeError("Failed to initialize tokenizer")
-        
-        # Create unified state once
-        state = create_unified_state(ffn_models, metadata['context_length'])
-        
-        # Initialize causal mask once
-        causal_mask = initialize_causal_mask(metadata['context_length'])
-        
-        # Add split_lm_head to metadata for generate_next_token
-        metadata['split_lm_head'] = getattr(args, 'split_lm_head', 8)
-        
-        # Warmup runs to prevent Python GIL issues with CoreML !
-        if not args.nw:
-            for i in range(2):
-                chat_loop(
-                    embed_model=embed_model,
-                    ffn_models=ffn_models,
-                    lmhead_model=lmhead_model,
-                    tokenizer=tokenizer,
-                    metadata=metadata,
-                    state=state,  # Pass the state
-                    causal_mask=causal_mask,  # Pass the causal mask
-                    warmup=True,
-                    auto_prompt="who are you?"
-                )
-        
-        # Main run
-        chat_loop(
-            embed_model=embed_model,
-            ffn_models=ffn_models,
-            lmhead_model=lmhead_model,
-            tokenizer=tokenizer,
-            metadata=metadata,
-            state=state,  # Pass the state
-            causal_mask=causal_mask,  # Pass the causal mask
-            warmup=False,
-            auto_prompt=args.prompt
-        )
-        
+
+        metadata = {}
+
+        # Branch based on model type
+        if getattr(args, 'is_monolithic', False):
+            # MONOLITHIC MODEL PATH
+            infer_model, prefill_model, metadata = load_monolithic_model(args, metadata)
+
+            # Override context length from command line if provided
+            if args.context_length is not None:
+                metadata['context_length'] = args.context_length
+                metadata['state_length'] = args.context_length
+
+            # Set metadata values
+            metadata['batch_size'] = getattr(args, 'batch_size', 64)
+            metadata['split_lm_head'] = getattr(args, 'split_lm_head', 16)
+
+            print(f"\nMonolithic metadata: {metadata}")
+
+            # Create state from infer model
+            state = infer_model.make_state()
+            print("\nCreated unified transformer state for monolithic model")
+
+            # Initialize causal mask
+            causal_mask = initialize_causal_mask(metadata['context_length'])
+
+            # Warmup runs
+            if not args.nw:
+                for _ in range(2):
+                    chat_loop_monolithic(
+                        infer_model=infer_model,
+                        prefill_model=prefill_model,
+                        tokenizer=tokenizer,
+                        metadata=metadata,
+                        state=state,
+                        causal_mask=causal_mask,
+                        warmup=True,
+                        auto_prompt="who are you?"
+                    )
+
+            # Main run
+            chat_loop_monolithic(
+                infer_model=infer_model,
+                prefill_model=prefill_model,
+                tokenizer=tokenizer,
+                metadata=metadata,
+                state=state,
+                causal_mask=causal_mask,
+                warmup=False,
+                auto_prompt=args.prompt
+            )
+
+        else:
+            # CHUNKED MODEL PATH (original code)
+            # Update paths to be relative to model directory
+            args.embed = str(model_dir / args.embed)
+            args.ffn = str(model_dir / args.ffn)
+            args.lmhead = str(model_dir / args.lmhead)
+
+            # Load models and extract metadata
+            embed_model, ffn_models, lmhead_model, metadata = load_models(args, metadata)
+
+            print(f"\nMetadata befor args.context_length: {metadata}")
+
+            # Override context length from command line if provided
+            if args.context_length is not None:
+                metadata['context_length'] = args.context_length
+                metadata['state_length'] = args.context_length  # Also update state_length
+                print(f"\nOverriding context length from command line: {args.context_length}")
+
+            print(f"\nMetadata after load_models: {metadata}")
+
+            # Create unified state once
+            state = create_unified_state(ffn_models, metadata['context_length'])
+
+            # Initialize causal mask once
+            causal_mask = initialize_causal_mask(metadata['context_length'])
+
+            # Add split_lm_head to metadata for generate_next_token
+            metadata['split_lm_head'] = getattr(args, 'split_lm_head', 8)
+
+            # Warmup runs to prevent Python GIL issues with CoreML !
+            if not args.nw:
+                for i in range(2):
+                    chat_loop(
+                        embed_model=embed_model,
+                        ffn_models=ffn_models,
+                        lmhead_model=lmhead_model,
+                        tokenizer=tokenizer,
+                        metadata=metadata,
+                        state=state,  # Pass the state
+                        causal_mask=causal_mask,  # Pass the causal mask
+                        warmup=True,
+                        auto_prompt="who are you?"
+                    )
+
+            # Main run
+            chat_loop(
+                embed_model=embed_model,
+                ffn_models=ffn_models,
+                lmhead_model=lmhead_model,
+                tokenizer=tokenizer,
+                metadata=metadata,
+                state=state,  # Pass the state
+                causal_mask=causal_mask,  # Pass the causal mask
+                warmup=False,
+                auto_prompt=args.prompt
+            )
+
     except Exception as e:
         print(f"\nError: {str(e)}")
         import traceback
         traceback.print_exc()
         return 1
-    
+
     return 0
 
 if __name__ == "__main__":
