@@ -19,6 +19,9 @@ import CoreFoundation
     private var FilterLLAMA01: Bool = false
     private let splitLMHead: Int
     
+    private var kvCachePrefillInputs: [String: MLMultiArray]? //kv_cache
+    private var kvCachePrefillOutputs: [String: MLMultiArray]?
+    
     private var lmheadOutputBackings: [String: MLMultiArray]?
     private var hiddenStatesBackings_emb: [String: MLMultiArray]?  // For embed output
     private var hiddenStatesBackings_ffn: [String: MLMultiArray]?  // For FFN input/output
@@ -32,6 +35,7 @@ import CoreFoundation
         get { _busy }
         set { _busy = newValue }
     }
+    
     
     // Move struct definition to class scope, before the methods
     private struct PartialMax {
@@ -92,6 +96,8 @@ import CoreFoundation
 
         try initializePrefillBackings()
         try initializeLastChunkBacking()
+        try initializeKVCachePrefill()
+        
     }
     
     
@@ -188,6 +194,10 @@ import CoreFoundation
         lmheadOutputBackings = outputBackingsDict
     }
     
+   
+    
+   
+    
     private func initializeHiddenStatesBackings() throws {
         // Check embedding model shapes first
         if debugLevel >= 1 {
@@ -217,7 +227,7 @@ import CoreFoundation
                 print("Outputs:", ffnChunks[0].inferModel.modelDescription.outputDescriptionsByName.keys)
             }
             
-            let lastDim = shape.last?.intValue ?? 2048
+            let lastDim = shape.last?.intValue ?? 1
             self.hidden_states = lastDim
             let otherDims = shape.dropLast().reduce(1) { $0 * $1.intValue }
             
@@ -305,9 +315,40 @@ import CoreFoundation
         }
     }
     
+    private func initializeKVCachePrefill() throws {
+        // Build a kv cache input dict by inspecting all chunk prefill model descriptions
+        var inputs: [String: MLMultiArray] = [:]
+
+        for chunk in ffnChunks {
+            let descInputs = chunk.prefillModel.modelDescription.inputDescriptionsByName
+            for (name, feature) in descInputs {
+                if name.hasPrefix("kv_cache_") && name.hasSuffix("_in"), let constraint = feature.multiArrayConstraint {
+                    // create MLMultiArray with the requested shape (float16)
+                    let shape = constraint.shape
+                    // avoid duplicate creation
+                    if inputs[name] == nil {
+                        let arr = try MLMultiArray(shape: shape, dataType: .float16)
+                        // zero it
+                        for i in 0..<arr.count { arr[i] = 0 }
+                        inputs[name] = arr
+                    }
+                }
+            }
+        }
+
+        // store
+        if inputs.isEmpty {
+            kvCachePrefillInputs = nil
+        } else {
+            kvCachePrefillInputs = inputs
+        }
+        // also prepare outputs container
+        kvCachePrefillOutputs = [:]
+    }
+    
     private func initializePrefillBackings() throws {
         let hiddenSize = self.hidden_states  // Adjust based on your model's hidden size
-        let shape: [NSNumber] = [1, NSNumber(value: batchSize), NSNumber(value: hiddenSize)]
+        let shape: [NSNumber] = [1, NSNumber(value: contextLength), NSNumber(value: hiddenSize)]
         let attributes: [String: Any] = [kCVPixelBufferMetalCompatibilityKey as String: true]
         
         if debugLevel >= 1 {
@@ -322,7 +363,7 @@ import CoreFoundation
         let embedStatus = CVPixelBufferCreate(
             kCFAllocatorDefault,
             hiddenSize,  // Width
-            batchSize,   // Height
+            contextLength,   // Height
             kCVPixelFormatType_OneComponent16Half,
             attributes as CFDictionary,
             &embedPixelBuffer
@@ -341,7 +382,7 @@ import CoreFoundation
         let ffnStatus = CVPixelBufferCreate(
             kCFAllocatorDefault,
             hiddenSize,
-            batchSize,
+            contextLength,
             kCVPixelFormatType_OneComponent16Half,
             attributes as CFDictionary,
             &ffnPixelBuffer
@@ -408,7 +449,6 @@ import CoreFoundation
             }
         }
     }
-    
     public func runStPrefill(
         on contextTokens: inout [Int],
         contextPos: Int,
@@ -444,46 +484,56 @@ import CoreFoundation
             throw InferenceError.inferenceError("ffnChunks was nil in runPrefill()")
         }
         var batchPos = 0
+
+        // Ensure kvCachePrefillInputs exists (may be nil if model doesn't use unified kv inputs)
+        if kvCachePrefillInputs == nil {
+            // try to initialize if not present
+            try initializeKVCachePrefill()
+        }
+
         while batchPos < contextPos {
             let batchEnd = min(batchPos + batchSize, contextPos)
             let currentBatchSize = batchEnd - batchPos
-            
+
             if debugLevel >= 1 {
                 print("\nPrefill batch: \(batchPos) to \(batchEnd), currentBatchSize: \(currentBatchSize)")
             }
-            
-            // Create input tensor for current batch
-            let batchInput = try MLMultiArray(shape: [1, NSNumber(value: batchSize)], dataType: .int32)
+
+            // Create input tensor for current batch: we use contextLength as width, but only fill currentBatchSize
+            let batchInput = try MLMultiArray(shape: [1, NSNumber(value: contextLength)], dataType: .int32)
+            for i in 0..<contextLength {
+                // default pad with zeros (or pad token if desired)
+                batchInput[[0, i] as [NSNumber]] = 0
+            }
             for i in 0..<currentBatchSize {
                 batchInput[[0, i] as [NSNumber]] = NSNumber(value: contextTokens[batchPos + i])
             }
-            
-            // Generate position IDs
-            let positionIds = try MLMultiArray(shape: [NSNumber(value: batchSize)], dataType: .int32)
-            for i in 0..<batchSize {
+
+            // Generate position IDs (length = contextLength, but we fill from batchPos)
+            let positionIds = try MLMultiArray(shape: [1, NSNumber(value: contextLength)], dataType: .int32)
+            for i in 0..<contextLength {
                 positionIds[i] = NSNumber(value: batchPos + i)
             }
-            
-            // Create batch causal mask
+
+            // Create batch causal mask: [1,1,contextLength,contextLength]
             let batchCausalMask = try MLMultiArray(
-                shape: [1, 1, NSNumber(value: batchSize), NSNumber(value: contextLength)],  // Always use full contextLength
+                shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: contextLength)],
                 dataType: .float16
             )
-            
-            // Fill with -inf by default
+            // Fill with -inf first
+            let negInf = Float(-Float.infinity)
             for i in 0..<batchCausalMask.count {
-                batchCausalMask[i] = NSNumber(value: Float(-Float.infinity))
+                batchCausalMask[i] = NSNumber(value: negInf)
             }
-            
-            // Set causal attention pattern
-            for i in 0..<batchSize {
-                for j in 0..<contextLength {  // Use full contextLength
+            // Set causal pattern
+            for i in 0..<contextLength {
+                for j in 0..<contextLength {
                     if j <= (batchPos + i) {
                         batchCausalMask[[0, 0, i, j] as [NSNumber]] = NSNumber(value: Float(0.0))
                     }
                 }
             }
-            
+
             // Run embeddings with prefill backing
             let embedInput = try MLDictionaryFeatureProvider(dictionary: ["input_ids": batchInput])
             let embedOptions = MLPredictionOptions()
@@ -494,7 +544,7 @@ import CoreFoundation
                     print("Embedding input shape:", batchInput.shape.map { $0.intValue })
                 }
             }
-            
+
             if debugLevel >= 1 {
                 print("About to run embedding model prediction...")
             }
@@ -502,76 +552,129 @@ import CoreFoundation
             if debugLevel >= 1 {
                 print("Embedding model prediction completed successfully")
             }
-            
+
             guard let hiddenStates = hiddenStatesBackings_emb_prefill?["hidden_states"] else {
                 throw InferenceError.inferenceError("Missing embed prefill output backing")
             }
-            
+
             if debugLevel >= 1 {
                 print("Retrieved hidden states from embedding with shape:", hiddenStates.shape.map { $0.intValue })
             }
-            
+
             // Process FFN chunks
-            var currentHiddenStates = hiddenStates  // Shape: [1, 128, hidden_states]
+            var currentHiddenStates = hiddenStates
             let chunkCount = ffnChunks.count
-            
+
             for (index, chunk) in ffnChunks.enumerated() {
                 let isLastChunk = index == chunkCount - 1
                 let ffnOptions = MLPredictionOptions()
-                
+
                 if debugLevel >= 1 {
                     print("\nFFN chunk \(index + 1)/\(chunkCount), isLastChunk: \(isLastChunk)")
                     print("Current hidden states shape:", currentHiddenStates.shape.map { $0.intValue })
                 }
-                
-                // Assign output backing BEFORE predict
-                // Check what shape the model expects by looking at its OUTPUT description
+
+                // Decide which hidden-state output backing to use (last chunk small shape vs full batch)
                 var useLastChunkBacking = false
-                
                 if let outputDesc = chunk.prefillModel.modelDescription.outputDescriptionsByName["output_hidden_states"],
                    let constraint = outputDesc.multiArrayConstraint {
                     let expectedBatchDim = constraint.shape[1].intValue
                     if debugLevel >= 1 {
                         print("Chunk \(index + 1) prefill model expects output shape: \(constraint.shape.map { $0.intValue })")
                     }
-                    // If model expects output batch dim of 1, use last chunk backing
                     useLastChunkBacking = (expectedBatchDim == 1)
                 }
-                
+
+                // Prepare outputBackings dictionary to include output_hidden_states AND kv outputs
+                var localOutBackings: [String: MLMultiArray] = [:]
+
                 if useLastChunkBacking && !v110 {
                     if let backings = hiddenStatesBackings_last {
-                        ffnOptions.outputBackings = backings  // Shape: [1, 1, hidden_states]
+                        // copy entries into localOutBackings
+                        for (k, v) in backings {
+                            localOutBackings[k] = v
+                        }
                         if debugLevel >= 1 {
                             print("Using last chunk backing with shape:", backings["output_hidden_states"]?.shape.map { $0.intValue } ?? [])
                         }
                     }
                 } else {
-                    // For models expecting batch shape or when v110=true
                     if let backings = hiddenStatesBackings_ffn_prefill {
-                        ffnOptions.outputBackings = backings  // Shape: [1, batch_size, hidden_states]
+                        for (k, v) in backings {
+                            localOutBackings[k] = v
+                        }
                         if debugLevel >= 1 {
                             print("Using FFN prefill backing with shape:", backings["output_hidden_states"]?.shape.map { $0.intValue } ?? [])
                         }
                     }
                 }
-                
-                let currentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
-                currentPosArray[0] = NSNumber(value: batchPos)
-                
-                let prefillInput = try MLDictionaryFeatureProvider(dictionary: [
-                    "hidden_states": currentHiddenStates,  // Shape: [1, 128, hidden_states]
+
+                // Inspect chunk model outputs and create backings for kv outputs if needed
+                let outDescMap = chunk.prefillModel.modelDescription.outputDescriptionsByName
+                for (outName, feat) in outDescMap {
+                    if (outName.hasPrefix("key_cache_") || outName.hasPrefix("value_cache_")) && outName.hasSuffix("_out"),
+                       let constraint = feat.multiArrayConstraint {
+                        if localOutBackings[outName] == nil {
+                            // create fresh MLMultiArray with required shape
+                            let shape = constraint.shape
+                            let arr = try MLMultiArray(shape: shape, dataType: .float16)
+                            for i in 0..<arr.count { arr[i] = 0 }
+                            localOutBackings[outName] = arr
+                        }
+                    }
+                }
+
+                // Set output backings
+                ffnOptions.outputBackings = localOutBackings
+
+                // Build input dictionary, include KV cache inputs (from kvCachePrefillInputs) if model expects them
+                var inputDict: [String: Any] = [
+                    "hidden_states": currentHiddenStates,
                     "position_ids": positionIds,
                     "causal_mask": batchCausalMask,
-                    "current_pos": currentPosArray
-                ])
-                
-                // Run prediction with the assigned output backing
-                _ = try await chunk.prefillModel.prediction(
-                    from: prefillInput,
-                    using: state,
-                    options: ffnOptions
-                )
-                
+                    "current_pos": try {
+                        let a = try MLMultiArray(shape: [1], dataType: .int32)
+                        a[0] = NSNumber(value: batchPos)
+                        return a
+                    }()
+                ]
+
+                // For each declared input in the prefill model that matches kv_cache_*_in, attach the stored array
+                let inDescMap = chunk.prefillModel.modelDescription.inputDescriptionsByName
+                for (inName, feat) in inDescMap {
+                    if inName.hasPrefix("kv_cache_") && inName.hasSuffix("_in") {
+                        // prefer stored value in kvCachePrefillInputs, else create a zero array with declared shape
+                        if let existing = kvCachePrefillInputs?[inName] {
+                            inputDict[inName] = existing
+                        } else if let constraint = feat.multiArrayConstraint {
+                            let shape = constraint.shape
+                            let arr = try MLMultiArray(shape: shape, dataType: .float16)
+                            for i in 0..<arr.count { arr[i] = 0 }
+                            // store it so next chunk/batch can reuse
+                            if kvCachePrefillInputs == nil { kvCachePrefillInputs = [:] }
+                            kvCachePrefillInputs?[inName] = arr
+                            inputDict[inName] = arr
+                        } else {
+                            // fallback: skip if no constraint (unlikely)
+                        }
+                    }
+                }
+
+                let prefillInput = try MLDictionaryFeatureProvider(dictionary: inputDict)
+
+                // Run prediction with the assigned output backing (and state)
+                _ = try await chunk.prefillModel.prediction(from: prefillInput, using: state, options: ffnOptions)
+
+                // After prediction, collect kv outputs and store them for next iterations
+                for (outName, arr) in localOutBackings {
+                    if outName.hasPrefix("key_cache_") || outName.hasPrefix("value_cache_") {
+                        // store into kvCachePrefillOutputs for use or combine into next input
+                        kvCachePrefillOutputs?[outName] = arr
+                        // also mirror to kvCachePrefillInputs so next prefill invocation will find it
+                        kvCachePrefillInputs?[outName.replacingOccurrences(of: "_out", with: "_in")] = arr
+                    }
+                }
+
                 // Update currentHiddenStates - use the appropriate backing based on what model expects
                 if useLastChunkBacking && !v110 {
                     guard let nextHiddenStates = hiddenStatesBackings_last?["output_hidden_states"] else {
@@ -584,17 +687,19 @@ import CoreFoundation
                     }
                     currentHiddenStates = nextHiddenStates  // Shape: [1, batch_size, hidden_states]
                 }
-                
+
                 if debugLevel >= 2 {
                     debugTensor(currentHiddenStates, prefix: "FFN chunk \(index + 1) output")
                 }
             }
-            
+
             batchPos = batchEnd
         }
-        
+
         return contextPos
     }
+    
+    
 
     func topPSample(logits: [Float], temperature: Float = 1.0, topP: Float = 0.9) -> Int {
         // Apply temperature scaling
@@ -870,12 +975,12 @@ import CoreFoundation
                 print("\nTop-p sampled token:", sampledIndex)
             }
             return sampledIndex
-        }   
+        }
      }
     
     /// Shifts the context window if needed (similar to the Python code).
     public func shiftWindow(
-        currentPos: Int,  
+        currentPos: Int,
         contextTokens: inout [Int],
         onWindowShift: (() -> Void)? = nil
     ) throws {
