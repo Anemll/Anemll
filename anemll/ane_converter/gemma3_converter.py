@@ -463,7 +463,7 @@ class Gemma3Converter(BaseConverter):
         hidden_states = torch.zeros(
             (1, 1, model.config.hidden_size), dtype=torch.float16, device=TEST_DEVICE
         )
-        position_ids = torch.zeros((1, 1), dtype=torch.int32, device=TEST_DEVICE)
+        position_ids = torch.zeros((1, ), dtype=torch.int32, device=TEST_DEVICE)
         causal_mask = torch.zeros(
             (1, 1, 1, self.context_length), dtype=torch.float16, device=TEST_DEVICE
         )
@@ -680,125 +680,7 @@ class Gemma3Converter(BaseConverter):
         
         return mlmodel
         
-    # don't use this
-    def convert_prefill(self, model: Gemma3ForCausalLM) -> ct.models.MLModel:
-        """Convert Gemma3 model to CoreML format for prefill mode.
-
-        Args:
-            model: The Gemma3 model to convert
-
-        Returns:
-            ct.models.MLModel: Converted model for prefill processing
-        """
-        require_coreml()
-        print("Converting Gemma3 model for prefill mode...")
-
-        class PrefillWrapper(torch.nn.Module):
-            def __init__(
-                self, model: Gemma3ForCausalLM, context_length: int, batch_size: int
-            ) -> None:
-                super().__init__()
-                self.model = model
-                self.context_length = context_length
-                self.batch_size = batch_size
-
-            def forward(
-                self,
-                hidden_states: torch.Tensor,
-                position_ids: torch.Tensor,
-                causal_mask: torch.Tensor,
-                current_pos: torch.Tensor,
-            ) -> torch.Tensor:
-                # Prefill mode: only process transformer layers, skip embeddings and LM head
-                # This updates KV cache state without generating logits
-                return self.model.forward_prefill(
-                    hidden_states=hidden_states,
-                    position_ids=position_ids,
-                    causal_mask=causal_mask,
-                    current_pos=current_pos,
-                )
-
-        wrapper = PrefillWrapper(model, self.context_length, self.batch_size)
-        wrapper.eval()
-        print("Prefill wrapper model created and set to eval mode")
-
-        print("Preparing prefill model inputs for tracing...")
-        # Use batch_size for prefill mode (multiple tokens at once)
-        # Input is hidden_states instead of input_ids (skip embeddings)
-        sample_hidden_states = torch.zeros(
-            (1, self.batch_size, model.config.hidden_size),
-            dtype=torch.float16,
-            device=TEST_DEVICE,
-        )  # [1, batch_size, hidden_size]
-        sample_position_ids = torch.zeros(
-            (self.batch_size,), dtype=torch.int32, device=TEST_DEVICE
-        )  # [batch_size]
-        sample_causal_mask = torch.zeros(
-            (1, 1, self.batch_size, self.context_length),
-            dtype=torch.float16,
-            device=TEST_DEVICE,
-        )  # [1, 1, batch_size, context_length]
-        sample_current_pos = torch.zeros(
-            (1,), dtype=torch.int32, device=TEST_DEVICE
-        )  # [1] - current position
-
-        print("Prefill sample inputs created")
-        print(f"sample_hidden_states shape: {sample_hidden_states.shape}")
-        print(f"sample_position_ids shape: {sample_position_ids.shape}")
-        print(f"sample_causal_mask shape: {sample_causal_mask.shape}")
-        print(f"sample_current_pos shape: {sample_current_pos.shape}")
-
-        print("Starting torch.jit.trace for prefill...")
-        traced = torch.jit.trace(
-            wrapper,
-            (
-                sample_hidden_states,
-                sample_position_ids,
-                sample_causal_mask,
-                sample_current_pos,
-            ),
-        )
-        print("torch.jit.trace for prefill completed!")
-
-        print("Starting CoreML conversion for prefill...")
-        mlmodel = ct.convert(
-            traced,
-            inputs=[
-                ct.TensorType(
-                    name="hidden_states",
-                    shape=sample_hidden_states.shape,
-                    dtype=np.float16,
-                ),
-                ct.TensorType(
-                    name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
-                ),
-                ct.TensorType(
-                    name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
-                ),
-                ct.TensorType(
-                    name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
-                ),
-            ],
-            outputs=[
-                ct.TensorType(
-                    name="output_hidden_states", dtype=np.float16
-                ),  # Only output hidden states, no logits
-            ],
-            states=self.GetTransformerStates(model, part=None, prefix="model.model."),
-            compute_precision=ct.precision.FLOAT16,
-            compute_units=ct.ComputeUnit.CPU_AND_NE,
-            minimum_deployment_target=ct.target.iOS18,
-            convert_to="mlprogram",
-        )
-        print("CoreML conversion for prefill completed!")
-
-        # Apply LUT quantization if specified
-        if self.lut_bits:
-            self.converted_model = mlmodel
-            self.postprocess(num_workers=8)  # Allow passing num_workers if needed
-            mlmodel = self.converted_model
-
-        return mlmodel
+    
 
     def convert_embeddings(self, model: Gemma3ForCausalLM) -> ct.models.MLModel:
         """Convert embeddings layer to CoreML format.
@@ -834,14 +716,14 @@ class Gemma3Converter(BaseConverter):
         traced_model = torch.jit.trace(wrapper, sample_input)
 
         # Define enumerated input shapes for flexibility
-        #input_shape = ct.EnumeratedShapes(
-            #shapes=[
-                #[1, 1],
-                #[1, self.context_length],
-                #[1, 64],
-            #],  
-            #default=[1, self.context_length],  
-        #)
+        input_shape = ct.EnumeratedShapes(
+            shapes=[
+                [1, 1],
+                [1, self.context_length],
+                
+            ],  
+            default=[1, self.context_length],  
+        )
 
         print(f"Converting embeddings model with input shape: {input_shape}")
 
@@ -851,7 +733,7 @@ class Gemma3Converter(BaseConverter):
             inputs=[
                 ct.TensorType(
                     name="input_ids",
-                    shape=sample_input.shape, 
+                    shape=input_shape, 
                     dtype=np.int32,
                 )
             ],
