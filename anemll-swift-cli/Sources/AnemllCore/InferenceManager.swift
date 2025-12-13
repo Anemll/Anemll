@@ -19,7 +19,7 @@ import CoreFoundation
     private var FilterLLAMA01: Bool = false
     private let splitLMHead: Int
     
-    private var kvCachePrefillInputs: [String: MLMultiArray]? //kv_cache
+    private var kvCachePrefillInputs: [String: MLMultiArray]? //For KV_Cache
     private var kvCachePrefillOutputs: [String: MLMultiArray]?
     
     private var lmheadOutputBackings: [String: MLMultiArray]?
@@ -66,7 +66,7 @@ import CoreFoundation
         self.v110 = v110 // Set the v110 flag based on the parameter
 
         
-        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize)")
+        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), debugLevel=\(debugLevel)")
         self.fullCausalMask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: contextLength)], dataType: .float16)
 
         self.initState()
@@ -132,6 +132,8 @@ import CoreFoundation
         print("Debug level set to \(debugLevel)")
     }
     
+   
+    
     private func initializeLMHeadOutputBackings() throws {
         let outputDescription = lmheadModel.modelDescription.outputDescriptionsByName
         let featureNames = (1...splitLMHead).map { i in "logits\(i)" }
@@ -194,89 +196,59 @@ import CoreFoundation
         lmheadOutputBackings = outputBackingsDict
     }
     
-   
-    
-   
-    
     private func initializeHiddenStatesBackings() throws {
-        // Check embedding model shapes first
+        // inferModel input "hidden_states" should be [1,1,hidden]
+        guard let desc = ffnChunks.first?.inferModel.modelDescription.inputDescriptionsByName["hidden_states"],
+              let constraint = desc.multiArrayConstraint else {
+            throw InferenceError.inferenceError("Failed to read ffn inferModel hidden_states constraint")
+        }
+        let shape = constraint.shape // expect [1,1,1152]
         if debugLevel >= 1 {
-            print("\n=== Embedding Model Shapes ===")
-            for (name, desc) in embedModel.modelDescription.inputDescriptionsByName {
-                if let constraint = desc.multiArrayConstraint {
-                    print("Embed Input \(name):", constraint.shape.map { $0.intValue })
-                }
-            }
-            for (name, desc) in embedModel.modelDescription.outputDescriptionsByName {
-                if let constraint = desc.multiArrayConstraint {
-                    print("Embed Output \(name):", constraint.shape.map { $0.intValue })
-                }
-            }
+            print("FFN infer input shape from model:", shape.map { $0.intValue })
         }
-        
-        // Get shape from FFN model's input
-        if let desc = ffnChunks[0].inferModel.modelDescription.inputDescriptionsByName["hidden_states"],
-           let constraint = desc.multiArrayConstraint {
-            let shape = constraint.shape
-            
-            if debugLevel >= 1 {
-                print("\n=== FFN Model Shapes ===")
-                print("FFN Model Input Shape:", shape.map { $0.intValue })
-                print("\nFFN Model Features:")
-                print("Inputs:", ffnChunks[0].inferModel.modelDescription.inputDescriptionsByName.keys)
-                print("Outputs:", ffnChunks[0].inferModel.modelDescription.outputDescriptionsByName.keys)
-            }
-            
-            let lastDim = shape.last?.intValue ?? 1
-            self.hidden_states = lastDim
-            let otherDims = shape.dropLast().reduce(1) { $0 * $1.intValue }
-            
-            let attributes: [String: Any] = [
-                kCVPixelBufferMetalCompatibilityKey as String: true
-            ]
-            
-            // Create embed output backing
-            var embedPixelBuffer: CVPixelBuffer?
-            let embedStatus = CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                lastDim,
-                otherDims,
-                kCVPixelFormatType_OneComponent16Half,
-                attributes as CFDictionary,
-                &embedPixelBuffer
-            )
-            
-            guard embedStatus == kCVReturnSuccess, let embedBuffer = embedPixelBuffer else {
-                throw InferenceError.inferenceError("Failed to create pixel buffer for embed output")
-            }
-            
-            // Store embed output backing
-            hiddenStatesBackings_emb = ["hidden_states": MLMultiArray(pixelBuffer: embedBuffer, shape: shape)]
-            
-            if debugLevel >= 1 {
-                print("Single-token embed backing shape:", shape.map { $0.intValue })
-            }
-            
-            // Create FFN output backing
-            var ffnPixelBuffer: CVPixelBuffer?
-            let ffnStatus = CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                lastDim,
-                otherDims,
-                kCVPixelFormatType_OneComponent16Half,
-                attributes as CFDictionary,
-                &ffnPixelBuffer
-            )
-            
-            guard ffnStatus == kCVReturnSuccess, let ffnBuffer = ffnPixelBuffer else {
-                throw InferenceError.inferenceError("Failed to create pixel buffer for FFN output")
-            }
-            
-            // Store FFN input/output backing
-            hiddenStatesBackings_ffn = ["output_hidden_states": MLMultiArray(pixelBuffer: ffnBuffer, shape: shape)]
-        }
-    }
 
+        let hiddenSize = shape.last?.intValue ?? self.hidden_states
+        self.hidden_states = hiddenSize
+
+        // create pixel buffer for single-token decode: height = 1
+        let attributes: [String: Any] = [ kCVPixelBufferMetalCompatibilityKey as String: true ]
+        var ffnPixelBuffer: CVPixelBuffer?
+        let ffnStatus = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            hiddenSize,   // width = hidden_size
+            1,            // height = 1 for decode
+            kCVPixelFormatType_OneComponent16Half,
+            attributes as CFDictionary,
+            &ffnPixelBuffer
+        )
+        guard ffnStatus == kCVReturnSuccess, let ffnBuffer = ffnPixelBuffer else {
+            throw InferenceError.inferenceError("Failed to create single-token FFN pixel buffer")
+        }
+        hiddenStatesBackings_ffn = ["output_hidden_states": MLMultiArray(pixelBuffer: ffnBuffer, shape: shape)]
+
+        if debugLevel >= 1 {
+            print("FFN decode backing shape:", shape.map { $0.intValue })
+        }
+
+        // Also create single-token embed backing [1,1,1152] (for generateNextToken embed case)
+        var embedPixelBuffer: CVPixelBuffer?
+        let embedStatus = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            hiddenSize,
+            1,
+            kCVPixelFormatType_OneComponent16Half,
+            attributes as CFDictionary,
+            &embedPixelBuffer
+        )
+        guard embedStatus == kCVReturnSuccess, let embedBuf = embedPixelBuffer else {
+            throw InferenceError.inferenceError("Failed to create single-token embed pixel buffer")
+        }
+        hiddenStatesBackings_emb = ["hidden_states": MLMultiArray(pixelBuffer: embedBuf, shape: shape)]
+    }
+    
+   
+    
+    
 
     private func initializeLastChunkBacking() throws {
         guard let desc = ffnChunks.last?.prefillModel.modelDescription.outputDescriptionsByName["output_hidden_states"],
