@@ -121,7 +121,9 @@ public final class Tokenizer: @unchecked Sendable {
                         "llama": "</s>",
                         "mistral": "</s>",
                         "falcon": "</s>",
-                        "chatglm": "</s>"
+                        "chatglm": "</s>",
+                        "gemma3": "<eos>"
+                        
                     ]
                     
                     if let templateToken = eosTokenMap[template] {
@@ -153,7 +155,8 @@ public final class Tokenizer: @unchecked Sendable {
                         "llama": "<s>",
                         "mistral": "<s>",
                         "falcon": "<s>",
-                        "chatglm": "<s>"
+                        "chatglm": "<s>",
+                        "gemma3": "<bos>"
                     ]
                     
                     if let templateToken = bosTokenMap[template] {
@@ -185,7 +188,8 @@ public final class Tokenizer: @unchecked Sendable {
                         "llama": "<pad>",
                         "mistral": "<pad>",
                         "falcon": "<pad>",
-                        "chatglm": "<pad>"
+                        "chatglm": "<pad>",
+                        "gemma3": "<pad>"
                     ]
                     
                     if let templateToken = padTokenMap[template] {
