@@ -49,9 +49,9 @@ DISABLE_KV_CACHE = False  # Disable KV cache for simple testing
 
 # LM head configuration constants (following llama_model.py pattern)
 ENABLE_CONV2D = bool(1)      # Use Conv2d for LM head
-ENABLE_VACAB_SPLIT = bool(1)  # Split vocab into 2 parts
-ENABLE_VACAB_SPLIT8 = bool(0)  # Split vocab into 8 parts
-ENABLE_VACAB_SPLIT16 = bool(1)  # Split vocab into 16 parts
+ENABLE_VACAB_SPLIT = bool(0)  # Split vocab into 2 parts
+ENABLE_VACAB_SPLIT8 = bool(1)  # Split vocab into 8 parts
+ENABLE_VACAB_SPLIT16 = bool(0)  # Split vocab into 16 parts
 ENABLE_LOGITS2 = bool(1)    # Return separate logits arrays for CoreML
 ENABLE_COREML = bool(0)     # CoreML-specific returns
 
