@@ -4,9 +4,123 @@ This document describes different methods for converting quantized models to Cor
 
 ## Table of Contents
 
+0. [PyTorch Inference (Pre-check)](#0-pytorch-inference-pre-check) - Test checkpoint quality without conversion
 1. [Baked Weights Conversion](#1-baked-weights-conversion-quick-test) - Fast inference, pre-computed scales
 2. [MIL Graph Conversion](#2-mil-graph-conversion) - Full control, stateful KV cache
 3. [PyTorch Trace-Based Conversion](#3-pytorch-trace-based-conversion) - Dynamic scales with LUT compression
+
+---
+
+## 0. PyTorch Inference (Pre-check)
+
+**Use case:** Verify quantized checkpoint quality before CoreML conversion.
+
+This method runs inference directly in PyTorch using the quantized checkpoint. Use this to validate model quality before investing time in CoreML conversion.
+
+### When to Use
+
+- Quickly test if a checkpoint produces sensible outputs
+- Compare quantized vs FP16 model quality
+- Debug quantization issues before conversion
+- Interactive chat testing
+
+### Quick Start
+
+```bash
+# Basic test (auto-detects config from checkpoint directory)
+python tests/dev/test_qwenAQ1_load.py \
+    --checkpoint /path/to/snapped/model_state_dict.pt
+
+# With custom prompt
+python tests/dev/test_qwenAQ1_load.py \
+    --checkpoint /path/to/snapped/model_state_dict.pt \
+    --prompt "What is the capital of France?"
+
+# Interactive chat mode
+python tests/dev/test_qwenAQ1_load.py \
+    --checkpoint /path/to/snapped/model_state_dict.pt \
+    --interactive
+```
+
+### Auto-Config Detection
+
+The script automatically reads `config.json` from the checkpoint directory:
+
+```json
+{
+  "model_id": "Qwen/Qwen3-0.6B",
+  "snapped_mode": "lut",
+  "lut_bits": 4,
+  "attn_lut_bits": 4,
+  "scale_rank": 4,
+  "attn_scale_rank": 4
+}
+```
+
+No need to specify `--lut-bits`, `--scale-rank`, etc. if `config.json` exists.
+
+### CLI Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--checkpoint` | required | Path to checkpoint .pt file |
+| `--model-id` | Qwen/Qwen3-0.6B | Base HuggingFace model ID |
+| `--prompt` | - | Single prompt to test |
+| `--interactive` | - | Interactive chat mode |
+| `--max-tokens` | 512 | Max new tokens to generate |
+| `--temperature` | 0.6 | Sampling temperature |
+| `--no-thinking` | - | Disable thinking mode |
+| `--lut-bits` | auto | LUT bits for MLP (from config.json) |
+| `--attn-lut-bits` | auto | LUT bits for attention (from config.json) |
+| `--scale-rank` | auto | Scale rank for MLP (from config.json) |
+| `--attn-scale-rank` | auto | Scale rank for attention (from config.json) |
+
+### Examples
+
+```bash
+# Q4_4 checkpoint (4-bit LUT, rank-4 scales)
+python tests/dev/test_qwenAQ1_load.py \
+    --checkpoint /Users/anemll/Downloads/anemll_q4_a4_e2e_v2_scales_only/snapped/model_state_dict.pt
+
+# Q2_4 checkpoint (2-bit LUT, rank-4 scales)
+python tests/dev/test_qwenAQ1_load.py \
+    --checkpoint /Users/anemll/Downloads/q2_pt_good1/snapped_lut/model_state_dict.pt
+
+# Manual config override (if no config.json)
+python tests/dev/test_qwenAQ1_load.py \
+    --checkpoint /path/to/model_state_dict.pt \
+    --lut-bits 4 \
+    --attn-lut-bits 4 \
+    --scale-rank 4 \
+    --attn-scale-rank 4
+```
+
+### Expected Output
+
+```
+Device: cpu, dtype: torch.float32
+Found config.json in checkpoint directory:
+  {'model_id': 'Qwen/Qwen3-0.6B', 'snapped_mode': 'lut', 'lut_bits': 4, ...}
+Using: lut_bits=4, attn_lut_bits=4, scale_rank=4, attn_scale_rank=4
+Loading base model: Qwen/Qwen3-0.6B
+Replacing linears (q4_a4)...
+Loading checkpoint: /path/to/model_state_dict.pt
+  All keys matched
+  Set snapped_mode='lut' on 196 layers
+Freezing for inference...
+  Frozen 196 layers
+Model ready!
+
+> What is 2+2?
+<think>Simple arithmetic...</think>
+The answer is 4.
+```
+
+### Related Files
+
+| File | Description |
+|------|-------------|
+| [test_qwenAQ1_load.py](test_qwenAQ1_load.py) | PyTorch inference test script |
 
 ---
 
