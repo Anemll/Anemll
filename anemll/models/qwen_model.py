@@ -105,10 +105,13 @@ class QwenRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        # Store as plain Python float - NOT a tensor buffer
+        # This ensures it becomes a literal constant during tracing
+        # (tensor buffers create dynamic ops that require const_elimination to fold)
+        self.eps = float(eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    
+
         # ──────────────────────────────────────────────────────────────────────
         # Compatibility path for PyTorch 1.x / 2.0–2.3                           .
         # We build a tensor whose mean is *exactly* zero so that LayerNorm's
@@ -129,7 +132,7 @@ class QwenRMSNorm(nn.Module):
             normalized_shape=(2 * hidden_size,),
             weight=None,          # no affine factors here
             bias=None,
-            eps=float(self.variance_epsilon)
+            eps=self.eps  # Plain Python float, captured as literal at trace time
         )
 
         # ❸ Drop the mirror half → correct RMS‑normed activations.
@@ -141,17 +144,19 @@ class QwenRMSNorm(nn.Module):
                        .to(normed.device, copy=False))
 
 class QwenHeadNorm(nn.Module):
-
     """ANE optimized RMSNorm implementation. We use layer_norm and avoid the mean subtraction.
     This give us the best quality for Boolq and other benchmarks."""
 
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        # Store as plain Python float - NOT a tensor buffer
+        # This ensures it becomes a literal constant during tracing
+        # (tensor buffers create dynamic ops that require const_elimination to fold)
+        self.eps = float(eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    
+
         # ──────────────────────────────────────────────────────────────────────
         # Compatibility path for PyTorch 1.x / 2.0–2.3                           .
         # We build a tensor whose mean is *exactly* zero so that LayerNorm's
@@ -172,7 +177,7 @@ class QwenHeadNorm(nn.Module):
             normalized_shape=(2 * hidden_size,),
             weight=None,          # no affine factors here
             bias=None,
-            eps=float(self.variance_epsilon)
+            eps=self.eps  # Plain Python float, captured as literal at trace time
         )
 
         # ❸ Drop the mirror half → correct RMS‑normed activations.
