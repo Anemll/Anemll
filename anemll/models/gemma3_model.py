@@ -64,8 +64,8 @@ class Gemma3Config:
         self.bos_token_id = kwargs.get("bos_token_id", 2)
         self.eos_token_id = kwargs.get("eos_token_id", 1)
         self.hidden_act = kwargs.get("hidden_act", "gelu_pytorch_tanh")
-        #self.hidden_size = kwargs.get("hidden_size", 2304)
-        self.hidden_size = kwargs.get("hidden_size", 2048)
+        self.hidden_size = kwargs.get("hidden_size", 2304)
+        #self.hidden_size = kwargs.get("hidden_size", 2048)
         self.initializer_range = kwargs.get("initializer_range", 0.02)
         self.intermediate_size = kwargs.get("intermediate_size", 9216)
         self.max_position_embeddings = kwargs.get("max_position_embeddings", 131072)
@@ -86,7 +86,7 @@ class Gemma3Config:
         self.torch_required = kwargs.get("torch_dtype", "bfloat16")
         self.transformers_version = kwargs.get("transformers_version", "4.40.0.dev0")
         self.use_cache = kwargs.get("use_cache", True)
-        self.vocab_size = kwargs.get("vocab_size", 262208)
+        self.vocab_size = kwargs.get("vocab_size", 262144)
         self.context_length = kwargs.get("context_length", CONTEXT_LENGTH)
         self.state_length = kwargs.get("state_length", STATE_LENGTH)
         self.pad_token_id = kwargs.get("pad_token_id",0)
@@ -404,10 +404,10 @@ class Gemma3DecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             **kwargs,
-        )
-        #hidden_states = residual + 
+        ) 
 
         attn_output = attn_outputs[0]
+        hidden_states = residual + attn_output
         self_attn_weights = attn_outputs[1] if output_attentions else None
 
         # 2. MLP (Feed-Forward) block
@@ -416,7 +416,7 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states = self.mlp(normed_hidden_states)
         hidden_states = residual + hidden_states
 
-        present_key_value = attn_outputs[1] if use_cache and not output_attentions else (attn_outputs[2] if use_cache else None)
+        present_key_value = attn_outputs[2] if use_cache else None
 
         outputs = (hidden_states,)
         if output_attentions:
@@ -597,43 +597,87 @@ class Gemma3Attention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        
-        # Ensure all inputs are on the correct dtype
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+
+        # ─────────────────────────────────────────────────────────────
+        # dtype safety (ANE / CoreML)
+        # ─────────────────────────────────────────────────────────────
         hidden_states = hidden_states.to(MODEL_DTYPE)
         cos, sin = position_embeddings
         cos = cos.to(MODEL_DTYPE)
         sin = sin.to(MODEL_DTYPE)
-        position_embeddings = (cos, sin)
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(MODEL_DTYPE)
 
         bsz, q_len, _ = hidden_states.size()
 
-        # Reshape for Conv2d: [batch, seq_len, hidden_size] -> [batch, hidden_size, seq_len, 1]
+        # ─────────────────────────────────────────────────────────────
+        # Conv2d QKV projections
+        # [B, S, H] → [B, H, S, 1]
+        # ─────────────────────────────────────────────────────────────
         hidden_states_conv = hidden_states.transpose(1, 2).unsqueeze(-1)
-        
-        
-        query_states = self.q_proj(hidden_states_conv).squeeze(-1).transpose(1, 2).to(MODEL_DTYPE)
-        key_states = self.k_proj(hidden_states_conv).squeeze(-1).transpose(1, 2).to(MODEL_DTYPE)
-        value_states = self.v_proj(hidden_states_conv).squeeze(-1).transpose(1, 2).to(MODEL_DTYPE)
 
-        query_states = query_states.view(bsz, q_len, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = (
+            self.q_proj(hidden_states_conv)
+            .squeeze(-1)
+            .transpose(1, 2)
+            .to(MODEL_DTYPE)
+        )
+        key_states = (
+            self.k_proj(hidden_states_conv)
+            .squeeze(-1)
+            .transpose(1, 2)
+            .to(MODEL_DTYPE)
+        )
+        value_states = (
+            self.v_proj(hidden_states_conv)
+            .squeeze(-1)
+            .transpose(1, 2)
+            .to(MODEL_DTYPE)
+        )
 
+        # ─────────────────────────────────────────────────────────────
+        # Reshape to heads
+        # ─────────────────────────────────────────────────────────────
+        query_states = query_states.view(
+            bsz, q_len, self.config.num_attention_heads, self.head_dim
+        ).transpose(1, 2)
+
+        key_states = key_states.view(
+            bsz, q_len, self.config.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        value_states = value_states.view(
+            bsz, q_len, self.config.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        # ─────────────────────────────────────────────────────────────
+        # QK RMSNorm 
+        # ─────────────────────────────────────────────────────────────
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
-        # Apply rotary embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # ─────────────────────────────────────────────────────────────
+        # Rotary embedding
+        # ─────────────────────────────────────────────────────────────
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
 
-        # Repeat KV heads if using GQA
+        # ─────────────────────────────────────────────────────────────
+        # GQA KV repeat
+        # ─────────────────────────────────────────────────────────────
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+        # ─────────────────────────────────────────────────────────────
+        # Attention
+        # ─────────────────────────────────────────────────────────────
+        attn_weights = (
+            torch.matmul(query_states, key_states.transpose(2, 3))
+            * self.scaling
+        )
 
         if self.attn_logit_softcapping is not None:
             attn_weights = attn_weights / self.attn_logit_softcapping
@@ -642,31 +686,44 @@ class Gemma3Attention(nn.Module):
 
         if attention_mask is not None:
             if attention_mask.size() != attn_weights.size():
-                attention_mask = attention_mask[:, :, :q_len, :key_states.shape[-2]]
+                attention_mask = attention_mask[:, :, :q_len, : key_states.shape[-2]]
             attn_weights = attn_weights + attention_mask
 
-        
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=False)
-        
+        attn_weights = torch.softmax(attn_weights, dim=-1).to(query_states.dtype)
+
+        # dropout 
+        # attn_weights = nn.functional.dropout(attn_weights, p=0.0, training=False)
+
         attn_output = torch.matmul(attn_weights, value_states)
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.config.num_attention_heads * self.head_dim)
+        # ─────────────────────────────────────────────────────────────
+        # Merge heads
+        # ─────────────────────────────────────────────────────────────
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(bsz, q_len, self.config.num_attention_heads * self.head_dim)
+        )
 
-        # Reshape for o_proj Conv2d
+        # ─────────────────────────────────────────────────────────────
+        # Output projection (Conv2d)
+        # ─────────────────────────────────────────────────────────────
         attn_output_conv = attn_output.transpose(1, 2).unsqueeze(-1)
-        attn_output = self.o_proj(attn_output_conv).squeeze(-1).transpose(1, 2)
+        attn_output = (
+            self.o_proj(attn_output_conv)
+            .squeeze(-1)
+            .transpose(1, 2)
+        )
 
-        if not use_cache:
-            return attn_output, attn_weights
-        else:
-            # The state is returned as a tuple of (key, value)
-            present_key_value = (key_states.to(hidden_states.dtype), value_states.to(hidden_states.dtype))
-            if output_attentions:
-                return attn_output, attn_weights, present_key_value
-            else:
-                return attn_output, present_key_value
+        # ─────────────────────────────────────────────────────────────
+        # ALWAYS return fixed structure (CoreML safe)
+        # ─────────────────────────────────────────────────────────────
+        present_key_value = (
+            key_states.to(hidden_states.dtype),
+            value_states.to(hidden_states.dtype),
+        )
+
+        return attn_output, attn_weights, present_key_value
 
 
            
