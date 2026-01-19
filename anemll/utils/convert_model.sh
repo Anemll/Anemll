@@ -19,6 +19,7 @@ PREFIX="llama"  # Default prefix for model names
 MODEL_PATH=""
 OUTPUT_DIR=""
 NUM_CHUNKS=2   # Default number of chunks
+CHECKPOINT_PATH=""  # ANEMLL checkpoint with A, B, and snapped weights
 
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
@@ -50,6 +51,8 @@ print_usage() {
     echo "  --only          Run only specified step and exit (1-8)"
     echo "  --prefix        Prefix for model names (default: llama)"
     echo "  --chunk         Number of chunks to split FFN/prefill (default: 2)"
+    echo "  --checkpoint    Path to ANEMLL checkpoint with A, B, and snapped weights"
+    echo "                  (dynamic A*B: W * (A @ B) computed in CoreML at runtime)"
     echo "  --skip-check    Skip the dependency check step"
     echo ""
     echo "Examples:"
@@ -108,9 +111,9 @@ while [[ $# -gt 0 ]]; do
             NUM_CHUNKS="$2"
             shift 2
             ;;
-        --skip-check)
-            SKIP_CHECK=true
-            shift
+        --checkpoint)
+            CHECKPOINT_PATH="$2"
+            shift 2
             ;;
         --skip-check)
             SKIP_CHECK=true
@@ -223,6 +226,14 @@ run_step() {
     fi
 }
 
+# Build checkpoint parameter if specified
+CHECKPOINT_PARAM=""
+if [ ! -z "$CHECKPOINT_PATH" ]; then
+    CHECKPOINT_PARAM="--checkpoint \"$CHECKPOINT_PATH\""
+    echo "Using ANEMLL checkpoint: $CHECKPOINT_PATH"
+    echo "  (Dynamic A*B: W * (A @ B) computed in CoreML at runtime)"
+fi
+
 # Step 1: Convert Embeddings (Part 1)
 LUT1_PARAM=""
 if [ ! -z "$LUT_PART1" ]; then
@@ -233,8 +244,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "1" ]; then
     run_step 1 "Converting Embeddings" "$CONVERTER \
         --part 1 \
         $LUT1_PARAM \
-        --context-length $CONTEXT_LENGTH \
-        --batch-size $BATCH_SIZE \
+        $CHECKPOINT_PARAM \
         --context-length $CONTEXT_LENGTH \
         --batch-size $BATCH_SIZE \
         --prefix \"$PREFIX\" \
@@ -254,7 +264,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
     run_step 2 "Converting LM Head" "$CONVERTER \
         --part 3 \
         $LUT3_PARAM \
-        --context-length $CONTEXT_LENGTH \
+        $CHECKPOINT_PARAM \
         --context-length $CONTEXT_LENGTH \
         --prefix \"$PREFIX\" \
         --model \"$MODEL_PATH\" \
@@ -273,6 +283,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
     run_step 3 "Converting FFN" "$CONVERTER \
         --part 2 \
         $LUT2_PARAM \
+        $CHECKPOINT_PARAM \
         --chunk $NUM_CHUNKS \
         --context-length $CONTEXT_LENGTH \
         --batch-size $BATCH_SIZE \
@@ -287,6 +298,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
     run_step 4 "Converting Prefill" "$CONVERTER \
         --part 2_prefill \
         $LUT2_PARAM \
+        $CHECKPOINT_PARAM \
         --chunk $NUM_CHUNKS \
         --context-length $CONTEXT_LENGTH \
         --batch-size $BATCH_SIZE \
