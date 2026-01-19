@@ -207,6 +207,146 @@ def build_aq1_conv_layer(
     return output
 
 
+def build_factored_aq1_conv_layer(
+    x,  # MIL tensor input
+    indices_packed: np.ndarray,
+    lut: np.ndarray,
+    scale_A: np.ndarray,
+    scale_B: np.ndarray,
+    out_features: int,
+    in_features: int,
+    name: str,
+    bias: Optional[np.ndarray] = None,
+):
+    """
+    Build an AQ1 conv layer using FACTORED MIL operations.
+
+    This avoids materializing the full [out_features, in_features] scale matrix.
+
+    Instead of:
+        scales = A @ B                    # Materializes [out, in] matrix
+        W_eff = W_base * scales
+        output = conv(x, W_eff)
+
+    This computes:
+        y = sum_k(A[k] * conv(W_base, B[k] * x))
+
+    Where:
+        - W_base = constexpr_lut_to_dense(indices, LUT)
+        - B[k] is the k-th row of B: [1, in_features, 1, 1]
+        - A[k] is the k-th column of A: [1, out_features, 1, 1]
+
+    Benefits:
+        - No A @ B matmul (avoids [out, in] intermediate)
+        - Uses only mul, conv, add operations (ANE-friendly)
+        - Same numerical result as original approach
+
+    Args:
+        x: Input MIL tensor (shape: [batch, in_features, 1, seq_len])
+        indices_packed: Packed uint8 indices from pack_indices_to_bits()
+        lut: LUT values array (float16)
+        scale_A: Scale factor A [out_features, rank] (float16)
+        scale_B: Scale factor B [rank, in_features] (float16)
+        out_features: Output dimension
+        in_features: Input dimension
+        name: Layer name prefix
+        bias: Optional bias array
+
+    Returns:
+        MIL tensor output of the convolution
+    """
+    # Determine nbits from LUT size
+    lut_size = len(lut)
+    nbits = int(np.ceil(np.log2(lut_size))) if lut_size > 1 else 1
+
+    # Get proper sub-byte dtype for indices
+    from coremltools.converters.mil.mil.types import np_uint2_dtype, np_uint4_dtype
+    if nbits <= 2:
+        indices_dtype = np_uint2_dtype
+    elif nbits <= 4:
+        indices_dtype = np_uint4_dtype
+    else:
+        indices_dtype = np.uint8
+
+    # Convert indices to 4D with sub-byte dtype
+    if isinstance(indices_packed, np.ndarray) and indices_packed.dtype == np.uint8 and len(indices_packed.shape) == 1:
+        # Packed bytes - unpack first
+        indices_per_byte = 8 // nbits
+        total_elements = out_features * in_features
+        mask = (1 << nbits) - 1
+
+        unpacked = []
+        for byte in indices_packed:
+            for i in range(indices_per_byte):
+                if len(unpacked) < total_elements:
+                    unpacked.append((byte >> (i * nbits)) & mask)
+
+        indices_2d = np.array(unpacked, dtype=np.uint8).reshape(out_features, in_features)
+    else:
+        indices_2d = np.array(indices_packed, dtype=np.uint8).reshape(out_features, in_features)
+
+    # Convert to 4D and proper sub-byte dtype
+    indices_4d = indices_2d.reshape(out_features, in_features, 1, 1).astype(indices_dtype)
+
+    # LUT to 6D format [1, 1, 1, 1, lut_size, 1]
+    lut_6d = lut.astype(np.float16).reshape(1, 1, 1, 1, lut_size, 1)
+
+    # constexpr_lut_to_dense outputs 4D [out, in, 1, 1] - this is our Q (base weights)
+    Q_weights = mb.constexpr_lut_to_dense(
+        indices=indices_4d,
+        lut=lut_6d,
+        name=f"{name}_Q"
+    )
+
+    # Get rank from scale shapes
+    # scale_A: [out_features, rank], scale_B: [rank, in_features]
+    rank = scale_A.shape[1]
+
+    # Transpose scales for iteration:
+    # A_T: [rank, out_features] - each row k is A[:, k]
+    # B stays as [rank, in_features] - each row k is B[k, :]
+    scale_A_T = scale_A.T.astype(np.float16)  # [rank, out_features]
+    scale_B_np = scale_B.astype(np.float16)   # [rank, in_features]
+
+    y_accum = None
+
+    for k in range(rank):
+        # B[k]: shape [1, in_features, 1, 1] for broadcasting with x
+        B_k = scale_B_np[k:k+1, :, np.newaxis, np.newaxis]  # [1, in_features, 1, 1]
+        B_const = mb.const(val=B_k, name=f"{name}_B{k}")
+
+        # A[k]: shape [1, out_features, 1, 1] for broadcasting with conv output
+        A_k = scale_A_T[k:k+1, :, np.newaxis, np.newaxis]  # [1, out_features, 1, 1]
+        A_const = mb.const(val=A_k, name=f"{name}_A{k}")
+
+        # Step 1: x_scaled = x * B[k]
+        # x is [batch, in_features, 1, seq], B_k is [1, in_features, 1, 1]
+        x_scaled = mb.mul(x=x, y=B_const, name=f"{name}_xB{k}")
+
+        # Step 2: y_k = conv(Q, x_scaled)
+        # Q is [out, in, 1, 1], x_scaled is [batch, in, 1, seq]
+        # Output is [batch, out, 1, seq]
+        y_k = mb.conv(x=x_scaled, weight=Q_weights, pad_type="valid", name=f"{name}_conv{k}")
+
+        # Step 3: y_k = y_k * A[k]
+        # y_k is [batch, out, 1, seq], A_k is [1, out, 1, 1]
+        y_k_scaled = mb.mul(x=y_k, y=A_const, name=f"{name}_yA{k}")
+
+        # Step 4: Accumulate
+        if y_accum is None:
+            y_accum = y_k_scaled
+        else:
+            y_accum = mb.add(x=y_accum, y=y_k_scaled, name=f"{name}_add{k}")
+
+    # Add bias if present
+    if bias is not None:
+        bias_4d = bias.astype(np.float16).reshape(1, out_features, 1, 1)
+        bias_const = mb.const(val=bias_4d, name=f"{name}_bias")
+        y_accum = mb.add(x=y_accum, y=bias_const, name=f"{name}_biased")
+
+    return y_accum
+
+
 def prepare_aq1_layer_data(
     weight: np.ndarray,
     scale_A: np.ndarray,

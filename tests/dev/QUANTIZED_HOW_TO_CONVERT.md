@@ -8,6 +8,7 @@ This document describes different methods for converting quantized models to Cor
 1. [Baked Weights Conversion](#1-baked-weights-conversion-quick-test) - Fast inference, pre-computed scales
 2. [MIL Graph Conversion](#2-mil-graph-conversion) - Full control, stateful KV cache
 3. [PyTorch Trace-Based Conversion](#3-pytorch-trace-based-conversion) - Dynamic scales with LUT compression
+4. [V2 Factored Conversion](#4-v2-factored-conversion) - Production conversion with LoRA support
 
 ---
 
@@ -24,20 +25,22 @@ This method runs inference directly in PyTorch using the quantized checkpoint. U
 - Debug quantization issues before conversion
 - Interactive chat testing
 
-### Quick Start
-
+### Quick Start 
+# Factored AQ1 V2:  
+# Forward: y = Σₖ gₖ · (aₖ ⊙ (Q @ (bₖ ⊙ x)))
+# k - is rank
 ```bash
 # Basic test (auto-detects config from checkpoint directory)
-python tests/dev/test_qwenAQ1_load.py \
+python test_qwenAQ1_load_rf.py \
     --checkpoint /path/to/snapped/model_state_dict.pt
 
 # With custom prompt
-python tests/dev/test_qwenAQ1_load.py \
+python test_qwenAQ1_load_rf.py \
     --checkpoint /path/to/snapped/model_state_dict.pt \
     --prompt "What is the capital of France?"
 
 # Interactive chat mode
-python tests/dev/test_qwenAQ1_load.py \
+python test_qwenAQ1_load_rf.py \
     --checkpoint /path/to/snapped/model_state_dict.pt \
     --interactive
 ```
@@ -517,6 +520,124 @@ Running inference with test inputs...
 | [test_palettize_with_scales.py](test_palettize_with_scales.py) | Palettization with factored scales |
 | [ANEMLL-quant.py](ANEMLL-quant.py) | Quantization simulation script |
 | [ANE-group-quant.py](ANE-group-quant.py) | Group quantization simulation |
+
+---
+
+## 4. V2 Factored Conversion
+
+**Use case:** Production-ready conversion with LoRA support, 4-bit LUT compression, and multi-function CoreML models.
+
+This method uses PyTorch tracing with the V2 factored computation pattern: `y = Σₖ gₖ · (aₖ ⊙ (Q @ (bₖ ⊙ x)))`, producing optimized CoreML models with optional LoRA adapters.
+
+### When to Use V2 Factored Conversion
+
+- Converting V2 checkpoints (with `_Q`, `scale_A`, `scale_B` naming)
+- Need both decoder and prefill in a single multi-function model
+- Using LoRA adapters (MLP-only or full)
+- Production deployment
+
+### Quick Start
+
+```bash
+# Step 1: Convert checkpoint to CoreML (both decoder + prefill)
+python tests/dev/convert_v2_trace.py \
+    --checkpoint /path/to/snapped_checkpoint.pt \
+    --model Qwen/Qwen3-0.6B \
+    --context 512 \
+    --output /tmp/v2_output \
+    --mode both \
+    --prefix qwen
+
+# Step 2: Finalize (combine, compile, test) - --lut must match --mlp-bits
+./tests/dev/finalize_v2_models.sh /tmp/v2_output --lut 4 --prefix qwen --test
+```
+
+### Conversion Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--checkpoint` | required | Path to V2 checkpoint (.pt file) |
+| `--model` | Qwen/Qwen3-0.6B | HuggingFace model ID |
+| `--context` | 512 | Context length |
+| `--output` | required | Output directory |
+| `--mode` | decoder | `decoder`, `prefill`, or `both` |
+| `--prefix` | qwen | Model name prefix |
+| `--lut` | 4 | LUT bits for compression |
+| `--no-lora` | - | Disable LoRA even if checkpoint has it |
+
+### LoRA Support
+
+The converter auto-detects LoRA weights from the checkpoint. LoRA modes are determined by `config.json`:
+
+```json
+{
+  "mlp_only": true,      // Only MLP layers have LoRA
+  "skip_k_proj": true    // Skip k_proj in attention LoRA
+}
+```
+
+LoRA forward pass: `y = quant_forward(x) + (x @ lora_A.T @ lora_B.T) * scaling`
+
+### Finalization Script
+
+The `finalize_v2_models.sh` script combines and compiles the models:
+
+```bash
+./tests/dev/finalize_v2_models.sh <output_dir> [options]
+
+Options:
+  --lut <bits>    LUT bits (auto-detected if not specified)
+  --prefix <str>  Model prefix (default: qwen)
+  --test          Run inference test after finalization
+```
+
+**What finalization does:**
+
+1. **Combine** - Merges FFN + Prefill into `{prefix}_FFN_PF_lut{N}_chunk_01of01.mlpackage`
+2. **Compile** - CoreML compilation to `.mlmodelc` format
+3. **Update meta.yaml** - Sets correct FFN path
+4. **Test** - Optional inference verification
+
+### Complete Example with LoRA
+
+```bash
+# Convert LoRA checkpoint
+python tests/dev/convert_v2_trace.py \
+    --checkpoint /Users/anemll/Downloads/SR-008-32B/best_recovery_lora200_snapped.pt \
+    --model Qwen/Qwen3-0.6B \
+    --context 512 \
+    --output /tmp/q4_r32_lora_test \
+    --mode both \
+    --prefix qwen
+
+# Finalize and test (--lut must match --mlp-bits from convert step)
+./tests/dev/finalize_v2_models.sh /tmp/q4_r32_lora_test --lut 4 --test
+
+# Manual test
+echo "Hello, what is 2+2?" | python tests/chat.py --meta /tmp/q4_r32_lora_test/meta.yaml
+```
+
+### Output Structure
+
+```
+output/
+├── qwen_embeddings.mlmodelc/           # Embeddings (FP16)
+├── qwen_lm_head_lut6.mlmodelc/         # LM Head (6-bit LUT)
+├── qwen_FFN_lut4_chunk_01of01.mlpackage/   # Decoder (intermediate)
+├── qwen_prefill_lut4_chunk_01of01.mlpackage/  # Prefill (intermediate)
+├── qwen_FFN_PF_lut4_chunk_01of01.mlmodelc/  # Combined (after finalize)
+├── meta.yaml                           # Model configuration
+├── tokenizer.json                      # Tokenizer files
+└── ...
+```
+
+### Related Files
+
+| File | Description |
+|------|-------------|
+| [convert_v2_trace.py](convert_v2_trace.py) | V2 factored conversion script |
+| [finalize_v2_models.sh](finalize_v2_models.sh) | Finalization script |
+| [test_qwenAQ1_load_rf.py](test_qwenAQ1_load_rf.py) | PyTorch inference test |
 
 ---
 
