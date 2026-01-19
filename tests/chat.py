@@ -602,7 +602,7 @@ def create_unified_state(ffn_models, context_length, eval_mode=False):
             print("\nCreated unified transformer state")
         return state
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False, system_prompt=None, no_think=False):
     """Interactive chat loop."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
@@ -657,11 +657,20 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 if not warmup and not eval_mode:
                     print("Using raw input without chat template")
             elif has_chat_template:
-                messages = [{"role": "user", "content": user_input}]
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": user_input})
+                # Use enable_thinking=False for Qwen3 to disable thinking mode
+                template_kwargs = {
+                    "return_tensors": "pt",
+                    "add_generation_prompt": True,
+                }
+                if no_think:
+                    template_kwargs["enable_thinking"] = False
                 input_ids = tokenizer.apply_chat_template(
                     messages,
-                    return_tensors="pt",
-                    add_generation_prompt=True
+                    **template_kwargs
                 ).to(torch.int32)
             else:
                 # Manual formatting for Llama models without chat template
@@ -754,14 +763,19 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     if max_tokens is not None and tokens_generated >= max_tokens:
                         break
                         
-                    # Check for all possible EOS tokens
+                    # Check for all possible EOS tokens (including endoftext for Qwen3)
                     eos_token_ids = tokenizer.eos_token_id
+                    stop_ids = set()
                     if isinstance(eos_token_ids, list):
-                        if next_token in eos_token_ids:
-                            break
+                        stop_ids.update(eos_token_ids)
                     else:
-                        if next_token == eos_token_ids:
-                            break
+                        stop_ids.add(eos_token_ids)
+                    # Also check for endoftext token (often used as stop token)
+                    endoftext_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+                    if endoftext_id is not None and endoftext_id != tokenizer.unk_token_id:
+                        stop_ids.add(endoftext_id)
+                    if next_token in stop_ids:
+                        break
                 
                 # Calculate inference timing
                 inference_time = time.time() - inference_start
@@ -852,10 +866,18 @@ def parse_args():
     parser.add_argument('--nw', action='store_true',
                        help='Skip warmup phase')
     
-    # Add no-template flag  
+    # Add no-template flag
     parser.add_argument('--no-template', action='store_true',
                        help='Prefill the question itself and start inference directly without chat template')
-    
+
+    # Add system prompt option
+    parser.add_argument('--system', type=str, default=None,
+                       help='System prompt to prepend to conversation')
+
+    # Add no-think flag for Qwen3
+    parser.add_argument('--no-think', action='store_true',
+                       help='Disable Qwen3 thinking mode (adds empty <think></think> tags)')
+
     # Add eval mode flag
     parser.add_argument('--eval', action='store_true',
                        help='Evaluation mode: suppress all output except model response')
@@ -933,12 +955,22 @@ def parse_args():
                 num_chunks = int(params['num_chunks'])
 
                 # Set model paths if not specified
+                # First check explicit keys from meta.yaml, then fall back to constructed names
                 if not args.lmhead:
-                    args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
+                    if 'lm_head' in params:
+                        args.lmhead = params['lm_head'].replace('.mlmodelc', '').replace('.mlpackage', '')
+                    else:
+                        args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
                 if not args.embed:
-                    args.embed = f'{prefix}_embeddings{lut_embeddings}'
+                    if 'embeddings' in params:
+                        args.embed = params['embeddings'].replace('.mlmodelc', '').replace('.mlpackage', '')
+                    else:
+                        args.embed = f'{prefix}_embeddings{lut_embeddings}'
                 if not args.ffn:
-                    args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
+                    if 'ffn' in params:
+                        args.ffn = params['ffn'].replace('.mlmodelc', '').replace('.mlpackage', '')
+                    else:
+                        args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
                 if not args.tokenizer:
                     if 'tokenizer_path' in params:
                         args.tokenizer = params['tokenizer_path']
@@ -1090,7 +1122,7 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
 
 def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state, causal_mask=None,
                          auto_prompt=None, warmup=False, save_file=None, max_tokens=None,
-                         no_template=False, eval_mode=False):
+                         no_template=False, eval_mode=False, system_prompt=None, no_think=False):
     """Chat loop for monolithic models."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
@@ -1134,8 +1166,18 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
             if no_template:
                 input_ids = tokenizer(user_input, return_tensors="pt", add_special_tokens=True).input_ids.to(torch.int32)
             elif has_chat_template:
-                messages = [{"role": "user", "content": user_input}]
-                input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True).to(torch.int32)
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": user_input})
+                # Use enable_thinking=False for Qwen3 to disable thinking mode
+                template_kwargs = {
+                    "return_tensors": "pt",
+                    "add_generation_prompt": True,
+                }
+                if no_think:
+                    template_kwargs["enable_thinking"] = False
+                input_ids = tokenizer.apply_chat_template(messages, **template_kwargs).to(torch.int32)
             else:
                 formatted_prompt = f"[INST] {user_input} [/INST]"
                 input_ids = tokenizer(formatted_prompt, return_tensors="pt", add_special_tokens=True).input_ids.to(torch.int32)
@@ -1187,13 +1229,19 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                     if max_tokens is not None and tokens_generated >= max_tokens:
                         break
 
+                    # Check for all possible EOS tokens (including endoftext for Qwen3)
                     eos_token_ids = tokenizer.eos_token_id
+                    stop_ids = set()
                     if isinstance(eos_token_ids, list):
-                        if next_token in eos_token_ids:
-                            break
+                        stop_ids.update(eos_token_ids)
                     else:
-                        if next_token == eos_token_ids:
-                            break
+                        stop_ids.add(eos_token_ids)
+                    # Also check for endoftext token (often used as stop token)
+                    endoftext_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+                    if endoftext_id is not None and endoftext_id != tokenizer.unk_token_id:
+                        stop_ids.add(endoftext_id)
+                    if next_token in stop_ids:
+                        break
 
                 inference_time = time.time() - inference_start
                 inference_tokens_per_sec = inference_tokens / inference_time if inference_time > 0 else 0
@@ -1318,7 +1366,9 @@ def main():
                         warmup=True,
                         auto_prompt="who are you?",
                         no_template=args.no_template,
-                        eval_mode=args.eval
+                        eval_mode=args.eval,
+                        system_prompt=args.system,
+                        no_think=args.no_think
                     )
 
             # Main run
@@ -1334,7 +1384,9 @@ def main():
                 save_file=args.save,
                 max_tokens=args.max_tokens,
                 no_template=args.no_template,
-                eval_mode=args.eval
+                eval_mode=args.eval,
+                system_prompt=args.system,
+                no_think=args.no_think
             )
 
         else:
@@ -1387,7 +1439,9 @@ def main():
                         warmup=True,
                         auto_prompt="who are you?",
                         no_template=args.no_template,
-                        eval_mode=args.eval
+                        eval_mode=args.eval,
+                        system_prompt=args.system,
+                        no_think=args.no_think
                     )
 
             # Main run
@@ -1404,7 +1458,9 @@ def main():
                 save_file=args.save,
                 max_tokens=args.max_tokens,
                 no_template=args.no_template,
-                eval_mode=args.eval
+                eval_mode=args.eval,
+                system_prompt=args.system,
+                no_think=args.no_think
             )
         
     except Exception as e:

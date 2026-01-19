@@ -967,14 +967,19 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                     if warmup and tokens_generated >= WARMUP_TOKEN_LIMIT:
                         break
 
-                    # Check for all possible EOS tokens
+                    # Check for all possible EOS tokens (including endoftext for Qwen3)
                     eos_token_ids = tokenizer.eos_token_id
+                    stop_ids = set()
                     if isinstance(eos_token_ids, list):
-                        if next_token in eos_token_ids:
-                            break
+                        stop_ids.update(eos_token_ids)
                     else:
-                        if next_token == eos_token_ids:
-                            break
+                        stop_ids.add(eos_token_ids)
+                    # Also check for endoftext token (often used as stop token)
+                    endoftext_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+                    if endoftext_id is not None and endoftext_id != tokenizer.unk_token_id:
+                        stop_ids.add(endoftext_id)
+                    if next_token in stop_ids:
+                        break
 
                 inference_time = time.time() - inference_start  # Calculate inference time
 
@@ -1256,21 +1261,26 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     if warmup and tokens_generated >= WARMUP_TOKEN_LIMIT:
                         break
                     
-                    # Check for all possible EOS tokens
+                    # Check for all possible EOS tokens (including endoftext for Qwen3)
                     eos_token_ids = tokenizer.eos_token_id
+                    stop_ids = set()
                     if isinstance(eos_token_ids, list):
-                        if next_token in eos_token_ids:
-                            break
+                        stop_ids.update(eos_token_ids)
                     else:
-                        if next_token == eos_token_ids:
-                            break
-                
+                        stop_ids.add(eos_token_ids)
+                    # Also check for endoftext token (often used as stop token)
+                    endoftext_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+                    if endoftext_id is not None and endoftext_id != tokenizer.unk_token_id:
+                        stop_ids.add(endoftext_id)
+                    if next_token in stop_ids:
+                        break
+
                 inference_time = time.time() - inference_start  # Calculate inference time
-                
+
                 # Add assistant response to conversation
                 response_text = token_printer.stop()
                 conversation.append({"role": "assistant", "content": response_text})
-                
+
                 # Print stats only if not in warmup
                 if not warmup:
                     total_time = time.time() - generation_start_time
