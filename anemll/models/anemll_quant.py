@@ -775,13 +775,22 @@ def load_anemll_weights(
         loaded = False
         for base_key in base_keys:
             weight_key = f'{base_key}.weight'
+            q_key = f'{base_key}._Q'  # V2 format: snapped weights in _Q
             scale_a_key = f'{base_key}.scale_A'
             scale_b_key = f'{base_key}.scale_B'
+            mag_key = f'{base_key}.rank_magnitude'  # V2 format
             lut_key = f'{base_key}.lut'
 
             if weight_key in state_dict:
+                # Prefer V2 _Q buffer for snapped weights if available
+                if q_key in state_dict:
+                    w = state_dict[q_key]
+                    if q_key in unexpected_keys:
+                        unexpected_keys.remove(q_key)
+                else:
+                    w = state_dict[weight_key]
+
                 # Load weight [out, in] -> [out, in, 1, 1]
-                w = state_dict[weight_key]
                 if w.dim() == 2:
                     w = w.view(w.shape[0], w.shape[1], 1, 1)
                 module.weight.data.copy_(w.to(module.weight.dtype))
@@ -792,9 +801,18 @@ def load_anemll_weights(
 
                 # Load scales if present
                 if scale_a_key in state_dict:
-                    module.scale_A.data.copy_(
-                        state_dict[scale_a_key].to(module.scale_A.dtype)
-                    )
+                    scale_A = state_dict[scale_a_key].to(module.scale_A.dtype)
+
+                    # V2: incorporate rank_magnitude into scale_A
+                    # This way scale_A @ scale_B produces correct scales
+                    if mag_key in state_dict:
+                        rank_mag = state_dict[mag_key].to(module.scale_A.dtype)
+                        # Broadcast: [out, rank] * [rank] -> [out, rank]
+                        scale_A = scale_A * rank_mag.unsqueeze(0)
+                        if mag_key in unexpected_keys:
+                            unexpected_keys.remove(mag_key)
+
+                    module.scale_A.data.copy_(scale_A)
                     if scale_a_key in unexpected_keys:
                         unexpected_keys.remove(scale_a_key)
                 else:
@@ -1012,8 +1030,17 @@ def load_baked_weights_for_ane(
     else:
         state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
+    # Detect V2 checkpoint format (has _Q buffers and rank_magnitude)
+    has_q_buffers = any('._Q' in k for k in state_dict.keys())
+    has_rank_magnitude = any('.rank_magnitude' in k for k in state_dict.keys())
+    is_v2_checkpoint = has_q_buffers and has_rank_magnitude
+
     if verbose:
         print(f"Loading ANEMLL checkpoint for ANE conversion: {len(state_dict)} keys")
+        if is_v2_checkpoint:
+            print(f"  Detected V2 checkpoint format (rank_magnitude + _Q buffers)")
+        else:
+            print(f"  Using V1 checkpoint format (scale_A @ scale_B)")
 
     # Identify quantized projection layer names
     quantized_proj_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
@@ -1046,14 +1073,32 @@ def load_baked_weights_for_ane(
             scale_b_key = f'{base_key}.scale_B'
 
             if weight_key in state_dict and scale_a_key in state_dict and scale_b_key in state_dict:
-                # Load snapped weights and scales
-                snapped = state_dict[weight_key].to(torch.float32)
+                # Check for V2 checkpoint format: use _Q for snapped weights if available
+                q_key = f'{base_key}._Q'
+                if q_key in state_dict:
+                    # V2 format: snapped weights in _Q buffer
+                    snapped = state_dict[q_key].to(torch.float32)
+                else:
+                    # V1 format: snapped weights in weight parameter
+                    snapped = state_dict[weight_key].to(torch.float32)
+
                 scale_A = state_dict[scale_a_key].to(torch.float32)
                 scale_B = state_dict[scale_b_key].to(torch.float32)
 
-                # Compute baked weight: snapped * (scale_A @ scale_B)
+                # Check for V2 rank_magnitude parameter
+                mag_key = f'{base_key}.rank_magnitude'
+                if mag_key in state_dict:
+                    # V2 format: scales = (A * g) @ B
+                    rank_magnitude = state_dict[mag_key].to(torch.float32)
+                    # Broadcast: A [out, rank] * g [rank] -> [out, rank]
+                    scale_A_scaled = scale_A * rank_magnitude.unsqueeze(0)
+                    scales = scale_A_scaled @ scale_B
+                else:
+                    # V1 format: scales = A @ B
+                    scales = scale_A @ scale_B
+
                 # Clamp scales to positive values (matching AnemllConv2d.forward behavior)
-                scales = (scale_A @ scale_B).clamp(min=1e-8)
+                scales = scales.clamp(min=1e-8)
 
                 # Handle shape: snapped is [out, in] or [out, in, 1, 1]
                 if snapped.dim() == 4:
@@ -1201,6 +1246,10 @@ def load_dynamic_weights_for_ane(
     - const W: [out_features, in_features] (snapped LUT values)
     - runtime: scales = matmul(A, B), W_effective = W * scales, output = conv(x, W_effective)
 
+    Supports both V1 and V2 checkpoint formats:
+    - V1: snapped weights in `weight`, scales = A @ B
+    - V2: snapped weights in `_Q`, scales = (A * rank_magnitude) @ B
+
     Args:
         model: Model with nn.Conv2d layers (not AnemllConv2d)
         checkpoint_path: Path to ANEMLL checkpoint with snapped weights + scales
@@ -1215,8 +1264,17 @@ def load_dynamic_weights_for_ane(
     else:
         state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
+    # Detect V2 checkpoint format (has _Q buffers and rank_magnitude)
+    has_q_buffers = any('._Q' in k for k in state_dict.keys())
+    has_rank_magnitude = any('.rank_magnitude' in k for k in state_dict.keys())
+    is_v2_checkpoint = has_q_buffers and has_rank_magnitude
+
     if verbose:
         print(f"Loading ANEMLL checkpoint for DYNAMIC A*B conversion: {len(state_dict)} keys")
+        if is_v2_checkpoint:
+            print(f"  Detected V2 checkpoint format (rank_magnitude + _Q buffers)")
+        else:
+            print(f"  Using V1 checkpoint format (scale_A @ scale_B)")
 
     # Identify quantized projection layer names
     quantized_proj_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
@@ -1273,12 +1331,26 @@ def load_dynamic_weights_for_ane(
 
         # Load checkpoint data
         weight_key = f'{base_key}.weight'
+        q_key = f'{base_key}._Q'
         scale_a_key = f'{base_key}.scale_A'
         scale_b_key = f'{base_key}.scale_B'
+        mag_key = f'{base_key}.rank_magnitude'
 
-        snapped = state_dict[weight_key].to(torch.float32)
+        # V2: use _Q for snapped weights if available
+        if q_key in state_dict:
+            snapped = state_dict[q_key].to(torch.float32)
+        else:
+            snapped = state_dict[weight_key].to(torch.float32)
+
         scale_A = state_dict[scale_a_key].to(torch.float32)
         scale_B = state_dict[scale_b_key].to(torch.float32)
+
+        # V2: incorporate rank_magnitude into scale_A
+        # This way scale_A @ scale_B produces correct scales
+        if mag_key in state_dict:
+            rank_magnitude = state_dict[mag_key].to(torch.float32)
+            # Broadcast: [out, rank] * [rank] -> [out, rank]
+            scale_A = scale_A * rank_magnitude.unsqueeze(0)
 
         # Handle shape: snapped is [out, in] or [out, in, 1, 1]
         if snapped.dim() == 2:
@@ -1304,7 +1376,8 @@ def load_dynamic_weights_for_ane(
 
         replaced_count += 1
         if verbose and replaced_count <= 5:
-            print(f"  Replaced {base_key}: snapped{list(snapped.shape)}, "
+            v2_marker = " [V2]" if mag_key in state_dict else ""
+            print(f"  Replaced {base_key}{v2_marker}: snapped{list(snapped.shape)}, "
                   f"scale_A{list(scale_A.shape)}, scale_B{list(scale_B.shape)}, "
                   f"lut_bits={new_module.lut_bits}")
 
