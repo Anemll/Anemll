@@ -38,6 +38,7 @@ from ..models.qwen_model import (
 )
 from ..models.aq1_mil_layer import (
     build_aq1_conv_layer,
+    build_factored_aq1_conv_layer,
     load_aq1_checkpoint,
     get_layer_aq1_data,
     compute_aq1_storage_size,
@@ -245,6 +246,7 @@ class QwenConverter(BaseConverter):
         aq1_nbits_mlp: int = 2,
         aq1_nbits_attn: int = 4,
         num_layers: Optional[int] = None,
+        aq1_factored: bool = True,
     ) -> None:
         super().__init__(model)
         self.context_length = context_length
@@ -262,6 +264,8 @@ class QwenConverter(BaseConverter):
         self.aq1_nbits_attn = aq1_nbits_attn
         self.aq1_data = None  # Loaded on demand
         self.num_layers = num_layers  # For limiting layers in AQ1 conversion
+        # Factored AQ1: use y = sum_k(A[k] * conv(Q, B[k] * x)) instead of scales = A @ B
+        self.aq1_factored = aq1_factored
 
     @staticmethod
     def GetTransformerStates(model, part=None, prefix="model.model."):
@@ -1241,6 +1245,15 @@ class QwenConverter(BaseConverter):
         hidden_size = model.config.hidden_size
         intermediate_size = model.config.intermediate_size
 
+        # Choose between factored and materialized approach
+        use_factored = self.aq1_factored
+        if use_factored:
+            print("  Using FACTORED approach: y = sum_k(A[k] * conv(Q, B[k] * x))")
+            aq1_conv_fn = build_factored_aq1_conv_layer
+        else:
+            print("  Using MATERIALIZED approach: scales = A @ B, y = conv(x, Q * scales)")
+            aq1_conv_fn = build_aq1_conv_layer
+
         # Build MIL program for MLP layers
         @mb.program(
             input_specs=[
@@ -1263,7 +1276,7 @@ class QwenConverter(BaseConverter):
                     raise ValueError(f"Missing AQ1 data for MLP layer {layer_idx}")
 
                 # Gate projection with AQ1
-                gate = build_aq1_conv_layer(
+                gate = aq1_conv_fn(
                     x=x,
                     indices_packed=gate_data['indices_packed'],
                     lut=gate_data['lut'],
@@ -1275,7 +1288,7 @@ class QwenConverter(BaseConverter):
                 )
 
                 # Up projection with AQ1
-                up = build_aq1_conv_layer(
+                up = aq1_conv_fn(
                     x=x,
                     indices_packed=up_data['indices_packed'],
                     lut=up_data['lut'],
@@ -1293,7 +1306,7 @@ class QwenConverter(BaseConverter):
                 hidden = mb.mul(x=gate_silu, y=up, name=f"layer{layer_idx}_hidden")
 
                 # Down projection with AQ1
-                mlp_out = build_aq1_conv_layer(
+                mlp_out = aq1_conv_fn(
                     x=hidden,
                     indices_packed=down_data['indices_packed'],
                     lut=down_data['lut'],
@@ -1549,7 +1562,7 @@ class QwenConverter(BaseConverter):
         """
         from coremltools.converters.mil import Builder as mb
         from coremltools.converters.mil.mil import types
-        from ..models.aq1_mil_layer import build_aq1_conv_layer, load_aq1_checkpoint, get_layer_aq1_data
+        from ..models.aq1_mil_layer import build_aq1_conv_layer, build_factored_aq1_conv_layer, load_aq1_checkpoint, get_layer_aq1_data
 
         require_coreml()
 
@@ -1557,6 +1570,14 @@ class QwenConverter(BaseConverter):
         aq1_data = self._load_aq1_data()
         if not aq1_data:
             raise ValueError("AQ1 checkpoint required. Use --aq1-checkpoint")
+
+        # Choose between factored and materialized approach
+        if self.aq1_factored:
+            print("  Using FACTORED approach: y = sum_k(A[k] * conv(Q, B[k] * x))")
+            aq1_conv_fn = build_factored_aq1_conv_layer
+        else:
+            print("  Using MATERIALIZED approach: scales = A @ B, y = conv(x, Q * scales)")
+            aq1_conv_fn = build_aq1_conv_layer
 
         # Get model config
         config = model.config
@@ -1730,19 +1751,19 @@ class QwenConverter(BaseConverter):
                 k_data = layer_data['attn.k_proj']
                 v_data = layer_data['attn.v_proj']
 
-                q = build_aq1_conv_layer(
+                q = aq1_conv_fn(
                     x_conv, q_data['indices_packed'], q_data['lut'],
                     q_data['scale_A'], q_data['scale_B'],
                     q_data['out_features'], q_data['in_features'],
                     name=f"layer{layer_idx}_q_proj"
                 )
-                k = build_aq1_conv_layer(
+                k = aq1_conv_fn(
                     x_conv, k_data['indices_packed'], k_data['lut'],
                     k_data['scale_A'], k_data['scale_B'],
                     k_data['out_features'], k_data['in_features'],
                     name=f"layer{layer_idx}_k_proj"
                 )
-                v = build_aq1_conv_layer(
+                v = aq1_conv_fn(
                     x_conv, v_data['indices_packed'], v_data['lut'],
                     v_data['scale_A'], v_data['scale_B'],
                     v_data['out_features'], v_data['in_features'],
@@ -1912,7 +1933,7 @@ class QwenConverter(BaseConverter):
 
                 # ========== O Projection ==========
                 o_data = layer_data['attn.o_proj']
-                attn_out = build_aq1_conv_layer(
+                attn_out = aq1_conv_fn(
                     attn_out, o_data['indices_packed'], o_data['lut'],
                     o_data['scale_A'], o_data['scale_B'],
                     o_data['out_features'], o_data['in_features'],
@@ -1935,13 +1956,13 @@ class QwenConverter(BaseConverter):
                 up_data = layer_data['mlp.up_proj']
                 down_data = layer_data['mlp.down_proj']
 
-                gate = build_aq1_conv_layer(
+                gate = aq1_conv_fn(
                     x_conv, gate_data['indices_packed'], gate_data['lut'],
                     gate_data['scale_A'], gate_data['scale_B'],
                     gate_data['out_features'], gate_data['in_features'],
                     name=f"layer{layer_idx}_gate_proj"
                 )
-                up = build_aq1_conv_layer(
+                up = aq1_conv_fn(
                     x_conv, up_data['indices_packed'], up_data['lut'],
                     up_data['scale_A'], up_data['scale_B'],
                     up_data['out_features'], up_data['in_features'],
@@ -1955,7 +1976,7 @@ class QwenConverter(BaseConverter):
                 hidden = mb.mul(x=gate_silu, y=up, name=f"layer{layer_idx}_hidden")
 
                 # Down projection
-                down_out = build_aq1_conv_layer(
+                down_out = aq1_conv_fn(
                     hidden, down_data['indices_packed'], down_data['lut'],
                     down_data['scale_A'], down_data['scale_B'],
                     down_data['out_features'], down_data['in_features'],
@@ -2037,8 +2058,11 @@ class QwenConverter(BaseConverter):
             else:
                 print(f"  ⚠ LUT count mismatch")
 
-            if read_state_count == expected_read_state and update_state_count == expected_update_state:
-                print("  ✓ KV cache state verified (ANE pattern)!")
+            # KV cache can use either coreml_update_state or slice_update pattern
+            if update_state_count == expected_update_state:
+                print("  ✓ KV cache state verified (coreml_update_state pattern)!")
+            elif scatter_count == expected_slice_updates:
+                print("  ✓ KV cache state verified (slice_update pattern)!")
             else:
                 print(f"  ⚠ KV cache state count mismatch")
 
@@ -2555,6 +2579,19 @@ def parse_args() -> argparse.Namespace:
         help="Number of bits for attention LUT quantization in AQ1 (default: 4)",
     )
     parser.add_argument(
+        "--aq1-factored",
+        action="store_true",
+        default=True,
+        help="Use factored AQ1 approach: y = sum_k(A[k] * conv(Q, B[k] * x)). "
+             "Avoids materializing full [out, in] scale matrix. (default: True)",
+    )
+    parser.add_argument(
+        "--aq1-materialized",
+        action="store_true",
+        help="Use materialized AQ1 approach: scales = A @ B, y = conv(x, Q * scales). "
+             "Materializes full scale matrix (CPU-only for dynamic weights).",
+    )
+    parser.add_argument(
         "--num-layers",
         type=int,
         default=None,
@@ -2594,6 +2631,7 @@ def test_conversion(
     aq1_nbits_mlp: int = 2,
     aq1_nbits_attn: int = 4,
     num_layers: Optional[int] = None,
+    aq1_factored: bool = True,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
     """Convert a Qwen model and save the result.
 
@@ -2689,6 +2727,7 @@ def test_conversion(
         aq1_nbits_mlp=aq1_nbits_mlp,
         aq1_nbits_attn=aq1_nbits_attn,
         num_layers=num_layers,  # Pass num_layers for AQ1 layer filtering
+        aq1_factored=aq1_factored,  # Use factored approach for AQ1 (no A @ B materialization)
     )
 
     print("Starting conversion...")
@@ -2777,6 +2816,8 @@ def main() -> None:
     aq1_nbits_mlp = getattr(args, 'aq1_nbits_mlp', 2)
     aq1_nbits_attn = getattr(args, 'aq1_nbits_attn', 4)
     num_layers = getattr(args, 'num_layers', None)
+    # Factored is default, materialized overrides
+    aq1_factored = getattr(args, 'aq1_factored', True) and not getattr(args, 'aq1_materialized', False)
 
     print(f"\nConverting model from: {model_path}")
     print(f"Output filename prefix: {args.prefix}")
@@ -2788,7 +2829,10 @@ def main() -> None:
     if aq1_checkpoint:
         print(f"AQ1 checkpoint: {aq1_checkpoint}")
         print(f"  MLP bits: {aq1_nbits_mlp}, Attention bits: {aq1_nbits_attn}")
-        print("  (Using constexpr_lut_to_dense + dynamic A*B)")
+        if aq1_factored:
+            print("  Using FACTORED approach: y = sum_k(A[k] * conv(Q, B[k] * x))")
+        else:
+            print("  Using MATERIALIZED approach: scales = A @ B, y = conv(x, Q * scales)")
     if lut_bits:
         print(f"LUT quantization: {lut_bits} bits, per_channel group size: {per_channel}")
     if args.chunk:
@@ -2818,6 +2862,7 @@ def main() -> None:
             aq1_nbits_mlp=aq1_nbits_mlp,
             aq1_nbits_attn=aq1_nbits_attn,
             num_layers=num_layers,
+            aq1_factored=aq1_factored,
         )
         print(f"Conversion completed successfully! Result: {type(result)}")
     except Exception as e:  # pragma: no cover - CLI tool
