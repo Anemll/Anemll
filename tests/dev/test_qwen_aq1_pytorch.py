@@ -253,13 +253,17 @@ def generate(
 ) -> str:
     """Generate text using QwenModel."""
 
+    # Apply chat template - use enable_thinking=False for no-think mode (official Qwen3 approach)
+    messages = [{"role": "user", "content": prompt}]
+    template_kwargs = {
+        "tokenize": True,
+        "return_tensors": "pt",
+        "add_generation_prompt": True,
+    }
     if no_think:
-        messages = [{"role": "user", "content": f"/no_think {prompt}"}]
-    else:
-        messages = [{"role": "user", "content": prompt}]
+        template_kwargs["enable_thinking"] = False
 
-    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+    input_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
 
     batch_size, seq_len = input_ids.shape
     state_length = model.config.state_length
@@ -372,7 +376,8 @@ def main():
     parser.add_argument('--temperature', '-t', type=float, default=0.0)
     parser.add_argument('--context-length', type=int, default=512)
     parser.add_argument('--state-length', type=int, default=512)
-    parser.add_argument('--no-think', action='store_true')
+    parser.add_argument('--no-think', action='store_true',
+                        help='Disable thinking mode (uses enable_thinking=False)')
     parser.add_argument('--verbose', '-v', action='store_true')
     parser.add_argument('--no-stream', action='store_true')
 

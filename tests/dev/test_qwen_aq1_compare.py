@@ -37,6 +37,12 @@ Usage:
         ~/Downloads/snapped_step1800.pt \
         /Users/anemll/Models/ANE/q4_r32_lut_ka \
         --prompt "List all US presidents" --driver coreml --stop
+
+    # Use HuggingFace model as reference (isolates quantization effects)
+    python tests/dev/test_qwen_aq1_compare.py \
+        --hf-reference Qwen/Qwen3-0.6B \
+        /Users/anemll/Models/ANE/q4_r32_lut_ka \
+        --prompt "What is AI?" --driver coreml --no-think
 """
 
 from __future__ import annotations
@@ -59,6 +65,119 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from anemll.models.qwen_model import QwenModel, QwenConfig, MODEL_DTYPE
 from anemll.models.anemll_quant import load_baked_weights_for_ane
+
+
+# =============================================================================
+# HUGGINGFACE MODEL SUPPORT
+# =============================================================================
+
+class HFQwenInferenceModel(nn.Module):
+    """Wrapper that uses HuggingFace Qwen3 model for inference (reference baseline)."""
+
+    def __init__(self, hf_model, context_length: int, state_length: int):
+        super().__init__()
+        self.hf_model = hf_model
+        self.context_length = context_length
+        self.state_length = state_length
+        self.config = hf_model.config
+
+        # Create a fake model attribute for KV cache compatibility
+        self.model = self
+
+        # Initialize simple KV cache storage for single-token decode
+        self._kv_cache = None
+        self._cache_pos = 0
+
+    def reset_cache(self):
+        """Reset KV cache state."""
+        self._kv_cache = None
+        self._cache_pos = 0
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        causal_mask: torch.Tensor = None,  # Unused, HF handles internally
+        position_ids: torch.LongTensor = None,
+        current_pos: int = 0,
+        IN_PREFILL: bool = False,
+    ) -> torch.Tensor:
+        """Forward pass returning logits."""
+        with torch.no_grad():
+            if IN_PREFILL:
+                # Prefill: process full sequence
+                outputs = self.hf_model(
+                    input_ids=input_ids,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                self._kv_cache = outputs.past_key_values
+                self._cache_pos = input_ids.shape[1]
+                return outputs.logits
+            else:
+                # Decode: single token with KV cache
+                outputs = self.hf_model(
+                    input_ids=input_ids,
+                    past_key_values=self._kv_cache,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                self._kv_cache = outputs.past_key_values
+                self._cache_pos += 1
+                return outputs.logits
+
+
+def load_hf_pytorch_model(model_id: str, context_length: int, state_length: int = None, verbose: bool = False):
+    """Load HuggingFace Qwen3 model as reference baseline.
+
+    Args:
+        model_id: HuggingFace model ID (e.g., 'Qwen/Qwen3-0.6B')
+        context_length: Maximum context length
+        state_length: State length for KV cache (default: same as context_length)
+
+    Returns:
+        model: HFQwenInferenceModel wrapper
+        config: Model config object with required attributes
+    """
+    from transformers import AutoModelForCausalLM
+
+    if state_length is None:
+        state_length = context_length
+
+    if verbose:
+        print(f"Loading HuggingFace model: {model_id}")
+        print(f"  Context length: {context_length}, State length: {state_length}")
+
+    # Load HF model
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.float32,  # Use fp32 for reference accuracy
+        trust_remote_code=True,
+    )
+    hf_model.eval()
+
+    if verbose:
+        print(f"  Loaded config: hidden_size={hf_model.config.hidden_size}, "
+              f"num_layers={hf_model.config.num_hidden_layers}, "
+              f"vocab_size={hf_model.config.vocab_size}")
+
+    # Wrap in inference model
+    model = HFQwenInferenceModel(hf_model, context_length, state_length)
+
+    # Create a config-like object for compatibility
+    class HFConfig:
+        def __init__(self, hf_config, context_length, state_length):
+            self.vocab_size = hf_config.vocab_size
+            self.hidden_size = hf_config.hidden_size
+            self.num_hidden_layers = hf_config.num_hidden_layers
+            self.num_attention_heads = hf_config.num_attention_heads
+            self.num_key_value_heads = getattr(hf_config, 'num_key_value_heads', hf_config.num_attention_heads)
+            self.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+            self.intermediate_size = hf_config.intermediate_size
+            self.context_length = context_length
+            self.state_length = state_length
+
+    config = HFConfig(hf_model.config, context_length, state_length)
+    return model, config
 
 
 # =============================================================================
@@ -438,7 +557,11 @@ def tokenwise_prompt_feed_teacher(
     first_prompt_mismatch_pos = None
 
     # Reset PyTorch KV cache
-    if hasattr(pytorch_model.model, 'kv_cache_0'):
+    if hasattr(pytorch_model, 'reset_cache'):
+        # HF model wrapper
+        pytorch_model.reset_cache()
+    elif hasattr(pytorch_model.model, 'kv_cache_0'):
+        # Baked model
         pytorch_model.model.kv_cache_0.zero_()
 
     for pos in range(seq_len):
@@ -689,13 +812,17 @@ def run_comparison(
     split_lm_head = coreml_metadata['split_lm_head']
 
     # Format prompt
+    # Use enable_thinking=False to match chat.py behavior (pre-fills <think></think>)
+    messages = [{"role": "user", "content": prompt}]
+    template_kwargs = {
+        "tokenize": True,
+        "return_tensors": "pt",
+        "add_generation_prompt": True,
+    }
     if no_think:
-        messages = [{"role": "user", "content": f"/no_think {prompt}"}]
-    else:
-        messages = [{"role": "user", "content": prompt}]
+        template_kwargs["enable_thinking"] = False
 
-    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+    input_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
     input_ids_np = input_ids.numpy().astype(np.int32)
 
     seq_len = input_ids.shape[1]
@@ -704,8 +831,19 @@ def run_comparison(
     print(f"Driver mode: {driver.upper()}")
     print(f"Prefill mode: {prefill_mode.upper()}")
 
+    # Debug: show full tokenized prompt
+    if verbose:
+        decoded_prompt = tokenizer.decode(input_ids[0])
+        print(f"\n--- Full tokenized prompt ---")
+        print(repr(decoded_prompt))
+        print(f"--- Token IDs: {input_ids[0].tolist()[:20]}{'...' if seq_len > 20 else ''}")
+
     # Reset PyTorch KV cache
-    if hasattr(pytorch_model.model, 'kv_cache_0'):
+    if hasattr(pytorch_model, 'reset_cache'):
+        # HF model wrapper
+        pytorch_model.reset_cache()
+    elif hasattr(pytorch_model.model, 'kv_cache_0'):
+        # Baked model
         pytorch_model.model.kv_cache_0.zero_()
 
     # Create CoreML state (prefer infer state for token mode)
@@ -928,13 +1066,24 @@ def run_comparison(
     print(f"  PyTorch: {pt_rep:.3f}")
     print(f"  CoreML:  {cm_rep:.3f}")
 
-    print(f"\nPyTorch tokens: {pt_tokens}")
-    print(f"CoreML tokens:  {cm_tokens}")
+    print(f"\nPyTorch tokens: {pt_tokens[:20]}{'...' if len(pt_tokens) > 20 else ''}")
+    print(f"CoreML tokens:  {cm_tokens[:20]}{'...' if len(cm_tokens) > 20 else ''}")
     if driver == 'coreml':
-        print(f"Driver tokens:  {driver_tokens}")
+        print(f"Driver tokens:  {driver_tokens[:20]}{'...' if len(driver_tokens) > 20 else ''}")
 
-    print(f"\nPyTorch output: {tokenizer.decode(pt_tokens)}")
-    print(f"CoreML output:  {tokenizer.decode(cm_tokens)}")
+    # Decode outputs with clear visual separation
+    pt_output = tokenizer.decode(pt_tokens)
+    cm_output = tokenizer.decode(cm_tokens)
+
+    print("\n" + "="*60)
+    print("PYTORCH OUTPUT")
+    print("="*60)
+    print(pt_output)
+    print("\n" + "-"*60)
+    print("COREML OUTPUT")
+    print("-"*60)
+    print(cm_output)
+    print("-"*60)
 
     return {
         'matches': matches,
@@ -964,7 +1113,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
-    parser.add_argument('checkpoint', type=str, help='Path to AQ1 checkpoint for PyTorch')
+    parser.add_argument('checkpoint', type=str, nargs='?', default=None,
+                        help='Path to AQ1 checkpoint for PyTorch (required unless --hf-reference is used)')
     parser.add_argument('coreml_dir', type=str, help='Path to CoreML model directory')
     parser.add_argument('--prompt', '-p', type=str, default='What is AI?')
     parser.add_argument('--max-tokens', '-n', type=int, default=20)
@@ -979,25 +1129,39 @@ def main():
                         help='Driver mode: pt (PyTorch drives), coreml (CoreML drives, realistic ANE), teacher')
     parser.add_argument('--prefill-mode', type=str, default='batch', choices=['batch', 'token'],
                         help='Prefill mode: batch (default, faster) or token (single-token stepping, better for dataset generation)')
+    parser.add_argument('--hf-reference', type=str, default=None,
+                        help='Use HuggingFace model as reference instead of baked checkpoint (e.g., Qwen/Qwen3-0.6B)')
     parser.add_argument('--verbose', '-v', action='store_true')
 
     args = parser.parse_args()
 
-    checkpoint_path = os.path.expanduser(args.checkpoint)
+    # Validate arguments
+    use_hf_reference = args.hf_reference is not None
+    if not use_hf_reference and args.checkpoint is None:
+        parser.error("checkpoint is required unless --hf-reference is specified")
+
     coreml_dir = os.path.expanduser(args.coreml_dir)
 
-    if not os.path.exists(checkpoint_path):
-        print(f"Error: Checkpoint not found: {checkpoint_path}")
-        sys.exit(1)
+    if not use_hf_reference:
+        checkpoint_path = os.path.expanduser(args.checkpoint)
+        if not os.path.exists(checkpoint_path):
+            print(f"Error: Checkpoint not found: {checkpoint_path}")
+            sys.exit(1)
 
     if not os.path.exists(coreml_dir):
         print(f"Error: CoreML directory not found: {coreml_dir}")
         sys.exit(1)
 
     print("="*60)
-    print("PyTorch vs CoreML Comparison")
+    if use_hf_reference:
+        print("HuggingFace vs CoreML Comparison")
+    else:
+        print("PyTorch vs CoreML Comparison")
     print("="*60)
-    print(f"PyTorch checkpoint: {checkpoint_path}")
+    if use_hf_reference:
+        print(f"HuggingFace model: {args.hf_reference}")
+    else:
+        print(f"PyTorch checkpoint: {checkpoint_path}")
     print(f"CoreML directory: {coreml_dir}")
     print(f"Prompt: {args.prompt}")
     print(f"Max tokens: {args.max_tokens}")
@@ -1019,11 +1183,17 @@ def main():
     # State length defaults to context_length
     state_length = args.state_length if args.state_length is not None else context_length
 
-    # Load PyTorch model with matching context/state length
-    print("\n--- Loading PyTorch model ---")
-    pytorch_model, pytorch_config = load_pytorch_model(
-        checkpoint_path, context_length, state_length=state_length, verbose=True
-    )
+    # Load reference model (HF or baked checkpoint)
+    if use_hf_reference:
+        print(f"\n--- Loading HuggingFace reference model ---")
+        pytorch_model, pytorch_config = load_hf_pytorch_model(
+            args.hf_reference, context_length, state_length=state_length, verbose=True
+        )
+    else:
+        print("\n--- Loading PyTorch model ---")
+        pytorch_model, pytorch_config = load_pytorch_model(
+            checkpoint_path, context_length, state_length=state_length, verbose=True
+        )
 
     # Load tokenizer
     print("\n--- Loading tokenizer ---")

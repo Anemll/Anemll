@@ -164,9 +164,44 @@ The model conversion follows an 8-step process:
    ```
    - This is REQUIRED for ANE compatibility - standard RMSNorm without mean subtraction will fail on ANE
 
-2. **Conv2d Layers**: All dense layers must be expressed as `nn.Conv2d` with `kernel_size=1`
+2. **Conv2d Layers for ANE**: All dense layers must be expressed as `nn.Conv2d` with `kernel_size=1`. Critical requirements:
 
-3. **Weight Reshaping**: Weights from HuggingFace models need proper reshaping for Conv2d format
+   - **Weight Shape**: Weights MUST be 4D: `[out_channels, in_channels, kernel_h, kernel_w]`
+     ```python
+     # Correct: 4D weight tensor
+     weight = weight.reshape(out_features, in_features, 1, 1)
+     ```
+
+   - **Spatial Dimensions > 1**: ANE rejects 1×1 spatial dimensions. Use sequence length > 1:
+     ```python
+     # ❌ CPU-only (1×1 spatial)
+     x = torch.randn(1, hidden_size, 1, 1)
+
+     # ✅ ANE-compatible (H > 1)
+     x = torch.randn(1, hidden_size, seq_len, 1)  # seq_len >= 2, typically 64
+     ```
+
+   - **Static Weights Required**: ANE cannot execute conv with dynamically-computed weights. Pre-bake weights at conversion time:
+     ```python
+     # ❌ CPU-only: dynamic weight computation at runtime
+     scales = mb.matmul(x=scale_A, y=scale_B)
+     weights = mb.mul(x=base_weights, y=scales)
+     output = mb.conv(x=x, weight=weights)  # Runs on CPU!
+
+     # ✅ ANE-compatible: pre-bake weights during conversion
+     effective_weights = (base_weights * (scale_A @ scale_B)).astype(np.float16)
+     weight_const = mb.const(val=effective_weights)
+     output = mb.conv(x=x, weight=weight_const)  # Runs on ANE!
+     ```
+
+   - **Data Type**: Use fp16 for both input and weights for ANE execution
+
+3. **Weight Reshaping**: Weights from HuggingFace models need proper reshaping for Conv2d format:
+   ```python
+   # Linear: [out_features, in_features]
+   # Conv2d: [out_features, in_features, 1, 1]
+   weight = linear_weight.reshape(out_features, in_features, 1, 1)
+   ```
 
 ### Testing Infrastructure
 
@@ -212,6 +247,52 @@ Currently supports:
 - DeepHermes (3B, 8B)
 
 Pre-converted models available at https://huggingface.co/anemll
+
+## Tokenizer and Chat Template Requirements
+
+### Qwen3 Thinking Mode (CRITICAL)
+
+**IMPORTANT**: Qwen3 models have a "thinking" mode that outputs reasoning in `<think>...</think>` tags. To disable this mode, you MUST use the official `enable_thinking=False` parameter in `apply_chat_template()`.
+
+**CORRECT approach** (official Qwen3 method):
+```python
+# Use enable_thinking=False - this pre-fills <think>\n\n</think>\n\n (17 tokens)
+messages = [{"role": "user", "content": prompt}]
+template_kwargs = {
+    "tokenize": True,
+    "return_tensors": "pt",
+    "add_generation_prompt": True,
+}
+if no_think:
+    template_kwargs["enable_thinking"] = False
+
+input_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
+```
+
+**WRONG approach** (do NOT use):
+```python
+# ❌ WRONG: Adding /no_think prefix to prompt content
+messages = [{"role": "user", "content": f"/no_think {prompt}"}]  # WRONG!
+```
+
+**Why this matters**:
+- The `/no_think` prefix approach produces different token sequences (13 tokens vs 17 tokens)
+- This causes template mismatch between scripts, leading to inconsistent model behavior
+- When comparing PyTorch vs CoreML outputs, template differences appear as model divergence
+- The official `enable_thinking=False` approach matches `chat.py` behavior
+
+**Tokenized prompt with `enable_thinking=False`**:
+```
+<|im_start|>user
+What is AI?<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+```
+
+All test scripts in `tests/dev/` should use `enable_thinking=False` for consistency.
 
 #QWEN TEST
 export_coreml.py is a test file for Qwen export development
