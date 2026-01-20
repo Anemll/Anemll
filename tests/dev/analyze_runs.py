@@ -2,19 +2,22 @@
 """Analyze divergence harness runs and generate instability datasets.
 
 Reads NPZ + JSON outputs from qwen_aq1_divergence_harness.py and produces:
-- train_instability.jsonl  - prompts that triggered instability
-- val_instability.jsonl    - held-out unstable prompts (deterministic split)
-- stable_control.jsonl     - prompts that remained stable
+- train_instability.jsonl  - prompts that triggered instability (includes diverged)
+- val_instability.jsonl    - held-out unstable prompts (min 1 when unstable > 0)
+- stable_control.jsonl     - prompts that remained stable (>=98% match)
 - near_boundary.jsonl      - prompts at match_rate 95-98% (worth watching)
 - metrics.csv              - sortable summary of all runs
 
-Instability labeling rules:
-- Uses stop_reason from harness (repetition_stuck_token, repetition_phrase, repetition_rep4_spike)
-- Also detects streak-based patterns in NPZ data:
-  - Repetition loop: decode_rep4 > 0.30 for ≥8 consecutive steps
-  - Entropy collapse: decode_entropy_cm < 0.5 for ≥8 consecutive steps
-  - Margin explosion: decode_margin_cm > 20 for ≥4 consecutive steps
-  - Logit explosion: decode_maxlogit_cm > threshold
+Instability labeling rules (prompt marked unstable if ANY of these):
+1. Hard divergence: match_rate < 95% (token trajectory diverged)
+2. Repetition signals from harness (stuck_token, phrase_repeat, rep4_spike)
+3. Streak-based patterns in NPZ data:
+   - Repetition loop: decode_rep4 > 0.30 for ≥8 consecutive steps
+   - Entropy collapse: decode_entropy_cm < 0.1 for ≥16 consecutive steps
+   - Margin explosion: decode_margin_cm > 20 for ≥4 consecutive steps
+   - Logit explosion: decode_maxlogit_cm > 50
+
+Val split guarantees at least 1 sample when unstable set is non-empty.
 
 Usage:
     python tests/dev/analyze_runs.py runs/exp1 --output datasets/exp1
@@ -26,6 +29,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -204,8 +208,19 @@ def analyze_npz(npz_path: Path, json_path: Path, config: dict) -> dict:
                 instability_step = first_explosion
 
     result["instability_flags"] = instability_flags
-    result["is_unstable"] = len(instability_flags) > 0
     result["instability_step"] = instability_step
+
+    # Compute match_rate for divergence check
+    match_rate = 1.0 - (len(mismatch_indices) / len(pt_argmax)) if len(pt_argmax) else 1.0
+
+    # Mark as unstable if:
+    # 1. Any instability flag was triggered, OR
+    # 2. Match rate < 95% (hard divergence - token trajectory changed significantly)
+    is_diverged = match_rate < 0.95
+    if is_diverged and "diverged" not in instability_flags:
+        instability_flags.append("diverged")
+
+    result["is_unstable"] = len(instability_flags) > 0
 
     # Compute first_instability_step from any onset (harness-tracked or streak-detected)
     onset_steps = [
@@ -329,16 +344,20 @@ def main():
             return "DIVERGED"
 
     # Further split stable into OK vs NEAR boundary
+    # Note: diverged (<95%) are now automatically marked unstable with "diverged" flag
     stable_ok = [r for r in stable if get_status(r) == "OK"]
     near_boundary = [r for r in stable if get_status(r) == "NEAR"]
-    diverged_not_flagged = [r for r in stable if get_status(r) == "DIVERGED"]
+
+    # Count how many were flagged due to divergence vs other signals
+    diverged_count = sum(1 for r in unstable if "diverged" in r.get("instability_flags", []))
+    flagged_other = len(unstable) - diverged_count
 
     print(f"\nResults:")
-    print(f"  Unstable (flagged):     {len(unstable)} ({100*len(unstable)/len(results):.1f}%)")
+    print(f"  Unstable (total):       {len(unstable)} ({100*len(unstable)/len(results):.1f}%)")
+    print(f"    - diverged (<95%):    {diverged_count}")
+    print(f"    - other signals:      {flagged_other}")
     print(f"  Stable OK (>=98%):      {len(stable_ok)} ({100*len(stable_ok)/len(results):.1f}%)")
     print(f"  Near boundary (95-98%): {len(near_boundary)} ({100*len(near_boundary)/len(results):.1f}%)")
-    if diverged_not_flagged:
-        print(f"  Diverged but not flagged (<95%): {len(diverged_not_flagged)}")
 
     # Count instability types
     flag_counts = {}
@@ -352,8 +371,18 @@ def main():
             print(f"  {flag}: {count}")
 
     # Deterministic train/val split using hash
-    train_unstable = [r for r in unstable if deterministic_split(r["id"], args.val_fraction) == "train"]
-    val_unstable = [r for r in unstable if deterministic_split(r["id"], args.val_fraction) == "val"]
+    # Sort by hash for reproducibility, then take first N for val (with min 1 when unstable > 0)
+    def hash32(s: str) -> int:
+        return int(hashlib.md5(s.encode()).hexdigest()[:8], 16)
+
+    if unstable:
+        unstable_sorted = sorted(unstable, key=lambda r: hash32(r["id"]))
+        n_val = max(1, math.ceil(args.val_fraction * len(unstable_sorted)))
+        val_unstable = unstable_sorted[:n_val]
+        train_unstable = unstable_sorted[n_val:]
+    else:
+        train_unstable = []
+        val_unstable = []
 
     print(f"\nTrain/val split (unstable, deterministic hash):")
     print(f"  Train: {len(train_unstable)}")
@@ -376,7 +405,6 @@ def main():
     write_jsonl(output_dir / "val_instability.jsonl", val_unstable)
     write_jsonl(output_dir / "stable_control.jsonl", stable_ok)
     write_jsonl(output_dir / "near_boundary.jsonl", near_boundary)
-    write_jsonl(output_dir / "diverged_unflagged.jsonl", diverged_not_flagged)
 
     # Count expected_repetition prompts
     expected_rep_prompts = [r for r in results if r.get("expected_repetition")]
@@ -414,8 +442,6 @@ def main():
     print(f"  - val_instability.jsonl ({len(val_unstable)} prompts)")
     print(f"  - stable_control.jsonl ({len(stable_ok)} prompts)")
     print(f"  - near_boundary.jsonl ({len(near_boundary)} prompts)")
-    if diverged_not_flagged:
-        print(f"  - diverged_unflagged.jsonl ({len(diverged_not_flagged)} prompts)")
     print(f"  - metrics.csv (all {len(results)} runs)")
 
     # Print top unstable prompts by earliest instability onset
