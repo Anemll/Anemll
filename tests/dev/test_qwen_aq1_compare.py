@@ -3,19 +3,27 @@
 
 This test compares:
 1. Token-by-token generation (argmax)
-2. Logits values
-3. Probability distributions
+2. Logits values and probabilities
+3. Stability metrics: KL divergence, entropy, top1_margin
+4. Repetition detection (4-gram)
+
+Driver modes:
+- pt: PyTorch drives token selection (good for parity testing)
+- coreml: CoreML drives (realistic ANE behavior, catches instability)
+- teacher: Use provided token sequence (teacher forcing)
 
 Usage:
+    # Basic comparison (PyTorch drives)
     python tests/dev/test_qwen_aq1_compare.py \
         ~/Downloads/snapped_step1800.pt \
         /Users/anemll/Models/ANE/q4_r32_lut_ka \
         --prompt "What is AI?"
 
+    # CoreML-driven (realistic ANE behavior)
     python tests/dev/test_qwen_aq1_compare.py \
         ~/Downloads/snapped_step1800.pt \
         /Users/anemll/Models/ANE/q4_r32_lut_ka \
-        --prompt "Hello" --max-tokens 20 --no-think
+        --prompt "Hello" --max-tokens 100 --driver coreml
 
     # With custom context/state length
     python tests/dev/test_qwen_aq1_compare.py \
@@ -23,6 +31,12 @@ Usage:
         /Users/anemll/Models/ANE/q4_r32_lut_ka \
         --prompt "History of England and UK" --no-think \
         --context-length 1024 --state-length 1024 --max-tokens 2000
+
+    # Stop on first mismatch
+    python tests/dev/test_qwen_aq1_compare.py \
+        ~/Downloads/snapped_step1800.pt \
+        /Users/anemll/Models/ANE/q4_r32_lut_ka \
+        --prompt "List all US presidents" --driver coreml --stop
 """
 
 from __future__ import annotations
@@ -391,12 +405,194 @@ def coreml_forward_single(embed_model, ffn_infer, lmhead_model, input_ids, pos, 
     return logits
 
 
+def tokenwise_prompt_feed_teacher(
+    pytorch_model,
+    pytorch_config,
+    embed_model,
+    ffn_infer,
+    lmhead_model,
+    input_ids_np: np.ndarray,        # shape [1, seq_len]
+    context_length: int,
+    split_lm_head: int,
+    coreml_state,
+    probe_metrics: bool = True,
+):
+    """
+    Feed prompt one token at a time to BOTH PyTorch and CoreML (teacher forcing).
+    Uses single-token path only (no batch prefill).
+
+    This bypasses coreml_prefill() and exercises only ffn_infer.predict(...),
+    giving a clean "prompt divergence profile" per token.
+
+    Returns:
+        pt_logits_last: PyTorch logits for last prompt token [1, 1, vocab_size]
+        cm_logits_last: CoreML logits for last prompt token [1, 1, vocab_size]
+        prompt_metrics: List of stability metrics dicts per position (if probe_metrics=True)
+        first_prompt_mismatch_pos: Position of first argmax mismatch, or None
+    """
+    seq_len = input_ids_np.shape[1]
+
+    pt_logits_last = None
+    cm_logits_last = None
+    prompt_metrics = []
+    first_prompt_mismatch_pos = None
+
+    # Reset PyTorch KV cache
+    if hasattr(pytorch_model.model, 'kv_cache_0'):
+        pytorch_model.model.kv_cache_0.zero_()
+
+    for pos in range(seq_len):
+        tok_id = int(input_ids_np[0, pos])
+
+        # --- PyTorch single-token step ---
+        pt_in = torch.tensor([[tok_id]], dtype=torch.long)
+        pt_mask = create_causal_mask(1, pytorch_config.state_length, current_pos=pos)
+        pt_logits_last = pytorch_forward_single(
+            pytorch_model,
+            pt_in,
+            torch.tensor([pos]),
+            pt_mask,
+            current_pos=pos,
+            prefill=False,   # IMPORTANT: single-token stepping only
+        )
+
+        # --- CoreML single-token step ---
+        cm_in = np.array([[tok_id]], dtype=np.int32)
+        cm_logits_last = coreml_forward_single(
+            embed_model,
+            ffn_infer,
+            lmhead_model,
+            cm_in,
+            pos,
+            context_length,
+            coreml_state,
+            split_lm_head,
+        )
+
+        if probe_metrics:
+            pt_vec = pt_logits_last[0, -1, :].detach().cpu().numpy()
+            cm_vec = cm_logits_last[0, 0, :]
+            m = compute_stability_metrics(pt_vec, cm_vec)
+            prompt_metrics.append(m)
+
+            if first_prompt_mismatch_pos is None:
+                if int(np.argmax(pt_vec)) != int(np.argmax(cm_vec)):
+                    first_prompt_mismatch_pos = pos
+
+    return pt_logits_last, cm_logits_last, prompt_metrics, first_prompt_mismatch_pos
+
+
+# =============================================================================
+# STABILITY METRICS
+# =============================================================================
+
+def compute_stability_metrics(pt_logits, cm_logits):
+    """Compute stability metrics for ANE analysis.
+
+    Returns dict with:
+    - kl_divergence: KL(pt || cm)
+    - pt_entropy, cm_entropy: Distribution entropy
+    - pt_top1_margin, cm_top1_margin: logit[top1] - logit[top2]
+    - pt_max_logit, cm_max_logit: Maximum logit values
+    - pt_std_logit, cm_std_logit: Logit standard deviation
+    - correlation: Pearson correlation
+    """
+    eps = 1e-10
+
+    def softmax(x):
+        e_x = np.exp(x - np.max(x))
+        return e_x / (e_x.sum() + eps)
+
+    def entropy(probs):
+        probs = np.clip(probs, eps, 1.0)
+        return -np.sum(probs * np.log(probs))
+
+    def kl_divergence(p, q):
+        p = np.clip(p, eps, 1.0)
+        q = np.clip(q, eps, 1.0)
+        return np.sum(p * np.log(p / q))
+
+    pt_probs = softmax(pt_logits.astype(np.float64))
+    cm_probs = softmax(cm_logits.astype(np.float64))
+
+    # Top-1 margin (difference between top 2 logits)
+    pt_sorted = np.sort(pt_logits)[::-1]
+    cm_sorted = np.sort(cm_logits)[::-1]
+    pt_top1_margin = pt_sorted[0] - pt_sorted[1] if len(pt_sorted) > 1 else 0
+    cm_top1_margin = cm_sorted[0] - cm_sorted[1] if len(cm_sorted) > 1 else 0
+
+    return {
+        'kl_divergence': kl_divergence(pt_probs, cm_probs),
+        'pt_entropy': entropy(pt_probs),
+        'cm_entropy': entropy(cm_probs),
+        'pt_top1_margin': pt_top1_margin,
+        'cm_top1_margin': cm_top1_margin,
+        'pt_max_logit': float(pt_logits.max()),
+        'cm_max_logit': float(cm_logits.max()),
+        'pt_std_logit': float(pt_logits.std()),
+        'cm_std_logit': float(cm_logits.std()),
+        'correlation': np.corrcoef(pt_logits, cm_logits)[0, 1],
+    }
+
+
+def detect_instability(metrics_history, window=10):
+    """Detect instability patterns from metrics history.
+
+    Returns dict with flags:
+    - entropy_collapse: entropy below threshold for consecutive steps
+    - margin_explosion: top1_margin growing rapidly
+    - logit_explosion: max_logit exceeding threshold
+    """
+    if len(metrics_history) < 2:
+        return {'entropy_collapse': False, 'margin_explosion': False, 'logit_explosion': False}
+
+    recent = metrics_history[-window:] if len(metrics_history) >= window else metrics_history
+
+    # Entropy collapse: CoreML entropy < 0.5 for 3+ consecutive steps
+    cm_entropies = [m['cm_entropy'] for m in recent]
+    entropy_collapse = sum(1 for e in cm_entropies[-3:] if e < 0.5) >= 3 if len(cm_entropies) >= 3 else False
+
+    # Margin explosion: top1_margin > 20 (very peaky distribution)
+    cm_margins = [m['cm_top1_margin'] for m in recent]
+    margin_explosion = any(m > 20 for m in cm_margins[-3:]) if cm_margins else False
+
+    # Logit explosion: max_logit > 50
+    cm_max = [m['cm_max_logit'] for m in recent]
+    logit_explosion = any(m > 50 for m in cm_max[-3:]) if cm_max else False
+
+    return {
+        'entropy_collapse': entropy_collapse,
+        'margin_explosion': margin_explosion,
+        'logit_explosion': logit_explosion,
+    }
+
+
+def compute_repetition_score(tokens, n=4, window=50):
+    """Compute n-gram repetition score over last `window` tokens."""
+    if len(tokens) < n + 1:
+        return 0.0
+
+    recent = tokens[-window:] if len(tokens) >= window else tokens
+
+    # Count n-grams
+    ngrams = []
+    for i in range(len(recent) - n + 1):
+        ngrams.append(tuple(recent[i:i+n]))
+
+    if not ngrams:
+        return 0.0
+
+    unique_ratio = len(set(ngrams)) / len(ngrams)
+    repetition_score = 1.0 - unique_ratio  # Higher = more repetition
+    return repetition_score
+
+
 # =============================================================================
 # COMPARISON
 # =============================================================================
 
 def compare_logits(pytorch_logits, coreml_logits, tokenizer, top_k=10, verbose=True):
-    """Compare logits between PyTorch and CoreML."""
+    """Compare logits between PyTorch and CoreML with stability metrics."""
     # Get last token logits
     pt_logits = pytorch_logits[0, -1, :].numpy()  # [vocab_size]
     cm_logits = coreml_logits[0, 0, :]  # [vocab_size]
@@ -419,18 +615,23 @@ def compare_logits(pytorch_logits, coreml_logits, tokenizer, top_k=10, verbose=T
 
     match = pt_argmax == cm_argmax
 
+    # Compute stability metrics
+    stability = compute_stability_metrics(pt_logits, cm_logits)
+
     if verbose:
         print(f"\n  PyTorch argmax: {pt_argmax} ('{tokenizer.decode([pt_argmax])}') prob={pt_probs[pt_argmax]:.2f}%")
         print(f"  CoreML argmax:  {cm_argmax} ('{tokenizer.decode([cm_argmax])}') prob={cm_probs[cm_argmax]:.2f}%")
         print(f"  Match: {'YES' if match else 'NO'}")
 
-        # Logits statistics
-        print(f"\n  PyTorch logits: min={pt_logits.min():.4f}, max={pt_logits.max():.4f}, mean={pt_logits.mean():.4f}")
-        print(f"  CoreML logits:  min={cm_logits.min():.4f}, max={cm_logits.max():.4f}, mean={cm_logits.mean():.4f}")
+        # Stability metrics
+        print(f"\n  Stability: KL={stability['kl_divergence']:.4f} | "
+              f"Entropy PT={stability['pt_entropy']:.2f} CM={stability['cm_entropy']:.2f} | "
+              f"Margin PT={stability['pt_top1_margin']:.2f} CM={stability['cm_top1_margin']:.2f}")
 
-        # Correlation
-        corr = np.corrcoef(pt_logits, cm_logits)[0, 1]
-        print(f"  Correlation: {corr:.6f}")
+        # Logits statistics
+        print(f"  Logits: PT max={stability['pt_max_logit']:.2f} std={stability['pt_std_logit']:.2f} | "
+              f"CM max={stability['cm_max_logit']:.2f} std={stability['cm_std_logit']:.2f} | "
+              f"Corr={stability['correlation']:.4f}")
 
         # Top-k comparison with probabilities
         print(f"\n  Top-{top_k} comparison (prob = softmax %):")
@@ -450,9 +651,10 @@ def compare_logits(pytorch_logits, coreml_logits, tokenizer, top_k=10, verbose=T
         'match': match,
         'pt_argmax': pt_argmax,
         'cm_argmax': cm_argmax,
-        'correlation': np.corrcoef(pt_logits, cm_logits)[0, 1],
+        'correlation': stability['correlation'],
         'pt_logits': pt_logits,
         'cm_logits': cm_logits,
+        'stability': stability,
     }
 
 
@@ -466,9 +668,21 @@ def run_comparison(
     max_tokens: int = 20,
     no_think: bool = False,
     stop_on_mismatch: bool = False,
+    driver: str = 'pt',  # 'pt', 'coreml', or 'teacher'
+    prefill_mode: str = 'batch',  # 'batch' or 'token'
     verbose: bool = True,
 ):
-    """Run token-by-token comparison."""
+    """Run token-by-token comparison with stability tracking.
+
+    Args:
+        driver: Which model drives next token selection:
+            - 'pt': PyTorch argmax (default, good for parity testing)
+            - 'coreml': CoreML argmax (realistic ANE behavior, catches instability)
+            - 'teacher': Use provided token sequence (teacher forcing)
+        prefill_mode: How to process the prompt:
+            - 'batch': Use batch prefill (default, faster)
+            - 'token': Single-token stepping (better for dataset generation, exercises infer path)
+    """
     embed_model, ffn_infer, ffn_prefill, lmhead_model = coreml_models
     context_length = coreml_metadata['context_length']
     batch_size = coreml_metadata['batch_size']
@@ -487,72 +701,116 @@ def run_comparison(
     seq_len = input_ids.shape[1]
     print(f"\nPrompt tokens: {seq_len}")
     print(f"Prompt: {prompt}")
+    print(f"Driver mode: {driver.upper()}")
+    print(f"Prefill mode: {prefill_mode.upper()}")
 
     # Reset PyTorch KV cache
     if hasattr(pytorch_model.model, 'kv_cache_0'):
         pytorch_model.model.kv_cache_0.zero_()
 
-    # Create CoreML state
-    coreml_state = ffn_prefill.make_state()
+    # Create CoreML state (prefer infer state for token mode)
+    try:
+        coreml_state = ffn_infer.make_state()
+    except Exception:
+        coreml_state = ffn_prefill.make_state()
 
-    # === PREFILL ===
-    print("\n" + "="*60)
-    print("PREFILL PHASE")
-    print("="*60)
+    # Track prompt-phase metrics (only populated in token mode)
+    prompt_metrics = []
+    prompt_first_mismatch = None
 
-    # PyTorch prefill
-    t0 = time.time()
-    position_ids = torch.arange(seq_len)
-    causal_mask = create_causal_mask(seq_len, pytorch_config.state_length)
-    pt_logits = pytorch_forward_single(
-        pytorch_model, input_ids, position_ids, causal_mask, current_pos=0, prefill=True
-    )
-    pt_prefill_time = time.time() - t0
+    if prefill_mode == 'token':
+        # === TOKENWISE PREFILL (teacher forcing) ===
+        print("\n" + "="*60)
+        print("PROMPT FEED (tokenwise teacher forcing)")
+        print("="*60)
 
-    # CoreML prefill
-    t0 = time.time()
-    coreml_prefill(embed_model, ffn_prefill, input_ids_np, context_length, batch_size, coreml_state)
-    cm_prefill_time = time.time() - t0
+        t0 = time.time()
+        pt_logits, cm_logits, prompt_metrics, prompt_first_mismatch = tokenwise_prompt_feed_teacher(
+            pytorch_model=pytorch_model,
+            pytorch_config=pytorch_config,
+            embed_model=embed_model,
+            ffn_infer=ffn_infer,
+            lmhead_model=lmhead_model,
+            input_ids_np=input_ids_np,
+            context_length=context_length,
+            split_lm_head=split_lm_head,
+            coreml_state=coreml_state,
+            probe_metrics=True,
+        )
+        prompt_feed_time = time.time() - t0
 
-    # Get first token logits from CoreML (need to run inference for last position)
-    # Actually for prefill comparison, let's compare the last prefill position
-    last_token = input_ids_np[:, -1:]  # [1, 1]
-    cm_logits = coreml_forward_single(
-        embed_model, ffn_infer, lmhead_model,
-        last_token, seq_len - 1, context_length, coreml_state, split_lm_head
-    )
+        print(f"\nPrompt feed timing (tokenwise): {prompt_feed_time*1000:.1f}ms ({seq_len/prompt_feed_time:.1f} tok/s)")
 
-    print(f"\nPrefill timing:")
-    print(f"  PyTorch: {pt_prefill_time*1000:.1f}ms ({seq_len/pt_prefill_time:.1f} tok/s)")
-    print(f"  CoreML:  {cm_prefill_time*1000:.1f}ms ({seq_len/cm_prefill_time:.1f} tok/s)")
+        if prompt_first_mismatch is not None:
+            print(f"First prompt-token mismatch at pos={prompt_first_mismatch}")
 
-    print("\nComparing prefill output (last position):")
-    prefill_result = compare_logits(pt_logits, cm_logits, tokenizer, verbose=verbose)
+        if prompt_metrics:
+            kls = [m['kl_divergence'] for m in prompt_metrics]
+            print(f"Prompt feed KL: avg={float(np.mean(kls)):.4f} max={float(np.max(kls)):.4f}")
+
+        print("\nComparing logits after last prompt token:")
+        prefill_result = compare_logits(pt_logits, cm_logits, tokenizer, verbose=verbose)
+
+    else:
+        # === BATCH PREFILL (original behavior) ===
+        print("\n" + "="*60)
+        print("PREFILL PHASE (batch)")
+        print("="*60)
+
+        # PyTorch prefill
+        t0 = time.time()
+        position_ids = torch.arange(seq_len)
+        causal_mask = create_causal_mask(seq_len, pytorch_config.state_length)
+        pt_logits = pytorch_forward_single(
+            pytorch_model, input_ids, position_ids, causal_mask, current_pos=0, prefill=True
+        )
+        pt_prefill_time = time.time() - t0
+
+        # CoreML prefill
+        t0 = time.time()
+        coreml_prefill(embed_model, ffn_prefill, input_ids_np, context_length, batch_size, coreml_state)
+        cm_prefill_time = time.time() - t0
+
+        # Get first token logits from CoreML
+        last_token = input_ids_np[:, -1:]
+        cm_logits = coreml_forward_single(
+            embed_model, ffn_infer, lmhead_model,
+            last_token, seq_len - 1, context_length, coreml_state, split_lm_head
+        )
+
+        print(f"\nPrefill timing:")
+        print(f"  PyTorch: {pt_prefill_time*1000:.1f}ms ({seq_len/pt_prefill_time:.1f} tok/s)")
+        print(f"  CoreML:  {cm_prefill_time*1000:.1f}ms ({seq_len/cm_prefill_time:.1f} tok/s)")
+
+        print("\nComparing prefill output (last position):")
+        prefill_result = compare_logits(pt_logits, cm_logits, tokenizer, verbose=verbose)
 
     # === DECODE ===
     print("\n" + "="*60)
-    print("DECODE PHASE (token-by-token)")
+    print(f"DECODE PHASE (driver={driver.upper()})")
     print("="*60)
 
-    # Get first generated token
-    if prefill_result['match']:
-        next_token = prefill_result['pt_argmax']
-    else:
-        # Use PyTorch result
+    # Select first token based on driver
+    if driver == 'coreml':
+        next_token = prefill_result['cm_argmax']
+    else:  # 'pt' or 'teacher'
         next_token = prefill_result['pt_argmax']
 
-    pt_tokens = [next_token]
+    pt_tokens = [prefill_result['pt_argmax']]
     cm_tokens = [prefill_result['cm_argmax']]
+    driver_tokens = [next_token]  # Actual tokens fed to both models
 
     current_pos = seq_len
     results = []
+    metrics_history = []
+    first_mismatch_step = None
 
     for step in range(max_tokens - 1):
         if current_pos >= context_length - 1:
             print(f"\nReached context length limit ({context_length})")
             break
 
-        # Check EOS
+        # Check EOS (for driver token)
         if next_token in [151643, 151644, 151645]:
             print(f"\nEOS token generated at step {step}")
             break
@@ -568,18 +826,33 @@ def run_comparison(
             single_mask, current_pos=current_pos, prefill=False
         )
 
-        # CoreML decode
+        # CoreML decode (same input token for fair comparison)
         cm_input = np.array([[next_token]], dtype=np.int32)
         cm_logits = coreml_forward_single(
             embed_model, ffn_infer, lmhead_model,
             cm_input, current_pos, context_length, coreml_state, split_lm_head
         )
 
-        # Compare
+        # Compare and get stability metrics
         result = compare_logits(pt_logits, cm_logits, tokenizer, verbose=verbose)
         results.append(result)
 
-        # Check for mismatch and stop if requested
+        # Track stability metrics
+        if 'stability' in result:
+            metrics_history.append(result['stability'])
+
+            # Check for instability
+            instability = detect_instability(metrics_history)
+            if any(instability.values()):
+                flags = [k for k, v in instability.items() if v]
+                print(f"  *** INSTABILITY DETECTED: {', '.join(flags)} ***")
+
+        # Track first mismatch
+        if not result['match'] and first_mismatch_step is None:
+            first_mismatch_step = step + 1
+            print(f"  *** FIRST MISMATCH at step {first_mismatch_step} ***")
+
+        # Check for stop on mismatch
         if stop_on_mismatch and not result['match']:
             print(f"\n*** STOPPING: Token mismatch at step {step + 1} ***")
             print(f"  PyTorch: {result['pt_argmax']} ('{tokenizer.decode([result['pt_argmax']])}')")
@@ -588,11 +861,23 @@ def run_comparison(
             cm_tokens.append(result['cm_argmax'])
             break
 
-        # Next token (use PyTorch)
-        next_token = result['pt_argmax']
-        pt_tokens.append(next_token)
+        # Record predictions
+        pt_tokens.append(result['pt_argmax'])
         cm_tokens.append(result['cm_argmax'])
+
+        # Select next token based on driver mode
+        if driver == 'coreml':
+            next_token = result['cm_argmax']
+        else:  # 'pt' or 'teacher'
+            next_token = result['pt_argmax']
+
+        driver_tokens.append(next_token)
         current_pos += 1
+
+        # Track repetition
+        rep_score = compute_repetition_score(driver_tokens)
+        if rep_score > 0.3:
+            print(f"  *** HIGH REPETITION: {rep_score:.2f} ***")
 
     # === SUMMARY ===
     print("\n" + "="*60)
@@ -603,13 +888,50 @@ def run_comparison(
     total = len(results)
     correlations = [r['correlation'] for r in results]
 
-    print(f"\nToken matches: {matches}/{total} ({100*matches/total:.1f}%)")
-    print(f"Avg correlation: {np.mean(correlations):.6f}")
-    print(f"Min correlation: {np.min(correlations):.6f}")
-    print(f"Max correlation: {np.max(correlations):.6f}")
+    print(f"\nDriver mode: {driver.upper()}")
+    print(f"Token matches: {matches}/{total} ({100*matches/total:.1f}%)" if total > 0 else "No tokens generated")
+    if first_mismatch_step:
+        print(f"First mismatch at step: {first_mismatch_step}")
+
+    if correlations:
+        print(f"\nCorrelation stats:")
+        print(f"  Avg: {np.mean(correlations):.6f}")
+        print(f"  Min: {np.min(correlations):.6f}")
+        print(f"  Max: {np.max(correlations):.6f}")
+
+    # Prompt-phase stability summary (token mode only)
+    if prompt_metrics:
+        prompt_kl_values = [m['kl_divergence'] for m in prompt_metrics]
+        prompt_cm_entropies = [m['cm_entropy'] for m in prompt_metrics]
+
+        print(f"\nPrompt-phase stability (tokenwise):")
+        print(f"  KL divergence:  avg={np.mean(prompt_kl_values):.4f} max={np.max(prompt_kl_values):.4f}")
+        print(f"  CM entropy:     avg={np.mean(prompt_cm_entropies):.2f} min={np.min(prompt_cm_entropies):.2f}")
+        if prompt_first_mismatch is not None:
+            print(f"  First mismatch: pos={prompt_first_mismatch}")
+
+    # Decode-phase stability summary
+    if metrics_history:
+        kl_values = [m['kl_divergence'] for m in metrics_history]
+        cm_entropies = [m['cm_entropy'] for m in metrics_history]
+        cm_margins = [m['cm_top1_margin'] for m in metrics_history]
+
+        print(f"\nDecode-phase stability:")
+        print(f"  KL divergence:  avg={np.mean(kl_values):.4f} max={np.max(kl_values):.4f}")
+        print(f"  CM entropy:     avg={np.mean(cm_entropies):.2f} min={np.min(cm_entropies):.2f}")
+        print(f"  CM top1_margin: avg={np.mean(cm_margins):.2f} max={np.max(cm_margins):.2f}")
+
+    # Repetition analysis
+    pt_rep = compute_repetition_score(pt_tokens)
+    cm_rep = compute_repetition_score(cm_tokens)
+    print(f"\nRepetition scores (4-gram):")
+    print(f"  PyTorch: {pt_rep:.3f}")
+    print(f"  CoreML:  {cm_rep:.3f}")
 
     print(f"\nPyTorch tokens: {pt_tokens}")
     print(f"CoreML tokens:  {cm_tokens}")
+    if driver == 'coreml':
+        print(f"Driver tokens:  {driver_tokens}")
 
     print(f"\nPyTorch output: {tokenizer.decode(pt_tokens)}")
     print(f"CoreML output:  {tokenizer.decode(cm_tokens)}")
@@ -618,9 +940,17 @@ def run_comparison(
         'matches': matches,
         'total': total,
         'match_rate': matches / total if total > 0 else 0,
-        'avg_correlation': np.mean(correlations),
+        'avg_correlation': np.mean(correlations) if correlations else 0,
+        'first_mismatch_step': first_mismatch_step,
         'pt_tokens': pt_tokens,
         'cm_tokens': cm_tokens,
+        'driver_tokens': driver_tokens,
+        'metrics_history': metrics_history,
+        'pt_repetition': pt_rep,
+        'cm_repetition': cm_rep,
+        # Token-mode specific (empty for batch mode)
+        'prompt_metrics': prompt_metrics,
+        'prompt_first_mismatch': prompt_first_mismatch,
     }
 
 
@@ -645,6 +975,10 @@ def main():
     parser.add_argument('--no-think', action='store_true')
     parser.add_argument('--stop', action='store_true',
                         help='Stop when predicted tokens mismatch between PyTorch and CoreML')
+    parser.add_argument('--driver', type=str, default='pt', choices=['pt', 'coreml', 'teacher'],
+                        help='Driver mode: pt (PyTorch drives), coreml (CoreML drives, realistic ANE), teacher')
+    parser.add_argument('--prefill-mode', type=str, default='batch', choices=['batch', 'token'],
+                        help='Prefill mode: batch (default, faster) or token (single-token stepping, better for dataset generation)')
     parser.add_argument('--verbose', '-v', action='store_true')
 
     args = parser.parse_args()
@@ -707,6 +1041,8 @@ def main():
         max_tokens=args.max_tokens,
         no_think=args.no_think,
         stop_on_mismatch=args.stop,
+        driver=args.driver,
+        prefill_mode=args.prefill_mode,
         verbose=True,
     )
 
