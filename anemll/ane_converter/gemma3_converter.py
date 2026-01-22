@@ -1,15 +1,13 @@
-"""Converter for Gemma3 270M models.
+"""Converter for Gemma3 models.
 
 This module provides a lightweight converter that mirrors the
 :class:`LlamaConverter` behaviour for Gemma3 models without inheriting from
-it. Only the pieces required for the unit tests are implemented.
-
-NOTE: This is initially a copy of qwen_converter.py and needs modification for Gemma3
-specific conversion requirements. The following areas need to be updated:
-- Model class references
-- Configuration handling for Gemma3 270M
-- Weight loading and reshaping for Gemma3 architecture
-- Tokenizer configuration
+it. Supports Gemma3 architecture with its unique features:
+- Interleaved sliding window (512) and full attention at layers 6, 12, 18
+- Dual RoPE bases (1e6 for global, 10k for local layers)
+- Per-head Q/K normalization
+- Large vocabulary (262,144 tokens) with 16-way LM head splitting
+- GEGLU activation (GELU with tanh approximation)
 """
 
 from __future__ import annotations
@@ -326,7 +324,7 @@ class Gemma3Converter(BaseConverter):
         Returns:
             ct.models.MLModel: Converted model
         """
-        print(f"QwenConverter.convert() called with part={part}")
+        print(f"Gemma3Converter.convert() called with part={part}")
         require_coreml()
         print("Calling preprocess()...")
         self.preprocess()
@@ -363,7 +361,7 @@ class Gemma3Converter(BaseConverter):
 
         print("Calling postprocess()...")
         self.postprocess()
-        print("QwenConverter.convert() completed")
+        print("Gemma3Converter.convert() completed")
         return mlmodel
 
     def convert_to_coreml(self, model: Gemma3ForCausalLM) -> ct.models.MLModel:
@@ -493,17 +491,17 @@ class Gemma3Converter(BaseConverter):
     # --------------------------------------------------------------
     # Part-based conversion helpers
     # --------------------------------------------------------------
-    def convert_part_1(self, model: QwenForCausalLM) -> ct.models.MLModel:
+    def convert_part_1(self, model: Gemma3ForCausalLM) -> ct.models.MLModel:
         """Convert embeddings layer only."""
         require_coreml()
         return self.convert_embeddings(model)
 
-    def convert_part_3(self, model: QwenForCausalLM) -> ct.models.MLModel:
+    def convert_part_3(self, model: Gemma3ForCausalLM) -> ct.models.MLModel:
         """Convert LM head only."""
         require_coreml()
 
         class LMHeadWrapper(torch.nn.Module):
-            def __init__(self, model: QwenForCausalLM) -> None:
+            def __init__(self, model: Gemma3ForCausalLM) -> None:
                 super().__init__()
                 if hasattr(model, "lm_head16_1"):
                     self.heads = [
@@ -596,7 +594,7 @@ class Gemma3Converter(BaseConverter):
         return mlmodel
 
     def convert_part_2(
-        self, model: QwenForCausalLM, chunk_idx: int = 0, total_chunks: int = 1
+        self, model: Gemma3ForCausalLM, chunk_idx: int = 0, total_chunks: int = 1
     ) -> ct.models.MLModel:
         """Convert transformer layers for generation (FFN)."""
         require_coreml()
@@ -610,29 +608,32 @@ class Gemma3Converter(BaseConverter):
             end_layer = None
 
         class FFNWrapper(torch.nn.Module):
-            def __init__(self, model: QwenForCausalLM) -> None:
+            def __init__(self, model: Gemma3ForCausalLM, start_layer: int, end_layer: int) -> None:
                 super().__init__()
-                self.model = model  # Use QwenForCausalLM as root
-                self.states = QwenConverter.GetTransformerStates(
+                self.model = model  # Use Gemma3ForCausalLM as root
+                self.start_layer = start_layer
+                self.end_layer = end_layer
+                self.states = Gemma3Converter.GetTransformerStates(
                     model, part="2", prefix="model.model."
                 )
 
             def forward(self, hidden_states, position_ids, causal_mask, current_pos):
-                rotary = self.model.model.get_rotary_embeddings_s(current_pos)
+                # RoPE is now retrieved per-layer inside process_layers
                 out = self.model.model.process_layers(
                     hidden_states,
                     position_ids,
                     causal_mask,
                     current_pos,
-                    rotary,
-                    start_layer=start_layer,
-                    end_layer=end_layer,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
                     IN_PREFILL=False,
                 )
-                out = self.model.model.norm(out)
+                # Only apply final norm if this is the last chunk
+                if self.end_layer is None or self.end_layer == len(self.model.model.layers):
+                    out = self.model.model.norm(out)
                 return out
 
-        wrapper = FFNWrapper(model)
+        wrapper = FFNWrapper(model, start_layer, end_layer)
         wrapper.eval()
 
         hidden_states = torch.zeros(
@@ -685,7 +686,7 @@ class Gemma3Converter(BaseConverter):
         return mlmodel
 
     def convert_part_2_prefill(
-        self, model: QwenForCausalLM, chunk_idx: int = 0, total_chunks: int = 1
+        self, model: Gemma3ForCausalLM, chunk_idx: int = 0, total_chunks: int = 1
     ) -> ct.models.MLModel:
         """Convert transformer layers for prefill mode."""
         require_coreml()
@@ -699,23 +700,22 @@ class Gemma3Converter(BaseConverter):
             end_layer = None
 
         class PrefillWrapper(torch.nn.Module):
-            def __init__(self, model: QwenForCausalLM, start_layer=0, end_layer=None):
+            def __init__(self, model: Gemma3ForCausalLM, start_layer=0, end_layer=None):
                 super().__init__()
-                self.model = model  # Use QwenForCausalLM as root
+                self.model = model  # Use Gemma3ForCausalLM as root
                 self.start_layer = start_layer
                 self.end_layer = end_layer
-                self.states = QwenConverter.GetTransformerStates(
+                self.states = Gemma3Converter.GetTransformerStates(
                     model, part="2_prefill", prefix="model.model."
                 )
 
             def forward(self, hidden_states, position_ids, causal_mask, current_pos):
-                rotary = self.model.model.get_rotary_embedding_prefill(position_ids)
+                # RoPE is now retrieved per-layer inside process_layers
                 out = self.model.model.process_layers(
                     hidden_states,
                     position_ids,
                     causal_mask,
                     current_pos,
-                    rotary,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                     IN_PREFILL=True,
@@ -727,7 +727,7 @@ class Gemma3Converter(BaseConverter):
                     print("Skipping final normalization for prefill, data not used!")
                     # Return only first token to minimize memory usage
                     return out[:, 0:1, :]
-                
+
                 return out
 
         wrapper = PrefillWrapper(model, start_layer, end_layer)
@@ -791,21 +791,21 @@ class Gemma3Converter(BaseConverter):
 
         return mlmodel
 
-    def convert_prefill(self, model: QwenForCausalLM) -> ct.models.MLModel:
-        """Convert Qwen model to CoreML format for prefill mode.
+    def convert_prefill(self, model: Gemma3ForCausalLM) -> ct.models.MLModel:
+        """Convert Gemma3 model to CoreML format for prefill mode.
 
         Args:
-            model: The Qwen model to convert
+            model: The Gemma3 model to convert
 
         Returns:
             ct.models.MLModel: Converted model for prefill processing
         """
         require_coreml()
-        print("Converting Qwen model for prefill mode...")
+        print("Converting Gemma3 model for prefill mode...")
 
         class PrefillWrapper(torch.nn.Module):
             def __init__(
-                self, model: QwenForCausalLM, context_length: int, batch_size: int
+                self, model: Gemma3ForCausalLM, context_length: int, batch_size: int
             ) -> None:
                 super().__init__()
                 self.model = model
@@ -910,25 +910,29 @@ class Gemma3Converter(BaseConverter):
 
         return mlmodel
 
-    def convert_embeddings(self, model: QwenForCausalLM) -> ct.models.MLModel:
+    def convert_embeddings(self, model: Gemma3ForCausalLM) -> ct.models.MLModel:
         """Convert embeddings layer to CoreML format.
 
         Args:
-            model: The Qwen model containing embeddings
+            model: The Gemma3 model containing embeddings
 
         Returns:
             ct.models.MLModel: Converted CoreML model for embeddings
         """
         require_coreml()
-        print("\nConverting Qwen embeddings layer...")
+        print("\nConverting Gemma3 embeddings layer...")
 
         class EmbeddingsWrapper(torch.nn.Module):
             def __init__(self, model):
                 super().__init__()
                 self.embed_tokens = model.model.embed_tokens
+                # Gemma3 scales embeddings by sqrt(hidden_size)
+                self.embedding_scale = model.model.embedding_scale
 
             def forward(self, input_ids):
                 hidden_states = self.embed_tokens(input_ids)
+                # Apply Gemma3 embedding scaling (sqrt(hidden_size))
+                hidden_states = hidden_states * self.embedding_scale
                 return hidden_states.to(MODEL_DTYPE)
 
         # Create wrapper and ensure eval mode
@@ -984,17 +988,17 @@ class Gemma3Converter(BaseConverter):
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments for the converter."""
 
-    parser = argparse.ArgumentParser(description="Convert Qwen model to CoreML format")
+    parser = argparse.ArgumentParser(description="Convert Gemma3 model to CoreML format")
 
     parser.add_argument(
         "--model",
         type=str,
-        help="Path to model directory (default: Qwen/Qwen3-0.6B)",
+        help="Path to model directory (default: google/gemma-3n-E2B-it)",
     )
     parser.add_argument(
         "--prefix",
         type=str,
-        default="qwen",
+        default="gemma3",
         help="Prefix for output filenames",
     )
     parser.add_argument(
@@ -1039,9 +1043,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def test_conversion(
-    model: Optional[QwenForCausalLM] = None,
+    model: Optional[Gemma3ForCausalLM] = None,
     model_path: Optional[str] = None,
-    prefix: str = "qwen",
+    prefix: str = "gemma3",
     context_length: int = CONTEXT_LENGTH,
     lut_bits: Optional[int] = None,
     batch_size: int = 64,
@@ -1049,10 +1053,10 @@ def test_conversion(
     part: str = "full",
     num_chunks: int = 1,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
-    """Convert a Qwen model and save the result.
+    """Convert a Gemma3 model and save the result.
 
     Args:
-        model: Pre-loaded Qwen model (optional)
+        model: Pre-loaded Gemma3 model (optional)
         model_path: Path to model directory
         prefix: Model name prefix
         context_length: Context length for conversion
@@ -1075,7 +1079,7 @@ def test_conversion(
             raise ValueError(f"Config file not found at {config_path}")
 
         print("Loading config...")
-        config = QwenConfig.from_json(config_path)
+        config = Gemma3Config.from_json(config_path)
         print(
             f"Config loaded: hidden_size={config.hidden_size}, vocab_size={config.vocab_size}"
         )
@@ -1090,11 +1094,11 @@ def test_conversion(
         )
 
         print("Creating model...")
-        model = QwenForCausalLM(config, enable_coreml=True)
+        model = Gemma3ForCausalLM(config, enable_coreml=True)
         print("Loading pretrained weights...")
         model.load_pretrained_weights(model_path)
         print("Model loaded successfully!")
-        
+
         # Ensure model is in eval mode and gradients are disabled
         model.eval()
         for param in model.parameters():
@@ -1102,7 +1106,7 @@ def test_conversion(
         print("Model set to eval mode and gradients disabled")
 
     print("Creating converter...")
-    converter = QwenConverter(
+    converter = Gemma3Converter(
         model=model,
         context_length=context_length,
         batch_size=batch_size,
@@ -1163,11 +1167,11 @@ def test_conversion(
 
 
 def main() -> None:
-    print("Starting qwen_converter main()...")
+    print("Starting gemma3_converter main()...")
     args = parse_args()
     print(f"Parsed args: {args}")
 
-    model_path = args.model if args.model else "Qwen/Qwen3-0.6B"
+    model_path = args.model if args.model else "google/gemma-3n-E2B-it"
 
     print(f"\nConverting model from: {model_path}")
     print(f"Output filename prefix: {args.prefix}")

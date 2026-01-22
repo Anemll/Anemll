@@ -1,18 +1,10 @@
-"""Gemma3 model implementation for ANEMLL.
+"""Qwen 3 model implementation for ANEMLL.
 
-This module provides an ANE-optimized implementation of the Gemma3 architecture
-for Apple Neural Engine. All dense layers are expressed as ``nn.Conv2d`` with
-``kernel_size=1`` and weights are loaded from Hugging Face checkpoints with
-correct reshaping.
-
-Key Gemma3 architecture features:
-- Interleaved sliding window (512) and full attention at layers 6, 12, 18
-- Dual RoPE bases: rope_theta (1e6) for global, rope_local_base_freq (10k) for local
-- Per-head Q/K normalization before attention
-- GEGLU activation (GELU with tanh approximation)
-- Large vocabulary (262,144 tokens) with 16-way LM head splitting
-- Gemma-style RMSNorm with (1 + weight) scaling
-- Embedding scaling by sqrt(hidden_size)
+This module provides a lightweight implementation of the Qwen 3 architecture
+adapted to the Apple Neural Engine restrictions.  All dense layers are expressed
+as ``nn.Conv2d`` with ``kernel_size=1`` and weights are loaded from Hugging Face
+checkpoints with the correct reshaping.  Only the pieces required for the unit
+ tests are implemented.
 """
 
 from __future__ import annotations
@@ -28,17 +20,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
-# Gemma3 270M model implementation adapted from llama_model.py
+# Qwen 3 model implementation adapted from llama_model.py
 # ---------------------------------------------------------------------------
 
-MODEL_DTYPE = torch.float16  # Match HF model dtype
+MODEL_DTYPE = torch.float16
 TEST_DEVICE = "cpu"
 CONTEXT_LENGTH = 256
 
 # Cache configuration constants (following llama_model.py pattern)
 FORCE_UNIFIED_CACHE = True  # Force using a single unified KV cache
 ENABLE_UNIFIED_CACHE = True  # Enable unified KV cache by default
-STATE_LENGTH = CONTEXT_LENGTH   # match config.state_length by default
+STATE_LENGTH = 256   # KV cache state length
 DISABLE_KV_CACHE = False  # Disable KV cache for simple testing
 
 # LM head configuration constants (following llama_model.py pattern)
@@ -50,53 +42,44 @@ ENABLE_LOGITS2 = bool(1)    # Return separate logits arrays for CoreML
 ENABLE_COREML = bool(0)     # CoreML-specific returns
 
 
-class Gemma3Config:
+class QwenConfig:
     def __init__(self, **kwargs):
-        self.architectures = kwargs.get("architectures", ["Gemma3ForCausalLM"])
+        self.architectures = kwargs.get("architectures", ["QwenForCausalLM"])
         self.attention_bias = kwargs.get("attention_bias", False)
         self.attention_dropout = kwargs.get("attention_dropout", 0.0)
-
-        # Tokenizer / specials
-        self.pad_token_id = kwargs.get("pad_token_id", 0)
-        self.bos_token_id = kwargs.get("bos_token_id", 2)
-        self.eos_token_id = kwargs.get("eos_token_id", 1)
-        self.eos_token_ids = kwargs.get("eos_token_ids", [1, 106])
-
-        # Geometry
-        self.hidden_act = kwargs.get("hidden_act", "gelu_pytorch_tanh")
-        self.hidden_size = kwargs.get("hidden_size", 640)
-        self.num_attention_heads = kwargs.get("num_attention_heads", 4)
-        self.num_hidden_layers = kwargs.get("num_hidden_layers", 18)
-        self.num_key_value_heads = kwargs.get("num_key_value_heads", 1)
-        self.head_dim = kwargs.get("head_dim", 256)
-        self.intermediate_size = kwargs.get("intermediate_size", 2048)
-
+        self.bos_token_id = kwargs.get("bos_token_id", 128000)
+        self.eos_token_id = kwargs.get("eos_token_id", 128001)
+        self.hidden_act = kwargs.get("hidden_act", "silu")
+        self.hidden_size = kwargs.get("hidden_size", 4096)
         self.initializer_range = kwargs.get("initializer_range", 0.02)
-        self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
-        self.rope_theta = kwargs.get("rope_theta", 1_000_000.0)
-        self.rope_local_base_freq = kwargs.get("rope_local_base_freq", 10_000.0)
-        self.query_pre_attn_scalar = kwargs.get("query_pre_attn_scalar", 256)
-
-        self.model_type = kwargs.get("model_type", "gemma3")
-        self.transformers_version = kwargs.get("transformers_version", "4.55.2")
-
-        # Context / cache
-        self.context_length = kwargs.get("context_length", 256)
-        self.state_length = kwargs.get("state_length", self.context_length)
-
-        # Interleaved attention
-        self.sliding_window = kwargs.get("sliding_window", 512)
-        default_layer_types = ["sliding_attention"] * self.num_hidden_layers
-        for i in (5, 11, 17):  # 0-indexed -> layers 6, 12, 18 are global
-            if i < len(default_layer_types): default_layer_types[i] = "full_attention"
-        self.layer_types = kwargs.get("layer_types", default_layer_types)
-
-        # Vocab
-        self.vocab_size = kwargs.get("vocab_size", 262_144)
-        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", True)
-
+        self.intermediate_size = kwargs.get("intermediate_size", 14336)
+        self.max_position_embeddings = kwargs.get("max_position_embeddings", 8192)
+        self.model_type = kwargs.get("model_type", "qwen3")
+        self.num_attention_heads = kwargs.get("num_attention_heads", 32)
+        self.num_hidden_layers = kwargs.get("num_hidden_layers", 32)
+        self.num_key_value_heads = kwargs.get("num_key_value_heads", 8)
+        self.head_dim = kwargs.get(
+            "head_dim",
+            self.hidden_size // max(1, self.num_attention_heads),
+        )
+        # Note: For Qwen, head_dim may not equal hidden_size // num_attention_heads
+        # The model architecture uses a different relationship
+        self.pretraining_tp = kwargs.get("pretraining_tp", 1)
+        self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-05)
+        self.rope_scaling = kwargs.get("rope_scaling", None)
+        if self.rope_scaling:
+            self.rope_scaling["rope_type"] = self.rope_scaling.get("rope_type", "qwen3")
+        self.rope_theta = kwargs.get("rope_theta", 500000.0)
+        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", False)
+        self.torch_required = kwargs.get("torch_dtype", "bfloat16")
+        self.transformers_version = kwargs.get("transformers_version", "4.40.0.dev0")
         self.use_cache = kwargs.get("use_cache", True)
-        self.context_length = kwargs.get("context_length", 256)
+        self.vocab_size = kwargs.get("vocab_size", 128257)
+        self.context_length = kwargs.get("context_length", CONTEXT_LENGTH)
+        self.state_length = kwargs.get("state_length", STATE_LENGTH)
+        # KV cache packing: pack multiple layers when context_length < state_length
+        self.pack_kvc = kwargs.get("pack_kvc", False)
+        self.pack_factor = kwargs.get("pack_factor", 1)
 
     @classmethod
     def from_json(cls, json_file):
@@ -113,19 +96,46 @@ def get_kv_cache_idx(layer_idx, num_layers, num_groups=1):
     return group_idx, layer_in_group_idx, layers_per_group
 
 
+def get_packed_kv_indices(layer_idx, num_layers, pack_factor, context_length):
+    """Calculate packed KV cache buffer index and slice offset.
+
+    When pack_kvc is enabled, multiple layers share a single buffer:
+    - K buffers: indices 0 to ceil(num_layers/pack_factor)-1
+    - V buffers: indices ceil(num_layers/pack_factor) to 2*ceil(num_layers/pack_factor)-1
+
+    Each layer's data is stored at a slice offset within the buffer:
+    - Layer 0: positions 0 to context_length-1
+    - Layer 1: positions context_length to 2*context_length-1
+    - etc.
+
+    Args:
+        layer_idx: Layer index (0 to num_layers-1)
+        num_layers: Total number of layers
+        pack_factor: How many layers are packed per buffer
+        context_length: Context length (size of each layer's slice)
+
+    Returns:
+        tuple: (k_buffer_idx, v_buffer_idx, slice_offset)
+    """
+    packed_per_type = (num_layers + 4 - 1) // 4
+    k_buffer_idx = layer_idx // 4
+    v_buffer_idx = packed_per_type + (layer_idx // 4)
+    slice_offset = ((layer_idx // 4)*4 - layer_idx) * context_length
+    return k_buffer_idx, v_buffer_idx, slice_offset
+
+
 # -----------------------------------------------------------------------------
-# Gemma3 building blocks
+# Qwen building blocks
 # -----------------------------------------------------------------------------
 
 
-class Gemma3RMSNorm(nn.Module):
+class QwenRMSNorm(nn.Module):
     """ANE optimized RMSNorm implementation. We use layer_norm and avoid the mean subtraction.
     This give us the best quality for Boolq and other benchmarks."""
 
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
-        # Gemma-style: learned offset around 1 → initialize to 0 and add in forward
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -156,20 +166,19 @@ class Gemma3RMSNorm(nn.Module):
         # ❸ Drop the mirror half → correct RMS‑normed activations.
         normed = normed[..., : hidden_size]
 
-        # ❹ Apply Gemma-style gain: (1 + w)
-        return (normed * (1.0 + self.weight
+        # ❹ Apply the learnable gain (γ) and cast / move exactly once.
+        return (normed * self.weight
                        .to(normed.dtype, copy=False)
-                       .to(normed.device, copy=False)))
+                       .to(normed.device, copy=False))
 
-class Gemma3HeadNorm(nn.Module):
+class QwenHeadNorm(nn.Module):
 
     """ANE optimized RMSNorm implementation. We use layer_norm and avoid the mean subtraction.
     This give us the best quality for Boolq and other benchmarks."""
 
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
-        # Gemma-style: learned offset around 1 → initialize to 0 and add in forward
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -200,17 +209,19 @@ class Gemma3HeadNorm(nn.Module):
         # ❸ Drop the mirror half → correct RMS‑normed activations.
         normed = normed[..., : hidden_size]
 
-        # ❹ Apply Gemma-style gain: (1 + w)
-        return (normed * (1.0 + self.weight
+        # ❹ Apply the learnable gain (γ) and cast / move exactly once.
+        return (normed * self.weight
                        .to(normed.dtype, copy=False)
-                       .to(normed.device, copy=False)))
+                       .to(normed.device, copy=False))
 
-class Gemma3RotaryEmbedding(nn.Module):
+class QwenRotaryEmbedding(nn.Module):
     """Simple rotary positional embedding."""
 
-    def __init__(self, config: Gemma3Config) -> None:
+    def __init__(self, config: QwenConfig) -> None:
         super().__init__()
-        self.dim = config.head_dim
+        self.dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
         inv_freq = 1.0 / (
             config.rope_theta ** (torch.arange(0, self.dim, 2).float().to(TEST_DEVICE) / self.dim)
         )
@@ -289,53 +300,48 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.view(bsz, n_kv * n_rep, seq_len, head_dim)
 
 
-class Gemma3MLP(nn.Module):
-    def __init__(self, config: Gemma3Config) -> None:
+class QwenMLP(nn.Module):
+    def __init__(self, config: QwenConfig) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
 
-        # Use single Conv2d layers (no splitting for Gemma3 for now)
+        # Use single Conv2d layers (no splitting for Qwen for now)
         self.gate_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
         self.up_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
         self.down_proj = nn.Conv2d(self.intermediate_size, self.hidden_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
 
-        # GEGLU: gate uses GELU(tanh); keep the same three-projection GLU wiring
-        def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
-            return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * (x ** 3))))
-        self.act_fn = gelu_tanh
+        self.act_fn = F.silu
 
     def forward(self, x):
         # Use identical step-by-step computation to LlamaMLP to prevent numerical explosion
-        # Weights stay FP16, computation dtype follows input (Conv2d handles conversion)
-        x = x.permute(0, 2, 1).unsqueeze(2)  # Reshape for Conv2d: [bsz, hidden, 1, seq]
-
+        x = x.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)  # Ensure proper dtype and shape
+        
         # Step-by-step computation for numerical stability (like LlamaMLP)
-        a = self.gate_proj(x)          # gate projection
-        b = self.up_proj(x)            # up projection
-        d = self.act_fn(a) * b         # GEGLU: GELU(tanh)(gate) ⊙ up
-        e = self.down_proj(d)          # down projection
-
+        a = self.gate_proj(x)      # gate projection
+        b = self.up_proj(x)        # up projection
+        c = self.act_fn(a)         # activation on gate
+        d = c * b                  # multiply gate * up
+        e = self.down_proj(d)      # down projection
+        
         return e.squeeze(2).permute(0, 2, 1)  # Final output shape: [bsz, seq_len, hidden_size]
 
 
-class Gemma3Attention(nn.Module):
-    def __init__(self, config: Gemma3Config) -> None:
+class QwenAttention(nn.Module):
+    def __init__(self, config: QwenConfig) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
-        if not hasattr(Gemma3Attention, '_config_printed'):
-            print(f"Gemma3Attention using head_dim={self.head_dim} (from config: {getattr(config, 'head_dim', 'not set')})")
-            print(f"Gemma3Attention projection dims: Q={self.num_heads * self.head_dim}, K/V={self.num_kv_heads * self.head_dim}")
-            Gemma3Attention._config_printed = True
+        if not hasattr(QwenAttention, '_config_printed'):
+            print(f"QwenAttention using head_dim={self.head_dim} (from config: {getattr(config, 'head_dim', 'not set')})")
+            print(f"QwenAttention projection dims: Q={self.num_heads * self.head_dim}, K/V={self.num_kv_heads * self.head_dim}")
+            QwenAttention._config_printed = True
             
-        # Two RoPE bases: global uses rope_theta (default 1e6), local uses rope_local_base_freq (10k)
-        # We'll store the layer type on the attention module for easy access
-        self.layer_type = None  # Will be set by DecoderLayer
+        self.rotary_emb = QwenRotaryEmbedding(config)
 
         # Calculate correct projection dimensions
         q_proj_dim = self.num_heads * self.head_dim  # 16 * 128 = 2048
@@ -369,9 +375,9 @@ class Gemma3Attention(nn.Module):
             bias=False,
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE)
-        self.q_norm = Gemma3HeadNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Gemma3HeadNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.scale = 1 / math.sqrt(getattr(config, "query_pre_attn_scalar", self.head_dim))
+        self.q_norm = QwenHeadNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = QwenHeadNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.scale = 1 / math.sqrt(self.head_dim)
 
     def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
         """
@@ -397,7 +403,7 @@ class Gemma3Attention(nn.Module):
         key_states = self.k_proj(hidden_states).view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
         value_states = self.v_proj(hidden_states).view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
         
-        # Apply query and key normalization (critical for Gemma3!)
+        # Apply query and key normalization (critical for Qwen!)
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
         
@@ -425,7 +431,7 @@ class Gemma3Attention(nn.Module):
         key_states = key_states.view(1, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)  # [1, num_kv_heads, seq_len, head_dim]
         value_states = value_states.view(1, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)  # [1, num_kv_heads, seq_len, head_dim]
 
-        # Apply query and key normalization (critical for Gemma3!)
+        # Apply query and key normalization (critical for Qwen!)
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
@@ -491,29 +497,24 @@ class Gemma3Attention(nn.Module):
         out = self.o_proj(attn_output.permute(0, 2, 1).unsqueeze(2))
         return out.squeeze(2).permute(0, 2, 1)
 
-    def forward_regular(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None, current_pos=None, layer_idx=None):
+    def forward_regular(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None, current_pos=None):
         """Forward pass for single token generation."""
         bsz, q_len, _ = hidden_states.shape
-                
+
         # Get KV cache
         K_layer_cache, V_layer_cache = kv_cache_layer
-        
-        # Determine the usable KV range for windowed attention
-        q_len = query_states.shape[2]
-        pos = int(current_pos) if current_pos is not None else 0
-        end = min(pos + (q_len if q_len > 1 else 1), self.config.state_length)
-        start = 0
-        if layer_idx is not None and hasattr(self.config, "layer_types"):
-            if self.config.layer_types[layer_idx] == "sliding_attention":
-                start = max(0, end - self.config.sliding_window)
-        
-        K_window = K_layer_cache[:, start:end, :]
-        V_window = V_layer_cache[:, start:end, :]
+
+        # For CoreML compatibility, use fixed cache length
+        # In packed mode, cache slice is context_length; otherwise use state_length
+        pack_kvc = getattr(self.config, 'pack_kvc', False)
+        cache_len = self.config.context_length if pack_kvc else self.config.state_length
+        K_layer_cache = K_layer_cache[..., :cache_len, :]
+        V_layer_cache = V_layer_cache[..., :cache_len, :]
         
         # Repeat KV for multi-head attention
         n_rep = self.num_heads // self.num_kv_heads
-        key_states = self.repeat_kv(K_window, n_rep)
-        value_states = self.repeat_kv(V_window, n_rep)
+        key_states = self.repeat_kv(K_layer_cache, n_rep)
+        value_states = self.repeat_kv(V_layer_cache, n_rep)
 
         # Compute attention using optimized path for batch_size=1
         attn_weights = torch.matmul(query_states.to(MODEL_DTYPE), key_states.transpose(-1, -2).to(MODEL_DTYPE)) * self.scale
@@ -538,37 +539,32 @@ class Gemma3Attention(nn.Module):
         attn_output = self.o_proj(attn_output.permute(0, 2, 1).unsqueeze(2))
         return attn_output.squeeze(2).permute(0, 2, 1)
 
-    def forward_prefill(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None, layer_idx=None):
+    def forward_prefill(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None):
         """Forward pass for prefill mode"""
         bsz, q_len, _ = hidden_states.shape
-                
+
         # Get KV cache
         K_layer_cache, V_layer_cache = kv_cache_layer
-        
-        # Determine the usable KV range for windowed attention
-        q_len = query_states.shape[2]
-        pos = 0  # For prefill, we start from position 0
-        end = min(pos + q_len, self.config.state_length)
-        start = 0
-        if layer_idx is not None and hasattr(self.config, "layer_types"):
-            if self.config.layer_types[layer_idx] == "sliding_attention":
-                start = max(0, end - self.config.sliding_window)
-        
-        K_window = K_layer_cache[:, start:end, :]
-        V_window = V_layer_cache[:, start:end, :]
-        
+
+        # For prefill mode, slice KV cache to context_length
+        # In packed mode, cache is already context_length; in standard mode, slice from state_length
+        cache_len = self.config.context_length
+        K_layer_cache = K_layer_cache[..., :cache_len, :]
+        V_layer_cache = V_layer_cache[..., :cache_len, :]
+
         # Repeat KV for multi-head attention
         n_rep = self.num_heads // self.num_kv_heads
-        key_states = self.repeat_kv(K_window, n_rep)
-        value_states = self.repeat_kv(V_window, n_rep)
-        
+        key_states = self.repeat_kv(K_layer_cache, n_rep)
+        value_states = self.repeat_kv(V_layer_cache, n_rep)
+
         # Compute scaled dot-product attention
         attn_weights = torch.einsum('bhqd,bhkd->bhqk', query_states.to(MODEL_DTYPE), key_states.to(MODEL_DTYPE)) * self.scale
-        
+
         if causal_mask is not None:
-            # Slice causal mask to match actual query and key sequence lengths
-            q_seq_len = query_states.shape[2]  # Query sequence length
-            k_seq_len = min(key_states.shape[2], self.config.context_length)  # Key sequence length
+            # Slice causal mask to match query and key sequence lengths
+            # Use config-based lengths to avoid tensor shape operations that don't trace well
+            q_seq_len = self.config.context_length  # Query sequence length (batch size in prefill)
+            k_seq_len = self.config.context_length  # Key sequence length
             mask_slice = causal_mask.to(MODEL_DTYPE)[:, :, :q_seq_len, :k_seq_len]
             attn_weights = attn_weights + mask_slice
         
@@ -586,20 +582,15 @@ class Gemma3Attention(nn.Module):
         return attn_output.squeeze(2).permute(0, 2, 1)
 
 
-class Gemma3DecoderLayer(nn.Module):
-    def __init__(self, config: Gemma3Config) -> None:
+class QwenDecoderLayer(nn.Module):
+    def __init__(self, config: QwenConfig) -> None:
         super().__init__()
-        self.self_attn = Gemma3Attention(config)
-        self.mlp = Gemma3MLP(config)
-        # Gemma3 uses 4 norms per block:
-        # 1. input_layernorm - before attention
-        # 2. post_attention_layernorm - after attention (before residual add)
-        # 3. pre_feedforward_layernorm - before MLP
-        # 4. post_feedforward_layernorm - after MLP (before residual add)
-        self.input_layernorm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = QwenAttention(config)
+        self.mlp = QwenMLP(config)
+        self.input_layernorm = QwenRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = QwenRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -608,69 +599,68 @@ class Gemma3DecoderLayer(nn.Module):
         position_ids: torch.LongTensor,
         current_pos: torch.LongTensor,
     ) -> torch.Tensor:
-        # Gemma3 architecture: pre-norm + post-norm for both attention and MLP
-        # Note: Clamping is required for FP16/ANE to prevent overflow (Gemma3 was trained in bfloat16)
-
-        # Attention block
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states, causal_mask, position_ids, current_pos
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-        # Clamp to FP16 range to prevent overflow (max ~65504)
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
 
-        # MLP block
         residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-        # Clamp to FP16 range to prevent overflow
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
         return hidden_states
 
 
-class Gemma3Model(nn.Module):
-    def __init__(self, config: Gemma3Config) -> None:
+class QwenModel(nn.Module):
+    def __init__(self, config: QwenConfig) -> None:
         super().__init__()
         self.config = config
         self.disable_kv_cache = False  # Will be set by parent model
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=MODEL_DTYPE)
-        # Gemma3 scales embeddings by sqrt(hidden_size)
-        self.embedding_scale = config.hidden_size ** 0.5
-        
-        # Create dual RoPE embeddings for local vs global layers
-        self.rotary_emb_global = Gemma3RotaryEmbedding(config)  # Uses rope_theta (1e6)
-        # Create a config copy for local RoPE with different theta
-        local_config = type(config)(**config.__dict__)
-        local_config.rope_theta = getattr(config, 'rope_local_base_freq', 10000.0)
-        self.rotary_emb_local = Gemma3RotaryEmbedding(local_config)  # Uses rope_local_base_freq (10k)
-        
-        self.layers = nn.ModuleList(
-            [Gemma3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size).to(
+            TEST_DEVICE
         )
-        self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers = nn.ModuleList(
+            [QwenDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.norm = QwenRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Initialize KV cache with MODEL_DTYPE (following llama_model.py pattern)  
+        # Initialize KV cache with MODEL_DTYPE (following llama_model.py pattern)
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        if not hasattr(Gemma3Model, '_config_printed'):
-            print(f"Gemma3Model using head_dim={self.head_dim} for KV cache (config has: {getattr(config, 'head_dim', 'not set')})")
-            Gemma3Model._config_printed = True
-        
+        if not hasattr(QwenModel, '_config_printed'):
+            print(f"QwenModel using head_dim={self.head_dim} for KV cache (config has: {getattr(config, 'head_dim', 'not set')})")
+            QwenModel._config_printed = True
+
+        # Check for KV cache packing
+        self.pack_kvc = getattr(config, 'pack_kvc', False)
+        self.pack_factor = getattr(config, 'pack_factor', 1)
+
         if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
+            # Calculate number of buffers based on pack_kvc setting
+            if self.pack_kvc and config.context_length < config.state_length:
+                pack_factor = config.state_length // config.context_length
+                packed_per_type = (config.num_hidden_layers + pack_factor - 1) // pack_factor
+                num_buffers = packed_per_type * 2
+                self.pack_factor = pack_factor
+                self.packed_per_type = packed_per_type
+            else:
+                num_buffers = 2 * config.num_hidden_layers
+                self.packed_per_type = config.num_hidden_layers
+
             cache_size = (
-                2 * config.num_hidden_layers,
+                num_buffers,
                 config.num_key_value_heads,
                 config.state_length,
                 self.head_dim
             )
             self.register_buffer("kv_cache_0", torch.zeros(cache_size, dtype=MODEL_DTYPE, device=TEST_DEVICE))
-            if not hasattr(Gemma3Model, '_cache_init_printed'):
+
+            if not hasattr(QwenModel, '_cache_init_printed'):
                 print(f"Initialized unified KV kv_cache_0 with shape: {self.kv_cache_0.shape}")
-                Gemma3Model._cache_init_printed = True
+                if self.pack_kvc:
+                    print(f"  Pack KVC enabled: pack_factor={self.pack_factor}, packed_per_type={self.packed_per_type}")
+                QwenModel._cache_init_printed = True
         else:
             layers_per_group = config.num_hidden_layers
             for i in range(config.num_hidden_layers):
@@ -685,65 +675,35 @@ class Gemma3Model(nn.Module):
                     torch.zeros(cache_size, dtype=MODEL_DTYPE, device=TEST_DEVICE)
                 )
 
-    def get_rotary_embeddings_s(self, current_pos, layer_idx=0):
+    def get_rotary_embeddings_s(self, current_pos):
         """Get rotary embeddings for the current position"""
-        # Select RoPE based on layer type
-        if hasattr(self.config, "layer_types") and self.config.layer_types[layer_idx] == "full_attention":
-            rotary_emb = self.rotary_emb_global
-        else:
-            rotary_emb = self.rotary_emb_local
-            
-        sin = rotary_emb.sin_cached[:, current_pos].view(1, 1, 1, -1)
-        cos = rotary_emb.cos_cached[:, current_pos].view(1, 1, 1, -1)
+        sin = self.layers[0].self_attn.rotary_emb.sin_cached[:, current_pos].view(1, 1, 1, -1)
+        cos = self.layers[0].self_attn.rotary_emb.cos_cached[:, current_pos].view(1, 1, 1, -1)
         return cos.to(MODEL_DTYPE), sin.to(MODEL_DTYPE)
 
-    def get_rotary_embedding_prefill(self, positions, layer_idx=0):
+    def get_rotary_embedding_prefill(self, positions):
         """Get rotary embeddings for a sequence of positions.
         Args:
             positions: Tensor of position indices
-            layer_idx: Layer index to determine local vs global RoPE
         Returns:
             Tuple of (cos, sin) tensors with shape [1, seq_len, 1, head_dim]
         """
-        # Select RoPE based on layer type
-        if hasattr(self.config, "layer_types") and self.config.layer_types[layer_idx] == "full_attention":
-            rotary_emb = self.rotary_emb_global
-        else:
-            rotary_emb = self.rotary_emb_local
+        # Get rotary embeddings from the first attention layer
+        rotary_emb = self.layers[0].self_attn.rotary_emb
         
         # Get embeddings for the range of positions directly
-        # positions should be [batch_size, seq_len] or [seq_len]
-        if positions.dim() == 2:
-            seq_len = positions.size(1)  # [batch_size, seq_len]
-            pos_indices = positions.squeeze(0)  # Remove batch dimension
-        else:
-            seq_len = positions.size(0)  # [seq_len]
-            pos_indices = positions
-            
-        cos = rotary_emb.cos_cached[:, pos_indices].view(1, seq_len, 1, rotary_emb.dim)
-        sin = rotary_emb.sin_cached[:, pos_indices].view(1, seq_len, 1, rotary_emb.dim)
+        seq_len = positions.size(0)
+        cos = rotary_emb.cos_cached[:, positions].view(1, seq_len, 1, rotary_emb.dim)
+        sin = rotary_emb.sin_cached[:, positions].view(1, seq_len, 1, rotary_emb.dim)
         
         return cos.to(MODEL_DTYPE), sin.to(MODEL_DTYPE)
 
-    def _kv_slice(self, layer_idx: int, current_pos: int, q_len: int) -> tuple[int, int]:
-        """Return [start, end) key range to attend to for this layer / step."""
-        if self.config.layer_types[layer_idx] == "full_attention":
-            end = min(current_pos + q_len, self.config.state_length)
-            return 0, end
-        # sliding layer
-        end = min(current_pos + q_len, self.config.state_length)
-        start = max(0, end - self.config.sliding_window)
-        return start, end
-
-    def process_layer_prefill(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset):
+    def process_layer_prefill(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset):
         """Process a single transformer layer in prefill mode"""
         layer = self.layers[layer_idx]
-        
-        # Get layer-specific RoPE
-        rotary_emb = self.get_rotary_embedding_prefill(position_ids, layer_idx)
 
         normalized_states = layer.input_layernorm(hidden_states)
-        
+
         # Get query, key and value states for prefill
         query_states, key_states, value_states = layer.self_attn.get_new_kv_cache_prefill(
             normalized_states,
@@ -751,27 +711,50 @@ class Gemma3Model(nn.Module):
             rotary_emb
         )
 
-        # Get group indices
-        group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
-
-        # Get the combined KV cache for this group
+        # Get the combined KV cache
         if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
             kv_cache = getattr(self, "kv_cache_0")
         else:
+            group_idx, _, _ = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
             kv_cache = getattr(self, f"kv_cache_{group_idx}")
 
-        key_idx = layer_in_group_idx
-        value_idx = layer_in_group_idx + layers_per_group
-
-        # Store the full sequence length in prefill mode with bounds checking
         seq_length = key_states.shape[2]  # Get actual sequence length
-        end = min(current_pos + seq_length, self.config.state_length)
-        kv_cache[key_idx:key_idx + 1, :, current_pos:end, :] = key_states[:, :end-current_pos, :]
-        kv_cache[value_idx:value_idx + 1, :, current_pos:end, :] = value_states[:, :end-current_pos, :]
-        
-        # Get the key and value states for this layer from the merged cache
-        key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
-        value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+
+        # Debug: print shapes for first few layers
+        if layer_idx < 2:
+            print(f"[PREFILL DEBUG] layer_idx={layer_idx}, pack_kvc={self.pack_kvc}")
+            print(f"  kv_cache shape: {kv_cache.shape}")
+            print(f"  key_states shape: {key_states.shape}, seq_length={seq_length}")
+            print(f"  current_pos: {current_pos}, type: {type(current_pos)}")
+
+        if self.pack_kvc:
+            # Packed KV cache mode: IDENTICAL to non-packed, just different buffer indices
+            k_buffer_idx, v_buffer_idx, slice_offset = get_packed_kv_indices(
+                layer_idx, self.config.num_hidden_layers, self.pack_factor, self.config.context_length
+            )
+            key_idx = k_buffer_idx
+            value_idx = v_buffer_idx
+
+            # Store at current_pos (SAME as non-packed)
+            kv_cache[key_idx:key_idx + 1, :, current_pos:current_pos + seq_length, :] = key_states
+            kv_cache[value_idx:value_idx + 1, :, current_pos:current_pos + seq_length, :] = value_states
+
+            # Get the full buffer row for attention (SAME as non-packed)
+            key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+            value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+        else:
+            # Standard mode: each layer has its own buffer row
+            group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
+            key_idx = layer_in_group_idx
+            value_idx = layer_in_group_idx + layers_per_group
+
+            # Store at current_pos
+            kv_cache[key_idx:key_idx + 1, :, current_pos:current_pos + seq_length, :] = key_states
+            kv_cache[value_idx:value_idx + 1, :, current_pos:current_pos + seq_length, :] = value_states
+
+            # Get the full buffer row for attention
+            key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+            value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
 
         # Run attention with the updated KV cache
         attn_output = layer.self_attn.forward_prefill(
@@ -781,34 +764,20 @@ class Gemma3Model(nn.Module):
             causal_mask=causal_mask,
         )
 
-        # Apply post_attention_layernorm before residual add
-        attn_output = layer.post_attention_layernorm(attn_output)
         hidden_states = hidden_states + attn_output
-        # Clamp to FP16 range to prevent overflow (Gemma3 was trained in bfloat16)
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
 
-        # Apply MLP with proper normalization (Gemma3: pre + post feedforward norms)
-        residual = hidden_states
-        hidden_states = layer.pre_feedforward_layernorm(hidden_states)
-        hidden_states = layer.mlp(hidden_states)
-        hidden_states = layer.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-        # Clamp to FP16 range to prevent overflow
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+        # Always apply MLP in prefill mode when we need the output for generation
+        # Only skip MLP when doing pure cache priming (not generation)
+        post_attn = layer.post_attention_layernorm(hidden_states)
+        hidden_states = hidden_states + layer.mlp(post_attn)
 
         return hidden_states
 
-    def process_layer_regular(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset):
+    def process_layer_regular(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset):
         """Process a single transformer layer in regular (non-prefill) mode"""
         layer = self.layers[layer_idx]
         batch_size = position_ids.shape[0]
         seq_len = hidden_states.shape[1]
-        
-        # Get layer-specific RoPE
-        if seq_len == 1:
-            rotary_emb = self.get_rotary_embeddings_s(current_pos, layer_idx)
-        else:
-            rotary_emb = self.get_rotary_embedding_prefill(position_ids, layer_idx)
 
         normalized_states = layer.input_layernorm(hidden_states)
         
@@ -830,35 +799,76 @@ class Gemma3Model(nn.Module):
 
         if not self.disable_kv_cache:
             # Standard KV cache path
-            # Get group indices
-            group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
-
-            # Get the combined KV cache for this group
+            # Get the combined KV cache
             if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
                 kv_cache = getattr(self, "kv_cache_0")
             else:
+                group_idx, _, _ = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
                 kv_cache = getattr(self, f"kv_cache_{group_idx}")
 
-            key_idx = layer_in_group_idx
-            value_idx = layer_in_group_idx + layers_per_group
+            if self.pack_kvc:
+                # Packed KV cache mode: IDENTICAL to non-packed, just different buffer indices
+                k_buffer_idx, v_buffer_idx, slice_offset = get_packed_kv_indices(
+                    layer_idx, self.config.num_hidden_layers, self.pack_factor, self.config.context_length
+                )
+                key_idx = k_buffer_idx
+                value_idx = v_buffer_idx
 
-            if seq_len == 1:
-                # Single token storage
-                pos = current_pos            
-                kv_cache[key_idx:key_idx + 1, :, pos:pos + 1, :] = key_states
-                kv_cache[value_idx:value_idx + 1, :, pos:pos + 1, :] = value_states
+                if seq_len == 1:
+                    index = int(layer_idx-(layer_idx // 4)*4 )
+                    offset = int(index * 64)
+                    # we have 4 by 64 vectors packed in 256 context length,
+                    # Single token storage (SAME as non-packed)
+                    # pos -->
+                    # we have 4 x 64 layer in buffer
+
+                    # key_idx --> key_idx /4 
+                    # value_idx --> value_idx /4
+
+                    #pos = current_pos 
+                    pos = current_pos + torch.tensor([index * 64], dtype=current_pos.dtype, device=current_pos.device)
+
+                    kv_cache[  key_idx//4:  key_idx//4 + 1, :, pos:pos + 1, :] = key_states
+                    kv_cache[value_idx//4:value_idx//4 + 1, :, pos:pos + 1, :] = value_states
+
+                    # Get the full buffer row for attention (SAME as non-packed)
+                    key_cache =   kv_cache[  key_idx//4:  key_idx//4 + 1].squeeze(0)
+                    value_cache = kv_cache[value_idx//4:value_idx//4 + 1].squeeze(0)
+
+                    # [ heads, state_length, head_dim]
+                    # cut out offset:offset + seq_len for 64 valuse only!
+                    key_cache   = key_cache  [..., offset:offset + 64,:] 
+                    value_cache = value_cache[..., offset:offset + 64,:]
+
+                else:
+                    # Multi-token storage (SAME as non-packed)
+                    pos = current_pos.item() if isinstance(current_pos, torch.Tensor) else current_pos
+                    kv_cache[key_idx:key_idx + 1, :, pos:pos + seq_len, :] = key_states
+                    kv_cache[value_idx:value_idx + 1, :, pos:pos + seq_len, :] = value_states
+                    # Get the full buffer row for attention (SAME as non-packed)
+                    key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+                    value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+
             else:
-                # Multi-token storage (like prefill)
-                pos = current_pos.item() if isinstance(current_pos, torch.Tensor) else current_pos
-                # Store the key and value states in the cache with bounds checking
-                end = min(pos + seq_len, self.config.state_length)
-                kv_cache[key_idx:key_idx + 1, :, pos:end, :] = key_states[:, :end-pos, :]
-                kv_cache[value_idx:value_idx + 1, :, pos:end, :] = value_states[:, :end-pos, :]
+                # Standard mode: each layer has its own buffer row
+                group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
+                key_idx = layer_in_group_idx
+                value_idx = layer_in_group_idx + layers_per_group
 
-            
-            # Get the key and value states for this layer from the merged cache
-            key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
-            value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+                if seq_len == 1:
+                    # Single token storage
+                    pos = current_pos
+                    kv_cache[key_idx:key_idx + 1, :, pos:pos + 1, :] = key_states
+                    kv_cache[value_idx:value_idx + 1, :, pos:pos + 1, :] = value_states
+                else:
+                    # Multi-token storage (like prefill)
+                    pos = current_pos.item() if isinstance(current_pos, torch.Tensor) else current_pos
+                    kv_cache[key_idx:key_idx + 1, :, pos:pos + seq_len, :] = key_states
+                    kv_cache[value_idx:value_idx + 1, :, pos:pos + seq_len, :] = value_states
+
+                # Get the key and value states for this layer from the merged cache
+                key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+                value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
 
             # Run attention with the updated KV cache
             if seq_len == 1:
@@ -868,26 +878,25 @@ class Gemma3Model(nn.Module):
                     kv_cache_layer=(key_cache, value_cache),
                     causal_mask=causal_mask,
                     current_pos=current_pos,
-                    layer_idx=layer_idx,
                 )
             else:
                 # For multi-token sequences, adjust causal mask to match cache dimensions
-                cache_len = self.config.state_length
+                # Use context_length for packed mode, state_length for standard mode
+                cache_len = self.config.context_length if self.pack_kvc else self.config.state_length
                 adjusted_causal_mask = torch.zeros((1, 1, seq_len, cache_len), dtype=MODEL_DTYPE, device=TEST_DEVICE)
-                
+
                 # Apply causal mask only to the positions we're using (pos:pos+seq_len)
                 pos = current_pos.item() if isinstance(current_pos, torch.Tensor) else current_pos
                 for i in range(seq_len):
                     for j in range(pos + i + 1, pos + seq_len):
                         if j < cache_len:  # Make sure we don't go out of bounds
                             adjusted_causal_mask[0, 0, i, j] = float('-inf')
-                
+
                 attn_output = layer.self_attn.forward_prefill(
                     hidden_states=normalized_states,
                     query_states=query_states,
                     kv_cache_layer=(key_cache, value_cache),
                     causal_mask=adjusted_causal_mask,
-                    layer_idx=layer_idx,
                 )
         else:
             # No KV cache path - use the computed K/V directly without cache
@@ -934,7 +943,6 @@ class Gemma3Model(nn.Module):
                     kv_cache_layer=(fake_key_cache, fake_value_cache),
                     causal_mask=adjusted_causal_mask,
                     current_pos=current_pos,
-                    layer_idx=layer_idx,
                 )
             else:
                 attn_output = layer.self_attn.forward_prefill(
@@ -942,34 +950,24 @@ class Gemma3Model(nn.Module):
                     query_states=query_states,
                     kv_cache_layer=(fake_key_cache, fake_value_cache),
                     causal_mask=adjusted_causal_mask,
-                    layer_idx=layer_idx,
                 )
 
-        # Apply post_attention_layernorm before residual add
-        attn_output = layer.post_attention_layernorm(attn_output)
         hidden_states = hidden_states + attn_output
-        # Clamp to FP16 range to prevent overflow (Gemma3 was trained in bfloat16)
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
 
-        # Apply MLP with proper normalization (Gemma3: pre + post feedforward norms)
-        residual = hidden_states
-        hidden_states = layer.pre_feedforward_layernorm(hidden_states)
-        hidden_states = layer.mlp(hidden_states)
-        hidden_states = layer.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-        # Clamp to FP16 range to prevent overflow
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+        # Add post-attention normalization and MLP
+        post_attn = layer.post_attention_layernorm(hidden_states)
+        hidden_states = hidden_states + layer.mlp(post_attn)
 
         return hidden_states
 
-    def process_layer(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset, IN_PREFILL=False):
+    def process_layer(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset, IN_PREFILL=False):
         """Process a single transformer layer, delegating to the appropriate mode-specific implementation"""
         if IN_PREFILL:
-           return self.process_layer_prefill(layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset)
+           return self.process_layer_prefill(layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset)
         else:
-            return self.process_layer_regular(layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset)
+            return self.process_layer_regular(layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset)
 
-    def process_layers(self, hidden_states, position_ids, causal_mask, current_pos, start_layer=0, end_layer=None, IN_PREFILL=False):
+    def process_layers(self, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, start_layer=0, end_layer=None, IN_PREFILL=False):
         """Process a range of transformer layers"""
         if end_layer is None:
             end_layer = len(self.layers)
@@ -981,7 +979,7 @@ class Gemma3Model(nn.Module):
         for i in range(start_layer, end_layer):
             hidden_states = self.process_layer(
                 i, hidden_states, position_ids,
-                causal_mask, current_pos, layer_offset, IN_PREFILL
+                causal_mask, current_pos, rotary_emb, layer_offset, IN_PREFILL
             )
         return hidden_states
 
@@ -995,13 +993,17 @@ class Gemma3Model(nn.Module):
     ) -> torch.Tensor:
         """Forward pass through the transformer layers with KV cache support."""
         hidden_states = self.embed_tokens(input_ids)
-        # Apply Gemma3 embedding scaling
-        hidden_states = hidden_states * self.embedding_scale
         
-        # Process layers (rotary embeddings are now retrieved per-layer based on layer type)
+        # Get rotary embeddings
+        if IN_PREFILL:
+            rotary_emb = self.get_rotary_embedding_prefill(position_ids)
+        else:
+            rotary_emb = self.get_rotary_embeddings_s(current_pos)
+
+        # Process layers
         hidden_states = self.process_layers(
             hidden_states, position_ids, causal_mask,
-            current_pos, start_layer=0, end_layer=None, IN_PREFILL=IN_PREFILL,
+            current_pos, rotary_emb, start_layer=0, end_layer=None, IN_PREFILL=IN_PREFILL,
         )
 
         # Always apply final normalization - critical for correct model output
@@ -1015,7 +1017,8 @@ class Gemma3Model(nn.Module):
         """
         batch_size, seq_length, _ = hidden_states.size()
         
-        # Note: rotary embeddings are now retrieved per-layer based on layer type
+        # Get rotary embeddings
+        rotary_emb = self.get_rotary_embedding_prefill(position_ids)
         
         # Process layers within the specified range if provided
         if start_layer is not None and end_layer is not None:
@@ -1024,6 +1027,7 @@ class Gemma3Model(nn.Module):
                 position_ids=position_ids,
                 causal_mask=causal_mask,
                 current_pos=current_pos,
+                rotary_emb=rotary_emb,
                 start_layer=start_layer,
                 end_layer=end_layer,
                 IN_PREFILL=True
@@ -1035,6 +1039,7 @@ class Gemma3Model(nn.Module):
                 position_ids=position_ids,
                 causal_mask=causal_mask,
                 current_pos=current_pos,
+                rotary_emb=rotary_emb,
                 IN_PREFILL=True
             )
         
@@ -1079,24 +1084,20 @@ class Gemma3Model(nn.Module):
                 conv_state[new_k] = v
 
         missing, unexpected = self.load_state_dict(conv_state, strict=False)
-        # Filter out expected missing keys
-        # - rotary embeddings are computed, not loaded
-        # - KV cache buffer is initialized separately
-        missing = [m for m in missing if "rotary_emb" not in m and "kv_cache" not in m]
-
-        # Filter out unexpected keys that are actually expected from HF format differences
-        # (none expected currently - all layer norms should now be present)
-
+        missing = [m for m in missing if "rotary_emb.inv_freq" not in m]
+        # Filter out expected missing keys including KV cache buffer
+        expected_missing = ['kv_cache_0']  # KV cache buffer is initialized separately
+        missing = [m for m in missing if m not in expected_missing]
         if missing or unexpected:
             print("Missing keys", missing)
             print("Unexpected keys", unexpected)
         return not missing and not unexpected
 
 
-class Gemma3ForCausalLM(nn.Module):
-    config_class = Gemma3Config
+class QwenForCausalLM(nn.Module):
+    config_class = QwenConfig
 
-    def __init__(self, config: Gemma3Config, enable_coreml=False, disable_kv_cache=False, **kwargs) -> None:
+    def __init__(self, config: QwenConfig, enable_coreml=False, disable_kv_cache=False, **kwargs) -> None:
         super().__init__()
         self.config = config
         self.enable_coreml = enable_coreml
@@ -1108,7 +1109,7 @@ class Gemma3ForCausalLM(nn.Module):
             ENABLE_COREML = True
             print(f"Set global ENABLE_COREML = {ENABLE_COREML} for CoreML conversion")
         
-        self.model = Gemma3Model(config)
+        self.model = QwenModel(config)
         # Set the disable_kv_cache flag on the model
         self.model.disable_kv_cache = self.disable_kv_cache
         
@@ -1122,9 +1123,9 @@ class Gemma3ForCausalLM(nn.Module):
                     split_size = vocab_split + (1 if i < vocab_remainder else 0)
                     setattr(self, f"lm_head16_{i+1}", 
                            nn.Conv2d(config.hidden_size, split_size, 1, bias=False, dtype=MODEL_DTYPE).to(TEST_DEVICE))
-                if not hasattr(Gemma3ForCausalLM, '_lm_head_printed'):
+                if not hasattr(QwenForCausalLM, '_lm_head_printed'):
                     print("Created lm_head16_1 through lm_head16_16")
-                    Gemma3ForCausalLM._lm_head_printed = True
+                    QwenForCausalLM._lm_head_printed = True
             elif ENABLE_VACAB_SPLIT8:
                 vocab_split = config.vocab_size // 8
                 vocab_remainder = config.vocab_size % 8
@@ -1286,8 +1287,6 @@ class Gemma3ForCausalLM(nn.Module):
         
         # Get embeddings and run through model
         hidden_states = self.model.embed_tokens(input_ids)
-        # Apply Gemma3 embedding scaling
-        hidden_states = hidden_states * self.model.embedding_scale
         hidden_states = hidden_states.to(MODEL_DTYPE)
 
         # Get correct causal mask for the sequence

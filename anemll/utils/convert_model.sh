@@ -142,6 +142,7 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)" || {
 
 # Detect architecture from config.json
 CONFIG_FILE="$MODEL_PATH/config.json"
+SPLIT_LM_HEAD=8  # Default for most models
 if [ -f "$CONFIG_FILE" ]; then
     ARCH=$(jq -r '.model_type // (.architectures[0] // "")' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
     # Check for Qwen2 (which is Qwen 2.5) or Qwen2ForCausalLM architecture
@@ -157,6 +158,14 @@ if [ -f "$CONFIG_FILE" ]; then
         if [ "$PREFIX" = "llama" ]; then
             PREFIX="qwen"
         fi
+    elif [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
+        CONVERTER="python3 -m anemll.ane_converter.gemma3_converter"
+        # Use "gemma3" as default prefix for Gemma3 models unless explicitly set
+        if [ "$PREFIX" = "llama" ]; then
+            PREFIX="gemma3"
+        fi
+        # Gemma3 uses 16-way LM head split due to large vocabulary (262,144 tokens)
+        SPLIT_LM_HEAD=16
     else
         CONVERTER="python3 -m anemll.ane_converter.llama_converter"
     fi
