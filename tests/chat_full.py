@@ -320,11 +320,12 @@ def parse_args():
                 args.batch_size = int(params['batch_size'])
             args.num_chunks = num_chunks
             
-            # Parse split_lm_head parameter from meta.yaml
-            if 'split_lm_head' in params:
-                args.split_lm_head = int(params['split_lm_head'])
-            else:
-                args.split_lm_head = 8  # Default value
+            # Parse split_lm_head parameter from meta.yaml, but allow CLI override
+            if args.split_lm_head is None:
+                if 'split_lm_head' in params:
+                    args.split_lm_head = int(params['split_lm_head'])
+                else:
+                    args.split_lm_head = 8  # Default value
             
             print(f"\nLoaded parameters from {args.meta}:")
             print(f"  Context Length: {args.context_length}")

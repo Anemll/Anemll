@@ -1,0 +1,3 @@
+{"id": "long_history_03", "prompt": "History of England and UK", "category": "long_form", "risk": "repetition"}
+{"id": "numeric_formulas_01", "prompt": "Write 50 lines of mathematical expressions like: x1 = sin(0.1) + cos(0.2), x2 = sin(0.2) + cos(0.4), continuing the pattern.", "category": "numeric", "risk": "high_repetition", "expected_repetition": true, "target_len": "long", "notes": "repeated arithmetic tokens stress"}
+{"id": "long_history_01", "prompt": "Write a detailed history of the Roman Empire from its founding to its fall.", "category": "long_form", "risk": "repetition"}

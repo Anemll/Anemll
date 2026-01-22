@@ -939,11 +939,12 @@ def parse_args():
             if 'num_logits' in params:
                 args.num_logits = int(params['num_logits'])
             
-            # Add split_lm_head parameter with default of 8
-            if 'split_lm_head' in params:
-                args.split_lm_head = int(params['split_lm_head'])
-            else:
-                args.split_lm_head = 8  # Default value for backward compatibility
+            # Add split_lm_head parameter with default of 8, but allow CLI override
+            if args.split_lm_head is None:
+                if 'split_lm_head' in params:
+                    args.split_lm_head = int(params['split_lm_head'])
+                else:
+                    args.split_lm_head = 8  # Default value for backward compatibility
             
             if not args.eval:
                 print(f"\nLoaded parameters from {args.meta}:")

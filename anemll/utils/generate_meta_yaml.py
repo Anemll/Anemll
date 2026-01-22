@@ -53,7 +53,10 @@ def main():
     ffn_path = f'{ffn_name}.mlmodelc'
     
     # Set split_lm_head based on architecture
-    split_lm_head = 16 if ARCH.startswith('qwen') else 8
+    if ARCH.startswith('qwen') or ARCH.startswith('gemma'):
+        split_lm_head = 16
+    else:
+        split_lm_head = 8
     
     meta = f'''model_info:
   name: anemll-{MODEL_NAME}-ctx{CONTEXT}
