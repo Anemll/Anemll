@@ -101,9 +101,14 @@ LUT_FFN=$(grep "lut_ffn:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6)
 LUT_LMHEAD=$(grep "lut_lmhead:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6)
 LUT_EMBEDDINGS=$(grep "lut_embeddings:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6 2>/dev/null || echo "")
 
-# Only llama is supported
+# Detect architecture for tokenizer config
+ARCH=$(grep "architecture:" "$INPUT_DIR/meta.yaml" | awk '{print $2}')
 MODEL_TYPE="llama"
 TOKENIZER_CLASS="LlamaTokenizer"
+if [[ "$ARCH" == gemma* ]]; then
+    MODEL_TYPE="gemma"
+    TOKENIZER_CLASS="GemmaTokenizer"
+fi
 
 # Validate and set default values for LUT parameters
 validate_lut_values
@@ -155,6 +160,9 @@ prepare_common_files() {
     cp "$INPUT_DIR/meta.yaml" "$target_dir/"
     cp "$INPUT_DIR/tokenizer.json" "$target_dir/"
     cp "$INPUT_DIR/tokenizer_config.json" "$target_dir/"
+    if [ -f "$INPUT_DIR/tokenizer.model" ]; then
+        cp "$INPUT_DIR/tokenizer.model" "$target_dir/"
+    fi
     
     # Copy tokenizer vocabulary files if they exist
     if [ -f "$INPUT_DIR/vocab.json" ]; then
