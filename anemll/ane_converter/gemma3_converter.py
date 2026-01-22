@@ -1086,9 +1086,8 @@ def test_conversion(
 
         # Update config to match conversion parameters
         config.context_length = context_length
-        config.state_length = max(
-            config.state_length, context_length
-        )  # Ensure state_length is at least context_length
+        # Align cache length to conversion context for test inputs.
+        config.state_length = context_length
         print(
             f"Updated config: context_length={config.context_length}, state_length={config.state_length}"
         )

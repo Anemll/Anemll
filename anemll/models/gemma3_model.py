@@ -498,17 +498,9 @@ class Gemma3Attention(nn.Module):
         # Get KV cache
         K_layer_cache, V_layer_cache = kv_cache_layer
         
-        # Determine the usable KV range for windowed attention
-        q_len = query_states.shape[2]
-        pos = int(current_pos) if current_pos is not None else 0
-        end = min(pos + (q_len if q_len > 1 else 1), self.config.state_length)
-        start = 0
-        if layer_idx is not None and hasattr(self.config, "layer_types"):
-            if self.config.layer_types[layer_idx] == "sliding_attention":
-                start = max(0, end - self.config.sliding_window)
-        
-        K_window = K_layer_cache[:, start:end, :]
-        V_window = V_layer_cache[:, start:end, :]
+        # Use fixed cache length to avoid tracing dynamic slices.
+        K_window = K_layer_cache[..., :self.config.state_length, :]
+        V_window = V_layer_cache[..., :self.config.state_length, :]
         
         # Repeat KV for multi-head attention
         n_rep = self.num_heads // self.num_kv_heads

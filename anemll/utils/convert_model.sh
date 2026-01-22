@@ -336,6 +336,7 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
         # Copy tokenizer files if they exist
         (cp \"$MODEL_PATH/tokenizer.json\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/tokenizer_config.json\" \"$OUTPUT_DIR/\" || true) && \
+        (cp \"$MODEL_PATH/tokenizer.model\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/vocab.json\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/merges.txt\" \"$OUTPUT_DIR/\" || true) && \
         
