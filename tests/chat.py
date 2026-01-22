@@ -167,12 +167,60 @@ def parse_model_path(path):
         
         # Add no-LUT candidates to the list for error reporting
         candidates.extend(candidates_no_lut)
+
+    # If FFN path isn't chunked, try to find chunked variants.
+    path_str = str(path)
+    base_str = str(path.with_suffix('')) if path.suffix in ('.mlmodelc', '.mlpackage') else path_str
+    if "_chunk_" not in base_str:
+        chunk_pattern = f"{base_str}_chunk_*of*"
+        chunk_candidates = sorted(glob.glob(chunk_pattern + ".mlmodelc"))
+        if not chunk_candidates:
+            chunk_candidates = sorted(glob.glob(chunk_pattern + ".mlpackage"))
+        if chunk_candidates:
+            return str(Path(chunk_candidates[0]))
+        candidates.extend([Path(p) for p in sorted(glob.glob(chunk_pattern + ".mlmodelc"))])
+        candidates.extend([Path(p) for p in sorted(glob.glob(chunk_pattern + ".mlpackage"))])
             
     # If we get here, no valid path was found
     print("\nError: Model not found. Tried following paths:")
     for candidate in candidates:
         print(f"  {candidate}")
     raise FileNotFoundError(f"Model not found: {path}")
+
+def build_stop_token_ids(tokenizer):
+    """Collect token IDs that should stop generation."""
+    def _get_token_id_if_present(token_str):
+        if not token_str:
+            return None
+        if hasattr(tokenizer, "get_vocab"):
+            vocab = tokenizer.get_vocab()
+            if token_str in vocab:
+                return vocab[token_str]
+        token_id = tokenizer.convert_tokens_to_ids(token_str)
+        if isinstance(token_id, list):
+            if len(token_id) == 1:
+                token_id = token_id[0]
+            else:
+                return None
+        if token_id is None:
+            return None
+        if tokenizer.unk_token_id is not None and token_id == tokenizer.unk_token_id:
+            return None
+        return token_id
+
+    stop_ids = set()
+    eos_token_ids = tokenizer.eos_token_id
+    if isinstance(eos_token_ids, list):
+        stop_ids.update(eos_token_ids)
+    elif eos_token_ids is not None:
+        stop_ids.add(eos_token_ids)
+
+    for token_str in ("<|endoftext|>", "<end_of_turn>", "<|eot_id|>"):
+        token_id = _get_token_id_if_present(token_str)
+        if token_id is not None:
+            stop_ids.add(token_id)
+
+    return stop_ids
 
 def parse_ffn_filename(path):
     """Parse FFN model filename to extract chunk information."""
@@ -192,10 +240,11 @@ def find_all_chunks(base_path):
     pattern = re.sub(r'_chunk_\d+of\d+', '_chunk_*', str(path))
     return sorted(glob.glob(pattern))
 
-def load_model(path, function_name=None):
+def load_model(path, function_name=None, compute_unit=None):
     """Load a CoreML model, handling both .mlmodelc and .mlpackage formats."""
     path = Path(path)
-    compute_unit = ct.ComputeUnit.CPU_AND_NE
+    if compute_unit is None:
+        compute_unit = ct.ComputeUnit.CPU_AND_NE
     
     try:
         if path.suffix == '.mlmodelc':
@@ -321,7 +370,12 @@ def load_models(args,metadata):
     """Load all required models and extract metadata."""
     if not args.eval:
         print("\nLoading models...")
-    
+
+    # Determine compute unit
+    compute_unit = ct.ComputeUnit.CPU_ONLY if getattr(args, 'cpu', False) else ct.ComputeUnit.CPU_AND_NE
+    if not args.eval and getattr(args, 'cpu', False):
+        print("Running in CPU-only mode")
+
     try:
         # Load embeddings model
         if not args.eval:
@@ -329,7 +383,7 @@ def load_models(args,metadata):
         embed_path = parse_model_path(args.embed)
         if not args.eval:
             print(f"Loading from: {embed_path}")
-        embed_model = load_model(embed_path)
+        embed_model = load_model(embed_path, compute_unit=compute_unit)
         if not args.eval:
             print("Embeddings model loaded successfully")
         metadata = load_metadata(embed_model,args)
@@ -342,7 +396,7 @@ def load_models(args,metadata):
         lmhead_path = parse_model_path(args.lmhead)
         if not args.eval:
             print(f"Loading from: {lmhead_path}")
-        lmhead_model = load_model(lmhead_path)
+        lmhead_model = load_model(lmhead_path, compute_unit=compute_unit)
         if not args.eval:
             print("LM head model loaded successfully")
         
@@ -367,8 +421,8 @@ def load_models(args,metadata):
                 try:
                     # For chunked models, we need both infer and prefill functions
                     ffn_models.append({
-                        'infer': load_model(chunk_path, function_name='infer'),
-                        'prefill': load_model(chunk_path, function_name='prefill')
+                        'infer': load_model(chunk_path, function_name='infer', compute_unit=compute_unit),
+                        'prefill': load_model(chunk_path, function_name='prefill', compute_unit=compute_unit)
                     })
                     if not args.eval:
                         print("Chunk loaded successfully")
@@ -381,7 +435,7 @@ def load_models(args,metadata):
         else:
             if not args.eval:
                 print("\nLoading single FFN model...")
-            ffn_models.append(load_model(ffn_path))
+            ffn_models.append(load_model(ffn_path, compute_unit=compute_unit))
             if not args.eval:
                 print("FFN model loaded successfully")
         
@@ -624,6 +678,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
     except:
         if not warmup and not eval_mode:
             print("\nUsing manual formatting for prompts")
+
+    stop_token_ids = build_stop_token_ids(tokenizer)
     
     conversation = []
     
@@ -763,18 +819,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     if max_tokens is not None and tokens_generated >= max_tokens:
                         break
                         
-                    # Check for all possible EOS tokens (including endoftext for Qwen3)
-                    eos_token_ids = tokenizer.eos_token_id
-                    stop_ids = set()
-                    if isinstance(eos_token_ids, list):
-                        stop_ids.update(eos_token_ids)
-                    else:
-                        stop_ids.add(eos_token_ids)
-                    # Also check for endoftext token (often used as stop token)
-                    endoftext_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
-                    if endoftext_id is not None and endoftext_id != tokenizer.unk_token_id:
-                        stop_ids.add(endoftext_id)
-                    if next_token in stop_ids:
+                    if next_token in stop_token_ids:
                         break
                 
                 # Calculate inference timing
@@ -802,7 +847,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                             time.sleep(0.5)
                             
                             # Make sure response ends with EOS token if it's supposed to
-                            if response and not response.endswith("<|eot_id|>") and not response.endswith("</s>"):
+                            if response and not response.endswith("<|eot_id|>") and not response.endswith("</s>") and not response.endswith("<end_of_turn>"):
                                 if tokenizer.eos_token:
                                     eos_text = tokenizer.decode([tokenizer.eos_token_id])
                                     if not response.endswith(eos_text):
@@ -881,7 +926,11 @@ def parse_args():
     # Add eval mode flag
     parser.add_argument('--eval', action='store_true',
                        help='Evaluation mode: suppress all output except model response')
-    
+
+    # Add CPU-only mode
+    parser.add_argument('--cpu', action='store_true',
+                       help='Run on CPU only (no ANE/GPU)')
+
     # Model configuration
     parser.add_argument('--context-length', type=int,
                        help='Context length for the model (default: 512), if not provided, it will be detected from the model directory name ctxNUMBER')
@@ -893,6 +942,11 @@ def parse_args():
                        help='Number of logits splits from LM head (default: 8 for llama, 16 for qwen)')
     
     args = parser.parse_args()
+
+    def _strip_model_ext(value):
+        if value is None:
+            return None
+        return value.replace('.mlmodelc', '').replace('.mlpackage', '')
     
     # If meta.yaml is provided, load parameters from it
     if args.meta:
@@ -925,11 +979,12 @@ def parse_args():
                     args.batch_size = int(params['batch_size'])
                 args.num_chunks = 1  # Monolithic has no chunks
 
-                # Set split_lm_head
-                if 'split_lm_head' in params:
-                    args.split_lm_head = int(params['split_lm_head'])
-                else:
-                    args.split_lm_head = 16 if 'qwen' in prefix.lower() else 8
+                # Set split_lm_head, but allow CLI override
+                if args.split_lm_head is None:
+                    if 'split_lm_head' in params:
+                        args.split_lm_head = int(params['split_lm_head'])
+                    else:
+                        args.split_lm_head = 16 if 'qwen' in prefix.lower() else 8
 
                 # Set tokenizer path
                 if not args.tokenizer:
@@ -958,17 +1013,27 @@ def parse_args():
                 # First check explicit keys from meta.yaml, then fall back to constructed names
                 if not args.lmhead:
                     if 'lm_head' in params:
-                        args.lmhead = params['lm_head'].replace('.mlmodelc', '').replace('.mlpackage', '')
+                        args.lmhead = _strip_model_ext(params['lm_head'])
                     else:
                         args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
                 if not args.embed:
                     if 'embeddings' in params:
-                        args.embed = params['embeddings'].replace('.mlmodelc', '').replace('.mlpackage', '')
+                        args.embed = _strip_model_ext(params['embeddings'])
                     else:
                         args.embed = f'{prefix}_embeddings{lut_embeddings}'
                 if not args.ffn:
                     if 'ffn' in params:
-                        args.ffn = params['ffn'].replace('.mlmodelc', '').replace('.mlpackage', '')
+                        ffn_candidate = _strip_model_ext(params['ffn'])
+                        ffn_path = Path(ffn_candidate)
+                        if "_chunk_" not in ffn_candidate:
+                            default_ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
+                            base_dir = ffn_path.parent if ffn_path.is_absolute() else Path(args.d)
+                            if (base_dir / f"{default_ffn}.mlmodelc").exists() or (base_dir / f"{default_ffn}.mlpackage").exists():
+                                args.ffn = str(base_dir / default_ffn) if ffn_path.is_absolute() else default_ffn
+                            else:
+                                args.ffn = ffn_candidate
+                        else:
+                            args.ffn = ffn_candidate
                     else:
                         args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
                 if not args.tokenizer:
@@ -986,10 +1051,12 @@ def parse_args():
                 if 'num_logits' in params:
                     args.num_logits = int(params['num_logits'])
 
-                if 'split_lm_head' in params:
-                    args.split_lm_head = int(params['split_lm_head'])
-                else:
-                    args.split_lm_head = 8
+                # Set split_lm_head, but allow CLI override
+                if args.split_lm_head is None:
+                    if 'split_lm_head' in params:
+                        args.split_lm_head = int(params['split_lm_head'])
+                    else:
+                        args.split_lm_head = 8
 
                 if not args.eval:
                     print(f"\nLoaded parameters from {args.meta}:")
@@ -1020,6 +1087,11 @@ def load_monolithic_model(args, metadata):
     if not args.eval:
         print("\nLoading monolithic model...")
 
+    # Determine compute unit
+    compute_unit = ct.ComputeUnit.CPU_ONLY if getattr(args, 'cpu', False) else ct.ComputeUnit.CPU_AND_NE
+    if not args.eval and getattr(args, 'cpu', False):
+        print("Running in CPU-only mode")
+
     model_path = str(Path(args.d) / args.monolithic_model)
     model_path = parse_model_path(model_path)
 
@@ -1027,8 +1099,8 @@ def load_monolithic_model(args, metadata):
         print(f"Loading from: {model_path}")
 
     # Load both infer and prefill functions
-    infer_model = load_model(model_path, function_name='infer')
-    prefill_model = load_model(model_path, function_name='prefill')
+    infer_model = load_model(model_path, function_name='infer', compute_unit=compute_unit)
+    prefill_model = load_model(model_path, function_name='prefill', compute_unit=compute_unit)
 
     if not args.eval:
         print("Monolithic model loaded successfully (infer + prefill functions)")
@@ -1143,6 +1215,8 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
         if not warmup and not eval_mode:
             print("\nUsing manual formatting for prompts")
 
+    stop_token_ids = build_stop_token_ids(tokenizer)
+
     try:
         while True:
             try:
@@ -1229,18 +1303,7 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                     if max_tokens is not None and tokens_generated >= max_tokens:
                         break
 
-                    # Check for all possible EOS tokens (including endoftext for Qwen3)
-                    eos_token_ids = tokenizer.eos_token_id
-                    stop_ids = set()
-                    if isinstance(eos_token_ids, list):
-                        stop_ids.update(eos_token_ids)
-                    else:
-                        stop_ids.add(eos_token_ids)
-                    # Also check for endoftext token (often used as stop token)
-                    endoftext_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
-                    if endoftext_id is not None and endoftext_id != tokenizer.unk_token_id:
-                        stop_ids.add(endoftext_id)
-                    if next_token in stop_ids:
+                    if next_token in stop_token_ids:
                         break
 
                 inference_time = time.time() - inference_start

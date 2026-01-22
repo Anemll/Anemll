@@ -164,12 +164,91 @@ def parse_model_path(path):
         
         # Add no-LUT candidates to the list for error reporting
         candidates.extend(candidates_no_lut)
+
+    # If FFN path isn't chunked, try to find chunked variants.
+    path_str = str(path)
+    base_str = str(path.with_suffix('')) if path.suffix in ('.mlmodelc', '.mlpackage') else path_str
+    if "_chunk_" not in base_str:
+        chunk_pattern = f"{base_str}_chunk_*of*"
+        chunk_candidates = sorted(glob.glob(chunk_pattern + ".mlmodelc"))
+        if not chunk_candidates:
+            chunk_candidates = sorted(glob.glob(chunk_pattern + ".mlpackage"))
+        if chunk_candidates:
+            print(f"Found model at: {chunk_candidates[0]}")
+            return str(Path(chunk_candidates[0]))
+        candidates.extend([Path(p) for p in sorted(glob.glob(chunk_pattern + ".mlmodelc"))])
+        candidates.extend([Path(p) for p in sorted(glob.glob(chunk_pattern + ".mlpackage"))])
             
     # If we get here, no valid path was found
     print("\nError: Model not found. Tried following paths:")
     for candidate in candidates:
         print(f"  {candidate}")
     raise FileNotFoundError(f"Model not found: {path}")
+
+def build_stop_token_ids(tokenizer):
+    """Collect token IDs that should stop generation."""
+    def _get_token_id_if_present(token_str):
+        if not token_str:
+            return None
+        if hasattr(tokenizer, "get_vocab"):
+            vocab = tokenizer.get_vocab()
+            if token_str in vocab:
+                return vocab[token_str]
+        token_id = tokenizer.convert_tokens_to_ids(token_str)
+        if isinstance(token_id, list):
+            if len(token_id) == 1:
+                token_id = token_id[0]
+            else:
+                return None
+        if token_id is None:
+            return None
+        if tokenizer.unk_token_id is not None and token_id == tokenizer.unk_token_id:
+            return None
+        return token_id
+
+    stop_ids = set()
+    eos_token_ids = tokenizer.eos_token_id
+    if isinstance(eos_token_ids, list):
+        stop_ids.update(eos_token_ids)
+    elif eos_token_ids is not None:
+        stop_ids.add(eos_token_ids)
+
+    for token_str in ("<|endoftext|>", "<end_of_turn>", "<|eot_id|>"):
+        token_id = _get_token_id_if_present(token_str)
+        if token_id is not None:
+            stop_ids.add(token_id)
+
+    return stop_ids
+
+def format_manual_prompt(messages):
+    """Format a plain text prompt when no chat template is available."""
+    system = None
+    turns = []
+    pending_user = None
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content", "")
+        if role == "system":
+            system = content
+        elif role == "user":
+            pending_user = content
+        elif role == "assistant":
+            if pending_user is not None:
+                turns.append((pending_user, content))
+                pending_user = None
+
+    def _format_inst(user_text, system_text):
+        if system_text:
+            return f"[INST] <<SYS>>\n{system_text}\n<</SYS>>\n\n{user_text} [/INST]"
+        return f"[INST] {user_text} [/INST]"
+
+    blocks = []
+    for user_text, assistant_text in turns:
+        blocks.append(f"{_format_inst(user_text, system)} {assistant_text}")
+        system = None  # Only apply system prompt once.
+    if pending_user is not None:
+        blocks.append(_format_inst(pending_user, system))
+    return "\n".join(blocks)
 
 def parse_ffn_filename(path):
     """Parse FFN model filename to extract chunk information."""
@@ -189,10 +268,11 @@ def find_all_chunks(base_path):
     pattern = re.sub(r'_chunk_\d+of\d+', '_chunk_*', str(path))
     return sorted(glob.glob(pattern))
 
-def load_model(path, function_name=None):
+def load_model(path, function_name=None, compute_unit=None):
     """Load a CoreML model, handling both .mlmodelc and .mlpackage formats."""
     path = Path(path)
-    compute_unit = ct.ComputeUnit.CPU_AND_NE
+    if compute_unit is None:
+        compute_unit = ct.ComputeUnit.CPU_AND_NE
     
     try:
         if path.suffix == '.mlmodelc':
@@ -239,6 +319,8 @@ def parse_args():
     # Add new argument for auto-generation
     parser.add_argument('--prompt', type=str,
                        help='If specified, run once with this prompt and exit')
+    parser.add_argument('--max-tokens', type=int,
+                       help='Maximum number of tokens to generate')
 
     # Add no-warmup flag
     parser.add_argument('--nw', action='store_true',
@@ -248,11 +330,17 @@ def parse_args():
     parser.add_argument('--debug-level', type=int, default=0,
                        help='Debug level (0=none, 1=print prompts, 2=more verbose)')
 
+    # Add CPU-only mode
+    parser.add_argument('--cpu', action='store_true',
+                       help='Run on CPU only (no ANE/GPU)')
+
     # Model configuration
     parser.add_argument('--context-length', type=int,
                        help='Context length for the model (default: 512), if not provided, it will be detected from the model directory name ctxNUMBER')
     parser.add_argument('--batch-size', type=int,
                        help='Batch size for prefill (default: 64)')
+    parser.add_argument('--split-lm-head', type=int,
+                       help='Number of logits splits from LM head (default: 8 for llama, 16 for qwen)')
 
     args = parser.parse_args()
 
@@ -287,11 +375,12 @@ def parse_args():
                     args.batch_size = int(params['batch_size'])
                 args.num_chunks = 1  # Monolithic has no chunks
 
-                # Set split_lm_head
-                if 'split_lm_head' in params:
-                    args.split_lm_head = int(params['split_lm_head'])
-                else:
-                    args.split_lm_head = 16 if 'qwen' in prefix.lower() else 8
+                # Set split_lm_head, but allow CLI override
+                if args.split_lm_head is None:
+                    if 'split_lm_head' in params:
+                        args.split_lm_head = int(params['split_lm_head'])
+                    else:
+                        args.split_lm_head = 16 if 'qwen' in prefix.lower() else 8
 
                 # Set tokenizer path
                 if not args.tokenizer:
@@ -333,11 +422,12 @@ def parse_args():
                     args.batch_size = int(params['batch_size'])
                 args.num_chunks = num_chunks
 
-                # Parse split_lm_head parameter from meta.yaml
-                if 'split_lm_head' in params:
-                    args.split_lm_head = int(params['split_lm_head'])
-                else:
-                    args.split_lm_head = 8  # Default value
+                # Parse split_lm_head parameter from meta.yaml, but allow CLI override
+                if args.split_lm_head is None:
+                    if 'split_lm_head' in params:
+                        args.split_lm_head = int(params['split_lm_head'])
+                    else:
+                        args.split_lm_head = 8  # Default value
 
                 print(f"\nLoaded parameters from {args.meta}:")
                 print(f"  Context Length: {args.context_length}")
@@ -452,13 +542,18 @@ def load_metadata(model,args):
 def load_models(args,metadata):
     """Load all required models and extract metadata."""
     print("\nLoading models...")
-    
+
+    # Determine compute unit
+    compute_unit = ct.ComputeUnit.CPU_ONLY if getattr(args, 'cpu', False) else ct.ComputeUnit.CPU_AND_NE
+    if getattr(args, 'cpu', False):
+        print("Running in CPU-only mode")
+
     try:
         # Load embeddings model
         print("\nLoading embeddings model...")
         embed_path = parse_model_path(args.embed)
         print(f"Loading from: {embed_path}")
-        embed_model = load_model(embed_path)
+        embed_model = load_model(embed_path, compute_unit=compute_unit)
         print("Embeddings model loaded successfully")
         metadata = load_metadata(embed_model,args)
         
@@ -468,14 +563,14 @@ def load_models(args,metadata):
         print("\nLoading LM head model...")
         lmhead_path = parse_model_path(args.lmhead)
         print(f"Loading from: {lmhead_path}")
-        lmhead_model = load_model(lmhead_path)
+        lmhead_model = load_model(lmhead_path, compute_unit=compute_unit)
         print("LM head model loaded successfully")
-        
+
         # Parse FFN path and find chunks if needed
         print("\nLoading FFN+PREFILL model(s)...")
         ffn_path = parse_model_path(args.ffn)
         chunk_no, total_chunks = parse_ffn_filename(ffn_path)
-        
+
         ffn_models = []
         if chunk_no and total_chunks:
             print(f"\nDetected chunked FFN+PREFILL model ({total_chunks} chunks)")
@@ -483,14 +578,14 @@ def load_models(args,metadata):
             chunk_paths = find_all_chunks(ffn_path)
             if len(chunk_paths) != total_chunks:
                 raise ValueError(f"Found {len(chunk_paths)} chunks but filename indicates {total_chunks} chunks")
-                
+
             for chunk_path in chunk_paths:
                 print(f"\nLoading FFN+PREFILL chunk: {Path(chunk_path).name}")
                 try:
                     # For chunked models, we need both infer and prefill functions
                     ffn_models.append({
-                        'infer': load_model(chunk_path, function_name='infer'),
-                        'prefill': load_model(chunk_path, function_name='prefill')
+                        'infer': load_model(chunk_path, function_name='infer', compute_unit=compute_unit),
+                        'prefill': load_model(chunk_path, function_name='prefill', compute_unit=compute_unit)
                     })
                     print("Chunk loaded successfully")
                 except Exception as e:
@@ -500,7 +595,7 @@ def load_models(args,metadata):
 
         else:
             print("\nLoading single FFN model...")
-            ffn_models.append(load_model(ffn_path))
+            ffn_models.append(load_model(ffn_path, compute_unit=compute_unit))
             print("FFN model loaded successfully")
         
         return embed_model, ffn_models, lmhead_model, metadata
@@ -652,8 +747,20 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     lm_output = lmhead_model.predict({'hidden_states': hidden_states.numpy()})
     
     if 'logits1' in lm_output:
+        logit_indices = [
+            int(k[6:]) for k in lm_output.keys()
+            if k.startswith("logits") and k[6:].isdigit()
+        ]
+        max_available = max(logit_indices) if logit_indices else 0
+        num_logits = (
+            metadata.get('split_lm_head', metadata.get('num_logits', max_available or 8))
+            if metadata
+            else (max_available or 8)
+        )
+        if max_available and num_logits > max_available:
+            num_logits = max_available
         logits_parts = []
-        for i in range(1, metadata.get('split_lm_head', 8) + 1):
+        for i in range(1, num_logits + 1):
             key = f'logits{i}'
             if key in lm_output:
                 logits_parts.append(torch.from_numpy(lm_output[key]))
@@ -694,14 +801,19 @@ def load_monolithic_model(args, metadata):
     """Load monolithic model with infer and prefill functions."""
     print("\nLoading monolithic model...")
 
+    # Determine compute unit
+    compute_unit = ct.ComputeUnit.CPU_ONLY if getattr(args, 'cpu', False) else ct.ComputeUnit.CPU_AND_NE
+    if getattr(args, 'cpu', False):
+        print("Running in CPU-only mode")
+
     model_path = str(Path(args.d) / args.monolithic_model)
     model_path = parse_model_path(model_path)
 
     print(f"Loading from: {model_path}")
 
     # Load both infer and prefill functions
-    infer_model = load_model(model_path, function_name='infer')
-    prefill_model = load_model(model_path, function_name='prefill')
+    infer_model = load_model(model_path, function_name='infer', compute_unit=compute_unit)
+    prefill_model = load_model(model_path, function_name='prefill', compute_unit=compute_unit)
 
     print("Monolithic model loaded successfully (infer + prefill functions)")
 
@@ -766,6 +878,13 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
 
     # Combine logits1-N if they exist
     if 'logits1' in output:
+        logit_indices = [
+            int(k[6:]) for k in output.keys()
+            if k.startswith("logits") and k[6:].isdigit()
+        ]
+        max_available = max(logit_indices) if logit_indices else 0
+        if max_available and num_logits > max_available:
+            num_logits = max_available
         logits_parts = []
         for i in range(1, num_logits + 1):
             key = f'logits{i}'
@@ -792,7 +911,7 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
     return next_token
 
 
-def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state, causal_mask, auto_prompt=None, warmup=False):
+def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state, causal_mask, auto_prompt=None, warmup=False, max_tokens=None):
     """Chat loop for monolithic models with full conversation history."""
     global THINKING_MODE
     global DEBUG_LEVEL
@@ -807,6 +926,71 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
 
     # Keep track of conversation history
     conversation = []
+    stop_token_ids = build_stop_token_ids(tokenizer)
+    use_chat_template = False
+    try:
+        tokenizer.apply_chat_template([{"role": "user", "content": "test"}], return_tensors="pt")
+        use_chat_template = True
+        if not warmup:
+            print("\nUsing chat template for prompts")
+    except Exception:
+        if not warmup:
+            print("\nUsing manual formatting for prompts")
+
+    def _build_base_input_ids(messages, show_debug):
+        if use_chat_template:
+            base_input_ids = tokenizer.apply_chat_template(
+                messages,
+                return_tensors="pt",
+                add_generation_prompt=True
+            ).to(torch.int32)
+            if show_debug and DEBUG_LEVEL >= 1 and not warmup:
+                label = "Full prompt with thinking" if THINKING_MODE else "Full prompt"
+                print(f"\n{DARK_BLUE}Debug: {label}:{RESET_COLOR}")
+                print(tokenizer.decode(base_input_ids[0]))
+            return base_input_ids
+
+        prompt_text = format_manual_prompt(messages)
+        base_input_ids = tokenizer(
+            prompt_text, return_tensors="pt", add_special_tokens=True
+        ).input_ids.to(torch.int32)
+        if show_debug and DEBUG_LEVEL >= 1 and not warmup:
+            label = "Full prompt with thinking" if THINKING_MODE else "Full prompt"
+            print(f"\n{DARK_BLUE}Debug: {label}:{RESET_COLOR}")
+            print(prompt_text)
+        return base_input_ids
+    use_chat_template = False
+    try:
+        tokenizer.apply_chat_template([{"role": "user", "content": "test"}], return_tensors="pt")
+        use_chat_template = True
+        if not warmup:
+            print("\nUsing chat template for prompts")
+    except Exception:
+        if not warmup:
+            print("\nUsing manual formatting for prompts")
+
+    def _build_base_input_ids(messages, show_debug):
+        if use_chat_template:
+            base_input_ids = tokenizer.apply_chat_template(
+                messages,
+                return_tensors="pt",
+                add_generation_prompt=True
+            ).to(torch.int32)
+            if show_debug and DEBUG_LEVEL >= 1 and not warmup:
+                label = "Full prompt with thinking" if THINKING_MODE else "Full prompt"
+                print(f"\n{DARK_BLUE}Debug: {label}:{RESET_COLOR}")
+                print(tokenizer.decode(base_input_ids[0]))
+            return base_input_ids
+
+        prompt_text = format_manual_prompt(messages)
+        base_input_ids = tokenizer(
+            prompt_text, return_tensors="pt", add_special_tokens=True
+        ).input_ids.to(torch.int32)
+        if show_debug and DEBUG_LEVEL >= 1 and not warmup:
+            label = "Full prompt with thinking" if THINKING_MODE else "Full prompt"
+            print(f"\n{DARK_BLUE}Debug: {label}:{RESET_COLOR}")
+            print(prompt_text)
+        return base_input_ids
 
     try:
         while True:
@@ -836,42 +1020,20 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
             # Add user message to conversation
             conversation.append({"role": "user", "content": user_input})
 
-            # Format using chat template with full history
+            messages = conversation
             if THINKING_MODE:
-                # Add thinking prompt to system message
-                conversation_with_thinking = [{"role": "system", "content": THINKING_PROMPT}] + conversation
-                base_input_ids = tokenizer.apply_chat_template(
-                    conversation_with_thinking,
-                    return_tensors="pt",
-                    add_generation_prompt=True
-                ).to(torch.int32)
-
-                # Print full prompt if debug level >= 1
-                if DEBUG_LEVEL >= 1 and not warmup:
-                    print(f"\n{DARK_BLUE}Debug: Full prompt with thinking:{RESET_COLOR}")
-                    print(tokenizer.decode(base_input_ids[0]))
-            else:
-                base_input_ids = tokenizer.apply_chat_template(
-                    conversation,
-                    return_tensors="pt",
-                    add_generation_prompt=True
-                ).to(torch.int32)
-
-                # Print full prompt if debug level >= 1
-                if DEBUG_LEVEL >= 1 and not warmup:
-                    print(f"\n{DARK_BLUE}Debug: Full prompt:{RESET_COLOR}")
-                    print(tokenizer.decode(base_input_ids[0]))
+                messages = [{"role": "system", "content": THINKING_PROMPT}] + conversation
+            base_input_ids = _build_base_input_ids(messages, show_debug=True)
 
             # Check if we need to trim history
             while base_input_ids.size(1) > context_length - 100:  # Leave room for response
                 # Remove oldest message pair (user + assistant)
                 if len(conversation) > 2:
                     conversation = conversation[2:]  # Remove oldest pair
-                    base_input_ids = tokenizer.apply_chat_template(
-                        conversation,
-                        return_tensors="pt",
-                        add_generation_prompt=True
-                    ).to(torch.int32)
+                    messages = conversation
+                    if THINKING_MODE:
+                        messages = [{"role": "system", "content": THINKING_PROMPT}] + conversation
+                    base_input_ids = _build_base_input_ids(messages, show_debug=False)
                 else:
                     # If only current message remains and still too long, truncate
                     base_input_ids = base_input_ids[:, -context_length//2:]
@@ -966,19 +1128,10 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                     # In warmup mode, limit tokens
                     if warmup and tokens_generated >= WARMUP_TOKEN_LIMIT:
                         break
+                    if not warmup and max_tokens is not None and tokens_generated >= max_tokens:
+                        break
 
-                    # Check for all possible EOS tokens (including endoftext for Qwen3)
-                    eos_token_ids = tokenizer.eos_token_id
-                    stop_ids = set()
-                    if isinstance(eos_token_ids, list):
-                        stop_ids.update(eos_token_ids)
-                    else:
-                        stop_ids.add(eos_token_ids)
-                    # Also check for endoftext token (often used as stop token)
-                    endoftext_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
-                    if endoftext_id is not None and endoftext_id != tokenizer.unk_token_id:
-                        stop_ids.add(endoftext_id)
-                    if next_token in stop_ids:
+                    if next_token in stop_token_ids:
                         break
 
                 inference_time = time.time() - inference_start  # Calculate inference time
@@ -1074,7 +1227,7 @@ def get_user_input():
         # Fallback for systems without termios
         return input("> ")
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask, auto_prompt=None, warmup=False):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask, auto_prompt=None, warmup=False, max_tokens=None):
     """Interactive chat loop."""
     global THINKING_MODE
     global DEBUG_LEVEL
@@ -1089,6 +1242,39 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
     
     # Keep track of conversation history
     conversation = []
+    stop_token_ids = build_stop_token_ids(tokenizer)
+    use_chat_template = False
+    try:
+        tokenizer.apply_chat_template([{"role": "user", "content": "test"}], return_tensors="pt")
+        use_chat_template = True
+        if not warmup:
+            print("\nUsing chat template for prompts")
+    except Exception:
+        if not warmup:
+            print("\nUsing manual formatting for prompts")
+
+    def _build_base_input_ids(messages, show_debug):
+        if use_chat_template:
+            base_input_ids = tokenizer.apply_chat_template(
+                messages,
+                return_tensors="pt",
+                add_generation_prompt=True
+            ).to(torch.int32)
+            if show_debug and DEBUG_LEVEL >= 1 and not warmup:
+                label = "Full prompt with thinking" if THINKING_MODE else "Full prompt"
+                print(f"\n{DARK_BLUE}Debug: {label}:{RESET_COLOR}")
+                print(tokenizer.decode(base_input_ids[0]))
+            return base_input_ids
+
+        prompt_text = format_manual_prompt(messages)
+        base_input_ids = tokenizer(
+            prompt_text, return_tensors="pt", add_special_tokens=True
+        ).input_ids.to(torch.int32)
+        if show_debug and DEBUG_LEVEL >= 1 and not warmup:
+            label = "Full prompt with thinking" if THINKING_MODE else "Full prompt"
+            print(f"\n{DARK_BLUE}Debug: {label}:{RESET_COLOR}")
+            print(prompt_text)
+        return base_input_ids
     
     try:
         while True:
@@ -1118,42 +1304,20 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
             # Add user message to conversation
             conversation.append({"role": "user", "content": user_input})
             
-            # Format using chat template with full history
+            messages = conversation
             if THINKING_MODE:
-                # Add thinking prompt to system message
-                conversation_with_thinking = [{"role": "system", "content": THINKING_PROMPT}] + conversation
-                base_input_ids = tokenizer.apply_chat_template(
-                    conversation_with_thinking,
-                    return_tensors="pt",
-                    add_generation_prompt=True
-                ).to(torch.int32)
-                
-                # Print full prompt if debug level >= 1
-                if DEBUG_LEVEL >= 1 and not warmup:
-                    print(f"\n{DARK_BLUE}Debug: Full prompt with thinking:{RESET_COLOR}")
-                    print(tokenizer.decode(base_input_ids[0]))
-            else:
-                base_input_ids = tokenizer.apply_chat_template(
-                    conversation,
-                    return_tensors="pt",
-                    add_generation_prompt=True
-                ).to(torch.int32)
-                
-                # Print full prompt if debug level >= 1
-                if DEBUG_LEVEL >= 1 and not warmup:
-                    print(f"\n{DARK_BLUE}Debug: Full prompt:{RESET_COLOR}")
-                    print(tokenizer.decode(base_input_ids[0]))
+                messages = [{"role": "system", "content": THINKING_PROMPT}] + conversation
+            base_input_ids = _build_base_input_ids(messages, show_debug=True)
             
             # Check if we need to trim history
             while base_input_ids.size(1) > context_length - 100:  # Leave room for response
                 # Remove oldest message pair (user + assistant)
                 if len(conversation) > 2:
                     conversation = conversation[2:]  # Remove oldest pair
-                    base_input_ids = tokenizer.apply_chat_template(
-                        conversation,
-                        return_tensors="pt",
-                        add_generation_prompt=True
-                    ).to(torch.int32)
+                    messages = conversation
+                    if THINKING_MODE:
+                        messages = [{"role": "system", "content": THINKING_PROMPT}] + conversation
+                    base_input_ids = _build_base_input_ids(messages, show_debug=False)
                 else:
                     # If only current message remains and still too long, truncate
                     base_input_ids = base_input_ids[:, -context_length//2:]
@@ -1260,19 +1424,10 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     # In warmup mode, limit tokens
                     if warmup and tokens_generated >= WARMUP_TOKEN_LIMIT:
                         break
+                    if not warmup and max_tokens is not None and tokens_generated >= max_tokens:
+                        break
                     
-                    # Check for all possible EOS tokens (including endoftext for Qwen3)
-                    eos_token_ids = tokenizer.eos_token_id
-                    stop_ids = set()
-                    if isinstance(eos_token_ids, list):
-                        stop_ids.update(eos_token_ids)
-                    else:
-                        stop_ids.add(eos_token_ids)
-                    # Also check for endoftext token (often used as stop token)
-                    endoftext_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
-                    if endoftext_id is not None and endoftext_id != tokenizer.unk_token_id:
-                        stop_ids.add(endoftext_id)
-                    if next_token in stop_ids:
+                    if next_token in stop_token_ids:
                         break
 
                 inference_time = time.time() - inference_start  # Calculate inference time
@@ -1386,7 +1541,8 @@ def main():
                 state=state,
                 causal_mask=causal_mask,
                 warmup=False,
-                auto_prompt=args.prompt
+                auto_prompt=args.prompt,
+                max_tokens=args.max_tokens
             )
 
         else:
@@ -1443,7 +1599,8 @@ def main():
                 state=state,  # Pass the state
                 causal_mask=causal_mask,  # Pass the causal mask
                 warmup=False,
-                auto_prompt=args.prompt
+                auto_prompt=args.prompt,
+                max_tokens=args.max_tokens
             )
 
     except Exception as e:

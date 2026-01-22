@@ -172,6 +172,12 @@ if [ -f "$CONFIG_FILE" ]; then
         if [ "$PREFIX" = "llama" ]; then
             PREFIX="qwen"
         fi
+    elif [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
+        CONVERTER="python3 -m anemll.ane_converter.gemma3_converter"
+        # Use "gemma3" as default prefix for Gemma3 models unless explicitly set
+        if [ "$PREFIX" = "llama" ]; then
+            PREFIX="gemma3"
+        fi
     else
         CONVERTER="python3 -m anemll.ane_converter.llama_converter"
     fi
@@ -351,6 +357,7 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
         # Copy tokenizer files if they exist
         (cp \"$MODEL_PATH/tokenizer.json\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/tokenizer_config.json\" \"$OUTPUT_DIR/\" || true) && \
+        (cp \"$MODEL_PATH/tokenizer.model\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/vocab.json\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/merges.txt\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/chat_template.jinja\" \"$OUTPUT_DIR/\" || true) && \
