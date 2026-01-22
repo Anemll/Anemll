@@ -40,7 +40,8 @@ class Gemma3nConverter(BaseConverter):
         chunk_size: int = 2,
         enable_laurel: bool = True,
         enable_per_layer_embeddings: bool = True,
-        text_only_mode: bool = True
+        text_only_mode: bool = True,
+        disable_sparsity: bool = False
     ):
         super().__init__(model_path)
         self.model_type = "gemma3n"
@@ -54,10 +55,13 @@ class Gemma3nConverter(BaseConverter):
         self.enable_laurel = enable_laurel
         self.enable_per_layer_embeddings = enable_per_layer_embeddings
         self.text_only_mode = text_only_mode
+        self.disable_sparsity = disable_sparsity
         
         # Load config
         hf_config = AutoConfig.from_pretrained(model_path)
         self.config = Gemma3nConfig.from_pretrained_config(hf_config)
+        if self.disable_sparsity:
+            self.config.activation_sparsity_pattern = [0.0] * self.config.num_hidden_layers
         
         # Update config with conversion parameters
         self.config.context_length = context_length
@@ -275,11 +279,19 @@ class Gemma3nConverter(BaseConverter):
                             # Full LAUREL block processing
                             hidden_states, _ = layer(hidden_states)
                         else:
-                            # Just FFN processing
-                            residual = hidden_states
-                            hidden_states = layer.post_attention_layernorm(hidden_states)
-                            hidden_states = layer.ffn(hidden_states)
-                            hidden_states = residual + hidden_states
+                            # Just FFN processing (convert Conv2d layout to [B, T, C])
+                            if hidden_states.dim() == 4:
+                                residual = hidden_states
+                                hidden_states = hidden_states.squeeze(-1).transpose(1, 2)
+                                hidden_states = layer.post_attention_layernorm(hidden_states)
+                                hidden_states = layer.ffn(hidden_states)
+                                hidden_states = hidden_states + residual.squeeze(-1).transpose(1, 2)
+                                hidden_states = hidden_states.transpose(1, 2).unsqueeze(-1)
+                            else:
+                                residual = hidden_states
+                                hidden_states = layer.post_attention_layernorm(hidden_states)
+                                hidden_states = layer.ffn(hidden_states)
+                                hidden_states = residual + hidden_states
                     return hidden_states
             
             # Load state dict and filter for text-only mode
@@ -366,8 +378,16 @@ class Gemma3nConverter(BaseConverter):
             def forward(self, hidden_states, attention_mask=None):
                 all_hidden_states = []
                 for layer in self.layers:
-                    hidden_states = layer.attention_norm(hidden_states)
-                    hidden_states, _ = layer.attention(hidden_states, attention_mask)
+                    if hidden_states.dim() == 4:
+                        hidden_states = hidden_states.squeeze(-1).transpose(1, 2)
+                        hidden_states = layer.input_layernorm(hidden_states)
+                        hidden_states, _ = layer.attention(hidden_states, attention_mask)
+                        hidden_states = layer.post_attention_layernorm(hidden_states)
+                        hidden_states = hidden_states.transpose(1, 2).unsqueeze(-1)
+                    else:
+                        hidden_states = layer.input_layernorm(hidden_states)
+                        hidden_states, _ = layer.attention(hidden_states, attention_mask)
+                        hidden_states = layer.post_attention_layernorm(hidden_states)
                     all_hidden_states.append(hidden_states)
                 return torch.stack(all_hidden_states, dim=1)
         
@@ -684,6 +704,7 @@ if __name__ == "__main__":
     parser.add_argument("--disable-laurel", action="store_true", help="Disable LAUREL blocks")
     parser.add_argument("--disable-per-layer-embeddings", action="store_true", help="Disable per-layer embeddings")
     parser.add_argument("--enable-multimodal", action="store_true", help="Enable multimodal weights (default: text-only mode)")
+    parser.add_argument("--disable-sparsity", action="store_true", help="Disable activation sparsity (conversion-friendly)")
     
     args = parser.parse_args()
     
@@ -697,7 +718,8 @@ if __name__ == "__main__":
         chunk_size=args.chunk,
         enable_laurel=not args.disable_laurel,
         enable_per_layer_embeddings=not args.disable_per_layer_embeddings,
-        text_only_mode=not args.enable_multimodal
+        text_only_mode=not args.enable_multimodal,
+        disable_sparsity=args.disable_sparsity,
     )
     
     converter.convert()

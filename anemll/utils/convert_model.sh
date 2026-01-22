@@ -22,9 +22,16 @@ NUM_CHUNKS=2   # Default number of chunks
 
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
+GEMMA3N=false
+
+# Prefer repository venv if available
+PYTHON_BIN="python3"
+if [ -x "$PROJECT_ROOT/env-anemll/bin/python" ]; then
+    PYTHON_BIN="$PROJECT_ROOT/env-anemll/bin/python"
+fi
 
 # Default converter; may be overridden after parsing config.json
-CONVERTER="python3 -m anemll.ane_converter.llama_converter"
+CONVERTER="$PYTHON_BIN -m anemll.ane_converter.llama_converter"
 
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
@@ -44,6 +51,10 @@ print_usage() {
     echo "  --only          Run only specified step and exit (1-8)"
     echo "  --prefix        Prefix for model names (default: llama)"
     echo "  --chunk         Number of chunks to split FFN/prefill (default: 2)"
+    echo "  --disable-laurel              (Gemma3n) Disable LAUREL blocks"
+    echo "  --disable-per-layer-embeddings (Gemma3n) Disable per-layer embeddings"
+    echo "  --disable-sparsity            (Gemma3n) Disable activation sparsity"
+    echo "  --enable-multimodal           (Gemma3n) Enable multimodal weights"
     echo "  --skip-check    Skip the dependency check step"
     echo "  --skip-check    Skip the dependency check step"
     exit 1
@@ -96,6 +107,22 @@ while [[ $# -gt 0 ]]; do
             NUM_CHUNKS="$2"
             shift 2
             ;;
+        --disable-laurel)
+            DISABLE_LAUREL=true
+            shift
+            ;;
+        --disable-per-layer-embeddings)
+            DISABLE_PLE=true
+            shift
+            ;;
+        --enable-multimodal)
+            ENABLE_MULTIMODAL=true
+            shift
+            ;;
+        --disable-sparsity)
+            DISABLE_SPARSITY=true
+            shift
+            ;;
         --skip-check)
             SKIP_CHECK=true
             shift
@@ -144,21 +171,29 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)" || {
 CONFIG_FILE="$MODEL_PATH/config.json"
 if [ -f "$CONFIG_FILE" ]; then
     ARCH=$(jq -r '.model_type // (.architectures[0] // "")' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
+    # Check for Gemma3n architectures
+    if [[ "$ARCH" == "gemma3n" ]] || [[ "$ARCH" == *"gemma3n"* ]]; then
+        CONVERTER="$PYTHON_BIN -m anemll.ane_converter.gemma3n_converter"
+        GEMMA3N=true
+        # Use "gemma3n" as default prefix unless explicitly set
+        if [ "$PREFIX" = "llama" ]; then
+            PREFIX="gemma3n"
+        fi
     # Check for Qwen2 (which is Qwen 2.5) or Qwen2ForCausalLM architecture
-    if [[ "$ARCH" == "qwen2" ]] || [[ "$ARCH" == *"qwen2forcausallm"* ]]; then
-        CONVERTER="python3 -m anemll.ane_converter.qwen2_5_converter"
+    elif [[ "$ARCH" == "qwen2" ]] || [[ "$ARCH" == *"qwen2forcausallm"* ]]; then
+        CONVERTER="$PYTHON_BIN -m anemll.ane_converter.qwen2_5_converter"
         # Use "qwen25" as default prefix for Qwen 2.5 models unless explicitly set
         if [ "$PREFIX" = "llama" ]; then
             PREFIX="qwen25"
         fi
     elif [[ "$ARCH" == qwen* ]]; then
-        CONVERTER="python3 -m anemll.ane_converter.qwen_converter"
+        CONVERTER="$PYTHON_BIN -m anemll.ane_converter.qwen_converter"
         # Use "qwen" as default prefix for Qwen models unless explicitly set
         if [ "$PREFIX" = "llama" ]; then
             PREFIX="qwen"
         fi
     else
-        CONVERTER="python3 -m anemll.ane_converter.llama_converter"
+        CONVERTER="$PYTHON_BIN -m anemll.ane_converter.llama_converter"
     fi
 fi
 
@@ -169,6 +204,42 @@ if [ "$SKIP_CHECK" = false ]; then
         echo "Dependency check failed. Aborting."
         exit 1
     fi
+fi
+
+# Gemma3n uses a dedicated converter (single pass, text-only by default)
+if [ "$GEMMA3N" = true ]; then
+    LUT2_PARAM=""
+    if [ ! -z "$LUT_PART2" ]; then
+        LUT2_PARAM="--lut2 $LUT_PART2"
+    fi
+    LUT3_PARAM=""
+    if [ ! -z "$LUT_PART3" ]; then
+        LUT3_PARAM="--lut3 $LUT_PART3"
+    fi
+    GEMMA3N_FLAGS=""
+    if [ "${DISABLE_LAUREL:-false}" = true ]; then
+        GEMMA3N_FLAGS="$GEMMA3N_FLAGS --disable-laurel"
+    fi
+    if [ "${DISABLE_PLE:-false}" = true ]; then
+        GEMMA3N_FLAGS="$GEMMA3N_FLAGS --disable-per-layer-embeddings"
+    fi
+    if [ "${DISABLE_SPARSITY:-false}" = true ]; then
+        GEMMA3N_FLAGS="$GEMMA3N_FLAGS --disable-sparsity"
+    fi
+    if [ "${ENABLE_MULTIMODAL:-false}" = true ]; then
+        GEMMA3N_FLAGS="$GEMMA3N_FLAGS --enable-multimodal"
+    fi
+    echo "Detected Gemma3n model. Running Gemma3n converter (text-only mode)."
+    $CONVERTER \
+        --model "$MODEL_PATH" \
+        --output "$OUTPUT_DIR" \
+        --context "$CONTEXT_LENGTH" \
+        --batch "$BATCH_SIZE" \
+        $LUT2_PARAM \
+        $LUT3_PARAM \
+        --chunk "$NUM_CHUNKS" \
+        $GEMMA3N_FLAGS
+    exit $?
 fi
 
 # Step 0: Check dependencies

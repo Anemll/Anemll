@@ -26,6 +26,7 @@ import json
 import math
 import os
 from safetensors import safe_open
+from transformers.activations import ACT2FN
 
 # LM head configuration constants (following qwen_model.py pattern)
 TEST_DEVICE = "cpu"
@@ -33,6 +34,7 @@ ENABLE_CONV2D = bool(1)      # Use Conv2d for LM head
 ENABLE_VACAB_SPLIT16 = bool(1)  # Split vocab into 16 parts
 ENABLE_LOGITS2 = bool(1)    # Return separate logits arrays for CoreML
 ENABLE_COREML = bool(1)     # CoreML-specific returns
+ENABLE_DEBUG = False        # Verbose debug logging
 
 
 MODEL_DTYPE = torch.float16
@@ -49,7 +51,7 @@ def create_rotary_cache(head_dim, seq_len, theta=1000000.0, device=None, dtype=N
     # HF calculates inv_freq for head_dim // 2
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
     
-    position_ids = torch.arange(seq_len, device=device, dtype=torch.int64).float()
+    position_ids = torch.arange(seq_len, device=device, dtype=torch.int32).float()
     
     # Expand inv_freq and position_ids for broadcasting
     inv_freq_expanded = inv_freq[None, :, None] # [1, head_dim // 2, 1]
@@ -80,14 +82,51 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+def apply_rotary_pos_emb_single(x, cos, sin, unsqueeze_dim=1):
+    """Apply rotary position embedding to a single tensor (HF-style)."""
+    def rotate_half(t):
+        t1 = t[..., : t.shape[-1] // 2]
+        t2 = t[..., t.shape[-1] // 2 :]
+        return torch.cat((-t2, t1), dim=-1)
+
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return (x * cos) + (rotate_half(x) * sin)
+
+def repeat_kv(hidden_states, n_rep):
+    """Repeat key/value heads for GQA."""
+    batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
+
+def create_causal_mask_4d(seq_len, batch_size, device, dtype):
+    mask = torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
+    mask = torch.triu(mask, diagonal=1)
+    return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+
+def create_sliding_window_causal_mask_4d(seq_len, sliding_window, batch_size, device, dtype):
+    mask = torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
+    mask = torch.triu(mask, diagonal=1)
+    if sliding_window is not None and sliding_window > 0:
+        for i in range(seq_len):
+            start_idx = max(0, i - sliding_window + 1)
+            mask[i, start_idx : i + 1] = 0.0
+    return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+
 class Gemma3nConfig:
     """Configuration class for Gemma3n model"""
     def __init__(self, context_length=256, **kwargs):
         # Basic model parameters (corrected defaults for Gemma3n)
         self.vocab_size = kwargs.get("vocab_size", 262400)
         self.hidden_size = kwargs.get("hidden_size", 2048)
-        self.intermediate_size = kwargs.get("intermediate_size", 8192)
         self.num_hidden_layers = kwargs.get("num_hidden_layers", 30)  # Gemma3n has 30 layers
+        intermediate_size = kwargs.get("intermediate_size", 8192)
+        if isinstance(intermediate_size, (list, tuple)):
+            self.intermediate_size = list(intermediate_size)
+        else:
+            self.intermediate_size = [intermediate_size] * self.num_hidden_layers
         self.num_attention_heads = kwargs.get("num_attention_heads", 8)
         self.num_key_value_heads = kwargs.get("num_key_value_heads", 2)  # Gemma3n has 2 KV heads
         self.head_dim = kwargs.get("head_dim", 256)
@@ -95,10 +134,12 @@ class Gemma3nConfig:
         self.context_length = context_length
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
         self.rope_theta = kwargs.get("rope_theta", 1000000.0)  # Gemma3n uses 1M theta
+        self.rope_local_base_freq = kwargs.get("rope_local_base_freq", 10000.0)
         self.sliding_window = kwargs.get("sliding_window", 512)  # Gemma3n sliding window
         self.final_logit_softcapping = kwargs.get("final_logit_softcapping", 30.0)  # Gemma3n uses 30.0
         self.model_type = kwargs.get("model_type", "gemma")
         self.architectures = kwargs.get("architectures", ["GemmaForCausalLM"])
+        self.hidden_activation = kwargs.get("hidden_activation", "gelu_pytorch_tanh")
         
         # Gemma3n specific parameters (corrected)
         self.laurel_rank = kwargs.get("laurel_rank", 64)  # Gemma3n uses rank 64
@@ -106,21 +147,21 @@ class Gemma3nConfig:
         self.use_laurel_blocks = kwargs.get("use_laurel_blocks", True)
         self.use_per_layer_embeddings = kwargs.get("use_per_layer_embeddings", True)  # Gemma3n uses PLE
         self.altup_num_inputs = kwargs.get("altup_num_inputs", 4)
-        self.query_pre_attn_scalar = kwargs.get("query_pre_attn_scalar", 256)
         self.altup_correct_scale = kwargs.get("altup_correct_scale", True)
         self.altup_coef_clip = kwargs.get("altup_coef_clip", 120.0)
         self.altup_active_idx = kwargs.get("altup_active_idx", 0)
         self.hidden_size_per_layer_input = kwargs.get("hidden_size_per_layer_input", 256)
         self.vocab_size_per_layer_input = kwargs.get("vocab_size_per_layer_input", 262144)
+        self.num_kv_shared_layers = kwargs.get("num_kv_shared_layers", 10)
         
         # HF config.json: "attention_bias": false - bias in attention projections
         self.attention_bias = kwargs.get("attention_bias", False)
         
-        # CRITICAL FIX: Layer types following HF pattern: layer_idx % 5 == 0 uses full_attention
-        # Layers 0,5,10,15,20,25 use full_attention, all others use sliding_attention
+        # Default HF-like pattern: layer_idx % 5 == 4 uses full_attention
+        # Layers 4,9,14,19,24,29 use full_attention, all others use sliding_attention
         default_layer_types = []
         for i in range(self.num_hidden_layers):
-            if i % 5 == 0:
+            if i % 5 == 4:
                 default_layer_types.append("full_attention")
             else:
                 default_layer_types.append("sliding_attention")
@@ -150,7 +191,7 @@ class Gemma3nConfig:
             context_length=256,  # Default context length for CoreML conversion
             vocab_size=text_config.vocab_size,
             hidden_size=text_config.hidden_size,
-            intermediate_size=text_config.intermediate_size[0],
+            intermediate_size=text_config.intermediate_size,
             num_hidden_layers=text_config.num_hidden_layers,
             num_attention_heads=text_config.num_attention_heads,
             num_key_value_heads=text_config.num_key_value_heads,
@@ -158,6 +199,7 @@ class Gemma3nConfig:
             max_position_embeddings=text_config.max_position_embeddings,
             rms_norm_eps=text_config.rms_norm_eps,
             rope_theta=text_config.rope_theta,
+            rope_local_base_freq=getattr(text_config, 'rope_local_base_freq', 10000.0),
             sliding_window=getattr(text_config, 'sliding_window', None),
             final_logit_softcapping=getattr(text_config, 'final_logit_softcapping', 30.0),
             model_type=getattr(hf_config, 'model_type', "gemma"),
@@ -167,11 +209,14 @@ class Gemma3nConfig:
             use_laurel_blocks=getattr(hf_config, 'use_laurel_blocks', True),
             use_per_layer_embeddings=getattr(hf_config, 'use_per_layer_embeddings', False),
             altup_num_inputs=getattr(text_config, 'altup_num_inputs', 4),
-            query_pre_attn_scalar=getattr(text_config, 'query_pre_attn_scalar', 256),
             altup_correct_scale=getattr(text_config, 'altup_correct_scale', True),
             layer_types=getattr(text_config, 'layer_types', ["sliding_attention"] * text_config.num_hidden_layers),
             attention_bias=getattr(text_config, 'attention_bias', False),  # HF config.json: "attention_bias": false
-            activation_sparsity_pattern=getattr(text_config, 'activation_sparsity_pattern', [0.95] * 10 + [0.0] * (text_config.num_hidden_layers - 10))
+            activation_sparsity_pattern=getattr(text_config, 'activation_sparsity_pattern', [0.95] * 10 + [0.0] * (text_config.num_hidden_layers - 10)),
+            hidden_activation=getattr(text_config, 'hidden_activation', "gelu_pytorch_tanh"),
+            num_kv_shared_layers=getattr(text_config, 'num_kv_shared_layers', 0),
+            hidden_size_per_layer_input=getattr(text_config, 'hidden_size_per_layer_input', 256),
+            vocab_size_per_layer_input=getattr(text_config, 'vocab_size_per_layer_input', 262144),
         )
 
 
@@ -181,80 +226,27 @@ class Gemma3nRMSNorm(nn.Module):
         self.eps = eps
         self.with_scale = with_scale
         self.dims = dims
-        
+
         if self.with_scale:
             self.weight = nn.Parameter(torch.ones(dims))
         else:
-            # CRITICAL FIX: Use tensor of correct shape, not scalar
-            # The previous implementation used torch.tensor(1.0), which created a scalar
-            # and caused a shape mismatch in F.layer_norm.
+            # Use tensor of correct shape, not scalar.
             self.register_buffer("weight", torch.ones(dims), persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # BLOCKER #12 FIX: RMSNorm dtype - compute in fp32 regardless of input dtype
+        # ANE-compatible path: subtract mean then use layer_norm.
         input_dtype = hidden_states.dtype
         hidden_states_fp32 = hidden_states.float()
-        
-        # Compute variance in fp32
-        variance = hidden_states_fp32.pow(2).mean(-1, keepdim=True)
-        normed = hidden_states_fp32 * torch.rsqrt(variance + self.eps)
-
-        #h2= hidden_states_fp32 * hidden_states_fp32
-        #variance = h2.mean(-1, keepdim=True)
-        #rms =  torch.sqrt(variance + self.eps)
-        #normed = hidden_states_fp32 / rms
-
-        # Apply scaling and convert back to input dtype
-        if self.with_scale:
-            output = normed * self.weight.to(normed.dtype)
-        else:
-            output = normed * self.weight  # weight is buffer with value 1.0
-        
-        return output.to(input_dtype)
-
-
-def create_rotary_cache(head_dim, max_seq_len, theta=1000000.0, device=None, dtype=None):
-    """Create rotary position embeddings cache."""
-    # Calculate frequencies
-    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=dtype) / head_dim))
-    
-    # Create position indices
-    position_ids = torch.arange(max_seq_len, device=device, dtype=dtype)
-    
-    # Calculate frequency matrix
-    freqs = torch.outer(position_ids, inv_freq)
-    
-    # Create cos and sin
-    cos = torch.cos(freqs)
-    sin = torch.sin(freqs)
-    
-    return cos, sin
-
-def apply_rotary_pos_emb(q, k, cos, sin):
-    """Apply rotary position embedding to query and key tensors."""
-    def rotate_half(x):
-        """Rotates half the hidden dims of the input."""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-    
-    # q, k shape: [batch, heads, seq_len, head_dim]
-    # cos, sin shape: [seq_len, head_dim//2]
-    
-    # Need to broadcast cos, sin to match q, k dimensions
-    # Expand cos, sin to [1, 1, seq_len, head_dim//2] then repeat for full head_dim
-    cos_expanded = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, head_dim//2] 
-    sin_expanded = sin.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, head_dim//2]
-    
-    # Repeat to match full head_dim
-    cos_full = torch.cat([cos_expanded, cos_expanded], dim=-1)  # [1, 1, seq_len, head_dim]
-    sin_full = torch.cat([sin_expanded, sin_expanded], dim=-1)  # [1, 1, seq_len, head_dim]
-    
-    # Apply rotary embeddings
-    q_embed = (q * cos_full) + (rotate_half(q) * sin_full)
-    k_embed = (k * cos_full) + (rotate_half(k) * sin_full)
-    
-    return q_embed, k_embed
+        mean = hidden_states_fp32.mean(-1, keepdim=True)
+        hidden_states_fp32 = hidden_states_fp32 - mean
+        normed = F.layer_norm(
+            hidden_states_fp32,
+            self.weight.shape,
+            self.weight.to(hidden_states_fp32.dtype, copy=False) if self.with_scale else None,
+            bias=None,
+            eps=float(self.eps),
+        )
+        return normed.to(input_dtype)
 
 
 def create_sliding_window_causal_mask(seq_len, sliding_window, device, dtype=torch.float32):
@@ -333,7 +325,7 @@ class Gemma3nAttention(nn.Module):
 
         # CRITICAL FIX: Generate position_ids if not provided
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=hidden_states.device, dtype=torch.int64).unsqueeze(0).expand(batch_size, -1)
+            position_ids = torch.arange(seq_len, device=hidden_states.device, dtype=torch.int32).unsqueeze(0).expand(batch_size, -1)
         
         
         # CRITICAL FIX: HF uses GLOBAL embeddings for ALL layers despite layer types
@@ -341,8 +333,13 @@ class Gemma3nAttention(nn.Module):
         cos, sin = self.cos_global, self.sin_global
         
         # Slice RoPE cache to match actual sequence length
-        cos = cos[:seq_len]
-        sin = sin[:seq_len]
+        cos = cos[:, :seq_len, :]
+        sin = sin[:, :seq_len, :]
+
+        # Ensure RoPE cache is on the same device/dtype as attention states
+        if cos.device != hidden_states.device or cos.dtype != hidden_states.dtype:
+            cos = cos.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            sin = sin.to(device=hidden_states.device, dtype=hidden_states.dtype)
         
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -396,7 +393,10 @@ class Gemma3nFFN(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        if isinstance(config.intermediate_size, (list, tuple)):
+            self.intermediate_size = config.intermediate_size[layer_idx]
+        else:
+            self.intermediate_size = config.intermediate_size
         
         # BLOCKER #8 FIX: Proper SwiGLU implementation
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
@@ -442,6 +442,207 @@ class Gemma3nFFN(nn.Module):
         up_proj = self.up_proj(x)
         return self.down_proj(activations * up_proj)  # EXACT HF pattern
 
+
+class Gemma3nTextMLP(nn.Module):
+    """HF-style Gemma3n MLP with activation sparsity."""
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size[layer_idx]
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_activation]
+        self.activation_sparsity = config.activation_sparsity_pattern[layer_idx]
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate_proj = self.gate_proj(hidden_states)
+        if self.activation_sparsity > 0.0:
+            gate_proj = self._gaussian_topk(gate_proj)
+        activations = self.act_fn(gate_proj)
+        up_proj = self.up_proj(hidden_states)
+        return self.down_proj(activations * up_proj)
+
+    def _gaussian_topk(self, inputs: torch.Tensor) -> torch.Tensor:
+        target_sparsity_tensor = torch.tensor(self.activation_sparsity, dtype=torch.float32, device=inputs.device)
+        normal_dist = torch.distributions.normal.Normal(0, 1)
+        std_multiplier: torch.Tensor = normal_dist.icdf(target_sparsity_tensor)
+        std_multiplier = std_multiplier.type(inputs.dtype)
+        inputs_mean = torch.mean(inputs, dim=-1, keepdim=True)
+        inputs_std = torch.std(inputs, dim=-1, keepdim=True, unbiased=False)
+        cutoff_x = inputs_mean + inputs_std * std_multiplier
+        return F.relu(inputs - cutoff_x)
+
+
+class Gemma3nTextLaurelBlock(nn.Module):
+    """LAUREL block (low-rank residual) following HF Gemma3n."""
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.laurel_rank = getattr(config, "laurel_rank", 64)
+        self.linear_left = nn.Linear(self.hidden_size, self.laurel_rank, bias=False)
+        self.linear_right = nn.Linear(self.laurel_rank, self.hidden_size, bias=False)
+        self.post_laurel_norm = Gemma3nRMSNorm(self.hidden_size, eps=config.rms_norm_eps, with_scale=True)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        laurel_hidden_states = self.linear_left(hidden_states)
+        laurel_hidden_states = self.linear_right(laurel_hidden_states)
+        normed = self.post_laurel_norm(laurel_hidden_states)
+        return hidden_states + normed
+
+
+class Gemma3nTextAttention(nn.Module):
+    """HF-style Gemma3n text attention with KV sharing."""
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.attention_dropout = 0.0
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+
+        self.q_norm = Gemma3nRMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=True)
+        self.k_norm = Gemma3nRMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=True)
+        self.v_norm = Gemma3nRMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
+
+        # KV sharing logic (HF pattern)
+        first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
+        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        prev_layers = config.layer_types[:first_kv_shared_layer_idx]
+        if self.is_kv_shared_layer:
+            self.kv_shared_layer_index = len(prev_layers) - 1 - prev_layers[::-1].index(config.layer_types[layer_idx])
+            self.store_full_length_kv = False
+        else:
+            self.kv_shared_layer_index = None
+            self.store_full_length_kv = layer_idx == len(prev_layers) - 1 - prev_layers[::-1].index(
+                config.layer_types[layer_idx]
+            )
+
+    def forward(self, hidden_states, position_embeddings, attention_mask=None, shared_kv=None):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        cos, sin = position_embeddings
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape)
+        query_states = self.q_norm(query_states)
+        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, unsqueeze_dim=2)
+        query_states = query_states.transpose(1, 2)
+
+        if self.is_kv_shared_layer and shared_kv is not None and self.kv_shared_layer_index in shared_kv:
+            key_states, value_states = shared_kv[self.kv_shared_layer_index]
+            key_states = key_states.to(query_states.device)
+            value_states = value_states.to(query_states.device)
+        else:
+            key_states = self.k_proj(hidden_states).view(hidden_shape)
+            key_states = self.k_norm(key_states)
+            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, unsqueeze_dim=2)
+            key_states = key_states.transpose(1, 2)
+
+            value_states = self.v_proj(hidden_states).view(hidden_shape)
+            value_states = self.v_norm(value_states)
+            value_states = value_states.transpose(1, 2)
+
+            if self.store_full_length_kv and shared_kv is not None:
+                shared_kv[self.layer_idx] = (key_states, value_states)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(*input_shape, -1)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None
+
+
+class Gemma3nTextDecoderLayer(nn.Module):
+    """HF-style Gemma3n decoder layer operating on 4-stream hidden states."""
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.attention_type = config.layer_types[layer_idx]
+        self.hidden_size = config.hidden_size
+        self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
+
+        self.attention = Gemma3nTextAttention(config, layer_idx)
+        self.ffn = Gemma3nTextMLP(config, layer_idx)
+        self.laurel = Gemma3nTextLaurelBlock(config)
+        self.altup = Gemma3nAltUp(config)
+
+        self.input_layernorm = Gemma3nRMSNorm(self.hidden_size, eps=config.rms_norm_eps, with_scale=True)
+        self.post_attention_layernorm = Gemma3nRMSNorm(self.hidden_size, eps=config.rms_norm_eps, with_scale=True)
+        self.pre_feedforward_layernorm = Gemma3nRMSNorm(self.hidden_size, eps=config.rms_norm_eps, with_scale=True)
+        self.post_feedforward_layernorm = Gemma3nRMSNorm(self.hidden_size, eps=config.rms_norm_eps, with_scale=True)
+        self.post_per_layer_input_norm = Gemma3nRMSNorm(self.hidden_size, eps=config.rms_norm_eps, with_scale=True)
+
+        self.per_layer_input_gate = nn.Linear(self.hidden_size, self.hidden_size_per_layer_input, bias=False)
+        self.per_layer_projection = nn.Linear(self.hidden_size_per_layer_input, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_activation]
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings_global,
+        position_embeddings_local,
+        per_layer_input,
+        attention_mask=None,
+        shared_kv=None,
+    ):
+        predictions = self.altup.predict(hidden_states)
+        active_prediction = predictions[self.config.altup_active_idx]
+
+        active_prediction_normed = self.input_layernorm(active_prediction)
+        laurel_output = self.laurel(active_prediction_normed)
+
+        position_embeddings = position_embeddings_local if self.attention_type == "sliding_attention" else position_embeddings_global
+        attn, _ = self.attention(
+            hidden_states=active_prediction_normed,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            shared_kv=shared_kv,
+        )
+        attn = self.post_attention_layernorm(attn)
+
+        attn_gated = active_prediction + attn
+        attn_laurel = (attn_gated + laurel_output) / math.sqrt(2)
+
+        attn_norm = self.pre_feedforward_layernorm(attn_laurel)
+        attn_ffw = self.ffn(attn_norm)
+        attn_ffw_norm = self.post_feedforward_layernorm(attn_ffw)
+        attn_ffw_laurel_gated = attn_laurel + attn_ffw_norm
+
+        corrected_predictions = self.altup.correct(predictions, attn_ffw_laurel_gated)
+
+        first_prediction = corrected_predictions[self.config.altup_active_idx].clone()
+        if self.config.altup_correct_scale:
+            first_prediction = self.altup.scale_corrected_output(first_prediction)
+
+        first_prediction = self.per_layer_input_gate(first_prediction)
+        first_prediction = self.act_fn(first_prediction)
+        first_prediction = torch.multiply(first_prediction, per_layer_input)
+        first_prediction = self.per_layer_projection(first_prediction)
+        first_prediction = self.post_per_layer_input_norm(first_prediction)
+
+        corrected_predictions[1:] += first_prediction
+        return corrected_predictions, None
 
 class Gemma3nLaurelBlock(nn.Module):
     """LAUREL (Learned Augmented Residual Layer) Block"""
@@ -654,8 +855,8 @@ class Gemma3nAltUp(nn.Module):
         altup_active_idx = getattr(self.config, 'altup_active_idx', 0)
         modalities = self.compute_router_modalities(hidden_states[altup_active_idx])  # [B, T, 4]
         
-        # DEBUG: Log active stream selection (disabled for CoreML)
-        if not ENABLE_COREML:
+        # DEBUG: Log active stream selection
+        if ENABLE_DEBUG:
             if 'altup.router_inputs' in self.debugger_hooks:
                 router_inputs = self.router_norm(hidden_states[altup_active_idx]) * self.router_input_scale
                 self.debugger_hooks['altup.router_inputs'](router_inputs)
@@ -672,12 +873,6 @@ class Gemma3nAltUp(nn.Module):
             print(f"  Modalities shape: {modalities.shape}")
             print(f"  Modalities values: {modalities.flatten()[:8].tolist()}")
         
-        # 2. Apply coefficient clipping (EXACT HF logic + inference safety)
-        altup_coef_clip = getattr(self.config, 'altup_coef_clip', 120.0)
-        if altup_coef_clip is not None:
-            # STEP 2: Clamp at inference too (harmless safety for long prompts)
-            self.prediction_coefs.weight.data.clamp_(-altup_coef_clip, altup_coef_clip)
-        
         # 3. Generate prediction coefficients (EXACT HF tensor operations)
         altup_num_inputs = getattr(self.config, 'altup_num_inputs', 4)
         all_coefs = (
@@ -687,7 +882,7 @@ class Gemma3nAltUp(nn.Module):
         )
         
         # DEBUG: Log prediction coefficients
-        if not ENABLE_COREML:
+        if ENABLE_DEBUG:
             print(f"🔍 AltUp DEBUG: Prediction coefficients shape: {all_coefs.shape}")
             print(f"  Coef matrix (first token): {all_coefs[0, 0, :, :].tolist()}")
         
@@ -698,8 +893,8 @@ class Gemma3nAltUp(nn.Module):
         # 5. Add residual connection (CRITICAL)
         predictions += hidden_states
         
-        # DEBUG: Log individual stream predictions (disabled for CoreML)
-        if not ENABLE_COREML:
+        # DEBUG: Log individual stream predictions
+        if ENABLE_DEBUG:
             for i in range(4):
                 if f'altup.predictions_stream_{i}' in self.debugger_hooks:
                     self.debugger_hooks[f'altup.predictions_stream_{i}'](predictions[i])
@@ -722,7 +917,7 @@ class Gemma3nAltUp(nn.Module):
         # 1. Compute modalities from activated output
         modalities = self.compute_router_modalities(activated)  # [B, T, 4]
         
-        if not ENABLE_COREML and 'altup.modalities_correct' in self.debugger_hooks:
+        if ENABLE_DEBUG and 'altup.modalities_correct' in self.debugger_hooks:
             self.debugger_hooks['altup.modalities_correct'](modalities)
         
         # 2. Calculate innovation (error) between actual and predicted active stream
@@ -730,7 +925,7 @@ class Gemma3nAltUp(nn.Module):
         altup_num_inputs = getattr(self.config, 'altup_num_inputs', 4)
         innovation = activated - predictions[altup_active_idx]  # [B, T, 2048]
         
-        if not ENABLE_COREML:
+        if ENABLE_DEBUG:
             # DEBUG: Log innovation details
             print(f"🔍 AltUp CORRECT DEBUG: Using active stream {altup_active_idx} for innovation")
             print(f"  Activated shape: {activated.shape}")
@@ -741,25 +936,19 @@ class Gemma3nAltUp(nn.Module):
         # Broadcast innovation to all streams
         innovation = innovation.repeat(altup_num_inputs, 1, 1, 1)  # [4, B, T, 2048]
         
-        # 3. Apply coefficient clipping (EXACT HF logic + inference safety)
-        altup_coef_clip = getattr(self.config, 'altup_coef_clip', 120.0)
-        if altup_coef_clip is not None:
-            # STEP 2: Clamp at inference too (harmless safety for long prompts)
-            self.correction_coefs.weight.data.clamp_(-altup_coef_clip, altup_coef_clip)
-        
-        # 4. Generate correction coefficients (EXACT HF implementation)
+        # 3. Generate correction coefficients (EXACT HF implementation)
         all_coefs = self.correction_coefs(modalities) + 1.0  # [B, T, 4] + 1.0 for stability
         all_coefs = all_coefs.permute(2, 0, 1).unsqueeze(-1)  # [4, B, T, 1] for broadcasting
         
         # DEBUG: Log correction coefficients
         correction_coefs_output = self.correction_coefs(modalities)
-        if not ENABLE_COREML:
+        if ENABLE_DEBUG:
             print(f"🔍 AltUp CORRECT DEBUG: Correction coefficients")
             print(f"  Raw correction coefs: {correction_coefs_output.flatten()[:8].tolist()}")
             print(f"  All coefs (+1.0): {all_coefs.flatten()[:8].tolist()}")
             print(f"  Correction coefs magnitude: {correction_coefs_output.norm().item():.6f}")
         
-        if not ENABLE_COREML:
+        if ENABLE_DEBUG:
             if 'altup.correction_coefs_output' in self.debugger_hooks:
                 self.debugger_hooks['altup.correction_coefs_output'](correction_coefs_output)
             
@@ -770,8 +959,8 @@ class Gemma3nAltUp(nn.Module):
         corrected = torch.mul(innovation, all_coefs)  # [4, B, T, 2048] * [4, B, T, 1] = [4, B, T, 2048]
         corrected += predictions  # Add back original predictions
         
-        # DEBUG: Log individual corrected streams (disabled for CoreML)
-        if not ENABLE_COREML:
+        # DEBUG: Log individual corrected streams
+        if ENABLE_DEBUG:
             for i in range(4):
                 if f'altup.corrected_stream_{i}' in self.debugger_hooks:
                     self.debugger_hooks[f'altup.corrected_stream_{i}'](corrected[i])
@@ -809,19 +998,31 @@ class Gemma3nModel(nn.Module):
             config.vocab_size_per_layer_input, 
             config.num_hidden_layers * config.hidden_size_per_layer_input
         )
-        self.ple_embed_scale = math.sqrt(256)  # CORRECT: HF uses √256 = 16.0 for PLE scaling!
+        self.ple_embed_scale = math.sqrt(config.hidden_size_per_layer_input)
+
+        # Per-layer projection path (HF pattern)
+        self.per_layer_model_projection = nn.Linear(
+            config.hidden_size,
+            config.num_hidden_layers * config.hidden_size_per_layer_input,
+            bias=False,
+        )
+        self.per_layer_projection_norm = Gemma3nRMSNorm(
+            config.hidden_size_per_layer_input, eps=config.rms_norm_eps, with_scale=True
+        )
+        self.register_buffer("per_layer_projection_scale", torch.tensor(config.hidden_size**-0.5), persistent=False)
+        self.register_buffer("per_layer_input_scale", torch.rsqrt(torch.tensor(2.0)), persistent=False)
 
         # Global AltUp projections (EXACT HF pattern: 3 projections for streams 1,2,3)
         # Stream 0 is identity (no projection), streams 1,2,3 use projections
-        self.altup_projections = nn.ModuleList([
-            nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-            for _ in range(1, config.altup_num_inputs)  # range(1, 4) = [1, 2, 3] -> 3 projections
-        ])
+        self.altup_projections = nn.ModuleList(
+            [nn.Linear(config.hidden_size, config.hidden_size, bias=False) for _ in range(1, config.altup_num_inputs)]
+        )
+        self.altup_unembed_projections = nn.ModuleList(
+            [nn.Linear(config.hidden_size, config.hidden_size, bias=False) for _ in range(1, config.altup_num_inputs)]
+        )
         
         # Transformer layers
-        self.layers = nn.ModuleList([
-            Gemma3nLaurelBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList([Gemma3nTextDecoderLayer(config, i) for i in range(config.num_hidden_layers)])
         
         # Final components
         self.norm = Gemma3nRMSNorm(config.hidden_size, eps=config.rms_norm_eps, with_scale=True)
@@ -862,54 +1063,105 @@ class Gemma3nModel(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
 
-        # Accept debugger_hooks from kwargs, populate self, and propagate to layers (disabled for CoreML)
-        if not ENABLE_COREML:
-            debugger_hooks = kwargs.get('debugger_hooks')
-            if debugger_hooks:
-                self.debugger_hooks = debugger_hooks
-                for i, layer in enumerate(self.layers):
-                    layer.debugger_hooks = {
-                        k.replace(f'layer_{i}.', ''): v for k, v in debugger_hooks.items() if k.startswith(f'layer_{i}.')
-                    }
-
         # Embeddings with scaling
-        hidden_states = self.embed_tokens(input_ids) * self.embed_scale
-        
-        # Debug hook for initial embedding
-        if not ENABLE_COREML and 'initial_embedding' in self.debugger_hooks:
-            self.debugger_hooks['initial_embedding'](hidden_states)
-        
-        # Per-layer embeddings (WITH √256 scaling for PLE)
-        per_layer_embeddings = self.embed_tokens_per_layer(input_ids) * self.ple_embed_scale  # [B, T, num_layers * 256]
-        
-        # Determine layer limit for processing
-        layer_limit = debug_layer_limit if debug_layer_limit is not None else self.config.num_hidden_layers
-        
-        new_past_key_values = []
-        for layer_idx, layer in enumerate(self.layers):
-            # DEBUG: Only process specified number of layers for fair comparison (only when explicitly limited)
-            if debug_layer_limit is not None and layer_idx >= layer_limit:
-                print(f"🔍 DEBUG: Skipping layer {layer_idx} for {layer_limit}-layer comparison")
-                break
-                
-            # Extract per-layer input for this specific layer
-            layer_start = layer_idx * self.config.hidden_size_per_layer_input
-            layer_end = (layer_idx + 1) * self.config.hidden_size_per_layer_input
-            per_layer_input = per_layer_embeddings[:, :, layer_start:layer_end]  # [B, T, 256]
+        inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
 
-            past_key_value = past_key_values[layer_idx] if past_key_values else None
-            hidden_states, past_key_value = layer(
-                hidden_states, attention_mask, position_ids, past_key_value, per_layer_input,
-                altup_projections=self.altup_projections, altup_unembed_projections=None
+        # Per-layer embeddings (scaled)
+        per_layer_inputs = self.embed_tokens_per_layer(input_ids) * self.ple_embed_scale
+        per_layer_inputs = per_layer_inputs.view(
+            batch_size,
+            seq_len,
+            self.config.num_hidden_layers,
+            self.config.hidden_size_per_layer_input,
+        )
+
+        # Per-layer projection from inputs_embeds (HF pattern)
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        per_layer_projection = per_layer_projection * self.per_layer_projection_scale.to(
+            dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
+        per_layer_projection = per_layer_projection.view(
+            batch_size,
+            seq_len,
+            self.config.num_hidden_layers,
+            self.config.hidden_size_per_layer_input,
+        )
+        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+        per_layer_inputs = (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale.to(
+            dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
+
+        # Position embeddings (global + local)
+        cos_global, sin_global = create_rotary_cache(
+            self.config.head_dim,
+            seq_len,
+            theta=self.config.rope_theta,
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+            batch_size=batch_size,
+        )
+        cos_local, sin_local = create_rotary_cache(
+            self.config.head_dim,
+            seq_len,
+            theta=self.config.rope_local_base_freq,
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+            batch_size=batch_size,
+        )
+
+        # 4-stream hidden states for AltUp
+        target_magnitude = torch.mean(inputs_embeds**2, dim=-1, keepdim=True) ** 0.5
+        epsilon_tensor = torch.tensor(1e-5, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        temp_hidden_states = [inputs_embeds]
+        for i in range(1, self.config.altup_num_inputs):
+            altup_proj = self.altup_projections[i - 1](inputs_embeds)
+            current_hidden_state = altup_proj.to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+            new_magnitude = torch.mean(current_hidden_state**2, dim=-1, keepdim=True)
+            new_magnitude = torch.sqrt(torch.maximum(new_magnitude, epsilon_tensor))
+            current_hidden_state = current_hidden_state * target_magnitude / new_magnitude
+            temp_hidden_states.append(current_hidden_state)
+        hidden_states = torch.stack(temp_hidden_states, dim=0)
+
+        # Masks
+        full_mask = create_causal_mask_4d(seq_len, batch_size, inputs_embeds.device, inputs_embeds.dtype)
+        sliding_mask = create_sliding_window_causal_mask_4d(
+            seq_len, self.config.sliding_window, batch_size, inputs_embeds.device, inputs_embeds.dtype
+        )
+
+        # KV sharing storage
+        shared_kv = {}
+
+        layer_limit = debug_layer_limit if debug_layer_limit is not None else self.config.num_hidden_layers
+        for layer_idx, layer in enumerate(self.layers):
+            if debug_layer_limit is not None and layer_idx >= layer_limit:
+                break
+
+            per_layer_input = per_layer_inputs[:, :, layer_idx, :]
+            attn_mask = sliding_mask if layer.attention_type == "sliding_attention" else full_mask
+            hidden_states, _ = layer(
+                hidden_states,
+                (cos_global, sin_global),
+                (cos_local, sin_local),
+                per_layer_input,
+                attention_mask=attn_mask,
+                shared_kv=shared_kv,
             )
-            new_past_key_values.append(past_key_value)
-            
-        # Final normalization
-        if not ENABLE_COREML and 'final_norm_input' in self.debugger_hooks:
-            self.debugger_hooks['final_norm_input'](hidden_states)
+
+        # Unembed and combine streams
+        target_magnitude = torch.mean(hidden_states[0] ** 2, dim=-1, keepdim=True) ** 0.5
+        epsilon_tensor = torch.tensor(1e-5, device=hidden_states.device, dtype=hidden_states.dtype)
+        temp_hidden_states = [hidden_states[0]]
+        for i in range(1, self.config.altup_num_inputs):
+            altup_unemb_proj = self.altup_unembed_projections[i - 1](hidden_states[i])
+            current_hidden_state = altup_unemb_proj.to(dtype=hidden_states.dtype, device=hidden_states.device)
+            new_magnitude = torch.mean(current_hidden_state**2, dim=-1, keepdim=True)
+            new_magnitude = torch.sqrt(torch.maximum(new_magnitude, epsilon_tensor))
+            current_hidden_state = current_hidden_state * target_magnitude / new_magnitude
+            temp_hidden_states.append(current_hidden_state)
+
+        hidden_states = torch.stack(temp_hidden_states, dim=0)
+        hidden_states = torch.mean(hidden_states, dim=0)
         hidden_states = self.norm(hidden_states)
-        if not ENABLE_COREML and 'final_norm_output' in self.debugger_hooks:
-            self.debugger_hooks['final_norm_output'](hidden_states)
         
         # LM head projection with split vocabulary support
         if ENABLE_CONV2D and ENABLE_VACAB_SPLIT16:
@@ -1049,6 +1301,16 @@ class Gemma3nModel(nn.Module):
                 print(f"  ✅ PLE dimensions match config")
                 ane_state_dict["embed_tokens_per_layer.weight"] = ple_embeddings
                 print(f"  ✅ Loaded per-layer embeddings: {ple_embeddings.shape}")
+
+        # Load per-layer projection weights
+        if "model.language_model.per_layer_model_projection.weight" in state_dict:
+            proj_weight = state_dict["model.language_model.per_layer_model_projection.weight"]
+            ane_state_dict["per_layer_model_projection.weight"] = proj_weight
+            print(f"  ✅ Loaded per-layer model projection: {proj_weight.shape}")
+        if "model.language_model.per_layer_projection_norm.weight" in state_dict:
+            norm_weight = state_dict["model.language_model.per_layer_projection_norm.weight"]
+            ane_state_dict["per_layer_projection_norm.weight"] = norm_weight
+            print(f"  ✅ Loaded per-layer projection norm: {norm_weight.shape}")
         
         # Load final norm
         if "model.language_model.norm.weight" in state_dict:
@@ -1104,11 +1366,11 @@ class Gemma3nModel(nn.Module):
             laurel_norm_key = f"{layer_prefix}.laurel.post_laurel_norm.weight"
             
             if laurel_left_key in state_dict:
-                ane_state_dict[f"layers.{layer_idx}.linear_left.weight"] = state_dict[laurel_left_key]
+                ane_state_dict[f"layers.{layer_idx}.laurel.linear_left.weight"] = state_dict[laurel_left_key]
             if laurel_right_key in state_dict:
-                ane_state_dict[f"layers.{layer_idx}.linear_right.weight"] = state_dict[laurel_right_key]
+                ane_state_dict[f"layers.{layer_idx}.laurel.linear_right.weight"] = state_dict[laurel_right_key]
             if laurel_norm_key in state_dict:
-                ane_state_dict[f"layers.{layer_idx}.post_laurel_norm.weight"] = state_dict[laurel_norm_key]
+                ane_state_dict[f"layers.{layer_idx}.laurel.post_laurel_norm.weight"] = state_dict[laurel_norm_key]
                 print(f"    ✅ Layer {layer_idx} LAUREL norm loaded: {state_dict[laurel_norm_key].shape}")
             
             # Attention weights
@@ -1171,6 +1433,12 @@ class Gemma3nModel(nn.Module):
             hf_key = f"model.language_model.altup_projections.{i}.weight"
             if hf_key in state_dict:
                 ane_state_dict[f"altup_projections.{i}.weight"] = state_dict[hf_key]
+
+        # Global AltUp unembed projections
+        for i in range(3):
+            hf_key = f"model.language_model.altup_unembed_projections.{i}.weight"
+            if hf_key in state_dict:
+                ane_state_dict[f"altup_unembed_projections.{i}.weight"] = state_dict[hf_key]
         
         # Sample norm keys for debugging
         sample_norm_keys = [k for k in state_dict.keys() if "norm.weight" in k][:5]
@@ -1180,5 +1448,3 @@ class Gemma3nModel(nn.Module):
         print(f"  🔍 LAUREL norm keys found: {len(laurel_norm_keys)}/{self.config.num_hidden_layers} layers")
         
         return ane_state_dict
-    
-''
