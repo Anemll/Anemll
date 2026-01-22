@@ -193,7 +193,36 @@ def load_model(path, function_name=None):
     """Load a CoreML model, handling both .mlmodelc and .mlpackage formats."""
     path = Path(path)
     compute_unit = ct.ComputeUnit.CPU_AND_NE
-    
+    def _get_token_id_if_present(token_str):
+        if not token_str:
+            return None
+        vocab = tokenizer.get_vocab()
+        if token_str in vocab:
+            return vocab[token_str]
+        token_id = tokenizer.convert_tokens_to_ids(token_str)
+        if isinstance(token_id, list):
+            if len(token_id) == 1:
+                token_id = token_id[0]
+            else:
+                return None
+        if token_id is None:
+            return None
+        if tokenizer.unk_token_id is not None and token_id == tokenizer.unk_token_id:
+            return None
+        return token_id
+
+    # Build stop token id set (EOS + known end-of-turn tokens).
+    stop_token_ids = set()
+    eos_token_ids = tokenizer.eos_token_id
+    if isinstance(eos_token_ids, list):
+        stop_token_ids.update(eos_token_ids)
+    else:
+        stop_token_ids.add(eos_token_ids)
+    for token_str in ("<end_of_turn>", "<|eot_id|>"):
+        token_id = _get_token_id_if_present(token_str)
+        if token_id is not None:
+            stop_token_ids.add(token_id)
+
     try:
         if path.suffix == '.mlmodelc':
             # For compiled models (.mlmodelc), use CompiledMLModel
@@ -891,14 +920,9 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     if warmup and tokens_generated >= WARMUP_TOKEN_LIMIT:
                         break
                     
-                    # Check for all possible EOS tokens
-                    eos_token_ids = tokenizer.eos_token_id
-                    if isinstance(eos_token_ids, list):
-                        if next_token in eos_token_ids:
-                            break
-                    else:
-                        if next_token == eos_token_ids:
-                            break
+                    # Check for EOS and end-of-turn tokens
+                    if next_token in stop_token_ids:
+                        break
                 
                 inference_time = time.time() - inference_start  # Calculate inference time
                 
