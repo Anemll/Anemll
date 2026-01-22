@@ -67,7 +67,10 @@ def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch,
         print(f"Warning: Monolithic model not found: {model_path}")
 
     # Set split_lm_head based on architecture
-    split_lm_head = 16 if arch.startswith('qwen') else 8
+    if arch.startswith('qwen') or arch.startswith('gemma'):
+        split_lm_head = 16
+    else:
+        split_lm_head = 8
 
     # Build meta.yaml content
     meta_parts = [f'''model_info:
@@ -161,16 +164,23 @@ def main():
     lmhead_name, lut_lmh_actual, _ = check_file_exists(OUTPUT_DIR, lmhead_base, lut_lmh_bits)
 
     # Check FFN (always use LUT if specified, as it's required for ANE) - use only bits for filename
+    # FFN files include chunk suffix: e.g., qwen_FFN_PF_lut4_chunk_01of01.mlmodelc
     ffn_base = f'{PREFIX}_FFN_PF'
-    ffn_name = f'{ffn_base}_lut{lut_ffn_bits}' if lut_ffn_bits != 'none' else ffn_base
-    
+    if lut_ffn_bits != 'none':
+        ffn_name = f'{ffn_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}'
+    else:
+        ffn_name = f'{ffn_base}_chunk_01of{int(NUM_CHUNKS):02d}'
+
     # Add .mlmodelc extension to model paths
     embeddings_path = f'{embeddings_name}.mlmodelc'
     lmhead_path = f'{lmhead_name}.mlmodelc'
     ffn_path = f'{ffn_name}.mlmodelc'
     
     # Set split_lm_head based on architecture
-    split_lm_head = 16 if ARCH.startswith('qwen') else 8
+    if ARCH.startswith('qwen') or ARCH.startswith('gemma'):
+        split_lm_head = 16
+    else:
+        split_lm_head = 8
 
     # Build metadata with per_channel info if available
     meta_parts = [f'''model_info:
