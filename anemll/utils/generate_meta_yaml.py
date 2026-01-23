@@ -40,7 +40,7 @@ def check_file_exists(output_dir, base_name, lut_value):
         print(f"Warning: {lut_name}.mlmodelc not found, using {base_name}.mlmodelc instead")
         return base_name, 'none', None
 
-def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch, output_dir):
+def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch, output_dir, argmax_in_model=False):
     """Generate meta.yaml for monolithic model format.
 
     Args:
@@ -51,6 +51,7 @@ def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch,
         prefix: Model name prefix
         arch: Architecture type
         output_dir: Output directory
+        argmax_in_model: If True, model computes argmax internally
     """
     # Parse LUT value
     lut_value, lut_per_channel, _ = parse_lut_value(lut_bits)
@@ -95,9 +96,11 @@ def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch,
     if lut_per_channel is not None:
         meta_parts.append(f'    lut_per_channel: {lut_per_channel}')
 
+    argmax_line = f'\n    argmax_in_model: true' if argmax_in_model else ''
+
     meta_parts.append(f'''    model_prefix: {prefix}
     monolithic_model: {model_name_file}
-    split_lm_head: {split_lm_head}
+    split_lm_head: {split_lm_head}{argmax_line}
     functions:
       - infer
       - prefill
@@ -120,9 +123,14 @@ def main():
     if is_monolithic:
         sys.argv.remove('--monolithic')
 
+    # Check for --argmax flag
+    argmax_in_model = '--argmax' in sys.argv
+    if argmax_in_model:
+        sys.argv.remove('--argmax')
+
     if is_monolithic:
         if len(sys.argv) != 11:
-            print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_bits> <lut_bits> <lut_bits> <num_chunks> <prefix> <arch> <output_dir> --monolithic")
+            print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_bits> <lut_bits> <lut_bits> <num_chunks> <prefix> <arch> <output_dir> --monolithic [--argmax]")
             sys.exit(1)
         # For monolithic, all LUT values should be the same (use the first one)
         generate_monolithic_meta(
@@ -132,7 +140,8 @@ def main():
             lut_bits=sys.argv[4],  # Use first LUT value for all
             prefix=sys.argv[8],
             arch=sys.argv[9],
-            output_dir=sys.argv[10]
+            output_dir=sys.argv[10],
+            argmax_in_model=argmax_in_model
         )
         return
 

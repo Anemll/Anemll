@@ -21,6 +21,7 @@ public struct YAMLConfig: Sendable {
     // Monolithic model support
     public let isMonolithic: Bool
     public let monolithicModelPath: String?
+    public let argmaxInModel: Bool  // If true, model outputs argmax_idx/val pairs instead of logits
     
     public init(from yamlString: String) throws {
         // Load YAML
@@ -57,6 +58,7 @@ public struct YAMLConfig: Sendable {
         // Monolithic model support
         self.isMonolithic = yaml["is_monolithic"] as? Bool ?? false
         self.monolithicModelPath = yaml["monolithic_model_path"] as? String
+        self.argmaxInModel = yaml["argmax_in_model"] as? Bool ?? false
 
         // Get the ffn_path
         let rawFFNPath = yaml["ffn_path"] as? String ?? ""
@@ -205,6 +207,9 @@ public struct YAMLConfig: Sendable {
                 }
             }
             
+            // Check for argmax_in_model flag
+            let argmaxInModel = params["argmax_in_model"] as? Bool ?? false
+
             // Build monolithic model path if applicable
             let monolithicModelPath: String?
             if isMonolithic {
@@ -216,6 +221,7 @@ public struct YAMLConfig: Sendable {
                     monolithicModelPath = "\(baseDir)/\(modelPrefix)_monolithic_full\(lutSuffix).mlmodelc"
                 }
                 print("\nMonolithic model path: \(monolithicModelPath!)")
+                print("Argmax in model: \(argmaxInModel)")
             } else {
                 monolithicModelPath = nil
                 print("\nModel paths (Python style):")
@@ -251,7 +257,8 @@ public struct YAMLConfig: Sendable {
                 "ffn_path": ffnPath,
                 "lmhead_path": lmheadPath,
                 "split_lm_head": splitLMHead,
-                "is_monolithic": isMonolithic
+                "is_monolithic": isMonolithic,
+                "argmax_in_model": argmaxInModel
             ]
             if let monolithicPath = monolithicModelPath {
                 configDict["monolithic_model_path"] = monolithicPath
@@ -283,7 +290,8 @@ public struct YAMLConfig: Sendable {
         lutEmbeddings: String,
         splitLMHead: Int,
         isMonolithic: Bool = false,
-        monolithicModelPath: String? = nil
+        monolithicModelPath: String? = nil,
+        argmaxInModel: Bool = false
     ) throws -> YAMLConfig {
         // Create YAML string for init(from:)
         var configDict: [String: Any] = [
@@ -303,7 +311,8 @@ public struct YAMLConfig: Sendable {
             "ffn_path": ffnPath,
             "lmhead_path": lmheadPath,
             "split_lm_head": splitLMHead,
-            "is_monolithic": isMonolithic
+            "is_monolithic": isMonolithic,
+            "argmax_in_model": argmaxInModel
         ]
         if let monolithicPath = monolithicModelPath {
             configDict["monolithic_model_path"] = monolithicPath

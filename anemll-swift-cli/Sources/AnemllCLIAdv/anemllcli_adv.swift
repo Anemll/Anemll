@@ -350,7 +350,8 @@ struct AnemllCLIAdv: AsyncParsableCommand {
             batchSize: config.batchSize,
             splitLMHead: config.splitLMHead,
             debugLevel: debugLevel,
-            v110: config.configVersion == "0.1.1"  // Set v110 flag based on version
+            v110: config.configVersion == "0.1.1",  // Set v110 flag based on version
+            argmaxInModel: config.argmaxInModel
         )
         
         // *** SET SAMPLING CONFIGURATION ***

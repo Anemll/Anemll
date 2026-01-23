@@ -21,6 +21,7 @@ OUTPUT_DIR=""
 RESTART_STEP=1
 ONLY_STEP=""
 SKIP_CHECK=false
+ARGMAX_IN_MODEL=false
 
 # Default converter; may be overridden after parsing config.json
 CONVERTER="python3 -m anemll.ane_converter.llama_converter"
@@ -43,6 +44,7 @@ print_usage() {
     echo "  --restart       Restart from specific step (1-6, default: 1)"
     echo "  --only          Run only specified step and exit (1-6)"
     echo "  --skip-check    Skip the dependency check step"
+    echo "  --argmax        Compute argmax inside model (outputs idx+val pairs instead of logits)"
     echo ""
     echo "Steps:"
     echo "  1. Convert monolithic inference model (embed + FFN + lm_head)"
@@ -100,6 +102,10 @@ while [[ $# -gt 0 ]]; do
             SKIP_CHECK=true
             shift
             ;;
+        --argmax)
+            ARGMAX_IN_MODEL=true
+            shift
+            ;;
         --help|-h)
             print_usage
             ;;
@@ -154,6 +160,11 @@ if [ -f "$CONFIG_FILE" ]; then
         if [ -z "$PREFIX" ]; then
             PREFIX="qwen"
         fi
+    elif [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
+        CONVERTER="python3 -m anemll.ane_converter.gemma3_converter"
+        if [ -z "$PREFIX" ]; then
+            PREFIX="gemma3"
+        fi
     else
         CONVERTER="python3 -m anemll.ane_converter.llama_converter"
         if [ -z "$PREFIX" ]; then
@@ -173,6 +184,7 @@ echo "Prefix:         $PREFIX"
 echo "Context length: $CONTEXT_LENGTH"
 echo "Batch size:     $BATCH_SIZE"
 echo "LUT bits:       $LUT_BITS"
+echo "Argmax in model:$ARGMAX_IN_MODEL"
 echo "=========================================="
 echo ""
 
@@ -225,10 +237,17 @@ if [ ! -z "$LUT_BITS" ]; then
     LUT_PARAM="--lut $LUT_BITS"
 fi
 
+# Prepare argmax parameter
+ARGMAX_PARAM=""
+if [ "$ARGMAX_IN_MODEL" = true ]; then
+    ARGMAX_PARAM="--argmax"
+fi
+
 # Step 1: Convert Monolithic Inference Model
 run_step 1 "Converting Monolithic Inference Model" "$CONVERTER \
     --part monolithic \
     $LUT_PARAM \
+    $ARGMAX_PARAM \
     --context-length $CONTEXT_LENGTH \
     --batch-size $BATCH_SIZE \
     --prefix \"$PREFIX\" \
@@ -239,6 +258,7 @@ run_step 1 "Converting Monolithic Inference Model" "$CONVERTER \
 run_step 2 "Converting Monolithic Prefill Model" "$CONVERTER \
     --part monolithic_prefill \
     $LUT_PARAM \
+    $ARGMAX_PARAM \
     --context-length $CONTEXT_LENGTH \
     --batch-size $BATCH_SIZE \
     --prefix \"$PREFIX\" \
@@ -276,6 +296,7 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
         # Copy tokenizer files if they exist
         (cp \"$MODEL_PATH/tokenizer.json\" \"$OUTPUT_DIR/\" 2>/dev/null || true) && \
         (cp \"$MODEL_PATH/tokenizer_config.json\" \"$OUTPUT_DIR/\" 2>/dev/null || true) && \
+        (cp \"$MODEL_PATH/tokenizer.model\" \"$OUTPUT_DIR/\" 2>/dev/null || true) && \
         (cp \"$MODEL_PATH/vocab.json\" \"$OUTPUT_DIR/\" 2>/dev/null || true) && \
         (cp \"$MODEL_PATH/merges.txt\" \"$OUTPUT_DIR/\" 2>/dev/null || true) && \
         (cp \"$MODEL_PATH/chat_template.jinja\" \"$OUTPUT_DIR/\" 2>/dev/null || true) && \
@@ -307,7 +328,7 @@ EOF_CONFIG
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \
             1 \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \
-            --monolithic
+            --monolithic $ARGMAX_PARAM
     "
 fi
 

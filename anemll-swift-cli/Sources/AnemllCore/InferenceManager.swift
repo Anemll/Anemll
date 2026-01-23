@@ -1,6 +1,9 @@
 import CoreVideo
 @preconcurrency import CoreML
 import CoreFoundation
+import Metal
+import IOSurface
+import Accelerate
 
 /// Manages inference by wrapping a CoreML model and handling state.
 @preconcurrency public final class InferenceManager: @unchecked Sendable {
@@ -19,13 +22,25 @@ import CoreFoundation
     private var FilterLLAMA01: Bool = false
     private let splitLMHead: Int
     private let isMonolithic: Bool  // Monolithic model support
-    
+    private let argmaxInModel: Bool  // If true, model outputs argmax_idx/val pairs instead of logits
+
     private var lmheadOutputBackings: [String: MLMultiArray]?
     private var hiddenStatesBackings_emb: [String: MLMultiArray]?  // For embed output
     private var hiddenStatesBackings_ffn: [String: MLMultiArray]?  // For FFN input/output
     private var hiddenStatesBackings_last: [String: MLMultiArray]?  // Prefill the last chunk
     private var hiddenStatesBackings_emb_prefill: [String: MLMultiArray]?  // For embed output in prefill
     private var hiddenStatesBackings_ffn_prefill: [String: MLMultiArray]?  // For FFN output in prefill
+
+    // Ring buffer for monolithic models to avoid ANE race conditions
+    // Using N=16 depth to ensure buffer isn't reused while still being read
+    private var monolithicOutputBackingsRing: [[String: MLMultiArray]] = []
+    private let monolithicRingBufferDepth = 16
+    private var monolithicTokenCounter: Int = 0
+
+    // For argmax mode: store raw pixel buffers separately (to avoid locking issues)
+    // MLMultiArray created from pixel buffer may lock it, so we keep raw buffers for direct access
+    private var argmaxIdxPixelBuffers: [CVPixelBuffer] = []
+    private var argmaxValPixelBuffers: [CVPixelBuffer] = []
     private var GreedySearch = true
     nonisolated(unsafe) private var abort_generation = Int(0)
     private var _busy = false
@@ -37,6 +52,27 @@ import CoreFoundation
     // Sampling configuration (defaults to greedy for backward compatibility)
     private var samplingConfig: SamplingConfig = .greedy
     private var generatedTokenHistory: [Int] = []
+
+    // Metal-based argmax for GPU processing (avoids CPU/ANE sync issues)
+    private var metalArgmax: MetalArgmax?
+
+    // Serial queue for ANE predictions to ensure thread safety
+    // ANE + MLState may not be thread-safe when accessed from different threads
+    private let predictionQueue = DispatchQueue(label: "com.anemll.prediction", qos: .userInitiated)
+
+    // Pre-allocated input tensors for sync argmax inference (avoid allocation overhead)
+    // All use IOSurface-backed buffers for proper ANE synchronization
+    private var argmaxTokenArray: MLMultiArray?
+    private var argmaxTokenBuffer: CVPixelBuffer?
+    private var argmaxPositionIds: MLMultiArray?
+    private var argmaxPositionBuffer: CVPixelBuffer?
+    private var argmaxCurrentPosArray: MLMultiArray?
+    private var argmaxCurrentPosBuffer: CVPixelBuffer?
+    private var argmaxCausalMask: MLMultiArray?
+    private var argmaxCausalMaskBuffer: CVPixelBuffer?
+    private var lastArgmaxPosition: Int = -1
+    private var argmaxInferOptions: MLPredictionOptions?
+    private var argmaxInferInput: MLDictionaryFeatureProvider?
     
     // Move struct definition to class scope, before the methods
     private struct PartialMax {
@@ -61,9 +97,10 @@ import CoreFoundation
     }
 
 
-    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false) throws {  // Make init throwing
+    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false) throws {  // Make init throwing
         self.debugLevel = debugLevel
         self.isMonolithic = models.isMonolithic
+        self.argmaxInModel = argmaxInModel
         self.embedModel = models.embedModel
         self.lmheadModel = models.lmheadModel
         // Assume models.ffnChunks is available (see note below)
@@ -73,7 +110,7 @@ import CoreFoundation
         self.splitLMHead = splitLMHead
         self.v110 = v110 // Set the v110 flag based on the parameter
 
-        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic)")
+        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel)")
         self.fullCausalMask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: contextLength)], dataType: .float16)
 
         self.initState()
@@ -81,6 +118,68 @@ import CoreFoundation
         initFullCausalMask()
 
         try initializeBackings()
+
+        // Pre-allocate input tensors for sync argmax inference (eliminates allocation overhead)
+        // int32 arrays use regular MLMultiArray (pixel buffer only supports fp16/uint8)
+        // fp16 causal mask uses IOSurface-backed pixel buffer for ANE synchronization
+        if argmaxInModel && isMonolithic {
+            // int32 input arrays - regular MLMultiArray
+            argmaxTokenArray = try MLMultiArray(shape: [1, 1], dataType: .int32)
+            argmaxPositionIds = try MLMultiArray(shape: [1], dataType: .int32)
+            argmaxCurrentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
+
+            // Causal mask [1, 1, 1, contextLength] - IOSurface-backed fp16 pixel buffer
+            let ioAttributes: [String: Any] = [
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+            ]
+
+            var maskBuffer: CVPixelBuffer?
+            let maskStatus = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                contextLength, 1,
+                kCVPixelFormatType_OneComponent16Half,
+                ioAttributes as CFDictionary,
+                &maskBuffer
+            )
+            guard maskStatus == kCVReturnSuccess, let mBuf = maskBuffer else {
+                throw InferenceError.inferenceError("Failed to create causal mask pixel buffer")
+            }
+            argmaxCausalMaskBuffer = mBuf
+            argmaxCausalMask = MLMultiArray(pixelBuffer: mBuf, shape: [1, 1, 1, NSNumber(value: contextLength)])
+
+            // Initialize causal mask with -inf
+            CVPixelBufferLockBaseAddress(mBuf, [])
+            if let baseAddress = CVPixelBufferGetBaseAddress(mBuf) {
+                let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                for i in 0..<contextLength {
+                    ptr[i] = Float16(-Float.infinity)
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(mBuf, [])
+            lastArgmaxPosition = -1
+
+            // Pre-allocate input feature provider (reused for all inferences)
+            argmaxInferInput = try MLDictionaryFeatureProvider(dictionary: [
+                "input_ids": argmaxTokenArray!,
+                "position_ids": argmaxPositionIds!,
+                "causal_mask": argmaxCausalMask!,
+                "current_pos": argmaxCurrentPosArray!
+            ])
+
+            // Pre-allocate prediction options
+            argmaxInferOptions = MLPredictionOptions()
+        }
+
+        // Metal argmax is available but CPU Accelerate SIMD is faster for this workload
+        // Metal overhead (IOSurface locking, command buffer) outweighs GPU benefit
+        // Keeping Metal code for reference but using CPU by default
+        if isMonolithic && debugLevel >= 2 {
+            self.metalArgmax = MetalArgmax()
+            if metalArgmax != nil {
+                print("Metal argmax available (disabled by default, CPU is faster)")
+            }
+        }
 
         // Debug model descriptions
         if debugLevel >= 1 && !isMonolithic {
@@ -141,7 +240,13 @@ import CoreFoundation
     }
     
     public func initState()  {
-        self.state = ffnChunks[0].prefillModel.makeState()
+        // For monolithic models, create state from inferModel (like Python does)
+        // This ensures state compatibility when switching between prefill and infer functions
+        if isMonolithic {
+            self.state = ffnChunks[0].inferModel.makeState()
+        } else {
+            self.state = ffnChunks[0].prefillModel.makeState()
+        }
     }
     
     public func ToggeDebugLevel()  {
@@ -380,68 +485,103 @@ import CoreFoundation
     }
 
     private func initializeMonolithicOutputBackings() throws {
-        // For monolithic models, initialize output backings from the monolithic model's output description
+        // Ring buffer with N=16 depth to avoid ANE race conditions.
+        // This ensures buffers aren't reused while still being read/written.
         let outputDescription = ffnChunks[0].inferModel.modelDescription.outputDescriptionsByName
-        let featureNames = (1...splitLMHead).map { i in "logits\(i)" }
-        var outputBackingsDict: [String: MLMultiArray] = [:]
 
         if debugLevel >= 1 {
-            print("\n=== Initializing Monolithic Output Backings ===")
+            print("\n=== Initializing Monolithic Output Backings (Ring Buffer N=\(monolithicRingBufferDepth)) ===")
             print("Available outputs: \(outputDescription.keys)")
+            print("ArgmaxInModel: \(argmaxInModel)")
         }
 
-        for featureName in featureNames {
-            guard let featureDesc = outputDescription[featureName] else {
-                if debugLevel >= 1 {
-                    print("Warning: Feature \(featureName) not found in monolithic model outputs")
+        // For argmax mode: use regular MLMultiArray output backings (NOT pixel buffers)
+        // Pixel buffers only support Float16/UInt8, but argmax_idx may be int32
+        // The arrays are small (16 elements) so overhead is negligible
+        if argmaxInModel {
+            let numChunks = splitLMHead  // 16 for 262K vocab
+
+            monolithicOutputBackingsRing = []
+            for bufferIndex in 0..<monolithicRingBufferDepth {
+                var outputBackingsDict: [String: MLMultiArray] = [:]
+
+                // Create argmax_idx backing (int32) - model outputs int32 indices
+                let idxArray = try MLMultiArray(shape: [NSNumber(value: numChunks)], dataType: .int32)
+                outputBackingsDict["argmax_idx"] = idxArray
+
+                // Create argmax_val backing (fp16) - model outputs fp16 values
+                let valArray = try MLMultiArray(shape: [NSNumber(value: numChunks)], dataType: .float16)
+                outputBackingsDict["argmax_val"] = valArray
+
+                monolithicOutputBackingsRing.append(outputBackingsDict)
+            }
+
+            monolithicTokenCounter = 0
+            print("✅ Argmax mode: using MLMultiArray backings with ring buffer (depth=\(monolithicRingBufferDepth))")
+            return
+        }
+
+        // For logits mode, use pixel buffer backings for efficient large array access
+        let featureNames = (1...splitLMHead).map { i in "logits\(i)" }
+
+        // Create N ring buffer slots
+        monolithicOutputBackingsRing = []
+
+        for bufferIndex in 0..<monolithicRingBufferDepth {
+            var outputBackingsDict: [String: MLMultiArray] = [:]
+
+            for featureName in featureNames {
+                guard let featureDesc = outputDescription[featureName] else {
+                    if debugLevel >= 1 {
+                        print("Warning: Feature \(featureName) not found in monolithic model outputs")
+                    }
+                    continue
                 }
-                continue
+
+                guard featureDesc.type.rawValue == 5,
+                      let constraint = featureDesc.multiArrayConstraint else {
+                    print("Feature \(featureName) is not a multiarray")
+                    throw InferenceError.inferenceError("Feature \(featureName) is not a multiarray")
+                }
+
+                let shape = constraint.shape
+                let lastDim = shape.last?.intValue ?? 1
+                let otherDims = shape.dropLast().reduce(1) { $0 * $1.intValue }
+
+                if bufferIndex == 0 {
+                    print("  \(featureName): shape=\(shape.map { $0.intValue }), pixelBuffer=\(lastDim)x\(otherDims)")
+                }
+
+                // IOSurface-backed buffer for ANE compatibility and polling
+                let attributes: [String: Any] = [
+                    kCVPixelBufferMetalCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+                ]
+
+                // Create CVPixelBuffer with original dimensions
+                var pixelBuffer: CVPixelBuffer?
+                let status = CVPixelBufferCreate(
+                    kCFAllocatorDefault,
+                    lastDim, otherDims,
+                    kCVPixelFormatType_OneComponent16Half,
+                    attributes as CFDictionary,
+                    &pixelBuffer
+                )
+                guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
+                    throw InferenceError.inferenceError("Failed to create pixel buffer \(bufferIndex) for \(featureName)")
+                }
+                outputBackingsDict[featureName] = MLMultiArray(pixelBuffer: buffer, shape: shape)
             }
 
-            // Check if it's a multiarray feature and get its constraint
-            guard featureDesc.type.rawValue == 5,
-                  let constraint = featureDesc.multiArrayConstraint else {
-                print("Feature \(featureName) is not a multiarray")
-                throw InferenceError.inferenceError("Feature \(featureName) is not a multiarray")
-            }
+            monolithicOutputBackingsRing.append(outputBackingsDict)
 
-            let shape = constraint.shape
-
-            // Calculate dimensions for pixel buffer
-            let lastDim = shape.last?.intValue ?? 1
-            let otherDims = shape.dropLast().reduce(1) { $0 * $1.intValue }
-
-            // Create IOSurface-backed pixel buffer
-            let attributes: [String: Any] = [
-                kCVPixelBufferMetalCompatibilityKey as String: true
-            ]
-
-            var pixelBuffer: CVPixelBuffer?
-            let status = CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                lastDim,     // Width is last dimension
-                otherDims,   // Height is product of other dimensions
-                kCVPixelFormatType_OneComponent16Half,
-                attributes as CFDictionary,
-                &pixelBuffer
-            )
             if debugLevel >= 2 {
-                print("Creating pixel buffer for \(featureName):")
-                print("- Width (last dim): \(lastDim)")
-                print("- Height (other dims): \(otherDims)")
-                print("- Status: \(status)")
+                print("Created ring buffer slot \(bufferIndex) with \(outputBackingsDict.count) outputs")
             }
-            guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
-                throw InferenceError.inferenceError("Failed to create pixel buffer for \(featureName)")
-            }
-
-            // Create MLMultiArray from pixel buffer
-            let outputBacking = MLMultiArray(pixelBuffer: buffer, shape: shape)
-            outputBackingsDict[featureName] = outputBacking
         }
 
-        lmheadOutputBackings = outputBackingsDict
-        print("✅ Monolithic output backings initialized for \(outputBackingsDict.count) logits outputs")
+        monolithicTokenCounter = 0
+        print("✅ Monolithic output backings initialized with ring buffer (depth=\(monolithicRingBufferDepth)) for \(featureNames.count) logits outputs")
     }
     
     // Helper to get causal mask slice for current position
@@ -761,18 +901,46 @@ import CoreFoundation
                 "current_pos": currentPosArray
             ])
 
-            // Run prediction with state
-            _ = try await monolithicModel.prediction(
-                from: prefillInput,
-                using: state,
-                options: MLPredictionOptions()
-            )
+            // Run prediction on serial queue for consistent execution context
+            var predictionError: Error?
+            predictionQueue.sync { [self] in
+                do {
+                    _ = try monolithicModel.prediction(
+                        from: prefillInput,
+                        using: state,
+                        options: MLPredictionOptions()
+                    )
+                } catch {
+                    predictionError = error
+                }
+            }
+            if let error = predictionError {
+                throw error
+            }
 
             if debugLevel >= 1 {
                 print("✅ Monolithic prefill batch completed")
             }
 
             batchPos = batchEnd
+        }
+
+        // Initialize argmax causal mask for token generation phase
+        // After prefill at contextPos, positions 0..contextPos-1 should be visible
+        if argmaxInModel, let maskBuffer = argmaxCausalMaskBuffer {
+            CVPixelBufferLockBaseAddress(maskBuffer, [])
+            if let baseAddress = CVPixelBufferGetBaseAddress(maskBuffer) {
+                let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                // Reset mask to -inf and set visible positions
+                for i in 0..<contextLength {
+                    ptr[i] = Float16(-Float.infinity)
+                }
+                for j in 0..<min(contextPos, contextLength) {
+                    ptr[j] = Float16(0.0)
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(maskBuffer, [])
+            lastArgmaxPosition = contextPos - 1
         }
 
         return contextPos
@@ -1247,20 +1415,26 @@ import CoreFoundation
     ) async throws -> Int {
         let monolithicModel = ffnChunks[0].inferModel
 
+        // Safety check: ensure position is within bounds
+        let safePos = currentPos - 1
+        guard safePos >= 0 && safePos < contextLength else {
+            throw InferenceError.inferenceError("Position \(safePos) out of bounds for context length \(contextLength)")
+        }
+
         // Create input tensor for single token
         let tokenArray = try MLMultiArray(shape: [1, 1], dataType: .int32)
         tokenArray[[0, 0] as [NSNumber]] = NSNumber(value: lastToken)
 
         // Create position IDs
         let positionIds = try MLMultiArray(shape: [1], dataType: .int32)
-        positionIds[0] = NSNumber(value: currentPos - 1)
+        positionIds[0] = NSNumber(value: safePos)
 
-        // Get causal mask for single token
+        // Get causal mask for single token (use currentPos for mask, which handles the +1 offset internally)
         let causalMask = try getCausalMask(for: 1, at: currentPos)
 
         // Create current_pos tensor
         let currentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
-        currentPosArray[0] = NSNumber(value: currentPos - 1)
+        currentPosArray[0] = NSNumber(value: safePos)
 
         // Create input feature provider - monolithic takes input_ids directly
         let inferInput = try MLDictionaryFeatureProvider(dictionary: [
@@ -1270,114 +1444,257 @@ import CoreFoundation
             "current_pos": currentPosArray
         ])
 
-        // Use output backings
+        // Use ring buffer (N=16) to avoid ANE race conditions.
+        // Select buffer slot based on token counter modulo ring depth.
+        let bufferSlot = monolithicTokenCounter % monolithicRingBufferDepth
+        monolithicTokenCounter += 1
+
+        // For both argmax and logits mode, use pre-allocated output backings
         let inferOptions = MLPredictionOptions()
-        if let backings = lmheadOutputBackings {
-            inferOptions.outputBackings = backings
-        }
 
-        // Run prediction with state
-        _ = try await monolithicModel.prediction(from: inferInput, using: state, options: inferOptions)
+        if argmaxInModel {
+            // Argmax mode: serial queue + output backings for synchronization
+            // Same queue as prefill ensures consistent execution context
+            guard bufferSlot < monolithicOutputBackingsRing.count else {
+                throw InferenceError.inferenceError("Ring buffer not initialized for argmax mode")
+            }
+            let currentBackings = monolithicOutputBackingsRing[bufferSlot]
+            inferOptions.outputBackings = currentBackings
 
-        guard let outputBackings = lmheadOutputBackings else {
-            throw InferenceError.inferenceError("Output backings not initialized for monolithic model")
-        }
-
-        // Process logits outputs (same as regular generateNextToken)
-        if GreedySearch {
-            // Argmax branch
-            let partialResults = try await withThrowingTaskGroup(of: PartialMax.self) { group -> [PartialMax] in
-                for i in 1...splitLMHead {
-                    let partIndex = i
-                    let logitsKey = "logits\(partIndex)"
-
-                    guard let logitsPart = outputBackings[logitsKey] else {
-                        throw InferenceError.inferenceError("Missing feature \(logitsKey)")
-                    }
-
-                    group.addTask { @Sendable in
-                        let localLogitsPart = logitsPart
-                        let localOffset = (partIndex - 1) * logitsPart.count
-
-                        guard let pixelBuffer = localLogitsPart.pixelBuffer else {
-                            throw InferenceError.inferenceError("Missing or invalid \(logitsKey) in output backings")
-                        }
-                        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-                        defer {
-                            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-                        }
-                        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                            throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
-                        }
-
-                        #if arch(arm64)
-                        let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
-                        let count = localLogitsPart.count
-                        var localMaxValue: Float = -Float.infinity
-                        var localMaxIndex = 0
-
-                        var start = 0
-                        if localOffset == 0 && self.FilterLLAMA01 {
-                            start = 2
-                        }
-
-                        for j in start..<count {
-                            let value = Float(buffer[j])
-                            if value > localMaxValue {
-                                localMaxValue = value
-                                localMaxIndex = localOffset + j
-                            }
-                        }
-                        return PartialMax(value: localMaxValue, index: localMaxIndex)
-                        #else
-                        fatalError("Unsupported architecture, only Apple Silicon is supported")
-                        #endif
-                    }
+            // Run prediction on same serial queue as prefill
+            var predictionError: Error?
+            predictionQueue.sync { [self] in
+                do {
+                    _ = try monolithicModel.prediction(from: inferInput, using: state, options: inferOptions)
+                } catch {
+                    predictionError = error
                 }
-
-                var results: [PartialMax] = []
-                for try await result in group {
-                    results.append(result)
-                }
-                return results
+            }
+            if let error = predictionError {
+                throw error
             }
 
-            let globalMax = partialResults.reduce(PartialMax(value: -Float.infinity, index: 0)) { current, next in
-                next.value > current.value ? next : current
+            // Read from backings - data is synced after prediction completes
+            guard let idxArray = currentBackings["argmax_idx"],
+                  let valArray = currentBackings["argmax_val"] else {
+                throw InferenceError.inferenceError("Missing argmax_idx or argmax_val in backings")
             }
 
+            // Find the chunk with highest value
+            var bestChunk = 0
+            var bestLocalIdx = 0
+            var bestVal: Float = -Float.infinity
+            let numChunks = idxArray.count
+            let chunkSize = 16384  // 262144 / 16
+
+            // Collect all values for debug output
+            var chunkData: [(chunk: Int, localIdx: Int, val: Float)] = []
+
+            for i in 0..<numChunks {
+                let localIdx = idxArray[i].intValue
+                let chunkVal = valArray[i].floatValue
+                chunkData.append((chunk: i, localIdx: localIdx, val: chunkVal))
+
+                if chunkVal > bestVal {
+                    bestVal = chunkVal
+                    bestChunk = i
+                    bestLocalIdx = localIdx
+                }
+            }
+
+            // Compute global token ID: local_idx + (chunk * chunk_size)
+            let globalIdx = bestLocalIdx + (bestChunk * chunkSize)
+
+            // Debug output (similar to Python's --debug-argmax)
             if debugLevel >= 1 {
-                print("\nMonolithic argmax token:", globalMax.index)
-            }
-            return globalMax.index
-        } else {
-            // Sampling branch - simplified version for monolithic
-            // Collect logits from all splits
-            var allLogits: [Float] = []
-            for i in 1...splitLMHead {
-                let logitsKey = "logits\(i)"
-                guard let logitsPart = outputBackings[logitsKey] else {
-                    throw InferenceError.inferenceError("Missing feature \(logitsKey)")
+                print("\n=== Argmax Debug (Swift) ===")
+                print("argmax_idx count: \(numChunks), argmax_val count: \(numChunks)")
+                print("Per-chunk results (LOCAL indices, chunk_size=\(chunkSize)):")
+
+                // Sort by value to find top-3
+                let sortedByVal = chunkData.sorted { $0.val > $1.val }
+                let top3Chunks = Set(sortedByVal.prefix(3).map { $0.chunk })
+
+                var anyOutOfRange = false
+                for i in 0..<numChunks {
+                    let local = chunkData[i].localIdx
+                    let val = chunkData[i].val
+                    let computedGlobal = local + (i * chunkSize)
+                    let inRange = local >= 0 && local < chunkSize
+                    if !inRange { anyOutOfRange = true }
+
+                    var marker = ""
+                    if i == bestChunk { marker += " <-- SELECTED" }
+                    if top3Chunks.contains(i) && i != bestChunk {
+                        if let rank = sortedByVal.firstIndex(where: { $0.chunk == i }) {
+                            marker += " (top-\(rank + 1))"
+                        }
+                    }
+                    let rangeOk = inRange ? "✓" : "✗ (expected 0-\(chunkSize-1))"
+                    print("  Chunk \(String(format: "%2d", i)): local=\(String(format: "%5d", local)), global=\(String(format: "%6d", computedGlobal)), val=\(String(format: "%8.4f", val)), range=\(rangeOk)\(marker)")
                 }
 
-                guard let pixelBuffer = logitsPart.pixelBuffer else {
-                    throw InferenceError.inferenceError("Missing pixel buffer for \(logitsKey)")
+                print("Result: best_chunk=\(bestChunk), local_idx=\(bestLocalIdx), global_idx=\(globalIdx), best_val=\(String(format: "%.4f", bestVal))")
+
+                // Value comparison
+                if sortedByVal.count >= 2 {
+                    let valDiff = abs(sortedByVal[0].val - sortedByVal[1].val)
+                    print("Value comparison: top-1=\(String(format: "%.6f", sortedByVal[0].val)), top-2=\(String(format: "%.6f", sortedByVal[1].val)), diff=\(String(format: "%.6f", valDiff))")
+                    if valDiff < 0.01 {
+                        print("  WARNING: Values are very close - possible precision issue!")
+                    }
                 }
+
+                if anyOutOfRange {
+                    print("⚠️ WARNING: Some local indices are outside expected range (0 to \(chunkSize-1))!")
+                }
+            }
+
+            return globalIdx
+        }
+
+        // Logits mode: use output backings
+        guard bufferSlot < monolithicOutputBackingsRing.count else {
+            throw InferenceError.inferenceError("Ring buffer not initialized properly")
+        }
+        let currentBackings = monolithicOutputBackingsRing[bufferSlot]
+
+        // Ring buffer depth ensures buffer isn't reused while ANE is still writing.
+        // IMPORTANT: Do NOT lock the CVPixelBuffer before prediction!
+        inferOptions.outputBackings = currentBackings
+
+        // Run prediction synchronously on serial queue to prevent ANE race conditions
+        var predictionError: Error?
+        predictionQueue.sync { [self] in
+            do {
+                _ = try monolithicModel.prediction(from: inferInput, using: state, options: inferOptions)
+            } catch {
+                predictionError = error
+            }
+        }
+        if let error = predictionError {
+            throw error
+        }
+
+        // Process logits - try Metal GPU argmax first, fallback to CPU
+        if GreedySearch {
+            // Try Metal argmax (processes all 16 chunks on GPU)
+            if let metal = metalArgmax {
+                do {
+                    let tokenId = try metal.findArgmax(
+                        backings: currentBackings,
+                        splitCount: splitLMHead,
+                        vocabSize: splitLMHead * 16384,
+                        filterFirst: FilterLLAMA01
+                    )
+                    if debugLevel >= 1 {
+                        print("\nMetal argmax token:", tokenId)
+                    }
+                    return tokenId
+                } catch {
+                    if debugLevel >= 1 {
+                        print("Metal argmax failed: \(error), falling back to CPU")
+                    }
+                }
+            }
+
+            // Fallback: parallel CPU argmax with Accelerate SIMD
+            let parallelFactor = 2
+            let totalTasks = splitLMHead * parallelFactor
+            var partialResults = [(Float, Int)](repeating: (-Float.infinity, 0), count: totalTasks)
+
+            DispatchQueue.concurrentPerform(iterations: totalTasks) { taskIdx in
+                let chunkIdx = taskIdx / parallelFactor
+                let subIdx = taskIdx % parallelFactor
+                let logitsKey = "logits\(chunkIdx + 1)"
+                let chunkOffset = chunkIdx * 16384
+
+                guard let logitsPart = currentBackings[logitsKey],
+                      let pixelBuffer = logitsPart.pixelBuffer else {
+                    return
+                }
+
                 CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
                 defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
                 guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                    throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
+                    return
                 }
 
-                #if arch(arm64)
+                let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
+                let totalCount = logitsPart.count
+                let subChunkSize = totalCount / parallelFactor
+
+                var subStart = subIdx * subChunkSize
+                var subEnd = (subIdx == parallelFactor - 1) ? totalCount : (subIdx + 1) * subChunkSize
+
+                if chunkOffset == 0 && subIdx == 0 && FilterLLAMA01 {
+                    subStart = 2
+                }
+
+                let effectiveCount = subEnd - subStart
+                if effectiveCount <= 0 {
+                    return
+                }
+
+                var floatBuffer = [Float](repeating: 0, count: effectiveCount)
+
+                buffer.advanced(by: subStart).withMemoryRebound(to: UInt16.self, capacity: effectiveCount) { uint16Ptr in
+                    var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: uint16Ptr),
+                                           height: 1, width: vImagePixelCount(effectiveCount),
+                                           rowBytes: effectiveCount * 2)
+                    floatBuffer.withUnsafeMutableBufferPointer { floatPtr in
+                        var dst = vImage_Buffer(data: floatPtr.baseAddress!,
+                                               height: 1, width: vImagePixelCount(effectiveCount),
+                                               rowBytes: effectiveCount * 4)
+                        vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
+                    }
+                }
+
+                var maxValue: Float = -Float.infinity
+                var maxIndex: vDSP_Length = 0
+                vDSP_maxvi(floatBuffer, 1, &maxValue, &maxIndex, vDSP_Length(effectiveCount))
+
+                partialResults[taskIdx] = (maxValue, chunkOffset + subStart + Int(maxIndex))
+            }
+
+            // Find global max from partial results
+            var globalMaxValue: Float = -Float.infinity
+            var globalMaxIndex = 0
+            for (maxVal, maxIdx) in partialResults {
+                if maxVal > globalMaxValue {
+                    globalMaxValue = maxVal
+                    globalMaxIndex = maxIdx
+                }
+            }
+
+            if debugLevel >= 1 {
+                print("\nMonolithic parallel argmax token:", globalMaxIndex)
+            }
+            return globalMaxIndex
+        } else {
+            // Sampling branch
+            var allLogits: [Float] = []
+            allLogits.reserveCapacity(splitLMHead * 16384)
+
+            for i in 1...splitLMHead {
+                let logitsKey = "logits\(i)"
+                guard let logitsPart = currentBackings[logitsKey],
+                      let pixelBuffer = logitsPart.pixelBuffer else {
+                    throw InferenceError.inferenceError("Missing \(logitsKey)")
+                }
+
+                CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+                defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+                guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                    throw InferenceError.inferenceError("No base address for \(logitsKey)")
+                }
+
                 let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
                 for j in 0..<logitsPart.count {
                     allLogits.append(Float(buffer[j]))
                 }
-                #else
-                fatalError("Unsupported architecture")
-                #endif
             }
 
             // Apply top-p sampling
@@ -1387,6 +1704,113 @@ import CoreFoundation
             }
             return sampledToken
         }
+    }
+
+    /// Synchronous argmax inference - eliminates async overhead for maximum performance.
+    /// This is called directly from the inference loop when argmaxInModel is true.
+    /// Returns the token ID synchronously without any async suspension/resume overhead.
+    public func generateNextTokenArgmaxSync(
+        for lastToken: Int,
+        currentPos: Int
+    ) throws -> Int {
+        guard argmaxInModel else {
+            throw InferenceError.inferenceError("generateNextTokenArgmaxSync called but argmaxInModel is false")
+        }
+
+        let monolithicModel = ffnChunks[0].inferModel
+
+        // Safety check: ensure position is within bounds
+        let safePos = currentPos - 1
+        guard safePos >= 0 && safePos < contextLength else {
+            throw InferenceError.inferenceError("Position \(safePos) out of bounds for context length \(contextLength)")
+        }
+
+        // Use pre-allocated input arrays
+        guard let tokenArray = argmaxTokenArray,
+              let positionIds = argmaxPositionIds,
+              let currentPosArray = argmaxCurrentPosArray else {
+            throw InferenceError.inferenceError("Pre-allocated argmax input arrays not initialized")
+        }
+
+        // Update int32 values using direct pointer access
+        tokenArray.dataPointer.assumingMemoryBound(to: Int32.self)[0] = Int32(lastToken)
+        positionIds.dataPointer.assumingMemoryBound(to: Int32.self)[0] = Int32(safePos)
+        currentPosArray.dataPointer.assumingMemoryBound(to: Int32.self)[0] = Int32(safePos)
+
+        // Use pre-allocated causal mask with efficient single-value update via pixel buffer
+        guard let maskBuffer = argmaxCausalMaskBuffer else {
+            throw InferenceError.inferenceError("Pre-allocated argmax causal mask buffer not initialized")
+        }
+
+        // Only update the mask if position changed (incremental update)
+        // For position N, we need positions 0..N to be 0 (visible), rest -inf
+        if lastArgmaxPosition != safePos {
+            // Set the new position to 0 (make visible) using direct pixel buffer access
+            if safePos < contextLength {
+                CVPixelBufferLockBaseAddress(maskBuffer, [])
+                if let baseAddress = CVPixelBufferGetBaseAddress(maskBuffer) {
+                    baseAddress.assumingMemoryBound(to: Float16.self)[safePos] = Float16(0.0)
+                }
+                CVPixelBufferUnlockBaseAddress(maskBuffer, [])
+            }
+            lastArgmaxPosition = safePos
+        }
+
+        // Use pre-allocated input feature provider (values already updated in backing arrays)
+        guard let inferInput = argmaxInferInput else {
+            throw InferenceError.inferenceError("Pre-allocated argmax input provider not initialized")
+        }
+
+        // Use ring buffer to avoid ANE race conditions
+        let bufferSlot = monolithicTokenCounter % monolithicRingBufferDepth
+        monolithicTokenCounter += 1
+
+        // Get output backings from ring buffer
+        guard bufferSlot < monolithicOutputBackingsRing.count else {
+            throw InferenceError.inferenceError("Ring buffer not initialized for argmax mode")
+        }
+        let currentBackings = monolithicOutputBackingsRing[bufferSlot]
+
+        // Set output backings
+        guard let inferOptions = argmaxInferOptions else {
+            throw InferenceError.inferenceError("Pre-allocated argmax options not initialized")
+        }
+        inferOptions.outputBackings = currentBackings
+
+        // Run prediction directly (no queue overhead since we're already synchronous)
+        _ = try monolithicModel.prediction(from: inferInput, using: state, options: inferOptions)
+
+        // Read from output backings (data is stable now)
+        guard let idxArray = currentBackings["argmax_idx"],
+              let valArray = currentBackings["argmax_val"] else {
+            throw InferenceError.inferenceError("Missing argmax backings")
+        }
+
+        // Find the chunk with highest value using direct pointer access
+        let chunkSize = 16384  // 262144 / 16
+        let numChunks = splitLMHead
+
+        var bestChunk = 0
+        var bestLocalIdx = 0
+        var bestVal: Float = -Float.infinity
+
+        // Use direct pointer access for performance
+        let idxPtr = idxArray.dataPointer.assumingMemoryBound(to: Int32.self)
+        let valPtr = valArray.dataPointer.assumingMemoryBound(to: Float16.self)
+
+        for i in 0..<numChunks {
+            let chunkVal = Float(valPtr[i])
+            if chunkVal > bestVal {
+                bestVal = chunkVal
+                bestChunk = i
+                bestLocalIdx = Int(idxPtr[i])
+            }
+        }
+
+        // Compute global token ID: local_idx + (chunk * chunk_size)
+        let globalIdx = bestLocalIdx + (bestChunk * chunkSize)
+
+        return globalIdx
     }
 
     /// Shifts the context window if needed (similar to the Python code).
@@ -1532,13 +1956,23 @@ import CoreFoundation
                     }
                     break
                 }
-                
-                let nextToken = try await generateNextToken(
-                    for: contextTokens[currentPos - 1],
-                    currentPos: currentPos,
-                    temperature: temperature,
-                    tokenizer: tokenizer
-                )
+
+                // Use synchronous path for argmax mode (eliminates async overhead for ~10% speedup)
+                // Async path is used for logits mode which needs sampling
+                let nextToken: Int
+                if argmaxInModel && isMonolithic {
+                    nextToken = try generateNextTokenArgmaxSync(
+                        for: contextTokens[currentPos - 1],
+                        currentPos: currentPos
+                    )
+                } else {
+                    nextToken = try await generateNextToken(
+                        for: contextTokens[currentPos - 1],
+                        currentPos: currentPos,
+                        temperature: temperature,
+                        tokenizer: tokenizer
+                    )
+                }
                 
                 // Debug token comparison
                 if debugLevel >= 1 {

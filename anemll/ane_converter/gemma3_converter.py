@@ -47,6 +47,7 @@ class Gemma3Converter(BaseConverter):
         lut_bits: int | None = 4,
         per_channel: int = 8,
         num_chunks: int = 1,
+        argmax_in_model: bool = False,
     ) -> None:
         super().__init__(model)
         self.context_length = context_length
@@ -58,40 +59,63 @@ class Gemma3Converter(BaseConverter):
         )
         self.converted_model = None
         self.num_chunks = num_chunks
+        self.argmax_in_model = argmax_in_model
 
     def load_weights_from_hf(self, hf_model_path: str) -> bool:
         """Load weights from Hugging Face model and transform them for ANEMLL.
-        
+
         Args:
             hf_model_path: Path to Hugging Face model or model name
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
         try:
             print(f"Loading weights from Hugging Face model: {hf_model_path}")
-            
-            # Load HF model
+
+            # Load HF model in float32 first to avoid bfloat16->float16 overflow
+            # Gemma3 was trained in bfloat16 which has a larger dynamic range than float16
             from transformers import AutoModelForCausalLM
             hf_model = AutoModelForCausalLM.from_pretrained(
                 hf_model_path,
-                torch_dtype='auto',
+                torch_dtype=torch.float32,  # Load in float32 to preserve precision
                 device_map='cpu',
                 trust_remote_code=True
             )
             hf_state_dict = hf_model.state_dict()
             
             print(f"Loaded {len(hf_state_dict)} weights from HF model")
-            
+
             # Get ANEMLL state dict
             anemll_state_dict = self.model.state_dict()
             print(f"ANEMLL model has {len(anemll_state_dict)} weights")
-            
+
+            # Helper function to safely convert weights to float16 with clamping
+            def safe_to_fp16(tensor: torch.Tensor, name: str = "") -> torch.Tensor:
+                """Convert tensor to float16 with clamping to avoid Inf/NaN.
+
+                Bfloat16 has range ±3.4e38 while float16 has range ±65504.
+                Values outside float16 range must be clamped to avoid overflow.
+                """
+                # First check for NaN/Inf in source tensor
+                if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                    nan_count = torch.isnan(tensor).sum().item()
+                    inf_count = torch.isinf(tensor).sum().item()
+                    print(f"  ⚠️  Warning: {name} has {nan_count} NaN and {inf_count} Inf values, replacing with 0")
+                    tensor = torch.where(torch.isnan(tensor) | torch.isinf(tensor),
+                                        torch.zeros_like(tensor), tensor)
+
+                # Clamp to float16 safe range before conversion
+                FP16_MAX = 65504.0
+                tensor = tensor.clamp(-FP16_MAX, FP16_MAX)
+
+                return tensor.to(dtype=torch.float16, device="cpu")
+
             # Track loading statistics
             loaded_count = 0
             skipped_count = 0
             transformed_count = 0
-            
+
             # Direct mappings (no shape transformation needed)
             direct_mappings = [
                 'model.embed_tokens.weight',
@@ -112,9 +136,9 @@ class Gemma3Converter(BaseConverter):
             # Load direct mappings
             for hf_key in direct_mappings:
                 if hf_key in hf_state_dict and hf_key in anemll_state_dict:
-                    # Convert to correct dtype and device
+                    # Convert to correct dtype and device with safe clamping
                     hf_weight = hf_state_dict[hf_key]
-                    anemll_weight = hf_weight.clone().to(dtype=torch.float16, device="cpu")
+                    anemll_weight = safe_to_fp16(hf_weight.clone(), hf_key)
                     anemll_state_dict[hf_key] = anemll_weight
                     loaded_count += 1
                     print(f"  ✅ Direct copy: {hf_key}")
@@ -137,13 +161,13 @@ class Gemma3Converter(BaseConverter):
                 for hf_suffix, anemll_suffix in attention_mappings:
                     hf_key = f'model.layers.{layer_idx}.self_attn.{hf_suffix}.weight'
                     anemll_key = f'model.layers.{layer_idx}.self_attn.{anemll_suffix}.weight'
-                    
+
                     if hf_key in hf_state_dict and anemll_key in anemll_state_dict:
                         # Transform from Linear [out, in] to Conv2d [out, in, 1, 1]
                         hf_weight = hf_state_dict[hf_key]
-                        transformed_weight = hf_weight.view(hf_weight.shape[0], hf_weight.shape[1], 1, 1).to(
-                            dtype=torch.float16, device="cpu"
-                        )
+                        # Safe conversion with clamping, then reshape for Conv2d
+                        safe_weight = safe_to_fp16(hf_weight.clone(), hf_key)
+                        transformed_weight = safe_weight.view(safe_weight.shape[0], safe_weight.shape[1], 1, 1)
                         anemll_state_dict[anemll_key] = transformed_weight
                         transformed_count += 1
                         print(f"  ✅ Transformed attention: {hf_key} -> {anemll_key}")
@@ -159,13 +183,13 @@ class Gemma3Converter(BaseConverter):
                 for hf_suffix, anemll_suffix in mlp_mappings:
                     hf_key = f'model.layers.{layer_idx}.mlp.{hf_suffix}.weight'
                     anemll_key = f'model.layers.{layer_idx}.mlp.{anemll_suffix}.weight'
-                    
+
                     if hf_key in hf_state_dict and anemll_key in anemll_state_dict:
                         # Transform from Linear [out, in] to Conv2d [out, in, 1, 1]
                         hf_weight = hf_state_dict[hf_key]
-                        transformed_weight = hf_weight.view(hf_weight.shape[0], hf_weight.shape[1], 1, 1).to(
-                            dtype=torch.float16, device="cpu"
-                        )
+                        # Safe conversion with clamping, then reshape for Conv2d
+                        safe_weight = safe_to_fp16(hf_weight.clone(), hf_key)
+                        transformed_weight = safe_weight.view(safe_weight.shape[0], safe_weight.shape[1], 1, 1)
                         anemll_state_dict[anemll_key] = transformed_weight
                         transformed_count += 1
                         print(f"  ✅ Transformed MLP: {hf_key} -> {anemll_key}")
@@ -176,20 +200,19 @@ class Gemma3Converter(BaseConverter):
                 vocab_size = hf_lm_head.shape[0]
                 hidden_size = hf_lm_head.shape[1]
                 split_size = vocab_size // 16
-                
+
                 print(f"  📦 Splitting LM head: {hf_lm_head.shape} -> 16 × [{split_size}, {hidden_size}, 1, 1]")
-                
+
                 for i in range(16):
                     start_idx = i * split_size
                     end_idx = start_idx + split_size if i < 15 else vocab_size
-                    
+
                     anemll_key = f'lm_head16_{i+1}.weight'
                     if anemll_key in anemll_state_dict:
-                        # Extract slice and transform to Conv2d
+                        # Extract slice and transform to Conv2d with safe conversion
                         slice_weight = hf_lm_head[start_idx:end_idx, :]
-                        transformed_weight = slice_weight.view(slice_weight.shape[0], slice_weight.shape[1], 1, 1).to(
-                            dtype=torch.float16, device="cpu"
-                        )
+                        safe_weight = safe_to_fp16(slice_weight.clone(), f"lm_head_split_{i+1}")
+                        transformed_weight = safe_weight.view(safe_weight.shape[0], safe_weight.shape[1], 1, 1)
                         anemll_state_dict[anemll_key] = transformed_weight
                         loaded_count += 1
                         print(f"  ✅ Split LM head {i+1}: {slice_weight.shape} -> {transformed_weight.shape}")
@@ -279,28 +302,34 @@ class Gemma3Converter(BaseConverter):
             num_workers: Optional number of workers for parallel processing.
                         If None, uses default single worker.
         """
+        import warnings
+
         if self.converted_model is not None and self.lut_bits is not None:
             print(
                 f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)..."
             )
             try:
-                # Set up quantization config
-                config = cto.coreml.OptimizationConfig(
-                    global_config=cto.coreml.OpPalettizerConfig(
-                        mode="kmeans",
-                        nbits=self.lut_bits,
-                        granularity="per_grouped_channel",
-                        group_size=self.per_channel,
-                        num_kmeans_workers=(
-                            num_workers if num_workers is not None else 1
-                        ),  # Use provided workers or default to 1
-                    ),
-                )
+                # Suppress sklearn warnings during quantization (common with edge cases)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-                # Apply quantization
-                self.converted_model = cto.coreml.palettize_weights(
-                    self.converted_model, config
-                )
+                    # Set up quantization config
+                    config = cto.coreml.OptimizationConfig(
+                        global_config=cto.coreml.OpPalettizerConfig(
+                            mode="kmeans",
+                            nbits=self.lut_bits,
+                            granularity="per_grouped_channel",
+                            group_size=self.per_channel,
+                            num_kmeans_workers=(
+                                num_workers if num_workers is not None else 1
+                            ),  # Use provided workers or default to 1
+                        ),
+                    )
+
+                    # Apply quantization
+                    self.converted_model = cto.coreml.palettize_weights(
+                        self.converted_model, config
+                    )
                 print("✅ LUT quantization completed successfully")
 
             except Exception as e:
@@ -356,6 +385,12 @@ class Gemma3Converter(BaseConverter):
         elif part == "3":
             print("Converting LM head...")
             mlmodel = self.convert_part_3(self.model)
+        elif part == "monolithic":
+            print("Converting monolithic model (infer)...")
+            mlmodel = self.convert_monolithic(self.model, is_prefill=False, argmax_in_model=self.argmax_in_model)
+        elif part == "monolithic_prefill":
+            print("Converting monolithic model (prefill)...")
+            mlmodel = self.convert_monolithic(self.model, is_prefill=True, argmax_in_model=self.argmax_in_model)
         else:
             raise ValueError(f"Unsupported part: {part}")
 
@@ -483,7 +518,259 @@ class Gemma3Converter(BaseConverter):
         # Apply LUT quantization if specified
         if self.lut_bits:
             self.converted_model = mlmodel  # Set for postprocess
-            self.postprocess(num_workers=8)  # Allow passing num_workers if needed
+            # Use single-threaded for full model to avoid multiprocessing issues
+            self.postprocess(num_workers=None)
+            mlmodel = self.converted_model
+
+        return mlmodel
+
+    def convert_monolithic(
+        self, model: Gemma3ForCausalLM, is_prefill: bool = False,
+        argmax_in_model: bool = False
+    ) -> ct.models.MLModel:
+        """Convert full model (embeddings + FFN + LM head) to a single CoreML model.
+
+        Args:
+            model: The Gemma3 model to convert
+            is_prefill: If True, convert for prefill mode (batch processing)
+                       If False, convert for inference mode (single token)
+            argmax_in_model: If True, compute argmax per LM head chunk inside the model.
+                            Outputs argmax_idx[16] and argmax_val[16] instead of 16 logits tensors.
+                            This reduces output from 262K values to 32 values (2 tensors).
+
+        Returns:
+            ct.models.MLModel: Monolithic CoreML model
+        """
+        require_coreml()
+        mode_str = "prefill" if is_prefill else "inference"
+        print(f"\nConverting monolithic model for {mode_str} mode...")
+
+        class MonolithicWrapper(torch.nn.Module):
+            """Wrapper combining embeddings + transformer + LM head."""
+
+            def __init__(
+                self, model: Gemma3ForCausalLM, context_length: int, is_prefill: bool,
+                argmax_in_model: bool = False
+            ) -> None:
+                super().__init__()
+                self.model = model
+                self.context_length = context_length
+                self.is_prefill = is_prefill
+                self.argmax_in_model = argmax_in_model
+
+                # Determine LM head mode
+                if hasattr(model, "lm_head16_1"):
+                    self.lm_head_mode = "16"
+                    self.lm_heads = [
+                        getattr(model, f"lm_head16_{i}") for i in range(1, 17)
+                    ]
+                    self.chunk_size = 16384  # 262144 / 16
+                elif hasattr(model, "lm_head8_1"):
+                    self.lm_head_mode = "8"
+                    self.lm_heads = [
+                        getattr(model, f"lm_head8_{i}") for i in range(1, 9)
+                    ]
+                    self.chunk_size = 32768  # 262144 / 8
+                elif hasattr(model, "lm_head2_1"):
+                    self.lm_head_mode = "2"
+                    self.lm_heads = [model.lm_head2_1, model.lm_head2_2]
+                    self.chunk_size = 131072  # 262144 / 2
+                elif hasattr(model, "lm_head1"):
+                    self.lm_head_mode = "1"
+                    self.lm_head = model.lm_head1
+                    self.chunk_size = 262144
+                else:
+                    self.lm_head_mode = "linear"
+                    self.lm_head = model.lm_head
+                    self.chunk_size = 262144
+
+            def forward(
+                self,
+                input_ids: torch.Tensor,
+                position_ids: torch.Tensor,
+                causal_mask: torch.Tensor,
+                current_pos: torch.Tensor,
+            ) -> tuple:
+                # Step 1: Embeddings (with Gemma3 scaling)
+                hidden_states = self.model.model.embed_tokens(input_ids)
+                hidden_states = hidden_states * self.model.model.embedding_scale
+                hidden_states = hidden_states.to(MODEL_DTYPE)
+
+                # Step 2: Transformer layers (RoPE handled inside process_layers)
+                hidden_states = self.model.model.process_layers(
+                    hidden_states,
+                    position_ids,
+                    causal_mask,
+                    current_pos,
+                    start_layer=0,
+                    end_layer=None,
+                    IN_PREFILL=self.is_prefill,
+                )
+
+                # Apply final normalization
+                hidden_states = self.model.model.norm(hidden_states)
+
+                # Step 3: LM Head
+                if self.lm_head_mode != "linear":
+                    hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
+
+                # Compute logits for each chunk
+                if self.lm_head_mode in ("16", "8", "2"):
+                    logits_list = [
+                        h(hidden_states).squeeze(2).transpose(1, 2)
+                        for h in self.lm_heads
+                    ]
+                elif self.lm_head_mode == "1":
+                    logits_list = [self.lm_head(hidden_states).squeeze(2).transpose(1, 2)]
+                else:
+                    logits_list = [self.lm_head(hidden_states)]
+
+                # If argmax_in_model, compute argmax per chunk and return 2 tensors
+                # NOTE: We return LOCAL indices (0 to chunk_size-1), not global indices.
+                # The global offset is computed on the Python/Swift side as:
+                #   global_idx = local_idx + (best_chunk * chunk_size)
+                # This avoids baking constants into the CoreML model.
+                # NOTE: Using int16 for ANE compatibility - ANE doesn't support int32 for argmax.
+                # Local indices (0 to 16383) fit in int16 (max 32767).
+                if self.argmax_in_model:
+                    all_idx = []
+                    all_val = []
+                    for i, logits in enumerate(logits_list):
+                        # logits shape: [1, 1, chunk_size] for inference mode
+                        # Get argmax index within chunk (0 to chunk_size-1)
+                        chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)  # [1, 1, 1], int64
+                        # Cast to int16 for ANE compatibility (ANE doesn't support int32 argmax)
+                        # Local indices 0-16383 fit in int16 (max 32767)
+                        local_idx = chunk_argmax.to(torch.int16)  # [1, 1, 1]
+                        # Get max value
+                        max_val = torch.max(logits, dim=-1, keepdim=True).values  # [1, 1, 1]
+                        all_idx.append(local_idx)
+                        all_val.append(max_val)
+                    # Concatenate along last dim: [1, 1, num_chunks], then squeeze to [num_chunks]
+                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], int16 (LOCAL indices)
+                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], fp16
+                    return (argmax_idx, argmax_val)
+                else:
+                    return tuple(logits_list)
+
+        wrapper = MonolithicWrapper(model, self.context_length, is_prefill, argmax_in_model)
+        wrapper.eval()
+
+        for param in wrapper.parameters():
+            param.requires_grad = False
+
+        argmax_str = ", argmax_in_model=True" if argmax_in_model else ""
+        print(f"Monolithic wrapper created (LM head mode: {wrapper.lm_head_mode}{argmax_str})")
+
+        # Prepare inputs based on mode
+        if is_prefill:
+            sample_input_ids = torch.zeros(
+                (1, self.batch_size), dtype=torch.int32, device=TEST_DEVICE
+            )
+            sample_position_ids = torch.zeros(
+                (self.batch_size,), dtype=torch.int32, device=TEST_DEVICE
+            )
+            sample_causal_mask = torch.zeros(
+                (1, 1, self.batch_size, self.context_length),
+                dtype=torch.float16,
+                device=TEST_DEVICE,
+            )
+        else:
+            sample_input_ids = torch.zeros(
+                (1, 1), dtype=torch.int32, device=TEST_DEVICE
+            )
+            sample_position_ids = torch.zeros(
+                (1,), dtype=torch.int32, device=TEST_DEVICE
+            )
+            sample_causal_mask = torch.zeros(
+                (1, 1, 1, self.context_length),
+                dtype=torch.float16,
+                device=TEST_DEVICE,
+            )
+
+        sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
+
+        print(f"Sample inputs ({mode_str} mode):")
+        print(f"  input_ids: {sample_input_ids.shape}")
+        print(f"  position_ids: {sample_position_ids.shape}")
+        print(f"  causal_mask: {sample_causal_mask.shape}")
+        print(f"  current_pos: {sample_current_pos.shape}")
+
+        print("Tracing monolithic model...")
+        with torch.no_grad():
+            traced = torch.jit.trace(
+                wrapper,
+                (
+                    sample_input_ids,
+                    sample_position_ids,
+                    sample_causal_mask,
+                    sample_current_pos,
+                ),
+            )
+        print("Tracing completed!")
+
+        # Determine number of chunks based on LM head mode
+        if wrapper.lm_head_mode == "16":
+            num_chunks = 16
+        elif wrapper.lm_head_mode == "8":
+            num_chunks = 8
+        elif wrapper.lm_head_mode == "2":
+            num_chunks = 2
+        else:
+            num_chunks = 1
+
+        # Build output specifications
+        if argmax_in_model:
+            # Output 2 tensors: argmax_idx[num_chunks] and argmax_val[num_chunks]
+            # Note: shape is inferred automatically by coremltools
+            # Using int16 for ANE compatibility - ANE doesn't support int32 for argmax
+            outputs = [
+                ct.TensorType(name="argmax_idx", dtype=np.int16),
+                ct.TensorType(name="argmax_val", dtype=np.float16)
+            ]
+            print(f"Outputs: argmax_idx[{num_chunks}] (int16) + argmax_val[{num_chunks}] (fp16) - reduced from {num_chunks * wrapper.chunk_size} logits")
+        else:
+            # Original logits outputs
+            if num_chunks == 1:
+                outputs = [ct.TensorType(name="logits", dtype=np.float16)]
+            else:
+                outputs = [
+                    ct.TensorType(name=f"logits{i}", dtype=np.float16)
+                    for i in range(1, num_chunks + 1)
+                ]
+
+        print("Starting CoreML conversion...")
+        mlmodel = ct.convert(
+            traced,
+            inputs=[
+                ct.TensorType(
+                    name="input_ids", shape=sample_input_ids.shape, dtype=np.int32
+                ),
+                ct.TensorType(
+                    name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
+                ),
+                ct.TensorType(
+                    name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
+                ),
+                ct.TensorType(
+                    name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
+                ),
+            ],
+            outputs=outputs,
+            states=self.GetTransformerStates(model, part=None, prefix="model.model."),
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram",
+        )
+        print(f"CoreML conversion for monolithic {mode_str} completed!")
+
+        if self.lut_bits:
+            print(f"Applying LUT quantization ({self.lut_bits} bits)...")
+            self.converted_model = mlmodel
+            # Use single-threaded quantization for monolithic models to avoid
+            # multiprocessing pool hanging issues with large models on macOS
+            self.postprocess(num_workers=None)
             mlmodel = self.converted_model
 
         return mlmodel
@@ -588,7 +875,8 @@ class Gemma3Converter(BaseConverter):
 
         if self.lut_bits:
             self.converted_model = mlmodel
-            self.postprocess(num_workers=8)
+            # Use single-threaded for LM head (large vocab) to avoid multiprocessing issues
+            self.postprocess(num_workers=None)
             mlmodel = self.converted_model
 
         return mlmodel
@@ -905,7 +1193,8 @@ class Gemma3Converter(BaseConverter):
         # Apply LUT quantization if specified
         if self.lut_bits:
             self.converted_model = mlmodel
-            self.postprocess(num_workers=8)  # Allow passing num_workers if needed
+            # Use single-threaded for full prefill to avoid multiprocessing issues
+            self.postprocess(num_workers=None)
             mlmodel = self.converted_model
 
         return mlmodel
@@ -979,7 +1268,8 @@ class Gemma3Converter(BaseConverter):
         # Apply LUT quantization if specified
         if self.lut_bits:
             self.converted_model = mlmodel
-            self.postprocess(num_workers=8)  # Allow passing num_workers if needed
+            # Use single-threaded for embeddings (large vocab) to avoid multiprocessing issues
+            self.postprocess(num_workers=None)
             mlmodel = self.converted_model
 
         return mlmodel
@@ -1028,7 +1318,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--part",
         type=str,
-        choices=["1", "2", "2_prefill", "3", "all", "full", "prefill", "embeddings"],
+        choices=["1", "2", "2_prefill", "3", "all", "full", "prefill", "embeddings", "monolithic", "monolithic_prefill"],
         default="all",
         help="Model part to convert",
     )
@@ -1037,6 +1327,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=".",
         help="Output directory for converted models",
+    )
+    parser.add_argument(
+        "--argmax",
+        action="store_true",
+        help="Compute argmax inside model for monolithic conversion. "
+             "Outputs (argmax_idx, argmax_val) pairs instead of full logits.",
     )
 
     return parser.parse_args()
@@ -1052,6 +1348,7 @@ def test_conversion(
     output_dir: str = ".",
     part: str = "full",
     num_chunks: int = 1,
+    argmax_in_model: bool = False,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
     """Convert a Gemma3 model and save the result.
 
@@ -1064,6 +1361,7 @@ def test_conversion(
         batch_size: Batch size for conversion
         output_dir: Output directory
         part: Part to convert ("full" or "prefill")
+        argmax_in_model: If True, compute argmax inside model for monolithic conversion
     """
     print(
         f"test_conversion called with model_path={model_path}, prefix={prefix}, part={part}"
@@ -1111,6 +1409,7 @@ def test_conversion(
         batch_size=batch_size,
         lut_bits=lut_bits,
         num_chunks=num_chunks,
+        argmax_in_model=argmax_in_model,
     )
 
     print("Starting conversion...")
@@ -1130,7 +1429,7 @@ def test_conversion(
             m,
             {
                 "context_length": context_length,
-                "batch_size": batch_size if part in ["2_prefill", "prefill"] else None,
+                "batch_size": batch_size if part in ["2_prefill", "prefill", "monolithic_prefill"] else None,
                 "lut_bits": lut_bits,
                 "num_chunks": num_chunks if part in ["2", "2_prefill"] else None,
                 "chunk_no": i + 1 if part in ["2", "2_prefill"] else None,
@@ -1144,6 +1443,10 @@ def test_conversion(
             fname += "_embeddings"
         elif part in ["3"]:
             fname += "_lm_head"
+        elif part == "monolithic":
+            fname += "_monolithic"
+        elif part == "monolithic_prefill":
+            fname += "_monolithic_prefill"
         elif part in ["2", "2_prefill"]:
             base = "FFN" if part == "2" else "prefill"
             fname += f"_{base}"
@@ -1197,6 +1500,7 @@ def main() -> None:
             output_dir=args.output,
             part=part,
             num_chunks=args.chunk or 1,
+            argmax_in_model=args.argmax,
         )
         print(f"Conversion completed successfully! Result: {type(result)}")
     except Exception as e:  # pragma: no cover - CLI tool

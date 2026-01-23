@@ -921,9 +921,11 @@ def parse_args():
                        help='Batch size for prefill (default: 64)')
     parser.add_argument('--num-logits', type=int, default=8,
                        help='Number of logits outputs from LM head (default: 8, legacy)')
-    parser.add_argument('--split-lm-head', type=int, 
+    parser.add_argument('--split-lm-head', type=int,
                        help='Number of logits splits from LM head (default: 8 for llama, 16 for qwen)')
-    
+    parser.add_argument('--debug-argmax', action='store_true',
+                       help='Enable debug output for argmax mode (print indices and values)')
+
     args = parser.parse_args()
 
     def _strip_model_ext(value):
@@ -969,6 +971,9 @@ def parse_args():
                     else:
                         args.split_lm_head = 16 if 'qwen' in prefix.lower() else 8
 
+                # Check for argmax_in_model flag
+                args.argmax_in_model = params.get('argmax_in_model', False)
+
                 # Set tokenizer path
                 if not args.tokenizer:
                     if 'tokenizer_path' in params:
@@ -982,6 +987,7 @@ def parse_args():
                     print(f"  Context Length: {args.context_length}")
                     print(f"  Batch Size: {args.batch_size}")
                     print(f"  Split LM Head: {args.split_lm_head}")
+                    print(f"  Argmax in Model: {args.argmax_in_model}")
                     print(f"  Models Directory: {args.d}")
             else:
                 # Standard chunked model configuration
@@ -1142,6 +1148,61 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
         'current_pos': position_ids.numpy().astype(np.int32)
     }
     output = model.predict(inputs, state)
+
+    # Check if model uses argmax_in_model mode (outputs 2 tensors instead of logits)
+    argmax_in_model = metadata.get('argmax_in_model', False)
+
+    if argmax_in_model and 'argmax_idx' in output:
+        # Argmax-in-model mode: find the chunk with highest value and compute global index
+        # Model outputs LOCAL indices (0 to chunk_size-1) for each chunk
+        # We compute: global_idx = local_idx + (best_chunk * chunk_size)
+        argmax_idx = output['argmax_idx']  # shape: [num_chunks], LOCAL indices
+        argmax_val = output['argmax_val']  # shape: [num_chunks]
+
+        # Flatten in case of extra dimensions
+        argmax_idx_flat = argmax_idx.flatten()
+        argmax_val_flat = argmax_val.flatten()
+
+        # Find chunk with highest value
+        best_chunk = int(np.argmax(argmax_val_flat))
+        local_idx = int(argmax_idx_flat[best_chunk])
+
+        # Compute global token ID: local_idx + (chunk * chunk_size)
+        chunk_size = 16384  # 262144 / 16
+        global_idx = local_idx + (best_chunk * chunk_size)
+
+        # Debug: print shapes and values
+        if metadata.get('debug_argmax', False):
+            print(f"\n=== Argmax Debug (pos={pos}) ===")
+            print(f"argmax_idx shape: {argmax_idx.shape}, dtype: {argmax_idx.dtype}")
+            print(f"argmax_val shape: {argmax_val.shape}, dtype: {argmax_val.dtype}")
+            print(f"Per-chunk results (LOCAL indices, chunk_size={chunk_size}):")
+
+            # Find top 3 chunks by value for comparison
+            sorted_indices = np.argsort(argmax_val_flat)[::-1][:3]
+
+            for i in range(min(16, len(argmax_idx_flat))):
+                local = int(argmax_idx_flat[i])
+                val = float(argmax_val_flat[i])
+                computed_global = local + (i * chunk_size)
+                in_range = 0 <= local < chunk_size
+                marker = " <-- SELECTED" if i == best_chunk else ""
+                if i in sorted_indices and i != best_chunk:
+                    marker += f" (top-{list(sorted_indices).index(i)+1})"
+                range_ok = "✓" if in_range else f"✗ (expected 0-{chunk_size-1})"
+                print(f"  Chunk {i:2d}: local={local:5d}, global={computed_global:6d}, val={val:8.4f}, range={range_ok}{marker}")
+
+            print(f"Result: best_chunk={best_chunk}, local_idx={local_idx}, global_idx={global_idx}, best_val={argmax_val_flat[best_chunk]:.4f}")
+
+            # Value comparison: show if there are close competing values
+            top_values = [float(argmax_val_flat[i]) for i in sorted_indices]
+            if len(top_values) >= 2:
+                val_diff = abs(top_values[0] - top_values[1])
+                print(f"Value comparison: top-1={top_values[0]:.6f}, top-2={top_values[1]:.6f}, diff={val_diff:.6f}")
+                if val_diff < 0.01:
+                    print(f"  WARNING: Values are very close - possible precision issue!")
+
+        return global_idx
 
     # Get number of logits from metadata
     num_logits = metadata.get('split_lm_head', metadata.get('num_logits', 8))
@@ -1376,6 +1437,8 @@ def main():
             # Set metadata values
             metadata['batch_size'] = getattr(args, 'batch_size', 64)
             metadata['split_lm_head'] = getattr(args, 'split_lm_head', 16)
+            metadata['argmax_in_model'] = getattr(args, 'argmax_in_model', False)
+            metadata['debug_argmax'] = getattr(args, 'debug_argmax', False)
 
             if not args.eval:
                 print(f"\nMonolithic metadata: {metadata}")
