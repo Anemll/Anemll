@@ -24,7 +24,8 @@ anemll.models.gemma3n_model.ENABLE_COREML = True
 
 from anemll.models.gemma3n_model import (
     Gemma3nModel, Gemma3nLaurelBlock,
-    Gemma3nAttention, Gemma3nFFN, Gemma3nRMSNorm, Gemma3nConfig
+    Gemma3nAttention, Gemma3nFFN, Gemma3nRMSNorm, Gemma3nConfig,
+    MODEL_DTYPE, TEST_DEVICE
 )
 
 
@@ -37,7 +38,7 @@ class Gemma3nConverter(BaseConverter):
         batch_size: int = 1,
         lut2: Optional[int] = None,
         lut3: Optional[int] = None,
-        chunk_size: int = 2,
+        chunk_size: int = 4,
         enable_laurel: bool = True,
         enable_per_layer_embeddings: bool = True,
         text_only_mode: bool = True,
@@ -69,6 +70,23 @@ class Gemma3nConverter(BaseConverter):
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
+
+    def _get_kv_cache_states(self, prefix: str = "model.") -> list:
+        head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
+        return [
+            ct.StateType(
+                wrapped_type=ct.TensorType(
+                    shape=(
+                        2 * self.config.num_hidden_layers,
+                        self.config.num_key_value_heads,
+                        self.config.state_length,
+                        head_dim,
+                    ),
+                    dtype=np.float16,
+                ),
+                name=f"{prefix}kv_cache_0",
+            )
+        ]
         
     def _is_multimodal_weight(self, key: str) -> bool:
         """Check if a weight belongs to multimodal components (vision/audio)"""
@@ -215,17 +233,22 @@ class Gemma3nConverter(BaseConverter):
         model = EmbeddingModel(self.config, embed_weights)
         model.eval()
         
-        # Convert to CoreML
-        example_input = torch.randint(0, self.config.vocab_size, (self.batch_size, self.context_length))
+        # Convert to CoreML (enumerated shapes: single-token + prefill length)
+        example_input = torch.randint(0, self.config.vocab_size, (1, 1))
         traced_model = torch.jit.trace(model, example_input)
-        
+
+        input_shape = ct.EnumeratedShapes(
+            shapes=[[1, 1], [1, self.batch_size]],
+            default=[1, 1],
+        )
+
         inputs = [
             ct.TensorType(
                 name="input_ids",
-                shape=(self.batch_size, self.context_length),
+                shape=input_shape,
                 dtype=np.int32
             )
-            ]
+        ]
         
         mlmodel = ct.convert(
             traced_model,
@@ -273,25 +296,36 @@ class Gemma3nConverter(BaseConverter):
                     self.enable_laurel = enable_laurel
                     self.layers = nn.ModuleList(layers)
                 
-                def forward(self, hidden_states):
+                def forward(self, hidden_states, causal_mask):
+                    conv2d_input = False
+                    if hidden_states.dim() == 4:
+                        conv2d_input = True
+                        hidden_states = hidden_states.squeeze(-1).transpose(1, 2)
+
                     for layer in self.layers:
                         if self.enable_laurel:
-                            # Full LAUREL block processing
-                            hidden_states, _ = layer(hidden_states)
+                            # Full LAUREL block processing (includes attention + MLP + residuals)
+                            hidden_states, _ = layer(hidden_states, attention_mask=causal_mask)
                         else:
-                            # Just FFN processing (convert Conv2d layout to [B, T, C])
-                            if hidden_states.dim() == 4:
-                                residual = hidden_states
-                                hidden_states = hidden_states.squeeze(-1).transpose(1, 2)
-                                hidden_states = layer.post_attention_layernorm(hidden_states)
-                                hidden_states = layer.ffn(hidden_states)
-                                hidden_states = hidden_states + residual.squeeze(-1).transpose(1, 2)
-                                hidden_states = hidden_states.transpose(1, 2).unsqueeze(-1)
-                            else:
-                                residual = hidden_states
-                                hidden_states = layer.post_attention_layernorm(hidden_states)
-                                hidden_states = layer.ffn(hidden_states)
-                                hidden_states = residual + hidden_states
+                            # Standard attention + MLP + residuals (LAUREL disabled)
+                            residual = hidden_states
+                            attn_input = layer.input_layernorm(hidden_states)
+                            attn_output, _ = layer.attention(
+                                attn_input,
+                                attention_mask=causal_mask,
+                                position_ids=None,
+                                past_key_value=None,
+                            )
+                            attn_output = layer.post_attention_layernorm(attn_output)
+                            hidden_states = residual + attn_output
+
+                            ffn_input = layer.pre_feedforward_layernorm(hidden_states)
+                            ffn_output = layer.ffn(ffn_input)
+                            ffn_output = layer.post_feedforward_layernorm(ffn_output)
+                            hidden_states = hidden_states + ffn_output
+
+                    if conv2d_input:
+                        hidden_states = hidden_states.transpose(1, 2).unsqueeze(-1)
                     return hidden_states
             
             # Load state dict and filter for text-only mode
@@ -326,8 +360,9 @@ class Gemma3nConverter(BaseConverter):
             # Convert to CoreML
             #example_input = torch.randn(self.batch_size, self.config.hidden_size, self.context_length, 1)
             example_input = torch.randn(self.batch_size, self.config.hidden_size, self.context_length, 1)
+            example_mask = torch.zeros((self.batch_size, 1, self.context_length, self.context_length), dtype=torch.float32)
 
-            traced_model = torch.jit.trace(model, example_input)
+            traced_model = torch.jit.trace(model, (example_input, example_mask))
             
             mlmodel = ct.convert(
                 traced_model,
@@ -336,7 +371,12 @@ class Gemma3nConverter(BaseConverter):
                         name="hidden_states",
                         shape=(self.batch_size, self.config.hidden_size, self.context_length, 1),
                         dtype=np.float32
-                    )
+                    ),
+                    ct.TensorType(
+                        name="causal_mask",
+                        shape=(self.batch_size, 1, self.context_length, self.context_length),
+                        dtype=np.float32
+                    ),
                     ],
                 outputs=[ct.TensorType(name="output_hidden_states")],
                 compute_units=ct.ComputeUnit.CPU_AND_NE,
@@ -587,11 +627,11 @@ class Gemma3nConverter(BaseConverter):
                     )
                 )
                 mlmodel = ct.optimize.coreml.linear_quantize_weights(mlmodel, config)
-            
-                # Save model
-                output_path = os.path.join(self.output_dir, "gemma3n_lm_head.mlpackage")
-                mlmodel.save(output_path)
-                print(f"LM head saved to {output_path}")
+
+            # Save model
+            output_path = os.path.join(self.output_dir, "gemma3n_lm_head.mlpackage")
+            mlmodel.save(output_path)
+            print(f"LM head saved to {output_path}")
         finally:
             # Restore original ENABLE_COREML value
             anemll.models.gemma3n_model.ENABLE_COREML = original_coreml
@@ -648,6 +688,13 @@ class Gemma3nConverter(BaseConverter):
             "embeddings_path": "gemma3n_embeddings.mlpackage",
             "lm_head_path": "gemma3n_lm_head.mlpackage",
             "attention_prefill_path": "gemma3n_attention_prefill.mlpackage",
+            "infer_init_path": "gemma3n_infer_init.mlpackage",
+            "combine_streams_path": "gemma3n_combine_streams.mlpackage",
+            "infer_path": "gemma3n_infer.mlpackage",
+            "infer_chunks": [
+                f"gemma3n_infer_chunk_{i:02d}of{self.chunk_size:02d}.mlpackage"
+                for i in range(self.chunk_size)
+            ],
             "ffn_chunks": [
                 f"gemma3n_FFN_chunk_{i:02d}of{self.chunk_size:02d}.mlpackage"
                 for i in range(self.chunk_size)
@@ -660,6 +707,188 @@ class Gemma3nConverter(BaseConverter):
         with open(meta_path, 'w') as f:
             yaml.dump(meta_config, f, default_flow_style=False)
         print(f"Meta configuration saved to {meta_path}")
+
+    def convert_infer_init(self):
+        """Convert Gemma3n infer init (input_ids -> hidden_states + per_layer_inputs)."""
+        print("Converting Gemma3n infer init model...")
+
+        class InferInitWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, input_ids):
+                inputs_embeds, per_layer_inputs = self.model._compute_inputs_and_per_layer(input_ids)
+                hidden_states = self.model._init_hidden_states(inputs_embeds)
+                return hidden_states, per_layer_inputs
+
+        model = Gemma3nModel(self.config)
+        model.load_weights(self.model_path, config=self.config)
+        model.to(device=TEST_DEVICE, dtype=MODEL_DTYPE)
+        model.eval()
+
+        wrapper = InferInitWrapper(model)
+        wrapper.eval()
+
+        sample_input_ids = torch.zeros((1, 1), dtype=torch.int32)
+        traced_model = torch.jit.trace(wrapper, (sample_input_ids,))
+
+        mlmodel = ct.convert(
+            traced_model,
+            inputs=[
+                ct.TensorType(name="input_ids", shape=(1, 1), dtype=np.int32),
+            ],
+            outputs=[
+                ct.TensorType(name="hidden_states", dtype=np.float16),
+                ct.TensorType(name="per_layer_inputs", dtype=np.float16),
+            ],
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram",
+        )
+
+        output_path = os.path.join(self.output_dir, "gemma3n_infer_init.mlpackage")
+        mlmodel.save(output_path)
+        print(f"Infer init model saved to {output_path}")
+
+    def convert_combine_streams(self):
+        """Convert Gemma3n combine-streams model (4-stream -> single stream)."""
+        print("Converting Gemma3n combine-streams model...")
+
+        class CombineStreamsWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, hidden_states):
+                return self.model._combine_streams(hidden_states)
+
+        model = Gemma3nModel(self.config)
+        model.load_weights(self.model_path, config=self.config)
+        model.to(device=TEST_DEVICE, dtype=MODEL_DTYPE)
+        model.eval()
+
+        wrapper = CombineStreamsWrapper(model)
+        wrapper.eval()
+
+        sample_hidden_states = torch.zeros((4, 1, 1, self.config.hidden_size), dtype=MODEL_DTYPE)
+        traced_model = torch.jit.trace(wrapper, (sample_hidden_states,))
+
+        mlmodel = ct.convert(
+            traced_model,
+            inputs=[
+                ct.TensorType(
+                    name="hidden_states",
+                    shape=(4, 1, 1, self.config.hidden_size),
+                    dtype=np.float16,
+                )
+            ],
+            outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram",
+        )
+
+        output_path = os.path.join(self.output_dir, "gemma3n_combine_streams.mlpackage")
+        mlmodel.save(output_path)
+        print(f"Combine-streams model saved to {output_path}")
+
+    def convert_infer(self, chunk_idx: int = 0, total_chunks: int = 1):
+        """Convert a stateful single-token infer model with KV cache (chunked)."""
+        print(f"Converting stateful Gemma3n infer chunk {chunk_idx}/{total_chunks}...")
+
+        layers_per_chunk = self.config.num_hidden_layers // total_chunks
+        start_layer = chunk_idx * layers_per_chunk
+        end_layer = start_layer + layers_per_chunk if chunk_idx < total_chunks - 1 else self.config.num_hidden_layers
+        print(f"  Layers: {start_layer}..{end_layer-1}")
+
+        class Gemma3nInferChunkWrapper(nn.Module):
+            def __init__(self, model, start_layer, end_layer):
+                super().__init__()
+                self.model = model
+                self.start_layer = start_layer
+                self.end_layer = end_layer
+
+            def forward(self, hidden_states, per_layer_inputs, causal_mask, current_pos):
+                hidden_states = self.model.process_layers(
+                    hidden_states,
+                    per_layer_inputs,
+                    causal_mask,
+                    current_pos,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    prefill=False,
+                )
+                return hidden_states
+
+        model = Gemma3nModel(self.config)
+        model.load_weights(self.model_path, config=self.config)
+        model.to(device=TEST_DEVICE, dtype=MODEL_DTYPE)
+        model.eval()
+
+        wrapper = Gemma3nInferChunkWrapper(model, start_layer, end_layer)
+        wrapper.eval()
+
+        sample_hidden_states = torch.zeros((4, 1, 1, self.config.hidden_size), dtype=MODEL_DTYPE)
+        sample_per_layer_inputs = torch.zeros(
+            (1, 1, self.config.num_hidden_layers, self.config.hidden_size_per_layer_input),
+            dtype=MODEL_DTYPE,
+        )
+        sample_causal_mask = torch.zeros(
+            (1, 1, self.context_length, self.context_length), dtype=torch.float16
+        )
+        sample_current_pos = torch.zeros((1,), dtype=torch.int32)
+
+        traced_model = torch.jit.trace(
+            wrapper,
+            (sample_hidden_states, sample_per_layer_inputs, sample_causal_mask, sample_current_pos),
+        )
+
+        outputs = [
+            ct.TensorType(name="output_hidden_states", dtype=np.float16)
+        ]
+
+        states = self._get_kv_cache_states(prefix="model.")
+
+        mlmodel = ct.convert(
+            traced_model,
+            inputs=[
+                ct.TensorType(
+                    name="hidden_states",
+                    shape=(4, 1, 1, self.config.hidden_size),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(
+                    name="per_layer_inputs",
+                    shape=(1, 1, self.config.num_hidden_layers, self.config.hidden_size_per_layer_input),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(
+                    name="causal_mask",
+                    shape=(1, 1, self.context_length, self.context_length),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(name="current_pos", shape=(1,), dtype=np.int32),
+            ],
+            outputs=outputs,
+            states=states,
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram",
+        )
+
+        if total_chunks > 1:
+            output_path = os.path.join(
+                self.output_dir,
+                f"gemma3n_infer_chunk_{chunk_idx:02d}of{total_chunks:02d}.mlpackage",
+            )
+        else:
+            output_path = os.path.join(self.output_dir, "gemma3n_infer.mlpackage")
+        mlmodel.save(output_path)
+        print(f"Infer model saved to {output_path}")
         
     def convert(self):
         """Run full conversion pipeline"""
@@ -677,11 +906,21 @@ class Gemma3nConverter(BaseConverter):
             
         # Step 4: Convert attention prefill
         self.convert_attention_prefill()
-        
-        # Step 5: Copy tokenizer
+
+        # Step 5: Convert infer init (input ids -> hidden states + per-layer inputs)
+        self.convert_infer_init()
+
+        # Step 6: Convert stateful infer (KV cache) chunks
+        for chunk_idx in range(self.chunk_size):
+            self.convert_infer(chunk_idx, self.chunk_size)
+
+        # Step 7: Convert combine-streams model
+        self.convert_combine_streams()
+
+        # Step 8: Copy tokenizer
         self.copy_tokenizer()
-        
-        # Step 6: Create meta configuration
+
+        # Step 9: Create meta configuration
         self.create_meta_config()
         
         print("Conversion complete!")
@@ -700,7 +939,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=1, help="Batch size")
     parser.add_argument("--lut2", type=int, help="LUT quantization for Part 2")
     parser.add_argument("--lut3", type=int, help="LUT quantization for Part 3")
-    parser.add_argument("--chunk", type=int, default=2, help="Number of FFN chunks")
+    parser.add_argument("--chunk", type=int, default=4, help="Number of FFN chunks")
     parser.add_argument("--disable-laurel", action="store_true", help="Disable LAUREL blocks")
     parser.add_argument("--disable-per-layer-embeddings", action="store_true", help="Disable per-layer embeddings")
     parser.add_argument("--enable-multimodal", action="store_true", help="Enable multimodal weights (default: text-only mode)")

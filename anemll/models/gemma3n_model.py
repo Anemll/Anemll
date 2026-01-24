@@ -101,18 +101,16 @@ def repeat_kv(hidden_states, n_rep):
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
+def get_kv_cache_idx(layer_idx, num_layers, num_groups=1):
+    """Helper function to get KV cache indices (matches llama/qwen pattern)."""
+    layers_per_group = num_layers // num_groups
+    group_idx = layer_idx // layers_per_group
+    layer_in_group_idx = layer_idx % layers_per_group
+    return group_idx, layer_in_group_idx, layers_per_group
+
 def create_causal_mask_4d(seq_len, batch_size, device, dtype):
     mask = torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
     mask = torch.triu(mask, diagonal=1)
-    return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
-
-def create_sliding_window_causal_mask_4d(seq_len, sliding_window, batch_size, device, dtype):
-    mask = torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
-    mask = torch.triu(mask, diagonal=1)
-    if sliding_window is not None and sliding_window > 0:
-        for i in range(seq_len):
-            start_idx = max(0, i - sliding_window + 1)
-            mask[i, start_idx : i + 1] = 0.0
     return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
 
 class Gemma3nConfig:
@@ -260,11 +258,14 @@ def create_sliding_window_causal_mask(seq_len, sliding_window, device, dtype=tor
         # Keep only the sliding window band
         for i in range(seq_len):
             start_idx = max(0, i - sliding_window + 1)
-            mask[i, start_idx:i+1] = 0.0
+            row = mask[i:i+1, :]
+            zeros = torch.zeros((1, i + 1 - start_idx), device=device, dtype=dtype)
+            row = torch.slice_scatter(row, zeros, dim=1, start=start_idx, end=i + 1)
+            mask = torch.slice_scatter(mask, row, dim=0, start=i, end=i + 1)
     else:
         # Full causal (no sliding window)
         mask = torch.tril(torch.zeros_like(mask))
-        mask = torch.where(mask == 0, float('-inf'), 0.0)
+        mask = torch.where(mask == 0, torch.full_like(mask, float('-inf')), torch.zeros_like(mask))
         mask = torch.triu(mask, diagonal=1)
     
     return mask
@@ -356,21 +357,25 @@ class Gemma3nAttention(nn.Module):
             key_states = key_states.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
             value_states = value_states.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
         
+        # Use a single causal mask; sliding window is enforced by KV slicing.
+        if attention_mask is None:
+            attention_mask = create_causal_mask_4d(seq_len, batch_size, hidden_states.device, query_states.dtype)
+
+        # Apply sliding-window KV slicing for sliding layers (Gemma3-style).
+        k_seq_len = key_states.shape[-2]
+        start = 0
+        if self.layer_type == "sliding_attention" and self.sliding_window is not None:
+            start = max(0, k_seq_len - self.sliding_window)
+            key_states = key_states[:, :, start:k_seq_len, :]
+            value_states = value_states[:, :, start:k_seq_len, :]
+            k_seq_len = key_states.shape[-2]
+
         # Compute attention scores
         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        # BLOCKER #2 FIX: Apply attention mask (sliding window or full causal)
-        if attention_mask is None:
-            if self.layer_type == 'sliding_attention':
-                attention_mask = create_sliding_window_causal_mask(seq_len, self.sliding_window, 
-                                                                 hidden_states.device, dtype=attn_weights.dtype)
-            else:
-                # Full causal mask for full attention layers
-                causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=hidden_states.device, dtype=torch.bool), diagonal=1)
-                attention_mask = torch.zeros(seq_len, seq_len, device=hidden_states.device, dtype=attn_weights.dtype)
-                attention_mask.masked_fill_(causal_mask, float('-inf'))
-
-        attn_weights = attn_weights + attention_mask
+        q_seq_len = query_states.shape[-2]
+        mask_slice = attention_mask.to(attn_weights.dtype)[:, :, :q_seq_len, start:start + k_seq_len]
+        attn_weights = attn_weights + mask_slice
 
         # BLOCKER #4 FIX: Attention logit soft-capping
         attn_weights = torch.tanh(attn_weights / 30.0) * 30.0
@@ -408,8 +413,14 @@ class Gemma3nFFN(nn.Module):
             self.activation_sparsity = config.activation_sparsity_pattern[layer_idx]
         else:
             self.activation_sparsity = getattr(config, 'activation_sparsity', 0.0)
-        
-        self.target_sparsity_tensor = torch.tensor(self.activation_sparsity, dtype=torch.float32, device=TEST_DEVICE)
+
+        # Precompute std-multiplier once (exact HF math, removes icdf from forward path).
+        if self.activation_sparsity > 0.0:
+            normal_dist = torch.distributions.normal.Normal(0, 1)
+            std_multiplier = normal_dist.icdf(torch.tensor(self.activation_sparsity, dtype=torch.float32))
+        else:
+            std_multiplier = torch.tensor(0.0, dtype=torch.float32)
+        self.register_buffer("std_multiplier", std_multiplier, persistent=False)
 
         # Debug infrastructure
         self.debugger_hooks = {}
@@ -422,11 +433,9 @@ class Gemma3nFFN(nn.Module):
         #   *   https://docs.jax.dev/en/latest/_autosummary/jax.scipy.stats.norm.ppf.html
         #   *   https://pytorch.org/docs/stable/distributions.html#torch.distributions.normal.Normal
         #   *   https://pytorch.org/docs/stable/distributions.html#torch.distributions.transformed_distribution.TransformedDistribution.icdf
-        normal_dist = torch.distributions.normal.Normal(0, 1)
-        std_multiplier: torch.Tensor = normal_dist.icdf(self.target_sparsity_tensor)
-        std_multiplier = std_multiplier.type(inputs.dtype)
         inputs_mean = torch.mean(inputs, dim=-1, keepdim=True)
         inputs_std = torch.std(inputs, dim=-1, keepdim=True, unbiased=False)
+        std_multiplier = self.std_multiplier.to(dtype=inputs.dtype, device=inputs.device)
         cutoff_x = inputs_mean + inputs_std * std_multiplier
         return nn.functional.relu(inputs - cutoff_x)
         
@@ -455,6 +464,12 @@ class Gemma3nTextMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_activation]
         self.activation_sparsity = config.activation_sparsity_pattern[layer_idx]
+        if self.activation_sparsity > 0.0:
+            normal_dist = torch.distributions.normal.Normal(0, 1)
+            std_multiplier = normal_dist.icdf(torch.tensor(self.activation_sparsity, dtype=torch.float32))
+        else:
+            std_multiplier = torch.tensor(0.0, dtype=torch.float32)
+        self.register_buffer("std_multiplier", std_multiplier, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_proj = self.gate_proj(hidden_states)
@@ -465,12 +480,9 @@ class Gemma3nTextMLP(nn.Module):
         return self.down_proj(activations * up_proj)
 
     def _gaussian_topk(self, inputs: torch.Tensor) -> torch.Tensor:
-        target_sparsity_tensor = torch.tensor(self.activation_sparsity, dtype=torch.float32, device=inputs.device)
-        normal_dist = torch.distributions.normal.Normal(0, 1)
-        std_multiplier: torch.Tensor = normal_dist.icdf(target_sparsity_tensor)
-        std_multiplier = std_multiplier.type(inputs.dtype)
         inputs_mean = torch.mean(inputs, dim=-1, keepdim=True)
         inputs_std = torch.std(inputs, dim=-1, keepdim=True, unbiased=False)
+        std_multiplier = self.std_multiplier.to(dtype=inputs.dtype, device=inputs.device)
         cutoff_x = inputs_mean + inputs_std * std_multiplier
         return F.relu(inputs - cutoff_x)
 
@@ -560,9 +572,24 @@ class Gemma3nTextAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        if attention_mask is None:
+            seq_len = query_states.shape[-2]
+            attention_mask = create_causal_mask_4d(seq_len, query_states.shape[0], query_states.device, query_states.dtype)
+
+        # Single causal mask; sliding window handled by KV slicing (Gemma3-style).
+        k_seq_len = key_states.shape[-2]
+        start = 0
+        if self.is_sliding and self.config.sliding_window is not None:
+            start = max(0, k_seq_len - self.config.sliding_window)
+            key_states = key_states[:, :, start:k_seq_len, :]
+            value_states = value_states[:, :, start:k_seq_len, :]
+            k_seq_len = key_states.shape[-2]
+
         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+
+        q_seq_len = query_states.shape[-2]
+        mask_slice = attention_mask.to(query_states.dtype)[:, :, :q_seq_len, start:start + k_seq_len]
+        attn_weights = attn_weights + mask_slice
 
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
@@ -570,6 +597,130 @@ class Gemma3nTextAttention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, None
+
+    def get_new_kv_cache(self, hidden_states, current_pos, rotary_emb):
+        """Get new key/value cache entries for single-token inference."""
+        bsz, seq_len, _ = hidden_states.shape
+
+        query_states = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim)
+        key_states = self.k_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+        value_states = self.v_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+        value_states = self.v_norm(value_states)
+
+        cos, sin = rotary_emb
+        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, unsqueeze_dim=2)
+        key_states = apply_rotary_pos_emb_single(key_states, cos, sin, unsqueeze_dim=2)
+
+        # [B, heads, T, D]
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        return query_states, key_states, value_states
+
+    def get_new_kv_cache_prefill(self, hidden_states, current_pos, rotary_emb):
+        """Get new key/value cache entries for batched prefill."""
+        bsz, seq_len, _ = hidden_states.shape
+
+        query_states = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim)
+        key_states = self.k_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+        value_states = self.v_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+        value_states = self.v_norm(value_states)
+
+        cos, sin = rotary_emb
+        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, unsqueeze_dim=2)
+        key_states = apply_rotary_pos_emb_single(key_states, cos, sin, unsqueeze_dim=2)
+
+        query_states = query_states.transpose(1, 2)  # [B, heads, T, D]
+        key_states = key_states.transpose(1, 2)      # [B, kv_heads, T, D]
+        value_states = value_states.transpose(1, 2)
+
+        return query_states, key_states, value_states
+
+    def forward_regular(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None, current_pos=None, layer_idx=None):
+        """Forward pass for single token generation with KV cache."""
+        bsz, q_len, _ = hidden_states.shape
+
+        K_layer_cache, V_layer_cache = kv_cache_layer
+        if K_layer_cache.dim() == 3:
+            K_layer_cache = K_layer_cache.unsqueeze(0)
+            V_layer_cache = V_layer_cache.unsqueeze(0)
+
+        pos = int(current_pos) if current_pos is not None else 0
+        end = min(pos + q_len, self.config.state_length)
+        start = 0
+        if layer_idx is not None and hasattr(self.config, "layer_types"):
+            if self.config.layer_types[layer_idx] == "sliding_attention":
+                start = max(0, end - self.config.sliding_window)
+
+        K_window = K_layer_cache[:, :, start:end, :]
+        V_window = V_layer_cache[:, :, start:end, :]
+
+        key_states = repeat_kv(K_window, self.num_key_value_groups)
+        value_states = repeat_kv(V_window, self.num_key_value_groups)
+
+        # Match dtypes to avoid matmul dtype errors during tracing.
+        if query_states.dtype != key_states.dtype:
+            query_states = query_states.to(key_states.dtype)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
+        if causal_mask is not None:
+            mask_slice = causal_mask.to(query_states.dtype)[:, :, pos:pos + q_len, start:end]
+            attn_weights = attn_weights + mask_slice
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.num_heads * self.head_dim)
+        if attn_output.dtype != self.o_proj.weight.dtype:
+            attn_output = attn_output.to(self.o_proj.weight.dtype)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+    def forward_prefill(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None, current_pos=None, layer_idx=None):
+        """Forward pass for batched prefill with KV cache."""
+        bsz, q_len, _ = hidden_states.shape
+
+        K_layer_cache, V_layer_cache = kv_cache_layer
+        if K_layer_cache.dim() == 3:
+            K_layer_cache = K_layer_cache.unsqueeze(0)
+            V_layer_cache = V_layer_cache.unsqueeze(0)
+
+        pos = int(current_pos) if current_pos is not None else 0
+        end = min(pos + q_len, self.config.state_length)
+        start = 0
+        if layer_idx is not None and hasattr(self.config, "layer_types"):
+            if self.config.layer_types[layer_idx] == "sliding_attention":
+                start = max(0, end - self.config.sliding_window)
+
+        K_window = K_layer_cache[:, :, start:end, :]
+        V_window = V_layer_cache[:, :, start:end, :]
+
+        key_states = repeat_kv(K_window, self.num_key_value_groups)
+        value_states = repeat_kv(V_window, self.num_key_value_groups)
+
+        if query_states.dtype != key_states.dtype:
+            query_states = query_states.to(key_states.dtype)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
+        if causal_mask is not None:
+            mask_slice = causal_mask.to(query_states.dtype)[:, :, pos:pos + q_len, start:end]
+            attn_weights = attn_weights + mask_slice
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.num_heads * self.head_dim)
+        if attn_output.dtype != self.o_proj.weight.dtype:
+            attn_output = attn_output.to(self.o_proj.weight.dtype)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
 
 
 class Gemma3nTextDecoderLayer(nn.Module):
@@ -1048,6 +1199,45 @@ class Gemma3nModel(nn.Module):
         
         # Final logit softcapping
         self.final_logit_softcapping = getattr(config, 'final_logit_softcapping', 30.0)
+
+        # Precompute rotary caches for infer/prefill paths
+        max_len = max(
+            config.context_length,
+            config.state_length,
+            config.sliding_window or 0,
+        ) * 2
+        cos_global, sin_global = create_rotary_cache(
+            self.config.head_dim,
+            max_len,
+            theta=self.config.rope_theta,
+            device=TEST_DEVICE,
+            dtype=MODEL_DTYPE,
+            batch_size=1,
+        )
+        cos_local, sin_local = create_rotary_cache(
+            self.config.head_dim,
+            max_len,
+            theta=self.config.rope_local_base_freq,
+            device=TEST_DEVICE,
+            dtype=MODEL_DTYPE,
+            batch_size=1,
+        )
+        self.register_buffer("cos_cached_global", cos_global, persistent=False)
+        self.register_buffer("sin_cached_global", sin_global, persistent=False)
+        self.register_buffer("cos_cached_local", cos_local, persistent=False)
+        self.register_buffer("sin_cached_local", sin_local, persistent=False)
+
+        # Initialize unified KV cache (following llama/qwen patterns)
+        cache_size = (
+            2 * config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.state_length,
+            self.config.head_dim,
+        )
+        self.register_buffer(
+            "kv_cache_0",
+            torch.zeros(cache_size, dtype=MODEL_DTYPE, device=TEST_DEVICE),
+        )
         
     def forward(
         self,
@@ -1056,12 +1246,14 @@ class Gemma3nModel(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         debug_layer_limit: Optional[int] = None,
+        attention_mask_global: Optional[torch.Tensor] = None,
+        attention_mask_local: Optional[torch.Tensor] = None,
         **kwargs
     ):
         batch_size, seq_len = input_ids.shape
         
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+            position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.int32).unsqueeze(0)
 
         # Embeddings with scaling
         inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
@@ -1122,11 +1314,12 @@ class Gemma3nModel(nn.Module):
             temp_hidden_states.append(current_hidden_state)
         hidden_states = torch.stack(temp_hidden_states, dim=0)
 
-        # Masks
-        full_mask = create_causal_mask_4d(seq_len, batch_size, inputs_embeds.device, inputs_embeds.dtype)
-        sliding_mask = create_sliding_window_causal_mask_4d(
-            seq_len, self.config.sliding_window, batch_size, inputs_embeds.device, inputs_embeds.dtype
-        )
+        # Masks (single causal mask; sliding handled inside attention)
+        full_mask = attention_mask
+        if full_mask is None and attention_mask_global is not None:
+            full_mask = attention_mask_global
+        if full_mask is None:
+            full_mask = create_causal_mask_4d(seq_len, batch_size, inputs_embeds.device, inputs_embeds.dtype)
 
         # KV sharing storage
         shared_kv = {}
@@ -1137,13 +1330,12 @@ class Gemma3nModel(nn.Module):
                 break
 
             per_layer_input = per_layer_inputs[:, :, layer_idx, :]
-            attn_mask = sliding_mask if layer.attention_type == "sliding_attention" else full_mask
             hidden_states, _ = layer(
                 hidden_states,
                 (cos_global, sin_global),
                 (cos_local, sin_local),
                 per_layer_input,
-                attention_mask=attn_mask,
+                attention_mask=full_mask,
                 shared_kv=shared_kv,
             )
 
@@ -1208,6 +1400,413 @@ class Gemma3nModel(nn.Module):
             logits = torch.tanh(logits / self.final_logit_softcapping) * self.final_logit_softcapping
         
         return logits
+
+    def _compute_inputs_and_per_layer(self, input_ids: torch.Tensor):
+        batch_size, seq_len = input_ids.shape
+        inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
+
+        per_layer_inputs = self.embed_tokens_per_layer(input_ids) * self.ple_embed_scale
+        per_layer_inputs = per_layer_inputs.view(
+            batch_size,
+            seq_len,
+            self.config.num_hidden_layers,
+            self.config.hidden_size_per_layer_input,
+        )
+
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        per_layer_projection = per_layer_projection * self.per_layer_projection_scale.to(
+            dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
+        per_layer_projection = per_layer_projection.view(
+            batch_size,
+            seq_len,
+            self.config.num_hidden_layers,
+            self.config.hidden_size_per_layer_input,
+        )
+        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+        per_layer_inputs = (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale.to(
+            dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
+
+        return inputs_embeds, per_layer_inputs
+
+    def _init_hidden_states(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        target_magnitude = torch.mean(inputs_embeds**2, dim=-1, keepdim=True) ** 0.5
+        epsilon_tensor = torch.tensor(1e-5, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        temp_hidden_states = [inputs_embeds]
+        for i in range(1, self.config.altup_num_inputs):
+            altup_proj = self.altup_projections[i - 1](inputs_embeds)
+            current_hidden_state = altup_proj.to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+            new_magnitude = torch.mean(current_hidden_state**2, dim=-1, keepdim=True)
+            new_magnitude = torch.sqrt(torch.maximum(new_magnitude, epsilon_tensor))
+            current_hidden_state = current_hidden_state * target_magnitude / new_magnitude
+            temp_hidden_states.append(current_hidden_state)
+        return torch.stack(temp_hidden_states, dim=0)
+
+    def _combine_streams(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        target_magnitude = torch.mean(hidden_states[0] ** 2, dim=-1, keepdim=True) ** 0.5
+        epsilon_tensor = torch.tensor(1e-5, device=hidden_states.device, dtype=hidden_states.dtype)
+        temp_hidden_states = [hidden_states[0]]
+        for i in range(1, self.config.altup_num_inputs):
+            altup_unemb_proj = self.altup_unembed_projections[i - 1](hidden_states[i])
+            current_hidden_state = altup_unemb_proj.to(dtype=hidden_states.dtype, device=hidden_states.device)
+            new_magnitude = torch.mean(current_hidden_state**2, dim=-1, keepdim=True)
+            new_magnitude = torch.sqrt(torch.maximum(new_magnitude, epsilon_tensor))
+            current_hidden_state = current_hidden_state * target_magnitude / new_magnitude
+            temp_hidden_states.append(current_hidden_state)
+
+        hidden_states = torch.stack(temp_hidden_states, dim=0)
+        hidden_states = torch.mean(hidden_states, dim=0)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+    def reset_kv_cache(self) -> None:
+        """Zero the unified KV cache."""
+        self.kv_cache_0.zero_()
+
+    def _get_rotary_embedding_single(self, current_pos, use_local, device, dtype):
+        pos = int(current_pos) if current_pos is not None else 0
+        cos_cache = self.cos_cached_local if use_local else self.cos_cached_global
+        sin_cache = self.sin_cached_local if use_local else self.sin_cached_global
+        cos = cos_cache[:, pos].view(1, 1, -1).to(device=device, dtype=dtype)
+        sin = sin_cache[:, pos].view(1, 1, -1).to(device=device, dtype=dtype)
+        return cos, sin
+
+    def _get_rotary_embedding_prefill(self, positions, use_local, device, dtype):
+        cos_cache = self.cos_cached_local if use_local else self.cos_cached_global
+        sin_cache = self.sin_cached_local if use_local else self.sin_cached_global
+        cos = cos_cache[:, positions].to(device=device, dtype=dtype)
+        sin = sin_cache[:, positions].to(device=device, dtype=dtype)
+        return cos, sin
+
+    def _get_kv_cache_layer(self, layer_idx):
+        group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(
+            layer_idx, self.config.num_hidden_layers
+        )
+        kv_cache = self.kv_cache_0  # unified cache
+        key_idx = layer_in_group_idx
+        value_idx = layer_in_group_idx + layers_per_group
+        return kv_cache, key_idx, value_idx, layers_per_group
+
+    def _process_layer_regular(self, layer_idx, hidden_states, per_layer_input, causal_mask, current_pos):
+        layer = self.layers[layer_idx]
+
+        predictions = layer.altup.predict(hidden_states)
+        active_prediction = predictions[self.config.altup_active_idx]
+
+        active_prediction_normed = layer.input_layernorm(active_prediction)
+        laurel_output = layer.laurel(active_prediction_normed)
+
+        use_local = layer.attention_type == "sliding_attention"
+        rotary_emb = self._get_rotary_embedding_single(
+            current_pos,
+            use_local,
+            device=active_prediction_normed.device,
+            dtype=active_prediction_normed.dtype,
+        )
+
+        query_states, key_states, value_states = layer.attention.get_new_kv_cache(
+            active_prediction_normed, current_pos, rotary_emb
+        )
+
+        kv_cache, key_idx, value_idx, _ = self._get_kv_cache_layer(layer_idx)
+        pos = int(current_pos) if current_pos is not None else 0
+        kv_cache[key_idx:key_idx + 1, :, pos:pos + 1, :] = key_states
+        kv_cache[value_idx:value_idx + 1, :, pos:pos + 1, :] = value_states
+
+        key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+        value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+
+        attn = layer.attention.forward_regular(
+            hidden_states=active_prediction_normed,
+            query_states=query_states,
+            kv_cache_layer=(key_cache, value_cache),
+            causal_mask=causal_mask,
+            current_pos=pos,
+            layer_idx=layer_idx,
+        )
+        attn = layer.post_attention_layernorm(attn)
+
+        attn_gated = active_prediction + attn
+        attn_laurel = (attn_gated + laurel_output) / math.sqrt(2)
+
+        attn_norm = layer.pre_feedforward_layernorm(attn_laurel)
+        attn_ffw = layer.ffn(attn_norm)
+        attn_ffw_norm = layer.post_feedforward_layernorm(attn_ffw)
+        attn_ffw_laurel_gated = attn_laurel + attn_ffw_norm
+
+        corrected_predictions = layer.altup.correct(predictions, attn_ffw_laurel_gated)
+
+        first_prediction = corrected_predictions[self.config.altup_active_idx].clone()
+        if self.config.altup_correct_scale:
+            first_prediction = layer.altup.scale_corrected_output(first_prediction)
+
+        first_prediction = layer.per_layer_input_gate(first_prediction)
+        first_prediction = layer.act_fn(first_prediction)
+        first_prediction = torch.multiply(first_prediction, per_layer_input)
+        first_prediction = layer.per_layer_projection(first_prediction)
+        first_prediction = layer.post_per_layer_input_norm(first_prediction)
+
+        corrected_predictions[1:] += first_prediction
+        return corrected_predictions
+
+    def _process_layer_prefill(self, layer_idx, hidden_states, per_layer_input, causal_mask, current_pos, position_ids):
+        layer = self.layers[layer_idx]
+
+        predictions = layer.altup.predict(hidden_states)
+        active_prediction = predictions[self.config.altup_active_idx]
+
+        active_prediction_normed = layer.input_layernorm(active_prediction)
+        laurel_output = layer.laurel(active_prediction_normed)
+
+        use_local = layer.attention_type == "sliding_attention"
+        rotary_emb = self._get_rotary_embedding_prefill(
+            position_ids,
+            use_local,
+            device=active_prediction_normed.device,
+            dtype=active_prediction_normed.dtype,
+        )
+
+        query_states, key_states, value_states = layer.attention.get_new_kv_cache_prefill(
+            active_prediction_normed, current_pos, rotary_emb
+        )
+
+        kv_cache, key_idx, value_idx, _ = self._get_kv_cache_layer(layer_idx)
+        pos = int(current_pos) if current_pos is not None else 0
+        seq_len = key_states.shape[2]
+        kv_cache[key_idx:key_idx + 1, :, pos:pos + seq_len, :] = key_states
+        kv_cache[value_idx:value_idx + 1, :, pos:pos + seq_len, :] = value_states
+
+        key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+        value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+
+        attn = layer.attention.forward_prefill(
+            hidden_states=active_prediction_normed,
+            query_states=query_states,
+            kv_cache_layer=(key_cache, value_cache),
+            causal_mask=causal_mask,
+            current_pos=pos,
+            layer_idx=layer_idx,
+        )
+        attn = layer.post_attention_layernorm(attn)
+
+        attn_gated = active_prediction + attn
+        attn_laurel = (attn_gated + laurel_output) / math.sqrt(2)
+
+        attn_norm = layer.pre_feedforward_layernorm(attn_laurel)
+        attn_ffw = layer.ffn(attn_norm)
+        attn_ffw_norm = layer.post_feedforward_layernorm(attn_ffw)
+        attn_ffw_laurel_gated = attn_laurel + attn_ffw_norm
+
+        corrected_predictions = layer.altup.correct(predictions, attn_ffw_laurel_gated)
+
+        first_prediction = corrected_predictions[self.config.altup_active_idx].clone()
+        if self.config.altup_correct_scale:
+            first_prediction = layer.altup.scale_corrected_output(first_prediction)
+
+        first_prediction = layer.per_layer_input_gate(first_prediction)
+        first_prediction = layer.act_fn(first_prediction)
+        first_prediction = torch.multiply(first_prediction, per_layer_input)
+        first_prediction = layer.per_layer_projection(first_prediction)
+        first_prediction = layer.post_per_layer_input_norm(first_prediction)
+
+        corrected_predictions[1:] += first_prediction
+        return corrected_predictions
+
+    def process_layers(
+        self,
+        hidden_states: torch.Tensor,
+        per_layer_inputs: torch.Tensor,
+        causal_mask: torch.Tensor,
+        current_pos: Optional[torch.Tensor],
+        start_layer: int = 0,
+        end_layer: Optional[int] = None,
+        prefill: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Process a range of layers for infer/prefill (chunk-friendly)."""
+        if end_layer is None:
+            end_layer = len(self.layers)
+        if prefill and position_ids is None:
+            raise ValueError("process_layers(prefill=True) requires position_ids")
+
+        for layer_idx in range(start_layer, end_layer):
+            per_layer_input = per_layer_inputs[:, :, layer_idx, :].to(
+                dtype=hidden_states.dtype, device=hidden_states.device
+            )
+            if prefill:
+                hidden_states = self._process_layer_prefill(
+                    layer_idx,
+                    hidden_states,
+                    per_layer_input,
+                    causal_mask,
+                    current_pos,
+                    position_ids,
+                )
+            else:
+                hidden_states = self._process_layer_regular(
+                    layer_idx,
+                    hidden_states,
+                    per_layer_input,
+                    causal_mask,
+                    current_pos,
+                )
+        return hidden_states
+
+    def forward_infer(
+        self,
+        input_ids: torch.Tensor,
+        causal_mask: Optional[torch.Tensor] = None,
+        current_pos: Optional[torch.Tensor] = None,
+    ):
+        """Single-token inference with KV cache and single causal mask."""
+        batch_size, seq_len = input_ids.shape
+        if seq_len != 1:
+            raise ValueError("forward_infer expects a single token (seq_len=1)")
+
+        if causal_mask is None:
+            causal_mask = create_causal_mask_4d(
+                self.config.state_length,
+                batch_size,
+                input_ids.device,
+                MODEL_DTYPE,
+            )
+
+        if current_pos is None:
+            current_pos = torch.tensor(0, device=input_ids.device)
+
+        inputs_embeds, per_layer_inputs = self._compute_inputs_and_per_layer(input_ids)
+        hidden_states = self._init_hidden_states(inputs_embeds)
+
+        for layer_idx, layer in enumerate(self.layers):
+            per_layer_input = per_layer_inputs[:, :, layer_idx, :]
+            hidden_states = self._process_layer_regular(
+                layer_idx,
+                hidden_states,
+                per_layer_input,
+                causal_mask,
+                current_pos,
+            )
+
+        hidden_states = self._combine_streams(hidden_states)
+
+        return hidden_states
+
+    def forward_infer_logits(
+        self,
+        input_ids: torch.Tensor,
+        causal_mask: Optional[torch.Tensor] = None,
+        current_pos: Optional[torch.Tensor] = None,
+    ):
+        """Single-token inference that returns logits (uses LM head)."""
+        hidden_states = self.forward_infer(
+            input_ids=input_ids,
+            causal_mask=causal_mask,
+            current_pos=current_pos,
+        )
+
+        if ENABLE_CONV2D and ENABLE_VACAB_SPLIT16:
+            hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
+            logits1 = self.lm_head16_1(hidden_states).squeeze(2).transpose(1, 2)
+            logits2 = self.lm_head16_2(hidden_states).squeeze(2).transpose(1, 2)
+            logits3 = self.lm_head16_3(hidden_states).squeeze(2).transpose(1, 2)
+            logits4 = self.lm_head16_4(hidden_states).squeeze(2).transpose(1, 2)
+            logits5 = self.lm_head16_5(hidden_states).squeeze(2).transpose(1, 2)
+            logits6 = self.lm_head16_6(hidden_states).squeeze(2).transpose(1, 2)
+            logits7 = self.lm_head16_7(hidden_states).squeeze(2).transpose(1, 2)
+            logits8 = self.lm_head16_8(hidden_states).squeeze(2).transpose(1, 2)
+            logits9 = self.lm_head16_9(hidden_states).squeeze(2).transpose(1, 2)
+            logits10 = self.lm_head16_10(hidden_states).squeeze(2).transpose(1, 2)
+            logits11 = self.lm_head16_11(hidden_states).squeeze(2).transpose(1, 2)
+            logits12 = self.lm_head16_12(hidden_states).squeeze(2).transpose(1, 2)
+            logits13 = self.lm_head16_13(hidden_states).squeeze(2).transpose(1, 2)
+            logits14 = self.lm_head16_14(hidden_states).squeeze(2).transpose(1, 2)
+            logits15 = self.lm_head16_15(hidden_states).squeeze(2).transpose(1, 2)
+            logits16 = self.lm_head16_16(hidden_states).squeeze(2).transpose(1, 2)
+            if ENABLE_COREML and ENABLE_LOGITS2:
+                return logits1, logits2, logits3, logits4, logits5, logits6, logits7, logits8, logits9, logits10, logits11, logits12, logits13, logits14, logits15, logits16
+            logits = torch.cat([logits1, logits2, logits3, logits4, logits5, logits6, logits7, logits8, logits9, logits10, logits11, logits12, logits13, logits14, logits15, logits16], dim=2)
+        elif ENABLE_CONV2D:
+            hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
+            logits = self.lm_head(hidden_states).squeeze(2).transpose(1, 2)
+        else:
+            logits = self.lm_head(hidden_states)
+
+        if self.final_logit_softcapping is not None and not (ENABLE_COREML and ENABLE_LOGITS2 and ENABLE_VACAB_SPLIT16):
+            logits = torch.tanh(logits / self.final_logit_softcapping) * self.final_logit_softcapping
+        return logits
+
+    def forward_prefill(
+        self,
+        input_ids: torch.Tensor,
+        causal_mask: Optional[torch.Tensor] = None,
+        current_pos: Optional[int] = 0,
+    ):
+        """Batch prefill with KV cache and single causal mask."""
+        batch_size, seq_len = input_ids.shape
+        if causal_mask is None:
+            causal_mask = create_causal_mask_4d(
+                self.config.state_length,
+                batch_size,
+                input_ids.device,
+                MODEL_DTYPE,
+            )
+
+        # Embeddings + per-layer inputs
+        inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
+
+        per_layer_inputs = self.embed_tokens_per_layer(input_ids) * self.ple_embed_scale
+        per_layer_inputs = per_layer_inputs.view(
+            batch_size,
+            seq_len,
+            self.config.num_hidden_layers,
+            self.config.hidden_size_per_layer_input,
+        )
+
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        per_layer_projection = per_layer_projection * self.per_layer_projection_scale.to(
+            dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
+        per_layer_projection = per_layer_projection.view(
+            batch_size,
+            seq_len,
+            self.config.num_hidden_layers,
+            self.config.hidden_size_per_layer_input,
+        )
+        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+        per_layer_inputs = (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale.to(
+            dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
+
+        # 4-stream hidden states
+        target_magnitude = torch.mean(inputs_embeds**2, dim=-1, keepdim=True) ** 0.5
+        epsilon_tensor = torch.tensor(1e-5, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        temp_hidden_states = [inputs_embeds]
+        for i in range(1, self.config.altup_num_inputs):
+            altup_proj = self.altup_projections[i - 1](inputs_embeds)
+            current_hidden_state = altup_proj.to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+            new_magnitude = torch.mean(current_hidden_state**2, dim=-1, keepdim=True)
+            new_magnitude = torch.sqrt(torch.maximum(new_magnitude, epsilon_tensor))
+            current_hidden_state = current_hidden_state * target_magnitude / new_magnitude
+            temp_hidden_states.append(current_hidden_state)
+        hidden_states = torch.stack(temp_hidden_states, dim=0)
+
+        pos = int(current_pos) if current_pos is not None else 0
+        position_ids = torch.arange(pos, pos + seq_len, device=input_ids.device, dtype=torch.int32)
+
+        for layer_idx, layer in enumerate(self.layers):
+            per_layer_input = per_layer_inputs[:, :, layer_idx, :]
+            hidden_states = self._process_layer_prefill(
+                layer_idx,
+                hidden_states,
+                per_layer_input,
+                causal_mask,
+                pos,
+                position_ids,
+            )
+
+        # Return hidden_states for chaining / debugging (no LM head needed for prefill)
+        return hidden_states
 
     def load_weights(self, model_path: str, config: Any = None) -> nn.Module:
         """Load weights from multi-safetensors Gemma3n checkpoint with exact HF matching."""
