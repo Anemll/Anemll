@@ -1097,17 +1097,30 @@ def load_monolithic_model(args, metadata):
     infer_rotate_model = None
     try:
         infer_rotate_model = load_model(model_path, function_name='infer_rotate', compute_unit=compute_unit)
-        if not args.eval:
-            print("Monolithic model loaded successfully (infer + infer_rotate + prefill functions)")
     except Exception:
         if not args.eval:
-            print("Monolithic model loaded successfully (infer + prefill functions)")
             print("  Note: infer_rotate not available - using infer for all positions")
+
+    # Try to load prefill_rotate (optional, for long context prefill with rotation)
+    prefill_rotate_model = None
+    try:
+        prefill_rotate_model = load_model(model_path, function_name='prefill_rotate', compute_unit=compute_unit)
+    except Exception:
+        pass  # prefill_rotate is optional
+
+    # Report loaded functions
+    if not args.eval:
+        functions = ["infer", "prefill"]
+        if infer_rotate_model:
+            functions.insert(1, "infer_rotate")
+        if prefill_rotate_model:
+            functions.append("prefill_rotate")
+        print(f"Monolithic model loaded successfully ({' + '.join(functions)} functions)")
 
     # Extract metadata from model
     metadata = load_metadata(infer_model, args)
 
-    return infer_model, infer_rotate_model, prefill_model, metadata
+    return infer_model, infer_rotate_model, prefill_model, prefill_rotate_model, metadata
 
 
 def run_monolithic_prefill(model, input_ids, context_pos, context_length, batch_size, state, causal_mask):
@@ -1138,6 +1151,99 @@ def run_monolithic_prefill(model, input_ids, context_pos, context_length, batch_
         # We don't need the output logits for prefill, just updating KV cache
 
         batch_pos = batch_end
+
+    return torch.tensor([context_pos], dtype=torch.int32)
+
+
+def run_monolithic_prefill_with_rotation(prefill_model, prefill_rotate_model, input_ids, context_pos,
+                                         context_length, batch_size, state, causal_mask, sliding_window,
+                                         infer_rotate_model=None):
+    """Run prefill with rotation support for long contexts.
+
+    When context_pos > sliding_window, this splits the prefill into two phases:
+    - Phase 1: Fill mode (prefill_model) for positions 0 to sliding_window-1
+    - Phase 2: Rotation mode (prefill_rotate_model) for positions sliding_window to context_pos-1
+
+    If prefill_rotate_model is None or context_pos <= sliding_window, falls back to standard prefill.
+    """
+    # If no rotation model or short context, use standard prefill
+    if prefill_rotate_model is None or context_pos <= sliding_window:
+        return run_monolithic_prefill(prefill_model, input_ids, context_pos, context_length,
+                                      batch_size, state, causal_mask)
+
+    # Phase 1: Fill mode for positions 0 to sliding_window-1
+    batch_pos = 0
+    while batch_pos < sliding_window:
+        batch_end = min(batch_pos + batch_size, sliding_window)
+        current_batch_size = batch_end - batch_pos
+
+        batch_input = input_ids[:, batch_pos:batch_end]
+        batch_input = F.pad(batch_input, (0, batch_size - current_batch_size), value=0)
+
+        position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
+
+        inputs = {
+            'input_ids': batch_input.numpy().astype(np.int32),
+            'position_ids': position_ids.numpy().astype(np.int32),
+            'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+            'current_pos': np.array([batch_pos], dtype=np.int32)
+        }
+        prefill_model.predict(inputs, state)
+        batch_pos = batch_end
+
+    # Phase 2: Rotation mode for positions sliding_window to context_pos-1
+    batch_pos = sliding_window
+    # Process full batches with prefill_rotate
+    while batch_pos + batch_size <= context_pos:
+        batch_end = batch_pos + batch_size
+
+        batch_input = input_ids[:, batch_pos:batch_end]
+        position_ids = torch.arange(batch_pos, batch_end, dtype=torch.int32)
+        batch_causal_mask = causal_mask[:, :, batch_pos:batch_end, :]
+
+        inputs = {
+            'input_ids': batch_input.numpy().astype(np.int32),
+            'position_ids': position_ids.numpy().astype(np.int32),
+            'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+            'current_pos': np.array([batch_pos], dtype=np.int32)
+        }
+        prefill_rotate_model.predict(inputs, state)
+        batch_pos = batch_end
+
+    # Handle remainder tokens without padding (token-by-token rotation)
+    if batch_pos < context_pos:
+        if infer_rotate_model is not None:
+            while batch_pos < context_pos:
+                token = input_ids[:, batch_pos:batch_pos + 1]
+                position_ids = torch.tensor([batch_pos], dtype=torch.int32)
+                single_causal_mask = causal_mask[:, :, batch_pos:batch_pos + 1, :]
+
+                inputs = {
+                    'input_ids': token.numpy().astype(np.int32),
+                    'position_ids': position_ids.numpy().astype(np.int32),
+                    'causal_mask': single_causal_mask.numpy().astype(np.float16),
+                    'current_pos': position_ids.numpy().astype(np.int32)
+                }
+                infer_rotate_model.predict(inputs, state)
+                batch_pos += 1
+        else:
+            # Fallback to padded batch if infer_rotate is unavailable
+            batch_end = context_pos
+            current_batch_size = batch_end - batch_pos
+            batch_input = input_ids[:, batch_pos:batch_end]
+            batch_input = F.pad(batch_input, (0, batch_size - current_batch_size), value=0)
+
+            position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+            batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
+
+            inputs = {
+                'input_ids': batch_input.numpy().astype(np.int32),
+                'position_ids': position_ids.numpy().astype(np.int32),
+                'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+                'current_pos': np.array([batch_pos], dtype=np.int32)
+            }
+            prefill_rotate_model.predict(inputs, state)
 
     return torch.tensor([context_pos], dtype=torch.int32)
 
@@ -1248,12 +1354,12 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
 
 def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state, causal_mask=None,
                          auto_prompt=None, warmup=False, save_file=None, max_tokens=None,
-                         no_template=False, eval_mode=False, infer_rotate_model=None):
+                         no_template=False, eval_mode=False, infer_rotate_model=None, prefill_rotate_model=None):
     """Chat loop for monolithic models.
 
     Args:
         infer_model: Model for single-token inference (fill mode, pos < sliding_window)
-        prefill_model: Model for batch prefill
+        prefill_model: Model for batch prefill (fill mode, for positions 0 to sliding_window-1)
         tokenizer: Tokenizer
         metadata: Model metadata dict
         state: CoreML state object
@@ -1266,6 +1372,9 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
         eval_mode: If True, minimal output for evaluation
         infer_rotate_model: Optional model for single-token inference with cache rotation
                            (rotation mode, pos >= sliding_window). If None, uses infer_model.
+        prefill_rotate_model: Optional model for batch prefill with cache rotation
+                              (rotation mode, for positions >= sliding_window). If None,
+                              uses prefill_model for all positions (legacy behavior).
     """
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
@@ -1333,9 +1442,10 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
             try:
                 prefill_start = time.time()
 
-                # Run prefill with monolithic model
-                _ = run_monolithic_prefill(
-                    prefill_model, input_ids, context_pos, context_length, batch_size, state, causal_mask
+                # Run prefill with monolithic model (uses rotation for pos >= sliding_window if available)
+                _ = run_monolithic_prefill_with_rotation(
+                    prefill_model, prefill_rotate_model, input_ids, context_pos, context_length,
+                    batch_size, state, causal_mask, sliding_window, infer_rotate_model
                 )
 
                 prefill_time = time.time() - prefill_start
@@ -1468,7 +1578,7 @@ def main():
         # Branch based on model type
         if getattr(args, 'is_monolithic', False):
             # MONOLITHIC MODEL PATH
-            infer_model, infer_rotate_model, prefill_model, metadata = load_monolithic_model(args, metadata)
+            infer_model, infer_rotate_model, prefill_model, prefill_rotate_model, metadata = load_monolithic_model(args, metadata)
 
             # Override context length from command line if provided
             if args.context_length is not None:
@@ -1501,6 +1611,7 @@ def main():
                         infer_model=infer_model,
                         infer_rotate_model=infer_rotate_model,
                         prefill_model=prefill_model,
+                        prefill_rotate_model=prefill_rotate_model,
                         tokenizer=tokenizer,
                         metadata=metadata,
                         state=state,
@@ -1516,6 +1627,7 @@ def main():
                 infer_model=infer_model,
                 infer_rotate_model=infer_rotate_model,
                 prefill_model=prefill_model,
+                prefill_rotate_model=prefill_rotate_model,
                 tokenizer=tokenizer,
                 metadata=metadata,
                 state=state,

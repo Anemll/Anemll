@@ -451,6 +451,9 @@ class Gemma3Converter(BaseConverter):
         elif part == "monolithic_prefill":
             print("Converting monolithic model (prefill)...")
             mlmodel = self.convert_monolithic(self.model, is_prefill=True, argmax_in_model=self.argmax_in_model)
+        elif part == "monolithic_prefill_rotate":
+            print("Converting monolithic model (prefill_rotate - rotation mode)...")
+            mlmodel = self.convert_monolithic(self.model, is_prefill=True, argmax_in_model=self.argmax_in_model, force_rotation=True)
         else:
             raise ValueError(f"Unsupported part: {part}")
 
@@ -606,7 +609,9 @@ class Gemma3Converter(BaseConverter):
             ct.models.MLModel: Monolithic CoreML model
         """
         require_coreml()
-        if is_prefill:
+        if is_prefill and force_rotation:
+            mode_str = "prefill_rotate (prefill with cache rotation)"
+        elif is_prefill:
             mode_str = "prefill"
         elif force_rotation:
             mode_str = "infer_rotate (cache rotation enabled)"
@@ -624,12 +629,13 @@ class Gemma3Converter(BaseConverter):
 
             def __init__(
                 self, model: Gemma3ForCausalLM, context_length: int, is_prefill: bool,
-                argmax_in_model: bool = False
+                argmax_in_model: bool = False, is_prefill_rotate: bool = False
             ) -> None:
                 super().__init__()
                 self.model = model
                 self.context_length = context_length
                 self.is_prefill = is_prefill
+                self.is_prefill_rotate = is_prefill_rotate
                 self.argmax_in_model = argmax_in_model
 
                 # Determine LM head mode
@@ -679,6 +685,7 @@ class Gemma3Converter(BaseConverter):
                     start_layer=0,
                     end_layer=None,
                     IN_PREFILL=self.is_prefill,
+                    IN_PREFILL_ROTATE=self.is_prefill_rotate,
                 )
 
                 # Apply final normalization
@@ -727,7 +734,9 @@ class Gemma3Converter(BaseConverter):
                 else:
                     return tuple(logits_list)
 
-        wrapper = MonolithicWrapper(model, self.context_length, is_prefill, argmax_in_model)
+        # Determine if this is prefill with rotation (prefill_rotate function)
+        is_prefill_rotate = is_prefill and force_rotation == True
+        wrapper = MonolithicWrapper(model, self.context_length, is_prefill, argmax_in_model, is_prefill_rotate)
         wrapper.eval()
 
         for param in wrapper.parameters():
@@ -1415,7 +1424,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--part",
         type=str,
-        choices=["1", "2", "2_prefill", "3", "all", "full", "prefill", "embeddings", "monolithic", "monolithic_rotate", "monolithic_prefill"],
+        choices=["1", "2", "2_prefill", "3", "all", "full", "prefill", "embeddings", "monolithic", "monolithic_rotate", "monolithic_prefill", "monolithic_prefill_rotate"],
         default="all",
         help="Model part to convert",
     )
@@ -1557,8 +1566,10 @@ def test_conversion(
         # sliding_window stays unchanged - it's Gemma3's architectural feature
         # attention_size controls causal_mask dimension only (can be smaller than state_length)
         config.attention_size = attention_size if attention_size is not None else context_length
+        # Set batch_size for prefill operations (needed for prefill_rotate tracing)
+        config.batch_size = batch_size
         print(
-            f"Updated config: context_length={config.context_length}, state_length={config.state_length}, attention_size={config.attention_size}, sliding_window={config.sliding_window}"
+            f"Updated config: context_length={config.context_length}, state_length={config.state_length}, attention_size={config.attention_size}, sliding_window={config.sliding_window}, batch_size={config.batch_size}"
         )
 
         print("Creating model...")
@@ -1641,6 +1652,14 @@ def test_conversion(
                     fname += f"_LUT{lut_bits}_CTX{context_length}_ATT{att_size}"
                 else:
                     fname += f"_FP16_CTX{context_length}_ATT{att_size}"
+        elif part == "monolithic_prefill_rotate":
+            fname += "_monolithic_prefill_rotate"
+            if decorate:
+                att_size = attention_size if attention_size is not None else context_length
+                if lut_bits is not None:
+                    fname += f"_LUT{lut_bits}_CTX{context_length}_ATT{att_size}"
+                else:
+                    fname += f"_FP16_CTX{context_length}_ATT{att_size}"
         elif part in ["2", "2_prefill"]:
             base = "FFN" if part == "2" else "prefill"
             fname += f"_{base}"
@@ -1651,7 +1670,7 @@ def test_conversion(
             fname += ""
         if part not in ["2", "2_prefill"]:
             # Skip lut suffix if already included in decoration
-            if lut_bits is not None and not (decorate and part in ["monolithic", "monolithic_prefill"]):
+            if lut_bits is not None and not (decorate and part in ["monolithic", "monolithic_rotate", "monolithic_prefill", "monolithic_prefill_rotate"]):
                 fname += f"_lut{lut_bits}"
             fname += ".mlpackage"
         else:

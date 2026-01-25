@@ -24,6 +24,7 @@ import sys
 LIGHT_BLUE = "\033[94m"
 DARK_BLUE = "\033[34m"
 LIGHT_GREEN = "\033[92m"
+SYSTEM_COLOR = "\033[93m"
 RESET_COLOR = "\033[0m"
 
 # Add at the top with other constants
@@ -31,6 +32,9 @@ WARMUP_TOKEN_LIMIT = 10  # Maximum tokens to generate during warmup
 THINKING_MODE = False
 THINKING_PROMPT = """You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem."""
 DEBUG_LEVEL = 0  # Default debug level
+
+def print_system(msg: str) -> None:
+    print(f"{SYSTEM_COLOR}[SYSTEM] {msg}{RESET_COLOR}")
 
 class TokenPrinter:
     """Handles background printing of generated tokens."""
@@ -471,6 +475,12 @@ def load_metadata(model,args):
         metadata['batch_size'] = int(meta.get('com.anemll.batch_size', 64))
         metadata['lut_bits'] = int(meta.get('com.anemll.lut_bits', 0))
         metadata['num_chunks'] = int(meta.get('com.anemll.num_chunks', 1))
+
+        # If meta.yaml/args provide overrides, prefer those for reporting/usage
+        if getattr(args, 'context_length', None) is not None:
+            metadata['context_length'] = int(args.context_length)
+        if getattr(args, 'state_length', None) is not None:
+            metadata['state_length'] = int(args.state_length)
         
         print("\nExtracted Parameters:")
         print(f"  Context Length: {metadata['context_length']}")
@@ -809,7 +819,7 @@ def initialize_causal_mask(context_length):
 
 
 def load_monolithic_model(args, metadata):
-    """Load monolithic model with infer, infer_rotate, and prefill functions."""
+    """Load monolithic model with infer, infer_rotate, prefill, and prefill_rotate functions."""
     print("\nLoading monolithic model...")
 
     # Determine compute unit
@@ -830,15 +840,28 @@ def load_monolithic_model(args, metadata):
     infer_rotate_model = None
     try:
         infer_rotate_model = load_model(model_path, function_name='infer_rotate', compute_unit=compute_unit)
-        print("Monolithic model loaded successfully (infer + infer_rotate + prefill functions)")
     except Exception as e:
-        print("Monolithic model loaded successfully (infer + prefill functions)")
         print(f"  Note: infer_rotate not available - using infer for all positions")
+
+    # Try to load prefill_rotate (optional, for long context prefill with rotation)
+    prefill_rotate_model = None
+    try:
+        prefill_rotate_model = load_model(model_path, function_name='prefill_rotate', compute_unit=compute_unit)
+    except Exception as e:
+        pass  # prefill_rotate is optional
+
+    # Report loaded functions
+    functions = ["infer", "prefill"]
+    if infer_rotate_model:
+        functions.insert(1, "infer_rotate")
+    if prefill_rotate_model:
+        functions.append("prefill_rotate")
+    print(f"Monolithic model loaded successfully ({' + '.join(functions)} functions)")
 
     # Extract metadata from model
     metadata = load_metadata(infer_model, args)
 
-    return infer_model, infer_rotate_model, prefill_model, metadata
+    return infer_model, infer_rotate_model, prefill_model, prefill_rotate_model, metadata
 
 
 def run_monolithic_prefill(model, input_ids, context_pos, context_length, batch_size, state, causal_mask):
@@ -869,6 +892,102 @@ def run_monolithic_prefill(model, input_ids, context_pos, context_length, batch_
         # We don't need the output logits for prefill, just updating KV cache
 
         batch_pos = batch_end
+
+    return torch.tensor([context_pos], dtype=torch.int32)
+
+
+def run_monolithic_prefill_with_rotation(prefill_model, prefill_rotate_model, input_ids, context_pos,
+                                         context_length, batch_size, state, causal_mask, sliding_window,
+                                         infer_rotate_model=None):
+    """Run prefill with rotation support for long contexts.
+
+    When context_pos > sliding_window, this splits the prefill into two phases:
+    - Phase 1: Fill mode (prefill_model) for positions 0 to sliding_window-1
+    - Phase 2: Rotation mode (prefill_rotate_model) for positions sliding_window to context_pos-1
+
+    If prefill_rotate_model is None or context_pos <= sliding_window, falls back to standard prefill.
+    """
+    # If no rotation model or short context, use standard prefill
+    if prefill_rotate_model is None or context_pos <= sliding_window:
+        return run_monolithic_prefill(prefill_model, input_ids, context_pos, context_length,
+                                      batch_size, state, causal_mask)
+
+    # Phase 1: Fill mode for positions 0 to sliding_window-1
+    print_system(f"Prefill Phase 1: Fill mode (0 to {sliding_window-1})")
+    batch_pos = 0
+    while batch_pos < sliding_window:
+        batch_end = min(batch_pos + batch_size, sliding_window)
+        current_batch_size = batch_end - batch_pos
+
+        batch_input = input_ids[:, batch_pos:batch_end]
+        batch_input = F.pad(batch_input, (0, batch_size - current_batch_size), value=0)
+
+        position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
+
+        inputs = {
+            'input_ids': batch_input.numpy().astype(np.int32),
+            'position_ids': position_ids.numpy().astype(np.int32),
+            'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+            'current_pos': np.array([batch_pos], dtype=np.int32)
+        }
+        prefill_model.predict(inputs, state)
+        batch_pos = batch_end
+
+    # Phase 2: Rotation mode for positions sliding_window to context_pos-1
+    print_system(f"Prefill Phase 2: Rotation mode ({sliding_window} to {context_pos-1})")
+    batch_pos = sliding_window
+    # Process full batches with prefill_rotate
+    while batch_pos + batch_size <= context_pos:
+        batch_end = batch_pos + batch_size
+
+        batch_input = input_ids[:, batch_pos:batch_end]
+        position_ids = torch.arange(batch_pos, batch_end, dtype=torch.int32)
+        batch_causal_mask = causal_mask[:, :, batch_pos:batch_end, :]
+
+        inputs = {
+            'input_ids': batch_input.numpy().astype(np.int32),
+            'position_ids': position_ids.numpy().astype(np.int32),
+            'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+            'current_pos': np.array([batch_pos], dtype=np.int32)
+        }
+        prefill_rotate_model.predict(inputs, state)
+        batch_pos = batch_end
+
+    # Handle remainder tokens without padding (token-by-token rotation)
+    if batch_pos < context_pos:
+        if infer_rotate_model is not None:
+            print_system(f"Prefill Phase 2b: Rotation single-token fill ({batch_pos} to {context_pos-1})")
+            while batch_pos < context_pos:
+                token = input_ids[:, batch_pos:batch_pos + 1]
+                position_ids = torch.tensor([batch_pos], dtype=torch.int32)
+                single_causal_mask = causal_mask[:, :, batch_pos:batch_pos + 1, :]
+
+                inputs = {
+                    'input_ids': token.numpy().astype(np.int32),
+                    'position_ids': position_ids.numpy().astype(np.int32),
+                    'causal_mask': single_causal_mask.numpy().astype(np.float16),
+                    'current_pos': position_ids.numpy().astype(np.int32)
+                }
+                infer_rotate_model.predict(inputs, state)
+                batch_pos += 1
+        else:
+            # Fallback to padded batch if infer_rotate is unavailable
+            batch_end = context_pos
+            current_batch_size = batch_end - batch_pos
+            batch_input = input_ids[:, batch_pos:batch_end]
+            batch_input = F.pad(batch_input, (0, batch_size - current_batch_size), value=0)
+
+            position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+            batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
+
+            inputs = {
+                'input_ids': batch_input.numpy().astype(np.int32),
+                'position_ids': position_ids.numpy().astype(np.int32),
+                'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+                'current_pos': np.array([batch_pos], dtype=np.int32)
+            }
+            prefill_rotate_model.predict(inputs, state)
 
     return torch.tensor([context_pos], dtype=torch.int32)
 
@@ -955,12 +1074,12 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
     return next_token
 
 
-def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state, causal_mask, auto_prompt=None, warmup=False, max_tokens=None, infer_rotate_model=None):
+def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state, causal_mask, auto_prompt=None, warmup=False, max_tokens=None, infer_rotate_model=None, prefill_rotate_model=None):
     """Chat loop for monolithic models with full conversation history.
 
     Args:
         infer_model: Model for single-token inference (fill mode, pos < sliding_window)
-        prefill_model: Model for batch prefill
+        prefill_model: Model for batch prefill (fill mode, for positions 0 to sliding_window-1)
         tokenizer: Tokenizer
         metadata: Model metadata dict
         state: CoreML state object
@@ -970,6 +1089,9 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
         max_tokens: Maximum tokens to generate
         infer_rotate_model: Optional model for single-token inference with cache rotation
                            (rotation mode, pos >= sliding_window). If None, uses infer_model.
+        prefill_rotate_model: Optional model for batch prefill with cache rotation
+                              (rotation mode, for positions >= sliding_window). If None,
+                              uses prefill_model for all positions (legacy behavior).
     """
     global THINKING_MODE
     global DEBUG_LEVEL
@@ -1100,9 +1222,10 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
             base_input_ids = _build_base_input_ids(messages, show_debug=True)
 
             # Check if we need to trim history
+            # Use state_length (global context) for split cache models, context_length otherwise
             history_trimmed = False
             original_size = base_input_ids.size(1)
-            while base_input_ids.size(1) > context_length - 100:  # Leave room for response
+            while base_input_ids.size(1) > state_length - 100:  # Leave room for response
                 history_trimmed = True
                 # Remove oldest message pair (user + assistant)
                 if len(conversation) > 2:
@@ -1113,14 +1236,14 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                     base_input_ids = _build_base_input_ids(messages, show_debug=False)
                 else:
                     # If only current message remains and still too long, truncate
-                    base_input_ids = base_input_ids[:, -context_length//2:]
+                    base_input_ids = base_input_ids[:, -state_length//2:]
                     break
 
             context_pos = base_input_ids.size(1)
             turn_number += 1
 
             if history_trimmed and not warmup:
-                print(f"{DARK_BLUE}[History trimmed: {original_size} → {context_pos} tokens, {len(conversation)} msgs remaining]{RESET_COLOR}")
+                print_system(f"History trimmed: {original_size} → {context_pos} tokens, {len(conversation)} msgs remaining")
                 # Note: KV cache state should be re-prefilled with trimmed context
                 # The prefill that runs next will update the cache appropriately
 
@@ -1135,25 +1258,28 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                 value=0
             )
 
-            if not warmup:
-                print(f"\n{LIGHT_BLUE}Assistant:{RESET_COLOR}", end=' ', flush=True)
-
             # Initialize token printer and collect response
             token_printer = TokenPrinter(tokenizer)
             response_tokens = []
             generation_start_time = time.time()
 
             try:
-                # Run prefill on entire context
-                current_pos = run_monolithic_prefill(
+                # Run prefill on entire context (uses rotation for pos >= sliding_window if available)
+                current_pos = run_monolithic_prefill_with_rotation(
                     prefill_model,
+                    prefill_rotate_model,
                     input_ids,
                     context_pos,
                     context_length,
                     batch_size,
                     state,
-                    causal_mask
+                    causal_mask,
+                    sliding_window,
+                    infer_rotate_model
                 )
+
+                if not warmup:
+                    print(f"\n{LIGHT_BLUE}Assistant:{RESET_COLOR}", end=' ', flush=True)
 
                 # Generation loop
                 pos = context_pos
@@ -1163,6 +1289,7 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                 while True:
                     # Check if we need to shift window
                     if pos >= context_length - 2:
+                        print_system(f"Context window reached {context_length} tokens; shifting context to continue.")
                         # Calculate shift to maintain full batches
                         batch_size = metadata.get('batch_size', 64)
                         # Calculate max batches that fit in context
@@ -1175,15 +1302,18 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                         tmp[:,0:new_size] = input_ids[:,pos-new_size:pos]
                         input_ids = tmp
 
-                        # Reset state and run prefill
-                        current_pos = run_monolithic_prefill(
+                        # Reset state and run prefill (uses rotation for pos >= sliding_window if available)
+                        current_pos = run_monolithic_prefill_with_rotation(
                             prefill_model,
+                            prefill_rotate_model,
                             input_ids,
                             new_size,  # Prefill the entire shifted content
                             context_length,
                             batch_size,
                             state,
-                            causal_mask
+                            causal_mask,
+                            sliding_window,
+                            infer_rotate_model
                         )
 
                         # Start generating from the next position
@@ -1257,7 +1387,7 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                         context_status = f"[Turn {turn_number} | LOCAL+{rotation_mode}: {total_tokens_in_memory}/{sliding_window} ctx, {len(conversation)} msgs]"
 
                     print(f"{DARK_BLUE}{inference_tokens_per_sec:.1f} t/s, "
-                          f"TTFT: {prefill_ms:.1f}ms ({prefill_tokens_per_sec:.1f} t/s), "
+                          f"TTFT: {prefill_ms:.1f}ms ({prefill_tokens_per_sec:.1f} t/s, {context_pos} tokens), "
                           f"{len(response_tokens)} tokens {context_status}{RESET_COLOR}")
 
                 if auto_prompt is not None:
@@ -1341,6 +1471,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
     global THINKING_MODE
     global DEBUG_LEVEL
     context_length = metadata.get('context_length')
+    state_length = metadata.get('state_length', context_length)  # For split cache models
     batch_size = metadata.get('batch_size', 64)
     
     if not warmup:
@@ -1419,7 +1550,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
             base_input_ids = _build_base_input_ids(messages, show_debug=True)
             
             # Check if we need to trim history
-            while base_input_ids.size(1) > context_length - 100:  # Leave room for response
+            # Use state_length (global context) for split cache models, context_length otherwise
+            while base_input_ids.size(1) > state_length - 100:  # Leave room for response
                 # Remove oldest message pair (user + assistant)
                 if len(conversation) > 2:
                     conversation = conversation[2:]  # Remove oldest pair
@@ -1429,9 +1561,9 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     base_input_ids = _build_base_input_ids(messages, show_debug=False)
                 else:
                     # If only current message remains and still too long, truncate
-                    base_input_ids = base_input_ids[:, -context_length//2:]
+                    base_input_ids = base_input_ids[:, -state_length//2:]
                     break
-            
+
             context_pos = base_input_ids.size(1)
             
             # Pad sequence to context_size
@@ -1441,11 +1573,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 value=0
             )
             
-            if not warmup:
-                print(f"\n{LIGHT_BLUE}Assistant:{RESET_COLOR}", end=' ', flush=True)
-            
             # split_lm_head should already be in metadata from caller
-            
+
             # Initialize token printer and collect response
             token_printer = TokenPrinter(tokenizer)
             response_tokens = []
@@ -1464,6 +1593,9 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     causal_mask
                 )
                 #print(f"\n[DEBUG] After initial prefill - current_pos: {current_pos}")
+
+                if not warmup:
+                    print(f"\n{LIGHT_BLUE}Assistant:{RESET_COLOR}", end=' ', flush=True)
                 
                 # Generation loop
                 pos = context_pos
@@ -1473,18 +1605,19 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 while True:
                     # Check if we need to shift window
                     if pos >= context_length - 2:
+                        print_system(f"Context window reached {context_length} tokens; shifting context to continue.")
                         # Calculate shift to maintain full batches
                         batch_size = metadata.get('batch_size', 64)
                         # Calculate max batches that fit in context
                         max_batches = context_length // batch_size
                         desired_batches = max(1, max_batches - 2)  # Leave room for new tokens
                         new_size = min(desired_batches * batch_size, context_length - batch_size)
-                        
+
                         # Create shifted input_ids
                         tmp = torch.zeros((1, context_length), dtype=torch.int32)
                         tmp[:,0:new_size] = input_ids[:,pos-new_size:pos]
                         input_ids = tmp
-                        
+
                         # Reset state and run prefill
                         # keep the same state
                         #state = create_unified_state(ffn_models, context_length)
@@ -1498,13 +1631,13 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                             state,
                             causal_mask
                         )
-                        
+
                         # Start generating from the next position
                         pos = new_size  # Don't back up, continue from where we left off
-                        
+
                         #print(f"\n[DEBUG] After shift - next token will be at pos {pos}")
                         #print(f"[DEBUG] Context before next token: {tokenizer.decode(input_ids[0, pos-40:pos])}")
-                        
+
                         window_shifted = True
                     
                     # Generate next token
@@ -1552,7 +1685,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     prefill_ms = prefill_time * 1000
                     prefill_tokens_per_sec = context_pos / prefill_time if prefill_time > 0 else 0
                     print(f"{DARK_BLUE}{inference_tokens_per_sec:.1f} t/s, "
-                          f"TTFT: {prefill_ms:.1f}ms ({prefill_tokens_per_sec:.1f} t/s), "
+                          f"TTFT: {prefill_ms:.1f}ms ({prefill_tokens_per_sec:.1f} t/s, {context_pos} tokens), "
                           f"{len(response_tokens)} tokens{RESET_COLOR}")
                 
                 if auto_prompt is not None:
@@ -1606,7 +1739,7 @@ def main():
         # Branch based on model type
         if getattr(args, 'is_monolithic', False):
             # MONOLITHIC MODEL PATH
-            infer_model, infer_rotate_model, prefill_model, metadata = load_monolithic_model(args, metadata)
+            infer_model, infer_rotate_model, prefill_model, prefill_rotate_model, metadata = load_monolithic_model(args, metadata)
 
             # Override context length from command line if provided
             if args.context_length is not None:
@@ -1637,6 +1770,7 @@ def main():
                         infer_model=infer_model,
                         infer_rotate_model=infer_rotate_model,
                         prefill_model=prefill_model,
+                        prefill_rotate_model=prefill_rotate_model,
                         tokenizer=tokenizer,
                         metadata=metadata,
                         state=state,
@@ -1650,6 +1784,7 @@ def main():
                 infer_model=infer_model,
                 infer_rotate_model=infer_rotate_model,
                 prefill_model=prefill_model,
+                prefill_rotate_model=prefill_rotate_model,
                 tokenizer=tokenizer,
                 metadata=metadata,
                 state=state,

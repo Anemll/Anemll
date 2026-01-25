@@ -1007,6 +1007,49 @@ class Gemma3Model(nn.Module):
         self.kv_cache_local[key_cache_idx:key_cache_idx + 1, :, start_pos:end_pos, :] = key_states[:, :end_pos - start_pos, :]
         self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, start_pos:end_pos, :] = value_states[:, :end_pos - start_pos, :]
 
+    def _update_kv_local_prefill(self, layer_idx: int, key_states: torch.Tensor,
+                                 value_states: torch.Tensor, seq_len: int) -> None:
+        """
+        Update KV states in local cache during prefill with rotation (multi-token).
+
+        Always performs shift-then-store for the entire batch:
+        1. Shift cache left by batch_size positions
+        2. Store new tokens at the end
+
+        Use for prefill when current_pos >= sliding_window.
+
+        Note: Uses config.batch_size instead of dynamic seq_len for CoreML tracing compatibility.
+        The traced model expects fixed batch_size (64) for prefill operations.
+
+        Args:
+            layer_idx: Original layer index (0-17)
+            key_states: Key tensor, shape [1, num_kv_heads, batch_size, head_dim]
+            value_states: Value tensor, same shape as key_states
+            seq_len: Ignored - uses config.batch_size for tracing compatibility
+        """
+        cache_idx = self._local_layer_indices.index(layer_idx)
+        num_local = len(self._local_layer_indices)
+        key_cache_idx = cache_idx
+        value_cache_idx = cache_idx + num_local
+
+        sw = self.config.sliding_window  # 512
+        # Use config batch_size for tracing (must be concrete value for CoreML)
+        batch_size = self.config.batch_size  # 64
+
+        # During prefill_rotate, we always shift by batch_size and store batch_size tokens
+        # batch_size (64) < sliding_window (512), so we always use the shift path
+        # Shift left by batch_size, store new at end
+        # Use positive slice indices for ANE compatibility (no negative offsets)
+        key_slice = self.kv_cache_local[key_cache_idx:key_cache_idx + 1]
+        key_tail = key_slice[:, :, batch_size:sw, :]  # Keep positions batch_size to sw-1
+        shifted_key = torch.cat([key_tail, key_states[:, :, :batch_size, :]], dim=2)
+        self.kv_cache_local[key_cache_idx:key_cache_idx + 1, :, :, :] = shifted_key
+
+        value_slice = self.kv_cache_local[value_cache_idx:value_cache_idx + 1]
+        value_tail = value_slice[:, :, batch_size:sw, :]  # Keep positions batch_size to sw-1
+        shifted_value = torch.cat([value_tail, value_states[:, :, :batch_size, :]], dim=2)
+        self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, :, :] = shifted_value
+
     def _store_kv_global(self, layer_idx: int, key_states: torch.Tensor,
                         value_states: torch.Tensor, current_pos: int) -> None:
         """
@@ -1027,6 +1070,38 @@ class Gemma3Model(nn.Module):
         pos = min(current_pos, self.config.state_length - 1)
         self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, pos:pos + 1, :] = key_states
         self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, pos:pos + 1, :] = value_states
+
+    def _update_kv_global(self, layer_idx: int, key_states: torch.Tensor,
+                          value_states: torch.Tensor) -> None:
+        """
+        Update KV states in global cache with rotation (single token).
+
+        Shifts left and stores at end, similar to _update_kv_local.
+        Use when current_pos >= state_length.
+
+        Args:
+            layer_idx: Original layer index (0-17)
+            key_states: Key tensor to store
+            value_states: Value tensor to store
+        """
+        cache_idx = self._global_layer_indices.index(layer_idx)
+        num_global = len(self._global_layer_indices)
+        key_cache_idx = cache_idx
+        value_cache_idx = cache_idx + num_global
+
+        sl = self.config.state_length  # 1024
+
+        # Shift left by 1, store new at end
+        # Use torch.narrow for ANE compatibility (positive indices only)
+        key_slice = self.kv_cache_global[key_cache_idx:key_cache_idx + 1]
+        key_tail = torch.narrow(key_slice, 2, 1, sl - 1)
+        shifted_key = torch.cat([key_tail, key_states], dim=2)
+        self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, :, :] = shifted_key
+
+        value_slice = self.kv_cache_global[value_cache_idx:value_cache_idx + 1]
+        value_tail = torch.narrow(value_slice, 2, 1, sl - 1)
+        shifted_value = torch.cat([value_tail, value_states], dim=2)
+        self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, :, :] = shifted_value
 
     def _store_kv_global_prefill(self, layer_idx: int, key_states: torch.Tensor,
                                 value_states: torch.Tensor, current_pos: int, seq_len: int) -> None:
@@ -1049,6 +1124,50 @@ class Gemma3Model(nn.Module):
         actual_len = end - current_pos
         self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, current_pos:end, :] = key_states[:, :actual_len, :]
         self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, current_pos:end, :] = value_states[:, :actual_len, :]
+
+    def _update_kv_global_prefill(self, layer_idx: int, key_states: torch.Tensor,
+                                  value_states: torch.Tensor, seq_len: int) -> None:
+        """
+        Update KV states in global cache during prefill with rotation (multi-token).
+
+        Always performs shift-then-store for the entire batch:
+        1. Shift cache left by seq_len positions
+        2. Store new tokens at the end
+
+        Use for prefill when current_pos >= state_length.
+
+        Args:
+            layer_idx: Original layer index (0-17)
+            key_states: Key tensor, shape [1, num_kv_heads, seq_len, head_dim]
+            value_states: Value tensor, same shape as key_states
+            seq_len: Number of tokens being prefilled
+        """
+        cache_idx = self._global_layer_indices.index(layer_idx)
+        num_global = len(self._global_layer_indices)
+        key_cache_idx = cache_idx
+        value_cache_idx = cache_idx + num_global
+
+        sl = self.config.state_length  # 1024
+
+        # Clamp seq_len to not exceed state_length
+        actual_store_len = min(seq_len, sl)
+
+        if seq_len >= sl:
+            # If batch >= state_length, just store last state_length tokens
+            self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, :, :] = key_states[:, :, -sl:, :]
+            self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, :, :] = value_states[:, :, -sl:, :]
+        else:
+            # Shift left by seq_len, store new at end
+            # Use torch.narrow for ANE compatibility (positive indices only)
+            key_slice = self.kv_cache_global[key_cache_idx:key_cache_idx + 1]
+            key_tail = torch.narrow(key_slice, 2, seq_len, sl - seq_len)
+            shifted_key = torch.cat([key_tail, key_states[:, :, :actual_store_len, :]], dim=2)
+            self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, :, :] = shifted_key
+
+            value_slice = self.kv_cache_global[value_cache_idx:value_cache_idx + 1]
+            value_tail = torch.narrow(value_slice, 2, seq_len, sl - seq_len)
+            shifted_value = torch.cat([value_tail, value_states[:, :, :actual_store_len, :]], dim=2)
+            self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, :, :] = shifted_value
 
     def _get_kv_cache_for_layer(self, layer_idx: int, current_pos: int) -> tuple:
         """
@@ -1136,6 +1255,72 @@ class Gemma3Model(nn.Module):
             # Get the key and value states for this layer from the merged cache
             key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
             value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+
+        # Run attention with the updated KV cache
+        attn_output = layer.self_attn.forward_prefill(
+            hidden_states=normalized_states,
+            query_states=query_states,
+            kv_cache_layer=(key_cache, value_cache),
+            causal_mask=causal_mask,
+            layer_idx=layer_idx,
+        )
+
+        # Apply post_attention_layernorm before residual add
+        attn_output = layer.post_attention_layernorm(attn_output)
+        hidden_states = hidden_states + attn_output
+        # Clamp to FP16 range to prevent overflow (Gemma3 was trained in bfloat16)
+        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+
+        # Apply MLP with proper normalization (Gemma3: pre + post feedforward norms)
+        residual = hidden_states
+        hidden_states = layer.pre_feedforward_layernorm(hidden_states)
+        hidden_states = layer.mlp(hidden_states)
+        hidden_states = layer.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+        # Clamp to FP16 range to prevent overflow
+        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+
+        return hidden_states
+
+    def process_layer_prefill_rotate(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset):
+        """Process a single transformer layer in prefill mode WITH ROTATION.
+
+        Use when prefilling at positions >= sliding_window.
+        Local layers use rotation (shift + store), global layers still use fill mode.
+        Global cache never rotates - it can store up to state_length tokens directly.
+        """
+        layer = self.layers[layer_idx]
+
+        # Get layer-specific RoPE
+        rotary_emb = self.get_rotary_embedding_prefill(position_ids, layer_idx)
+
+        normalized_states = layer.input_layernorm(hidden_states)
+
+        # Get query, key and value states for prefill
+        query_states, key_states, value_states = layer.self_attn.get_new_kv_cache_prefill(
+            normalized_states,
+            current_pos,
+            rotary_emb
+        )
+
+        seq_length = key_states.shape[2]
+        use_split_cache = getattr(self.config, 'use_split_cache', ENABLE_SPLIT_CACHE)
+
+        if use_split_cache:
+            # Split cache path
+            if self.config.layer_types[layer_idx] == "full_attention":
+                # Global layer - always use fill mode (global cache never rotates)
+                # Global attention can see up to state_length tokens without rotation
+                self._store_kv_global_prefill(layer_idx, key_states, value_states, current_pos, seq_length)
+            else:
+                # Local layer - use rotation (shift + store)
+                self._update_kv_local_prefill(layer_idx, key_states, value_states, seq_length)
+
+            # Get the KV cache for this layer
+            key_cache, value_cache = self._get_kv_cache_for_layer(layer_idx, current_pos)
+        else:
+            # Legacy unified cache path - not supported for rotation
+            raise NotImplementedError("Rotation prefill not supported with unified cache")
 
         # Run attention with the updated KV cache
         attn_output = layer.self_attn.forward_prefill(
@@ -1353,14 +1538,16 @@ class Gemma3Model(nn.Module):
 
         return hidden_states
 
-    def process_layer(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset, IN_PREFILL=False):
+    def process_layer(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset, IN_PREFILL=False, IN_PREFILL_ROTATE=False):
         """Process a single transformer layer, delegating to the appropriate mode-specific implementation"""
-        if IN_PREFILL:
-           return self.process_layer_prefill(layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset)
+        if IN_PREFILL_ROTATE:
+            return self.process_layer_prefill_rotate(layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset)
+        elif IN_PREFILL:
+            return self.process_layer_prefill(layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset)
         else:
             return self.process_layer_regular(layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset)
 
-    def process_layers(self, hidden_states, position_ids, causal_mask, current_pos, start_layer=0, end_layer=None, IN_PREFILL=False):
+    def process_layers(self, hidden_states, position_ids, causal_mask, current_pos, start_layer=0, end_layer=None, IN_PREFILL=False, IN_PREFILL_ROTATE=False):
         """Process a range of transformer layers"""
         if end_layer is None:
             end_layer = len(self.layers)
@@ -1372,7 +1559,7 @@ class Gemma3Model(nn.Module):
         for i in range(start_layer, end_layer):
             hidden_states = self.process_layer(
                 i, hidden_states, position_ids,
-                causal_mask, current_pos, layer_offset, IN_PREFILL
+                causal_mask, current_pos, layer_offset, IN_PREFILL, IN_PREFILL_ROTATE
             )
         return hidden_states
 

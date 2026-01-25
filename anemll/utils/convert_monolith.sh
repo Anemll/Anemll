@@ -22,6 +22,7 @@ RESTART_STEP=1
 ONLY_STEP=""
 SKIP_CHECK=false
 ARGMAX_IN_MODEL=false
+ATTENTION_WINDOW=""
 
 # Default converter; may be overridden after parsing config.json
 CONVERTER="python3 -m anemll.ane_converter.llama_converter"
