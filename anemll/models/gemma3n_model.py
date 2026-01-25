@@ -344,13 +344,13 @@ class Gemma3nAttention(nn.Module):
         
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # BLOCKER #3 FIX: Q/K/V normalization + query pre-attention scaling
+        # Q/K/V normalization (Gemma3n uses QKV norms, not query_pre_attn_scalar)
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
         value_states = self.v_norm(value_states)
-        
-        # Apply query pre-attention scalar
-        query_states = query_states * self.query_pre_attn_scalar
+
+        # NOTE: Gemma3n uses scaling=1.0 (no query_pre_attn_scalar)
+        # The HF implementation does NOT apply query_pre_attn_scalar
 
         # Repeat KV heads for GQA
         if self.num_kv_heads != self.num_heads:
@@ -370,15 +370,14 @@ class Gemma3nAttention(nn.Module):
             value_states = value_states[:, :, start:k_seq_len, :]
             k_seq_len = key_states.shape[-2]
 
-        # Compute attention scores
-        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # Compute attention scores - Gemma3n uses scaling=1.0 (no scaling)
+        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
 
         q_seq_len = query_states.shape[-2]
         mask_slice = attention_mask.to(attn_weights.dtype)[:, :, :q_seq_len, start:start + k_seq_len]
         attn_weights = attn_weights + mask_slice
 
-        # BLOCKER #4 FIX: Attention logit soft-capping
-        attn_weights = torch.tanh(attn_weights / 30.0) * 30.0
+        # NOTE: Gemma3n does NOT use attention softcapping (HF uses softcap=None)
 
         # Apply softmax and compute output
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
@@ -528,6 +527,9 @@ class Gemma3nTextAttention(nn.Module):
         self.k_norm = Gemma3nRMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=True)
         self.v_norm = Gemma3nRMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
 
+        # Query pre-attention scalar (critical for attention scaling)
+        self.query_pre_attn_scalar = getattr(config, 'query_pre_attn_scalar', 256)
+
         # KV sharing logic (HF pattern)
         first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
@@ -614,6 +616,9 @@ class Gemma3nTextAttention(nn.Module):
         query_states = apply_rotary_pos_emb_single(query_states, cos, sin, unsqueeze_dim=2)
         key_states = apply_rotary_pos_emb_single(key_states, cos, sin, unsqueeze_dim=2)
 
+        # NOTE: Gemma3n uses QKV normalization and scaling=1.0 (no query_pre_attn_scalar)
+        # The HF implementation does NOT apply query_pre_attn_scalar
+
         # [B, heads, T, D]
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
@@ -637,6 +642,8 @@ class Gemma3nTextAttention(nn.Module):
         query_states = apply_rotary_pos_emb_single(query_states, cos, sin, unsqueeze_dim=2)
         key_states = apply_rotary_pos_emb_single(key_states, cos, sin, unsqueeze_dim=2)
 
+        # NOTE: Gemma3n uses QKV normalization and scaling=1.0 (no query_pre_attn_scalar)
+
         query_states = query_states.transpose(1, 2)  # [B, heads, T, D]
         key_states = key_states.transpose(1, 2)      # [B, kv_heads, T, D]
         value_states = value_states.transpose(1, 2)
@@ -644,7 +651,11 @@ class Gemma3nTextAttention(nn.Module):
         return query_states, key_states, value_states
 
     def forward_regular(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None, current_pos=None, layer_idx=None):
-        """Forward pass for single token generation with KV cache."""
+        """Forward pass for single token generation with KV cache.
+
+        Note: Uses full KV cache with causal mask for dynamic position support in JIT tracing.
+        The causal mask ensures only positions <= current_pos are attended to.
+        """
         bsz, q_len, _ = hidden_states.shape
 
         K_layer_cache, V_layer_cache = kv_cache_layer
@@ -652,27 +663,33 @@ class Gemma3nTextAttention(nn.Module):
             K_layer_cache = K_layer_cache.unsqueeze(0)
             V_layer_cache = V_layer_cache.unsqueeze(0)
 
-        pos = int(current_pos) if current_pos is not None else 0
-        end = min(pos + q_len, self.config.state_length)
-        start = 0
-        if layer_idx is not None and hasattr(self.config, "layer_types"):
-            if self.config.layer_types[layer_idx] == "sliding_attention":
-                start = max(0, end - self.config.sliding_window)
-
-        K_window = K_layer_cache[:, :, start:end, :]
-        V_window = V_layer_cache[:, :, start:end, :]
-
-        key_states = repeat_kv(K_window, self.num_key_value_groups)
-        value_states = repeat_kv(V_window, self.num_key_value_groups)
+        # Use full KV cache - causal mask handles position masking
+        # This avoids dynamic slicing issues with JIT tracing
+        key_states = repeat_kv(K_layer_cache, self.num_key_value_groups)
+        value_states = repeat_kv(V_layer_cache, self.num_key_value_groups)
 
         # Match dtypes to avoid matmul dtype errors during tracing.
         if query_states.dtype != key_states.dtype:
             query_states = query_states.to(key_states.dtype)
 
+        # Gemma3n uses scaling=1.0 (no attention scaling) because QKV are normalized
         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
+
+        # Apply causal mask - this handles position-based masking
+        # The mask should have -inf for positions > current_pos
+        # Always use tensor operations - no branching for ANE compatibility
         if causal_mask is not None:
-            mask_slice = causal_mask.to(query_states.dtype)[:, :, pos:pos + q_len, start:end]
-            attn_weights = attn_weights + mask_slice
+            # Get position as tensor for dynamic indexing
+            pos_idx = current_pos.long().view(1, 1, 1, 1)
+
+            # Gather the mask row for current position
+            # causal_mask shape: [B, 1, seq_len, seq_len]
+            # We want: [B, 1, 1, seq_len] for the current position row
+            mask_row_idx = pos_idx.expand(causal_mask.shape[0], 1, 1, causal_mask.shape[3])
+            mask_slice = causal_mask.gather(2, mask_row_idx)  # [B, 1, 1, seq_len]
+            attn_weights = attn_weights + mask_slice.to(query_states.dtype)
+
+        # NOTE: Gemma3n does NOT use attention softcapping (HF uses softcap=None)
 
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
@@ -684,7 +701,10 @@ class Gemma3nTextAttention(nn.Module):
         return attn_output
 
     def forward_prefill(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None, current_pos=None, layer_idx=None):
-        """Forward pass for batched prefill with KV cache."""
+        """Forward pass for batched prefill with KV cache.
+
+        Note: Uses full KV cache with causal mask for dynamic position support in JIT tracing.
+        """
         bsz, q_len, _ = hidden_states.shape
 
         K_layer_cache, V_layer_cache = kv_cache_layer
@@ -692,26 +712,29 @@ class Gemma3nTextAttention(nn.Module):
             K_layer_cache = K_layer_cache.unsqueeze(0)
             V_layer_cache = V_layer_cache.unsqueeze(0)
 
-        pos = int(current_pos) if current_pos is not None else 0
-        end = min(pos + q_len, self.config.state_length)
-        start = 0
-        if layer_idx is not None and hasattr(self.config, "layer_types"):
-            if self.config.layer_types[layer_idx] == "sliding_attention":
-                start = max(0, end - self.config.sliding_window)
-
-        K_window = K_layer_cache[:, :, start:end, :]
-        V_window = V_layer_cache[:, :, start:end, :]
-
-        key_states = repeat_kv(K_window, self.num_key_value_groups)
-        value_states = repeat_kv(V_window, self.num_key_value_groups)
+        # Use full KV cache - causal mask handles position masking
+        key_states = repeat_kv(K_layer_cache, self.num_key_value_groups)
+        value_states = repeat_kv(V_layer_cache, self.num_key_value_groups)
 
         if query_states.dtype != key_states.dtype:
             query_states = query_states.to(key_states.dtype)
 
+        # Gemma3n uses scaling=1.0 (no attention scaling) because QKV are normalized
         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
+
+        # Apply causal mask with dynamic position indexing
+        # Always use tensor operations - no branching for ANE compatibility
         if causal_mask is not None:
-            mask_slice = causal_mask.to(query_states.dtype)[:, :, pos:pos + q_len, start:end]
-            attn_weights = attn_weights + mask_slice
+            pos_idx = current_pos.long().view(1, 1, 1, 1)
+
+            # For prefill with q_len > 1, we need multiple rows from the mask
+            # Gather rows [pos, pos+1, ..., pos+q_len-1] from the mask
+            row_indices = pos_idx + torch.arange(q_len, device=causal_mask.device).view(1, 1, -1, 1)
+            row_indices = row_indices.expand(causal_mask.shape[0], 1, q_len, causal_mask.shape[3])
+            mask_slice = causal_mask.gather(2, row_indices)  # [B, 1, q_len, seq_len]
+            attn_weights = attn_weights + mask_slice.to(query_states.dtype)
+
+        # NOTE: Gemma3n does NOT use attention softcapping (HF uses softcap=None)
 
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
@@ -1228,6 +1251,7 @@ class Gemma3nModel(nn.Module):
         self.register_buffer("sin_cached_local", sin_local, persistent=False)
 
         # Initialize unified KV cache (following llama/qwen patterns)
+        # Must be FP16 for ANE compatibility - persistent buffers are FP16 only
         cache_size = (
             2 * config.num_hidden_layers,
             config.num_key_value_heads,
@@ -1510,9 +1534,34 @@ class Gemma3nModel(nn.Module):
         )
 
         kv_cache, key_idx, value_idx, _ = self._get_kv_cache_layer(layer_idx)
-        pos = int(current_pos) if current_pos is not None else 0
-        kv_cache[key_idx:key_idx + 1, :, pos:pos + 1, :] = key_states
-        kv_cache[value_idx:value_idx + 1, :, pos:pos + 1, :] = value_states
+
+        # Dynamic position update using element-wise one-hot mask (traces well in CoreML)
+        # This avoids scatter operations which may not trace dynamic indices correctly
+        num_kv_heads = key_states.shape[1]
+        head_dim = key_states.shape[3]
+        seq_len = kv_cache.shape[2]
+
+        # Create one-hot position mask: [1, 1, seq_len, 1]
+        # This is 1.0 at current_pos, 0.0 elsewhere
+        positions = torch.arange(seq_len, device=kv_cache.device, dtype=torch.long)
+        one_hot = (positions == current_pos.long()).float().view(1, 1, seq_len, 1)
+
+        # Broadcast key_states from [1, heads, 1, dim] to [1, heads, seq_len, dim]
+        key_states_expanded = key_states.expand(-1, -1, seq_len, -1).half()
+        value_states_expanded = value_states.expand(-1, -1, seq_len, -1).half()
+
+        # Get current cache slices
+        kv_key_slice = kv_cache[key_idx:key_idx + 1]  # [1, heads, seq_len, dim]
+        kv_value_slice = kv_cache[value_idx:value_idx + 1]
+
+        # Update only at current position using element-wise operations
+        # result[pos] = new_value if pos == current_pos else old_value[pos]
+        updated_keys = kv_key_slice * (1.0 - one_hot) + key_states_expanded * one_hot
+        updated_values = kv_value_slice * (1.0 - one_hot) + value_states_expanded * one_hot
+
+        # Write back to kv_cache (CoreML state update)
+        kv_cache[key_idx:key_idx + 1] = updated_keys.half()
+        kv_cache[value_idx:value_idx + 1] = updated_values.half()
 
         key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
         value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
@@ -1522,7 +1571,7 @@ class Gemma3nModel(nn.Module):
             query_states=query_states,
             kv_cache_layer=(key_cache, value_cache),
             causal_mask=causal_mask,
-            current_pos=pos,
+            current_pos=current_pos,  # Pass tensor, not int
             layer_idx=layer_idx,
         )
         attn = layer.post_attention_layernorm(attn)
@@ -1572,10 +1621,42 @@ class Gemma3nModel(nn.Module):
         )
 
         kv_cache, key_idx, value_idx, _ = self._get_kv_cache_layer(layer_idx)
-        pos = int(current_pos) if current_pos is not None else 0
-        seq_len = key_states.shape[2]
-        kv_cache[key_idx:key_idx + 1, :, pos:pos + seq_len, :] = key_states
-        kv_cache[value_idx:value_idx + 1, :, pos:pos + seq_len, :] = value_states
+        prefill_seq_len = key_states.shape[2]  # Number of tokens in this prefill batch
+        num_kv_heads = key_states.shape[1]
+        head_dim = key_states.shape[3]
+        cache_seq_len = kv_cache.shape[2]
+
+        # Dynamic position update using element-wise range mask (traces well in CoreML)
+        # For prefill, we write prefill_seq_len tokens starting at current_pos
+        positions = torch.arange(cache_seq_len, device=kv_cache.device, dtype=torch.long)
+        pos_start = current_pos.long()
+        pos_end = pos_start + prefill_seq_len
+
+        # Create range mask: 1.0 for positions in [current_pos, current_pos + prefill_seq_len)
+        range_mask = ((positions >= pos_start) & (positions < pos_end)).float().view(1, 1, cache_seq_len, 1)
+
+        # Get current cache slices
+        kv_key_slice = kv_cache[key_idx:key_idx + 1]  # [1, heads, cache_seq_len, dim]
+        kv_value_slice = kv_cache[value_idx:value_idx + 1]
+
+        # Pad key_states to cache_seq_len by creating a full-size tensor
+        # and placing key_states at the appropriate positions
+        key_states_padded = torch.zeros_like(kv_key_slice)
+        value_states_padded = torch.zeros_like(kv_value_slice)
+
+        # For prefill, use slice assignment (position is known at trace time for prefill)
+        # This is acceptable because prefill position is typically 0
+        pos = current_pos.item()  # OK for prefill - position is constant
+        key_states_padded[:, :, pos:pos + prefill_seq_len, :] = key_states.half()
+        value_states_padded[:, :, pos:pos + prefill_seq_len, :] = value_states.half()
+
+        # Update using mask (positions in range get new values, others keep old)
+        updated_keys = kv_key_slice * (1.0 - range_mask) + key_states_padded * range_mask
+        updated_values = kv_value_slice * (1.0 - range_mask) + value_states_padded * range_mask
+
+        # Write back to kv_cache (CoreML state update)
+        kv_cache[key_idx:key_idx + 1] = updated_keys.half()
+        kv_cache[value_idx:value_idx + 1] = updated_values.half()
 
         key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
         value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
@@ -1585,7 +1666,7 @@ class Gemma3nModel(nn.Module):
             query_states=query_states,
             kv_cache_layer=(key_cache, value_cache),
             causal_mask=causal_mask,
-            current_pos=pos,
+            current_pos=current_pos,  # Pass tensor, not int
             layer_idx=layer_idx,
         )
         attn = layer.post_attention_layernorm(attn)

@@ -73,6 +73,7 @@ class Gemma3nConverter(BaseConverter):
 
     def _get_kv_cache_states(self, prefix: str = "model.") -> list:
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
+        # Must be FP16 for ANE compatibility - persistent buffers are FP16 only
         return [
             ct.StateType(
                 wrapped_type=ct.TensorType(
@@ -357,28 +358,28 @@ class Gemma3nConverter(BaseConverter):
             model = FFNChunkModel(self.config, layers, self.enable_laurel)
             model.eval()
             
-            # Convert to CoreML
-            #example_input = torch.randn(self.batch_size, self.config.hidden_size, self.context_length, 1)
-            example_input = torch.randn(self.batch_size, self.config.hidden_size, self.context_length, 1)
-            example_mask = torch.zeros((self.batch_size, 1, self.context_length, self.context_length), dtype=torch.float32)
+            # Convert to CoreML - use float16 for consistency with KV cache
+            example_input = torch.randn(self.batch_size, self.config.hidden_size, self.context_length, 1, dtype=torch.float16)
+            example_mask = torch.zeros((self.batch_size, 1, self.context_length, self.context_length), dtype=torch.float16)
 
             traced_model = torch.jit.trace(model, (example_input, example_mask))
-            
+
             mlmodel = ct.convert(
                 traced_model,
                 inputs=[
                     ct.TensorType(
                         name="hidden_states",
                         shape=(self.batch_size, self.config.hidden_size, self.context_length, 1),
-                        dtype=np.float32
+                        dtype=np.float16
                     ),
                     ct.TensorType(
                         name="causal_mask",
                         shape=(self.batch_size, 1, self.context_length, self.context_length),
-                        dtype=np.float32
+                        dtype=np.float16
                     ),
                     ],
-                outputs=[ct.TensorType(name="output_hidden_states")],
+                outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
+                compute_precision=ct.precision.FLOAT16,
                 compute_units=ct.ComputeUnit.CPU_AND_NE,
                 convert_to="mlprogram"
             )
