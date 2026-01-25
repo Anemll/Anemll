@@ -36,10 +36,16 @@ TEST_DEVICE = "cpu"
 CONTEXT_LENGTH = 256
 
 # Cache configuration constants (following llama_model.py pattern)
-FORCE_UNIFIED_CACHE = True  # Force using a single unified KV cache
-ENABLE_UNIFIED_CACHE = True  # Enable unified KV cache by default
+FORCE_UNIFIED_CACHE = False  # Deprecated: Use ENABLE_SPLIT_CACHE instead
+ENABLE_UNIFIED_CACHE = False  # Deprecated: Use ENABLE_SPLIT_CACHE instead
+ENABLE_SPLIT_CACHE = True  # Use separate caches for local/global attention layers
 STATE_LENGTH = CONTEXT_LENGTH   # match config.state_length by default
 DISABLE_KV_CACHE = False  # Disable KV cache for simple testing
+
+# Layer type constants for Gemma3 split cache
+GLOBAL_ATTENTION_LAYER_INDICES = [5, 11, 17]  # 0-indexed layers with full attention
+NUM_GLOBAL_LAYERS = 3
+NUM_LOCAL_LAYERS = 15  # 18 total - 3 global = 15 local
 
 # LM head configuration constants (following llama_model.py pattern)
 ENABLE_CONV2D = bool(1)      # Use Conv2d for LM head
@@ -84,12 +90,30 @@ class Gemma3Config:
         self.context_length = kwargs.get("context_length", 256)
         self.state_length = kwargs.get("state_length", self.context_length)
 
-        # Interleaved attention
+        # Interleaved attention (Gemma3 architectural feature - don't modify)
         self.sliding_window = kwargs.get("sliding_window", 512)
         default_layer_types = ["sliding_attention"] * self.num_hidden_layers
         for i in (5, 11, 17):  # 0-indexed -> layers 6, 12, 18 are global
             if i < len(default_layer_types): default_layer_types[i] = "full_attention"
         self.layer_types = kwargs.get("layer_types", default_layer_types)
+
+        # Attention window for ANE optimization (separate from sliding_window)
+        # Controls: KV cache size (state_length), causal_mask dimension, KV slice
+        self.attention_size = kwargs.get("attention_size", self.state_length)
+
+        # Split cache configuration for local/global attention
+        self.use_split_cache = kwargs.get("use_split_cache", ENABLE_SPLIT_CACHE)
+
+        # Cache fill direction for local cache
+        # False (default): Fill from left (standard), requires conditional for rotation
+        # True: Fill from right (ANE-friendly), always shifts, but needs adjusted mask
+        self.use_right_fill_cache = kwargs.get("use_right_fill_cache", False)
+
+        # Force rotation mode for local cache (used for CoreML tracing)
+        # None (default): Use conditional logic (pos < sliding_window -> fill, else -> rotate)
+        # False: Always use fill mode (for infer function, pos < sliding_window)
+        # True: Always use rotate mode (for infer_rotate function, pos >= sliding_window)
+        self.force_rotation_mode = kwargs.get("force_rotation_mode", None)
 
         # Vocab
         self.vocab_size = kwargs.get("vocab_size", 262_144)
@@ -111,6 +135,34 @@ def get_kv_cache_idx(layer_idx, num_layers, num_groups=1):
     group_idx = layer_idx // layers_per_group
     layer_in_group_idx = layer_idx % layers_per_group
     return group_idx, layer_in_group_idx, layers_per_group
+
+
+def get_layer_cache_mapping(layer_idx: int, layer_types: list) -> tuple:
+    """
+    Map layer index to cache type and index within that cache.
+
+    For split cache architecture:
+    - Local (sliding window) layers: map to kv_cache_local
+    - Global (full attention) layers: map to kv_cache_global
+
+    Args:
+        layer_idx: The original layer index (0-17 for Gemma3)
+        layer_types: List of layer types from config.layer_types
+
+    Returns:
+        Tuple of (cache_type, cache_index) where:
+        - cache_type is 'global' or 'local'
+        - cache_index is the layer's position within that cache (0-based)
+    """
+    if layer_types[layer_idx] == "full_attention":
+        # Global layers: 5->0, 11->1, 17->2
+        global_idx = GLOBAL_ATTENTION_LAYER_INDICES.index(layer_idx)
+        return 'global', global_idx
+    else:
+        # Local layers: count sliding_attention layers before this one
+        local_idx = sum(1 for i in range(layer_idx)
+                       if layer_types[i] == "sliding_attention")
+        return 'local', local_idx
 
 
 # -----------------------------------------------------------------------------
@@ -494,13 +546,25 @@ class Gemma3Attention(nn.Module):
     def forward_regular(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None, current_pos=None, layer_idx=None):
         """Forward pass for single token generation."""
         bsz, q_len, _ = hidden_states.shape
-                
+
         # Get KV cache
         K_layer_cache, V_layer_cache = kv_cache_layer
-        
-        # Use fixed cache length to avoid tracing dynamic slices.
-        K_window = K_layer_cache[..., :self.config.state_length, :]
-        V_window = V_layer_cache[..., :self.config.state_length, :]
+
+        # Determine window size based on layer type and cache mode
+        use_split_cache = getattr(self.config, 'use_split_cache', ENABLE_SPLIT_CACHE)
+        if use_split_cache and layer_idx is not None:
+            if self.config.layer_types[layer_idx] == "full_attention":
+                # Global layer - use full attention_size (or state_length)
+                window_size = self.config.attention_size
+            else:
+                # Local layer - use sliding_window (cache is already rotated)
+                window_size = self.config.sliding_window
+        else:
+            # Legacy mode - use attention_size
+            window_size = self.config.attention_size
+
+        K_window = K_layer_cache[..., :window_size, :]
+        V_window = V_layer_cache[..., :window_size, :]
         
         # Repeat KV for multi-head attention
         n_rep = self.num_heads // self.num_kv_heads
@@ -533,21 +597,25 @@ class Gemma3Attention(nn.Module):
     def forward_prefill(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None, layer_idx=None):
         """Forward pass for prefill mode"""
         bsz, q_len, _ = hidden_states.shape
-                
+
         # Get KV cache
         K_layer_cache, V_layer_cache = kv_cache_layer
-        
-        # Determine the usable KV range for windowed attention
-        q_len = query_states.shape[2]
-        pos = 0  # For prefill, we start from position 0
-        end = min(pos + q_len, self.config.state_length)
-        start = 0
-        if layer_idx is not None and hasattr(self.config, "layer_types"):
-            if self.config.layer_types[layer_idx] == "sliding_attention":
-                start = max(0, end - self.config.sliding_window)
-        
-        K_window = K_layer_cache[:, start:end, :]
-        V_window = V_layer_cache[:, start:end, :]
+
+        # Determine window size based on layer type and cache mode
+        use_split_cache = getattr(self.config, 'use_split_cache', ENABLE_SPLIT_CACHE)
+        if use_split_cache and layer_idx is not None:
+            if self.config.layer_types[layer_idx] == "full_attention":
+                # Global layer - use full attention_size (or state_length)
+                window_size = self.config.attention_size
+            else:
+                # Local layer - use sliding_window (cache is already rotated)
+                window_size = self.config.sliding_window
+        else:
+            # Legacy mode - use attention_size
+            window_size = self.config.attention_size
+
+        K_window = K_layer_cache[:, :window_size, :]
+        V_window = V_layer_cache[:, :window_size, :]
         
         # Repeat KV for multi-head attention
         n_rep = self.num_heads // self.num_kv_heads
@@ -646,13 +714,56 @@ class Gemma3Model(nn.Module):
         )
         self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Initialize KV cache with MODEL_DTYPE (following llama_model.py pattern)  
+        # Initialize KV cache with MODEL_DTYPE (following llama_model.py pattern)
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         if not hasattr(Gemma3Model, '_config_printed'):
             print(f"Gemma3Model using head_dim={self.head_dim} for KV cache (config has: {getattr(config, 'head_dim', 'not set')})")
             Gemma3Model._config_printed = True
-        
-        if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
+
+        # Determine cache mode: split (local/global) or unified
+        use_split_cache = getattr(config, 'use_split_cache', ENABLE_SPLIT_CACHE)
+
+        if use_split_cache:
+            # Split cache architecture for Gemma3 local/global attention
+            # Count layers by type
+            num_global_layers = sum(1 for t in config.layer_types if t == "full_attention")
+            num_local_layers = config.num_hidden_layers - num_global_layers
+
+            # Build layer index mappings
+            self._local_layer_indices = [i for i in range(config.num_hidden_layers)
+                                        if config.layer_types[i] == "sliding_attention"]
+            self._global_layer_indices = [i for i in range(config.num_hidden_layers)
+                                         if config.layer_types[i] == "full_attention"]
+
+            # Local cache: for sliding window attention layers
+            # Shape: [2*num_local_layers, num_kv_heads, sliding_window, head_dim]
+            local_cache_size = (
+                2 * num_local_layers,  # K and V for each local layer
+                config.num_key_value_heads,
+                config.sliding_window,  # 512 - only need sliding window size
+                self.head_dim
+            )
+            self.register_buffer("kv_cache_local",
+                               torch.zeros(local_cache_size, dtype=MODEL_DTYPE, device=TEST_DEVICE))
+
+            # Global cache: for full attention layers
+            # Shape: [2*num_global_layers, num_kv_heads, state_length, head_dim]
+            global_cache_size = (
+                2 * num_global_layers,  # K and V for each global layer
+                config.num_key_value_heads,
+                config.state_length,  # Full context length
+                self.head_dim
+            )
+            self.register_buffer("kv_cache_global",
+                               torch.zeros(global_cache_size, dtype=MODEL_DTYPE, device=TEST_DEVICE))
+
+            if not hasattr(Gemma3Model, '_cache_init_printed'):
+                print(f"Initialized SPLIT KV caches:")
+                print(f"  kv_cache_local: {self.kv_cache_local.shape} for {num_local_layers} sliding window layers {self._local_layer_indices}")
+                print(f"  kv_cache_global: {self.kv_cache_global.shape} for {num_global_layers} full attention layers {self._global_layer_indices}")
+                Gemma3Model._cache_init_printed = True
+        elif FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
+            # Legacy unified cache mode
             cache_size = (
                 2 * config.num_hidden_layers,
                 config.num_key_value_heads,
@@ -664,6 +775,7 @@ class Gemma3Model(nn.Module):
                 print(f"Initialized unified KV kv_cache_0 with shape: {self.kv_cache_0.shape}")
                 Gemma3Model._cache_init_printed = True
         else:
+            # Per-layer cache mode (legacy)
             layers_per_group = config.num_hidden_layers
             for i in range(config.num_hidden_layers):
                 cache_size = (
@@ -673,7 +785,7 @@ class Gemma3Model(nn.Module):
                     self.head_dim
                 )
                 self.register_buffer(
-                    f"kv_cache_{i}", 
+                    f"kv_cache_{i}",
                     torch.zeros(cache_size, dtype=MODEL_DTYPE, device=TEST_DEVICE)
                 )
 
@@ -718,24 +830,271 @@ class Gemma3Model(nn.Module):
         return cos.to(MODEL_DTYPE), sin.to(MODEL_DTYPE)
 
     def _kv_slice(self, layer_idx: int, current_pos: int, q_len: int) -> tuple[int, int]:
-        """Return [start, end) key range to attend to for this layer / step."""
+        """Return [start, end) key range to attend to for this layer / step.
+
+        For split cache architecture:
+        - Global layers: attend to full range [0, min(current_pos + q_len, state_length))
+        - Local layers: attend to full local cache [0, min(current_pos + q_len, sliding_window))
+                       (cache is already rotated to contain only valid positions)
+        """
         if self.config.layer_types[layer_idx] == "full_attention":
             end = min(current_pos + q_len, self.config.state_length)
             return 0, end
-        # sliding layer
-        end = min(current_pos + q_len, self.config.state_length)
-        start = max(0, end - self.config.sliding_window)
-        return start, end
+        # sliding layer - for split cache, we attend to the full local cache
+        # which contains the last sliding_window positions (already rotated)
+        if getattr(self.config, 'use_split_cache', ENABLE_SPLIT_CACHE):
+            effective_len = min(current_pos + q_len, self.config.sliding_window)
+            return 0, effective_len
+        else:
+            # Legacy unified cache behavior
+            end = min(current_pos + q_len, self.config.state_length)
+            start = max(0, end - self.config.sliding_window)
+            return start, end
+
+    # -------------------------------------------------------------------------
+    # Split cache storage and retrieval methods
+    # -------------------------------------------------------------------------
+
+    def _fill_kv_local(self, layer_idx: int, key_states: torch.Tensor,
+                      value_states: torch.Tensor, current_pos: int) -> None:
+        """
+        Fill KV states in local cache (for prefill, before cache is full).
+
+        Stores at position current_pos. Use for positions 0 to sliding_window-1.
+        No shift operation - direct storage.
+
+        Args:
+            layer_idx: Original layer index (0-17)
+            key_states: Key tensor to store, shape [1, num_kv_heads, 1, head_dim]
+            value_states: Value tensor to store, same shape as key_states
+            current_pos: Current position (0 to sliding_window-1)
+        """
+        cache_idx = self._local_layer_indices.index(layer_idx)
+        num_local = len(self._local_layer_indices)
+        key_cache_idx = cache_idx
+        value_cache_idx = cache_idx + num_local
+
+        # Direct store at current_pos (no shift)
+        self.kv_cache_local[key_cache_idx:key_cache_idx + 1, :, current_pos:current_pos + 1, :] = key_states
+        self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, current_pos:current_pos + 1, :] = value_states
+
+    def _update_kv_local(self, layer_idx: int, key_states: torch.Tensor,
+                        value_states: torch.Tensor) -> None:
+        """
+        Update KV states in local cache (for generation, after cache is full).
+
+        Always shifts left and stores at the end:
+        1. cache[0:LEN-1] = cache[1:LEN]  (shift left, discard oldest)
+        2. cache[LEN-1] = new_value  (store new at end)
+
+        Use for positions >= sliding_window. No conditionals.
+
+        Note: Uses torch.narrow + torch.cat for ANE compatibility.
+        - torch.narrow explicitly specifies positive start/length (avoids negative offset errors)
+        - torch.cat creates the new shifted tensor
+        The original approach (cache[:-1] = cache[1:].clone()) fails during torch.jit.trace,
+        and slice notation (cache[:, :, 1:, :]) causes "offset (-1)" errors on ANE.
+
+        Args:
+            layer_idx: Original layer index (0-17)
+            key_states: Key tensor to store, shape [1, num_kv_heads, 1, head_dim]
+            value_states: Value tensor to store, same shape as key_states
+        """
+        cache_idx = self._local_layer_indices.index(layer_idx)
+        num_local = len(self._local_layer_indices)
+        key_cache_idx = cache_idx
+        value_cache_idx = cache_idx + num_local
+
+        # Get sliding window size for narrow operation
+        sw = self.config.sliding_window  # 512
+
+        # Create shifted key cache: drop first token (use narrow to avoid negative offset)
+        # torch.narrow(tensor, dim, start, length) - all positive values
+        key_slice = self.kv_cache_local[key_cache_idx:key_cache_idx + 1]
+        key_tail = torch.narrow(key_slice, 2, 1, sw - 1)  # start=1, length=511
+        shifted_key = torch.cat([key_tail, key_states], dim=2)
+        self.kv_cache_local[key_cache_idx:key_cache_idx + 1, :, :, :] = shifted_key
+
+        # Create shifted value cache: drop first token (use narrow to avoid negative offset)
+        value_slice = self.kv_cache_local[value_cache_idx:value_cache_idx + 1]
+        value_tail = torch.narrow(value_slice, 2, 1, sw - 1)  # start=1, length=511
+        shifted_value = torch.cat([value_tail, value_states], dim=2)
+        self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, :, :] = shifted_value
+
+    def _store_kv_local(self, layer_idx: int, key_states: torch.Tensor,
+                       value_states: torch.Tensor, current_pos: int) -> None:
+        """
+        Store KV states in local cache (auto-selects fill or update).
+
+        Behavior depends on config.force_rotation_mode:
+        - None (default): Conditional logic based on current_pos
+          - current_pos < sliding_window: fill mode (direct store)
+          - current_pos >= sliding_window: rotate mode (shift + store)
+        - False: Always use fill mode (for 'infer' function, pos < sliding_window)
+        - True: Always use rotate mode (for 'infer_rotate' function, pos >= sliding_window)
+
+        For CoreML export, set force_rotation_mode before tracing:
+        - infer function: force_rotation_mode=False
+        - infer_rotate function: force_rotation_mode=True
+
+        Args:
+            layer_idx: Original layer index (0-17)
+            key_states: Key tensor to store
+            value_states: Value tensor to store
+            current_pos: Current absolute position in the sequence
+        """
+        force_rotation = getattr(self.config, 'force_rotation_mode', None)
+
+        if force_rotation is True:
+            # Always rotate (for infer_rotate function)
+            self._update_kv_local(layer_idx, key_states, value_states)
+        elif force_rotation is False:
+            # Always fill (for infer function)
+            self._fill_kv_local(layer_idx, key_states, value_states, current_pos)
+        else:
+            # Default: conditional based on position
+            sliding_window = self.config.sliding_window
+            if current_pos < sliding_window:
+                self._fill_kv_local(layer_idx, key_states, value_states, current_pos)
+            else:
+                self._update_kv_local(layer_idx, key_states, value_states)
+
+    def _store_kv_local_prefill(self, layer_idx: int, key_states: torch.Tensor,
+                               value_states: torch.Tensor, current_pos: int, seq_len: int) -> None:
+        """
+        Store KV states in local cache during prefill (multi-token).
+
+        Two modes controlled by USE_RIGHT_FILL_CACHE:
+        - False (default): Fill from left (positions 0 to seq_len-1)
+        - True: Fill from right (positions sliding_window-seq_len to sliding_window-1)
+
+        For prefill that exceeds sliding_window, only the last sliding_window tokens
+        are kept.
+
+        Args:
+            layer_idx: Original layer index (0-17)
+            key_states: Key tensor, shape [1, seq_len, num_kv_heads, head_dim] or similar
+            value_states: Value tensor, same shape as key_states
+            current_pos: Starting position in the sequence (typically 0 for prefill)
+            seq_len: Number of tokens being prefilled
+        """
+        cache_idx = self._local_layer_indices.index(layer_idx)
+        num_local = len(self._local_layer_indices)
+        key_cache_idx = cache_idx
+        value_cache_idx = cache_idx + num_local
+
+        sliding_window = self.config.sliding_window
+
+        # For prefill, if seq_len > sliding_window, only keep last sliding_window tokens
+        if seq_len > sliding_window:
+            key_states = key_states[:, -sliding_window:, :]
+            value_states = value_states[:, -sliding_window:, :]
+            seq_len = sliding_window
+
+        # Check which mode to use
+        use_right_fill = getattr(self.config, 'use_right_fill_cache', False)
+
+        if use_right_fill:
+            # Right-fill mode: store at positions (sliding_window - seq_len) to (sliding_window - 1)
+            # This aligns with the shift-and-store pattern in single-token generation
+            start_pos = sliding_window - seq_len
+            end_pos = sliding_window
+        else:
+            # Standard mode: fill from left (positions 0 to seq_len-1)
+            start_pos = current_pos
+            end_pos = min(current_pos + seq_len, sliding_window)
+
+        self.kv_cache_local[key_cache_idx:key_cache_idx + 1, :, start_pos:end_pos, :] = key_states[:, :end_pos - start_pos, :]
+        self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, start_pos:end_pos, :] = value_states[:, :end_pos - start_pos, :]
+
+    def _store_kv_global(self, layer_idx: int, key_states: torch.Tensor,
+                        value_states: torch.Tensor, current_pos: int) -> None:
+        """
+        Store KV states in global cache. No rotation - direct indexing.
+
+        Args:
+            layer_idx: Original layer index (0-17)
+            key_states: Key tensor to store
+            value_states: Value tensor to store
+            current_pos: Current position in the sequence
+        """
+        cache_idx = self._global_layer_indices.index(layer_idx)
+        num_global = len(self._global_layer_indices)
+        key_cache_idx = cache_idx
+        value_cache_idx = cache_idx + num_global
+
+        # Direct storage at position (clamped to state_length)
+        pos = min(current_pos, self.config.state_length - 1)
+        self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, pos:pos + 1, :] = key_states
+        self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, pos:pos + 1, :] = value_states
+
+    def _store_kv_global_prefill(self, layer_idx: int, key_states: torch.Tensor,
+                                value_states: torch.Tensor, current_pos: int, seq_len: int) -> None:
+        """
+        Store KV states in global cache during prefill (multi-token).
+
+        Args:
+            layer_idx: Original layer index (0-17)
+            key_states: Key tensor, shape [1, seq_len, num_kv_heads, head_dim] or similar
+            value_states: Value tensor, same shape as key_states
+            current_pos: Starting position in the sequence
+            seq_len: Number of tokens being prefilled
+        """
+        cache_idx = self._global_layer_indices.index(layer_idx)
+        num_global = len(self._global_layer_indices)
+        key_cache_idx = cache_idx
+        value_cache_idx = cache_idx + num_global
+
+        end = min(current_pos + seq_len, self.config.state_length)
+        actual_len = end - current_pos
+        self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, current_pos:end, :] = key_states[:, :actual_len, :]
+        self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, current_pos:end, :] = value_states[:, :actual_len, :]
+
+    def _get_kv_cache_for_layer(self, layer_idx: int, current_pos: int) -> tuple:
+        """
+        Get the key and value cache tensors for a specific layer.
+
+        Returns appropriately sliced cache based on layer type.
+
+        Args:
+            layer_idx: Original layer index (0-17)
+            current_pos: Current position (used for determining valid range)
+
+        Returns:
+            Tuple of (key_cache, value_cache) tensors
+        """
+        if self.config.layer_types[layer_idx] == "full_attention":
+            # Global layer - return from global cache
+            cache_idx = self._global_layer_indices.index(layer_idx)
+            num_global = len(self._global_layer_indices)
+            key_cache_idx = cache_idx
+            value_cache_idx = cache_idx + num_global
+
+            key_cache = self.kv_cache_global[key_cache_idx:key_cache_idx + 1].squeeze(0)
+            value_cache = self.kv_cache_global[value_cache_idx:value_cache_idx + 1].squeeze(0)
+            return key_cache, value_cache
+        else:
+            # Local layer - return from local cache
+            cache_idx = self._local_layer_indices.index(layer_idx)
+            num_local = len(self._local_layer_indices)
+            key_cache_idx = cache_idx
+            value_cache_idx = cache_idx + num_local
+
+            key_cache = self.kv_cache_local[key_cache_idx:key_cache_idx + 1].squeeze(0)
+            value_cache = self.kv_cache_local[value_cache_idx:value_cache_idx + 1].squeeze(0)
+            return key_cache, value_cache
+
+    # -------------------------------------------------------------------------
 
     def process_layer_prefill(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset):
         """Process a single transformer layer in prefill mode"""
         layer = self.layers[layer_idx]
-        
+
         # Get layer-specific RoPE
         rotary_emb = self.get_rotary_embedding_prefill(position_ids, layer_idx)
 
         normalized_states = layer.input_layernorm(hidden_states)
-        
+
         # Get query, key and value states for prefill
         query_states, key_states, value_states = layer.self_attn.get_new_kv_cache_prefill(
             normalized_states,
@@ -743,27 +1102,40 @@ class Gemma3Model(nn.Module):
             rotary_emb
         )
 
-        # Get group indices
-        group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
+        seq_length = key_states.shape[2]
+        use_split_cache = getattr(self.config, 'use_split_cache', ENABLE_SPLIT_CACHE)
 
-        # Get the combined KV cache for this group
-        if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
-            kv_cache = getattr(self, "kv_cache_0")
+        if use_split_cache:
+            # Split cache path - store in appropriate cache based on layer type
+            if self.config.layer_types[layer_idx] == "full_attention":
+                self._store_kv_global_prefill(layer_idx, key_states, value_states, current_pos, seq_length)
+            else:
+                self._store_kv_local_prefill(layer_idx, key_states, value_states, current_pos, seq_length)
+
+            # Get the KV cache for this layer
+            key_cache, value_cache = self._get_kv_cache_for_layer(layer_idx, current_pos)
         else:
-            kv_cache = getattr(self, f"kv_cache_{group_idx}")
+            # Legacy unified cache path
+            # Get group indices
+            group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
 
-        key_idx = layer_in_group_idx
-        value_idx = layer_in_group_idx + layers_per_group
+            # Get the combined KV cache for this group
+            if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
+                kv_cache = getattr(self, "kv_cache_0")
+            else:
+                kv_cache = getattr(self, f"kv_cache_{group_idx}")
 
-        # Store the full sequence length in prefill mode with bounds checking
-        seq_length = key_states.shape[2]  # Get actual sequence length
-        end = min(current_pos + seq_length, self.config.state_length)
-        kv_cache[key_idx:key_idx + 1, :, current_pos:end, :] = key_states[:, :end-current_pos, :]
-        kv_cache[value_idx:value_idx + 1, :, current_pos:end, :] = value_states[:, :end-current_pos, :]
-        
-        # Get the key and value states for this layer from the merged cache
-        key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
-        value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+            key_idx = layer_in_group_idx
+            value_idx = layer_in_group_idx + layers_per_group
+
+            # Store KV - direct indexing (model only used for positions < attention_size)
+            end = min(current_pos + seq_length, self.config.state_length)
+            kv_cache[key_idx:key_idx + 1, :, current_pos:end, :] = key_states[:, :end-current_pos, :]
+            kv_cache[value_idx:value_idx + 1, :, current_pos:end, :] = value_states[:, :end-current_pos, :]
+
+            # Get the key and value states for this layer from the merged cache
+            key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+            value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
 
         # Run attention with the updated KV cache
         attn_output = layer.self_attn.forward_prefill(
@@ -771,6 +1143,7 @@ class Gemma3Model(nn.Module):
             query_states=query_states,
             kv_cache_layer=(key_cache, value_cache),
             causal_mask=causal_mask,
+            layer_idx=layer_idx,
         )
 
         # Apply post_attention_layernorm before residual add
@@ -822,35 +1195,62 @@ class Gemma3Model(nn.Module):
 
         if not self.disable_kv_cache:
             # Standard KV cache path
-            # Get group indices
-            group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
+            use_split_cache = getattr(self.config, 'use_split_cache', ENABLE_SPLIT_CACHE)
 
-            # Get the combined KV cache for this group
-            if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
-                kv_cache = getattr(self, "kv_cache_0")
+            if use_split_cache:
+                # Split cache path - store in appropriate cache based on layer type
+                if seq_len == 1:
+                    # Single token storage with rotation for local cache
+                    if self.config.layer_types[layer_idx] == "full_attention":
+                        self._store_kv_global(layer_idx, key_states, value_states, current_pos)
+                    else:
+                        self._store_kv_local(layer_idx, key_states, value_states, current_pos)
+                else:
+                    # Multi-token storage
+                    if self.config.layer_types[layer_idx] == "full_attention":
+                        self._store_kv_global_prefill(layer_idx, key_states, value_states, current_pos, seq_len)
+                    else:
+                        self._store_kv_local_prefill(layer_idx, key_states, value_states, current_pos, seq_len)
+
+                # Get the KV cache for this layer
+                key_cache, value_cache = self._get_kv_cache_for_layer(layer_idx, current_pos)
             else:
-                kv_cache = getattr(self, f"kv_cache_{group_idx}")
+                # Legacy unified cache path
+                group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
 
-            key_idx = layer_in_group_idx
-            value_idx = layer_in_group_idx + layers_per_group
+                # Get the combined KV cache for this group
+                if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
+                    kv_cache = getattr(self, "kv_cache_0")
+                else:
+                    kv_cache = getattr(self, f"kv_cache_{group_idx}")
 
-            if seq_len == 1:
-                # Single token storage
-                pos = current_pos            
-                kv_cache[key_idx:key_idx + 1, :, pos:pos + 1, :] = key_states
-                kv_cache[value_idx:value_idx + 1, :, pos:pos + 1, :] = value_states
+                key_idx = layer_in_group_idx
+                value_idx = layer_in_group_idx + layers_per_group
+
+                if seq_len == 1:
+                    # Single token storage - direct indexing
+                    pos = current_pos
+                    kv_cache[key_idx:key_idx + 1, :, pos:pos + 1, :] = key_states
+                    kv_cache[value_idx:value_idx + 1, :, pos:pos + 1, :] = value_states
+                else:
+                    # Multi-token storage (prefill) - direct indexing
+                    pos = current_pos.item() if isinstance(current_pos, torch.Tensor) else current_pos
+                    end = min(pos + seq_len, self.config.state_length)
+                    kv_cache[key_idx:key_idx + 1, :, pos:end, :] = key_states[:, :end-pos, :]
+                    kv_cache[value_idx:value_idx + 1, :, pos:end, :] = value_states[:, :end-pos, :]
+
+                # Get the key and value states for this layer from the merged cache
+                key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+                value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+
+            # Determine cache length for causal mask based on cache type
+            if use_split_cache:
+                if self.config.layer_types[layer_idx] == "full_attention":
+                    cache_len = self.config.state_length
+                else:
+                    cache_len = self.config.sliding_window
             else:
-                # Multi-token storage (like prefill)
-                pos = current_pos.item() if isinstance(current_pos, torch.Tensor) else current_pos
-                # Store the key and value states in the cache with bounds checking
-                end = min(pos + seq_len, self.config.state_length)
-                kv_cache[key_idx:key_idx + 1, :, pos:end, :] = key_states[:, :end-pos, :]
-                kv_cache[value_idx:value_idx + 1, :, pos:end, :] = value_states[:, :end-pos, :]
-
-            
-            # Get the key and value states for this layer from the merged cache
-            key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
-            value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+                cache_len = self.config.state_length
 
             # Run attention with the updated KV cache
             if seq_len == 1:
@@ -864,16 +1264,15 @@ class Gemma3Model(nn.Module):
                 )
             else:
                 # For multi-token sequences, adjust causal mask to match cache dimensions
-                cache_len = self.config.state_length
                 adjusted_causal_mask = torch.zeros((1, 1, seq_len, cache_len), dtype=MODEL_DTYPE, device=TEST_DEVICE)
-                
+
                 # Apply causal mask only to the positions we're using (pos:pos+seq_len)
                 pos = current_pos.item() if isinstance(current_pos, torch.Tensor) else current_pos
                 for i in range(seq_len):
                     for j in range(pos + i + 1, pos + seq_len):
                         if j < cache_len:  # Make sure we don't go out of bounds
                             adjusted_causal_mask[0, 0, i, j] = float('-inf')
-                
+
                 attn_output = layer.self_attn.forward_prefill(
                     hidden_states=normalized_states,
                     query_states=query_states,

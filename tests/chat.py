@@ -960,6 +960,8 @@ def parse_args():
                 # Set other parameters
                 if args.context_length is None:
                     args.context_length = int(params['context_length'])
+                # state_length for split cache models (defaults to context_length if not specified)
+                args.state_length = int(params.get('state_length', args.context_length))
                 if args.batch_size is None:
                     args.batch_size = int(params['batch_size'])
                 args.num_chunks = 1  # Monolithic has no chunks
@@ -985,6 +987,7 @@ def parse_args():
                     print(f"\nLoaded MONOLITHIC model from {args.meta}:")
                     print(f"  Model: {args.monolithic_model}")
                     print(f"  Context Length: {args.context_length}")
+                    print(f"  State Length: {args.state_length}")
                     print(f"  Batch Size: {args.batch_size}")
                     print(f"  Split LM Head: {args.split_lm_head}")
                     print(f"  Argmax in Model: {args.argmax_in_model}")
@@ -1071,7 +1074,7 @@ def parse_args():
 
 
 def load_monolithic_model(args, metadata):
-    """Load monolithic model with infer and prefill functions."""
+    """Load monolithic model with infer, infer_rotate, and prefill functions."""
     if not args.eval:
         print("\nLoading monolithic model...")
 
@@ -1086,17 +1089,25 @@ def load_monolithic_model(args, metadata):
     if not args.eval:
         print(f"Loading from: {model_path}")
 
-    # Load both infer and prefill functions
+    # Load all functions
     infer_model = load_model(model_path, function_name='infer', compute_unit=compute_unit)
     prefill_model = load_model(model_path, function_name='prefill', compute_unit=compute_unit)
 
-    if not args.eval:
-        print("Monolithic model loaded successfully (infer + prefill functions)")
+    # Try to load infer_rotate (optional, for models with split cache rotation)
+    infer_rotate_model = None
+    try:
+        infer_rotate_model = load_model(model_path, function_name='infer_rotate', compute_unit=compute_unit)
+        if not args.eval:
+            print("Monolithic model loaded successfully (infer + infer_rotate + prefill functions)")
+    except Exception:
+        if not args.eval:
+            print("Monolithic model loaded successfully (infer + prefill functions)")
+            print("  Note: infer_rotate not available - using infer for all positions")
 
     # Extract metadata from model
     metadata = load_metadata(infer_model, args)
 
-    return infer_model, prefill_model, metadata
+    return infer_model, infer_rotate_model, prefill_model, metadata
 
 
 def run_monolithic_prefill(model, input_ids, context_pos, context_length, batch_size, state, causal_mask):
@@ -1237,13 +1248,35 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
 
 def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state, causal_mask=None,
                          auto_prompt=None, warmup=False, save_file=None, max_tokens=None,
-                         no_template=False, eval_mode=False):
-    """Chat loop for monolithic models."""
+                         no_template=False, eval_mode=False, infer_rotate_model=None):
+    """Chat loop for monolithic models.
+
+    Args:
+        infer_model: Model for single-token inference (fill mode, pos < sliding_window)
+        prefill_model: Model for batch prefill
+        tokenizer: Tokenizer
+        metadata: Model metadata dict
+        state: CoreML state object
+        causal_mask: Causal mask tensor
+        auto_prompt: Optional auto-prompt string
+        warmup: If True, skip output
+        save_file: Optional file to save conversation
+        max_tokens: Maximum tokens to generate
+        no_template: If True, don't use chat template
+        eval_mode: If True, minimal output for evaluation
+        infer_rotate_model: Optional model for single-token inference with cache rotation
+                           (rotation mode, pos >= sliding_window). If None, uses infer_model.
+    """
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
+    sliding_window = metadata.get('sliding_window', 512)  # For switching between infer modes
 
     if not warmup and not eval_mode:
         print(f"\nUsing context length: {context_length}")
+        if infer_rotate_model is not None:
+            print(f"Cache rotation: ENABLED (infer_rotate function available)")
+        else:
+            print(f"Cache rotation: NOT AVAILABLE (using infer for all positions)")
         print("\nStarting chat session. Press Ctrl+D to exit.")
 
     # Check chat template
@@ -1314,8 +1347,16 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                 inference_tokens = 0
 
                 while pos < context_length - 1:
+                    # Select the appropriate model based on position:
+                    # - pos < sliding_window: use infer_model (fill mode)
+                    # - pos >= sliding_window: use infer_rotate_model (rotation mode) if available
+                    if pos >= sliding_window and infer_rotate_model is not None:
+                        current_infer_model = infer_rotate_model
+                    else:
+                        current_infer_model = infer_model
+
                     next_token = generate_next_token_monolithic(
-                        infer_model, input_ids, pos, context_length, metadata, state, causal_mask
+                        current_infer_model, input_ids, pos, context_length, metadata, state, causal_mask
                     )
 
                     if pos < input_ids.size(1):
@@ -1427,18 +1468,20 @@ def main():
         # Branch based on model type
         if getattr(args, 'is_monolithic', False):
             # MONOLITHIC MODEL PATH
-            infer_model, prefill_model, metadata = load_monolithic_model(args, metadata)
+            infer_model, infer_rotate_model, prefill_model, metadata = load_monolithic_model(args, metadata)
 
             # Override context length from command line if provided
             if args.context_length is not None:
                 metadata['context_length'] = args.context_length
-                metadata['state_length'] = args.context_length
+            # Use state_length from args (parsed from YAML) or default to context_length
+            metadata['state_length'] = getattr(args, 'state_length', metadata['context_length'])
 
             # Set metadata values
             metadata['batch_size'] = getattr(args, 'batch_size', 64)
             metadata['split_lm_head'] = getattr(args, 'split_lm_head', 16)
             metadata['argmax_in_model'] = getattr(args, 'argmax_in_model', False)
             metadata['debug_argmax'] = getattr(args, 'debug_argmax', False)
+            metadata['sliding_window'] = 512  # Local attention window for Gemma3
 
             if not args.eval:
                 print(f"\nMonolithic metadata: {metadata}")
@@ -1448,14 +1491,15 @@ def main():
             if not args.eval:
                 print("\nCreated unified transformer state for monolithic model")
 
-            # Initialize causal mask
-            causal_mask = initialize_causal_mask(metadata['context_length'], args.eval)
+            # Initialize causal mask - use state_length for split cache models
+            causal_mask = initialize_causal_mask(metadata['state_length'], args.eval)
 
             # Warmup runs
             if not args.nw and not args.eval:
                 for _ in range(2):
                     chat_loop_monolithic(
                         infer_model=infer_model,
+                        infer_rotate_model=infer_rotate_model,
                         prefill_model=prefill_model,
                         tokenizer=tokenizer,
                         metadata=metadata,
@@ -1470,6 +1514,7 @@ def main():
             # Main run
             chat_loop_monolithic(
                 infer_model=infer_model,
+                infer_rotate_model=infer_rotate_model,
                 prefill_model=prefill_model,
                 tokenizer=tokenizer,
                 metadata=metadata,

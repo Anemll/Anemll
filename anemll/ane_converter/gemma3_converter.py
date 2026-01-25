@@ -31,6 +31,7 @@ from ..models.gemma3_model import (
     MODEL_DTYPE,
     TEST_DEVICE,
     CONTEXT_LENGTH,
+    ENABLE_SPLIT_CACHE,
 )
 
 
@@ -48,6 +49,7 @@ class Gemma3Converter(BaseConverter):
         per_channel: int = 8,
         num_chunks: int = 1,
         argmax_in_model: bool = False,
+        attention_size: int | None = None,
     ) -> None:
         super().__init__(model)
         self.context_length = context_length
@@ -60,6 +62,9 @@ class Gemma3Converter(BaseConverter):
         self.converted_model = None
         self.num_chunks = num_chunks
         self.argmax_in_model = argmax_in_model
+        # attention_size controls the attention computation span
+        # If None, uses model's default. Smaller values = faster inference
+        self.attention_size = attention_size if attention_size is not None else model.model.config.sliding_window
 
     def load_weights_from_hf(self, hf_model_path: str) -> bool:
         """Load weights from Hugging Face model and transform them for ANEMLL.
@@ -262,37 +267,89 @@ class Gemma3Converter(BaseConverter):
 
     @staticmethod
     def GetTransformerStates(model, part=None, prefix="model.model."):
-        """Get the transformer states for CoreML conversion"""
+        """Get the transformer states for CoreML conversion.
+
+        For split cache mode (Gemma3 local/global attention):
+        - Returns TWO state tensors: kv_cache_local and kv_cache_global
+        - kv_cache_local: For sliding window layers (15 layers), size = sliding_window
+        - kv_cache_global: For full attention layers (3 layers), size = state_length
+
+        For unified cache mode (legacy):
+        - Returns ONE state tensor: kv_cache_0
+        """
         head_dim = getattr(
             model.config,
             "head_dim",
             model.config.hidden_size // model.config.num_attention_heads,
         )
-        num_layers = (
-            model.config.num_hidden_layers
-        )  # Get total number of layers from config
 
-        # For unified cache
-        num_layers_this_part = num_layers * 2
-        print(
-            f"GetTransformerStates part={part} num_layers_this_part={num_layers_this_part} model.config.num_hidden_layers={model.config.num_hidden_layers}"
-        )
-        print(f"Using head_dim={head_dim} from config")
+        # Check if split cache is enabled
+        use_split_cache = getattr(model.config, 'use_split_cache', True)
 
-        states = [
-            ct.StateType(
-                wrapped_type=ct.TensorType(
-                    shape=(
-                        num_layers_this_part,
-                        model.config.num_key_value_heads,
-                        model.config.state_length,
-                        head_dim,
+        if use_split_cache:
+            # Split cache mode for Gemma3 local/global attention
+            # Count layers by type
+            num_global_layers = sum(1 for t in model.config.layer_types
+                                   if t == "full_attention")
+            num_local_layers = model.config.num_hidden_layers - num_global_layers
+
+            sliding_window = model.config.sliding_window  # 512
+
+            print(f"GetTransformerStates: SPLIT CACHE mode")
+            print(f"  {num_local_layers} local layers -> kv_cache_local [{2*num_local_layers}, {model.config.num_key_value_heads}, {sliding_window}, {head_dim}]")
+            print(f"  {num_global_layers} global layers -> kv_cache_global [{2*num_global_layers}, {model.config.num_key_value_heads}, {model.config.state_length}, {head_dim}]")
+
+            states = [
+                # Local cache for sliding window layers
+                ct.StateType(
+                    wrapped_type=ct.TensorType(
+                        shape=(
+                            2 * num_local_layers,  # K and V for local layers
+                            model.config.num_key_value_heads,
+                            sliding_window,  # 512 positions
+                            head_dim,
+                        ),
+                        dtype=np.float16,
                     ),
-                    dtype=np.float16,
+                    name=f"{prefix}kv_cache_local",
                 ),
-                name=f"{prefix}kv_cache_0",  # Only one group for unified cache
+                # Global cache for full attention layers
+                ct.StateType(
+                    wrapped_type=ct.TensorType(
+                        shape=(
+                            2 * num_global_layers,  # K and V for global layers
+                            model.config.num_key_value_heads,
+                            model.config.state_length,  # Full context length
+                            head_dim,
+                        ),
+                        dtype=np.float16,
+                    ),
+                    name=f"{prefix}kv_cache_global",
+                ),
+            ]
+        else:
+            # Legacy unified cache mode
+            num_layers = model.config.num_hidden_layers
+            num_layers_this_part = num_layers * 2
+            print(
+                f"GetTransformerStates part={part} num_layers_this_part={num_layers_this_part} model.config.num_hidden_layers={model.config.num_hidden_layers}"
             )
-        ]
+            print(f"Using head_dim={head_dim} from config")
+
+            states = [
+                ct.StateType(
+                    wrapped_type=ct.TensorType(
+                        shape=(
+                            num_layers_this_part,
+                            model.config.num_key_value_heads,
+                            model.config.state_length,
+                            head_dim,
+                        ),
+                        dtype=np.float16,
+                    ),
+                    name=f"{prefix}kv_cache_0",  # Only one group for unified cache
+                )
+            ]
         return states
 
     def postprocess(self, num_workers=None):
@@ -386,8 +443,11 @@ class Gemma3Converter(BaseConverter):
             print("Converting LM head...")
             mlmodel = self.convert_part_3(self.model)
         elif part == "monolithic":
-            print("Converting monolithic model (infer)...")
-            mlmodel = self.convert_monolithic(self.model, is_prefill=False, argmax_in_model=self.argmax_in_model)
+            print("Converting monolithic model (infer - fill mode)...")
+            mlmodel = self.convert_monolithic(self.model, is_prefill=False, argmax_in_model=self.argmax_in_model, force_rotation=False)
+        elif part == "monolithic_rotate":
+            print("Converting monolithic model (infer_rotate - rotation mode)...")
+            mlmodel = self.convert_monolithic(self.model, is_prefill=False, argmax_in_model=self.argmax_in_model, force_rotation=True)
         elif part == "monolithic_prefill":
             print("Converting monolithic model (prefill)...")
             mlmodel = self.convert_monolithic(self.model, is_prefill=True, argmax_in_model=self.argmax_in_model)
@@ -441,8 +501,8 @@ class Gemma3Converter(BaseConverter):
             (1,), dtype=torch.int32, device=TEST_DEVICE
         )  # [1] - single position
         sample_causal_mask = torch.zeros(
-            (1, 1, 1, self.context_length), dtype=torch.float16, device=TEST_DEVICE
-        )  # [1, 1, 1, context_length]
+            (1, 1, 1, self.attention_size), dtype=torch.float16, device=TEST_DEVICE
+        )  # [1, 1, 1, attention_size] - smaller window = faster attention
         sample_current_pos = torch.zeros(
             (1,), dtype=torch.int32, device=TEST_DEVICE
         )  # [1] - current position
@@ -526,7 +586,7 @@ class Gemma3Converter(BaseConverter):
 
     def convert_monolithic(
         self, model: Gemma3ForCausalLM, is_prefill: bool = False,
-        argmax_in_model: bool = False
+        argmax_in_model: bool = False, force_rotation: bool = None
     ) -> ct.models.MLModel:
         """Convert full model (embeddings + FFN + LM head) to a single CoreML model.
 
@@ -537,13 +597,27 @@ class Gemma3Converter(BaseConverter):
             argmax_in_model: If True, compute argmax per LM head chunk inside the model.
                             Outputs argmax_idx[16] and argmax_val[16] instead of 16 logits tensors.
                             This reduces output from 262K values to 32 values (2 tensors).
+            force_rotation: Controls local cache update behavior during tracing:
+                           None - use conditional (NOT recommended for CoreML, leads to incomplete tracing)
+                           False - always use fill mode (for infer function, positions < sliding_window)
+                           True - always use rotate mode (for infer_rotate function, positions >= sliding_window)
 
         Returns:
             ct.models.MLModel: Monolithic CoreML model
         """
         require_coreml()
-        mode_str = "prefill" if is_prefill else "inference"
-        print(f"\nConverting monolithic model for {mode_str} mode...")
+        if is_prefill:
+            mode_str = "prefill"
+        elif force_rotation:
+            mode_str = "infer_rotate (cache rotation enabled)"
+        else:
+            mode_str = "infer (cache fill mode)"
+        print(f"\nConverting monolithic model for {mode_str}...")
+
+        # Set force_rotation_mode on model config before tracing
+        if force_rotation is not None:
+            model.model.config.force_rotation_mode = force_rotation
+            print(f"  force_rotation_mode = {force_rotation}")
 
         class MonolithicWrapper(torch.nn.Module):
             """Wrapper combining embeddings + transformer + LM head."""
@@ -639,15 +713,15 @@ class Gemma3Converter(BaseConverter):
                         # logits shape: [1, 1, chunk_size] for inference mode
                         # Get argmax index within chunk (0 to chunk_size-1)
                         chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)  # [1, 1, 1], int64
-                        # Cast to int16 for ANE compatibility (ANE doesn't support int32 argmax)
-                        # Local indices 0-16383 fit in int16 (max 32767)
-                        local_idx = chunk_argmax.to(torch.int16)  # [1, 1, 1]
+                        # Cast to int32 for CoreML compatibility (int16 not supported for outputs)
+                        # Local indices 0-16383 fit easily in int32
+                        local_idx = chunk_argmax.to(torch.int32)  # [1, 1, 1]
                         # Get max value
                         max_val = torch.max(logits, dim=-1, keepdim=True).values  # [1, 1, 1]
                         all_idx.append(local_idx)
                         all_val.append(max_val)
                     # Concatenate along last dim: [1, 1, num_chunks], then squeeze to [num_chunks]
-                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], int16 (LOCAL indices)
+                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], int32 (LOCAL indices)
                     argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], fp16
                     return (argmax_idx, argmax_val)
                 else:
@@ -662,6 +736,20 @@ class Gemma3Converter(BaseConverter):
         argmax_str = ", argmax_in_model=True" if argmax_in_model else ""
         print(f"Monolithic wrapper created (LM head mode: {wrapper.lm_head_mode}{argmax_str})")
 
+        # Determine mask size based on cache mode
+        # For split cache: mask sized to state_length (global cache), local layers slice to sliding_window
+        # For unified cache: mask sized to attention_size
+        use_split_cache = getattr(model.model.config, 'use_split_cache', ENABLE_SPLIT_CACHE)
+        if use_split_cache:
+            # For split cache, mask must cover global attention (state_length)
+            mask_size = model.model.config.state_length
+            print(f"Split cache mode: mask size = {mask_size} (global cache size)")
+            print(f"  Local cache: {model.model.config.sliding_window} (sliding window)")
+            print(f"  Global cache: {model.model.config.state_length} (full context)")
+        else:
+            mask_size = self.attention_size
+            print(f"Unified cache mode: mask size = {mask_size}")
+
         # Prepare inputs based on mode
         if is_prefill:
             sample_input_ids = torch.zeros(
@@ -671,7 +759,7 @@ class Gemma3Converter(BaseConverter):
                 (self.batch_size,), dtype=torch.int32, device=TEST_DEVICE
             )
             sample_causal_mask = torch.zeros(
-                (1, 1, self.batch_size, self.context_length),
+                (1, 1, self.batch_size, mask_size),
                 dtype=torch.float16,
                 device=TEST_DEVICE,
             )
@@ -683,7 +771,7 @@ class Gemma3Converter(BaseConverter):
                 (1,), dtype=torch.int32, device=TEST_DEVICE
             )
             sample_causal_mask = torch.zeros(
-                (1, 1, 1, self.context_length),
+                (1, 1, 1, mask_size),
                 dtype=torch.float16,
                 device=TEST_DEVICE,
             )
@@ -723,12 +811,12 @@ class Gemma3Converter(BaseConverter):
         if argmax_in_model:
             # Output 2 tensors: argmax_idx[num_chunks] and argmax_val[num_chunks]
             # Note: shape is inferred automatically by coremltools
-            # Using int16 for ANE compatibility - ANE doesn't support int32 for argmax
+            # Using int32 for CoreML compatibility (int16 is not supported for outputs)
             outputs = [
-                ct.TensorType(name="argmax_idx", dtype=np.int16),
+                ct.TensorType(name="argmax_idx", dtype=np.int32),
                 ct.TensorType(name="argmax_val", dtype=np.float16)
             ]
-            print(f"Outputs: argmax_idx[{num_chunks}] (int16) + argmax_val[{num_chunks}] (fp16) - reduced from {num_chunks * wrapper.chunk_size} logits")
+            print(f"Outputs: argmax_idx[{num_chunks}] (int32) + argmax_val[{num_chunks}] (fp16) - reduced from {num_chunks * wrapper.chunk_size} logits")
         else:
             # Original logits outputs
             if num_chunks == 1:
@@ -928,8 +1016,9 @@ class Gemma3Converter(BaseConverter):
             (1, 1, model.config.hidden_size), dtype=torch.float16, device=TEST_DEVICE
         )
         position_ids = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
+        # Use attention_size for mask size
         causal_mask = torch.zeros(
-            (1, 1, 1, self.context_length), dtype=torch.float16, device=TEST_DEVICE
+            (1, 1, 1, self.attention_size), dtype=torch.float16, device=TEST_DEVICE
         )
         current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
 
@@ -1032,8 +1121,9 @@ class Gemma3Converter(BaseConverter):
         position_ids = torch.zeros(
             (self.batch_size,), dtype=torch.int32, device=TEST_DEVICE
         )
+        # Use attention_size for prefill mask size
         causal_mask = torch.zeros(
-            (1, 1, self.batch_size, self.context_length),
+            (1, 1, self.batch_size, self.attention_size),
             dtype=torch.float16,
             device=TEST_DEVICE,
         )
@@ -1132,10 +1222,10 @@ class Gemma3Converter(BaseConverter):
             (self.batch_size,), dtype=torch.int32, device=TEST_DEVICE
         )  # [batch_size]
         sample_causal_mask = torch.zeros(
-            (1, 1, self.batch_size, self.context_length),
+            (1, 1, self.batch_size, self.attention_size),
             dtype=torch.float16,
             device=TEST_DEVICE,
-        )  # [1, 1, batch_size, context_length]
+        )  # [1, 1, batch_size, attention_size] - smaller = faster attention
         sample_current_pos = torch.zeros(
             (1,), dtype=torch.int32, device=TEST_DEVICE
         )  # [1] - current position
@@ -1304,6 +1394,13 @@ def parse_args() -> argparse.Namespace:
         help="Maximum context length",
     )
     parser.add_argument(
+        "--state-length",
+        type=int,
+        default=None,
+        help="KV cache size for global attention layers. If not specified, uses context_length. "
+             "For split cache, this controls the size of the global cache buffer.",
+    )
+    parser.add_argument(
         "--lut",
         type=int,
         default=None,
@@ -1318,7 +1415,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--part",
         type=str,
-        choices=["1", "2", "2_prefill", "3", "all", "full", "prefill", "embeddings", "monolithic", "monolithic_prefill"],
+        choices=["1", "2", "2_prefill", "3", "all", "full", "prefill", "embeddings", "monolithic", "monolithic_rotate", "monolithic_prefill"],
         default="all",
         help="Model part to convert",
     )
@@ -1334,6 +1431,24 @@ def parse_args() -> argparse.Namespace:
         help="Compute argmax inside model for monolithic conversion. "
              "Outputs (argmax_idx, argmax_val) pairs instead of full logits.",
     )
+    parser.add_argument(
+        "--attention-size",
+        type=int,
+        default=None,
+        help="Attention computation size (default: context_length). "
+             "Controls KV cache size and causal mask dimension. "
+             "Smaller values = smaller attention matrix = faster inference.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip ANE minimum state size check (256). Use for testing smaller KV cache sizes.",
+    )
+    parser.add_argument(
+        "--decorate",
+        action="store_true",
+        help="Add CTX and ATT values to output filename (e.g., gemma3_monolithic_CTX512_ATT64.mlpackage)",
+    )
 
     return parser.parse_args()
 
@@ -1343,12 +1458,16 @@ def test_conversion(
     model_path: Optional[str] = None,
     prefix: str = "gemma3",
     context_length: int = CONTEXT_LENGTH,
+    state_length: Optional[int] = None,
     lut_bits: Optional[int] = None,
     batch_size: int = 64,
     output_dir: str = ".",
     part: str = "full",
     num_chunks: int = 1,
     argmax_in_model: bool = False,
+    attention_size: Optional[int] = None,
+    force: bool = False,
+    decorate: bool = False,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
     """Convert a Gemma3 model and save the result.
 
@@ -1357,12 +1476,59 @@ def test_conversion(
         model_path: Path to model directory
         prefix: Model name prefix
         context_length: Context length for conversion
+        state_length: KV cache size for global attention layers (default: context_length).
+                      For split cache, this controls the size of the global cache buffer.
         lut_bits: LUT quantization bits
         batch_size: Batch size for conversion
         output_dir: Output directory
         part: Part to convert ("full" or "prefill")
         argmax_in_model: If True, compute argmax inside model for monolithic conversion
+        attention_size: Attention computation window size (default: context_length).
+                          Controls how many KV positions each token attends to.
     """
+    # Early validation: Check output directory can be created/accessed
+    # This prevents wasting time on conversion only to fail at save time
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        # Test write access by creating a temporary file
+        test_file = os.path.join(output_dir, ".write_test")
+        with open(test_file, "w") as f:
+            f.write("test")
+        os.remove(test_file)
+        print(f"Output directory validated: {output_dir}")
+    except PermissionError:
+        raise RuntimeError(
+            f"Permission denied: Cannot write to output directory '{output_dir}'. "
+            f"Please check permissions or choose a different location."
+        )
+    except OSError as e:
+        raise RuntimeError(
+            f"Cannot create/access output directory '{output_dir}': {e}. "
+            f"Please ensure the path is valid and the parent directory exists."
+        )
+
+    # Validate minimum state size for ANE
+    # ANE requires minimum context_length (KV cache/state size) of 256
+    # attention_size only controls causal mask dimension (can be smaller)
+    MIN_ANE_STATE_SIZE = 256
+    if context_length < MIN_ANE_STATE_SIZE:
+        if force:
+            print(f"WARNING: context_length={context_length} is below ANE minimum of {MIN_ANE_STATE_SIZE}. "
+                  f"Using --force to override. Model may not run on ANE.")
+        else:
+            raise ValueError(
+                f"ANE requires minimum context_length (state size) of {MIN_ANE_STATE_SIZE}. "
+                f"Got context_length={context_length}. "
+                f"Use --context-length >= {MIN_ANE_STATE_SIZE}, or --force to override."
+            )
+
+    # attention_size must be <= context_length
+    if attention_size is not None and attention_size > context_length:
+        raise ValueError(
+            f"attention_size ({attention_size}) cannot exceed context_length ({context_length}). "
+            f"attention_size controls how many KV positions to attend to."
+        )
+
     print(
         f"test_conversion called with model_path={model_path}, prefix={prefix}, part={part}"
     )
@@ -1384,10 +1550,15 @@ def test_conversion(
 
         # Update config to match conversion parameters
         config.context_length = context_length
-        # Align cache length to conversion context for test inputs.
-        config.state_length = context_length
+        # state_length controls global KV cache size (for split cache: global attention layers)
+        # If not specified, defaults to context_length
+        config.state_length = state_length if state_length is not None else context_length
+        # Set attention_size for ANE optimization (separate from Gemma3's sliding_window)
+        # sliding_window stays unchanged - it's Gemma3's architectural feature
+        # attention_size controls causal_mask dimension only (can be smaller than state_length)
+        config.attention_size = attention_size if attention_size is not None else context_length
         print(
-            f"Updated config: context_length={config.context_length}, state_length={config.state_length}"
+            f"Updated config: context_length={config.context_length}, state_length={config.state_length}, attention_size={config.attention_size}, sliding_window={config.sliding_window}"
         )
 
         print("Creating model...")
@@ -1410,6 +1581,7 @@ def test_conversion(
         lut_bits=lut_bits,
         num_chunks=num_chunks,
         argmax_in_model=argmax_in_model,
+        attention_size=attention_size,
     )
 
     print("Starting conversion...")
@@ -1424,6 +1596,7 @@ def test_conversion(
     else:
         models = [mlmodel]
 
+    effective_attention_size = attention_size if attention_size is not None else context_length
     for i, m in enumerate(models):
         AddMetadata(
             m,
@@ -1436,6 +1609,7 @@ def test_conversion(
                 "split_part": (
                     ModelPart.FULL.value if part in ["full", "all", "123"] else part
                 ),
+                "attention_size": effective_attention_size,
             },
         )
         fname = f"{prefix}"
@@ -1445,8 +1619,28 @@ def test_conversion(
             fname += "_lm_head"
         elif part == "monolithic":
             fname += "_monolithic"
+            if decorate:
+                att_size = attention_size if attention_size is not None else context_length
+                if lut_bits is not None:
+                    fname += f"_LUT{lut_bits}_CTX{context_length}_ATT{att_size}"
+                else:
+                    fname += f"_FP16_CTX{context_length}_ATT{att_size}"
+        elif part == "monolithic_rotate":
+            fname += "_monolithic_rotate"
+            if decorate:
+                att_size = attention_size if attention_size is not None else context_length
+                if lut_bits is not None:
+                    fname += f"_LUT{lut_bits}_CTX{context_length}_ATT{att_size}"
+                else:
+                    fname += f"_FP16_CTX{context_length}_ATT{att_size}"
         elif part == "monolithic_prefill":
             fname += "_monolithic_prefill"
+            if decorate:
+                att_size = attention_size if attention_size is not None else context_length
+                if lut_bits is not None:
+                    fname += f"_LUT{lut_bits}_CTX{context_length}_ATT{att_size}"
+                else:
+                    fname += f"_FP16_CTX{context_length}_ATT{att_size}"
         elif part in ["2", "2_prefill"]:
             base = "FFN" if part == "2" else "prefill"
             fname += f"_{base}"
@@ -1456,7 +1650,8 @@ def test_conversion(
         if part in ["full", "all", "123"]:
             fname += ""
         if part not in ["2", "2_prefill"]:
-            if lut_bits is not None:
+            # Skip lut suffix if already included in decoration
+            if lut_bits is not None and not (decorate and part in ["monolithic", "monolithic_prefill"]):
                 fname += f"_lut{lut_bits}"
             fname += ".mlpackage"
         else:
@@ -1495,12 +1690,16 @@ def main() -> None:
             model_path=model_path,
             prefix=args.prefix,
             context_length=args.context_length,
+            state_length=args.state_length,
             lut_bits=args.lut,
             batch_size=args.batch_size,
             output_dir=args.output,
             part=part,
             num_chunks=args.chunk or 1,
             argmax_in_model=args.argmax,
+            attention_size=args.attention_size,
+            force=args.force,
+            decorate=args.decorate,
         )
         print(f"Conversion completed successfully! Result: {type(result)}")
     except Exception as e:  # pragma: no cover - CLI tool
