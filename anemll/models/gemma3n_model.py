@@ -42,28 +42,33 @@ MODEL_DTYPE = torch.float16
 def create_rotary_cache(head_dim, seq_len, theta=1000000.0, device=None, dtype=None, batch_size=1):
     """
     Create rotary position embeddings cache as per HF Gemma3n.
-    
+
     This implementation was cross-referenced with the canonical JAX implementation
     at gemma/gemma/gm/math/_positional_embeddings.py and found to be mathematically
     equivalent. The core logic for calculating inverse frequencies and applying
     them to position IDs is identical.
     """
-    # HF calculates inv_freq for head_dim // 2
+    # HF calculates inv_freq for head_dim // 2 (compute in float32 for precision)
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
-    
+
     position_ids = torch.arange(seq_len, device=device, dtype=torch.int32).float()
-    
+
     # Expand inv_freq and position_ids for broadcasting
     inv_freq_expanded = inv_freq[None, :, None] # [1, head_dim // 2, 1]
     position_ids_expanded = position_ids[None, None, :].expand(batch_size, 1, -1) # [batch_size, 1, seq_len]
 
     freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2) # [batch_size, seq_len, head_dim // 2]
     emb = torch.cat((freqs, freqs), dim=-1) # [batch_size, seq_len, head_dim]
-    
+
     # CRITICAL FIX: Do NOT apply attention scaling to position embeddings (HF doesn't do this)
     cos = emb.cos()
     sin = emb.sin()
-    
+
+    # Cast to requested dtype for ANE compatibility
+    if dtype is not None:
+        cos = cos.to(dtype)
+        sin = sin.to(dtype)
+
     return cos, sin
 
 def apply_rotary_pos_emb(q, k, cos, sin):
@@ -219,6 +224,16 @@ class Gemma3nConfig:
 
 
 class Gemma3nRMSNorm(nn.Module):
+    """ANE-optimized RMSNorm for Gemma3n models.
+
+    Uses the doubled-tensor trick from LLaMA/Qwen implementations:
+    concat([x, -x]) creates a tensor with mean=0, so LayerNorm's mean
+    subtraction becomes a no-op and we recover true RMSNorm statistics:
+        concat([x, -x]) → μ = 0, σ² = mean(x²)
+
+    This gives us the best quality for ANE execution while maintaining
+    mathematical equivalence to standard RMSNorm.
+    """
     def __init__(self, dims: int, eps: float = 1e-6, with_scale: bool = True):
         super().__init__()
         self.eps = eps
@@ -232,19 +247,35 @@ class Gemma3nRMSNorm(nn.Module):
             self.register_buffer("weight", torch.ones(dims), persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # ANE-compatible path: subtract mean then use layer_norm.
+        # ─────────────────────────────────────────────────────────────────────
+        # ANE-optimized RMSNorm using the doubled-tensor trick
+        # We build a tensor whose mean is *exactly* zero so that LayerNorm's
+        # mean-subtraction becomes a no-op and we recover RMS statistics:
+        #     concat([x, -x]) → μ = 0, σ² = mean(x²)
+        # ─────────────────────────────────────────────────────────────────────
         input_dtype = hidden_states.dtype
-        hidden_states_fp32 = hidden_states.float()
-        mean = hidden_states_fp32.mean(-1, keepdim=True)
-        hidden_states_fp32 = hidden_states_fp32 - mean
+        x = hidden_states
+        hidden_size = x.shape[-1]
+
+        # ❶ Make the last-dimension mean zero.
+        doubled = torch.cat([x, -x], dim=-1)
+
+        # ❷ Run the highly-optimized LayerNorm kernel on the doubled tensor.
         normed = F.layer_norm(
-            hidden_states_fp32,
-            self.weight.shape,
-            self.weight.to(hidden_states_fp32.dtype, copy=False) if self.with_scale else None,
+            doubled,
+            normalized_shape=(2 * hidden_size,),
+            weight=None,          # no affine factors here
             bias=None,
-            eps=float(self.eps),
+            eps=float(self.eps)
         )
-        return normed.to(input_dtype)
+
+        # ❸ Drop the mirror half → correct RMS-normed activations.
+        normed = normed[..., :hidden_size]
+
+        # ❹ Apply the learnable gain (γ) and cast / move exactly once.
+        return (normed * self.weight
+                       .to(normed.dtype, copy=False)
+                       .to(normed.device, copy=False)).to(input_dtype)
 
 
 def create_sliding_window_causal_mask(seq_len, sliding_window, device, dtype=torch.float32):
@@ -675,19 +706,15 @@ class Gemma3nTextAttention(nn.Module):
         # Gemma3n uses scaling=1.0 (no attention scaling) because QKV are normalized
         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
 
-        # Apply causal mask - this handles position-based masking
-        # The mask should have -inf for positions > current_pos
-        # Always use tensor operations - no branching for ANE compatibility
+        # Apply causal mask - for single-token inference, expect pre-sliced mask
+        # The caller provides a [B, 1, 1, seq_len] mask with the correct position row
+        # This avoids gather() which doesn't trace correctly to CoreML
         if causal_mask is not None:
-            # Get position as tensor for dynamic indexing
-            pos_idx = current_pos.long().view(1, 1, 1, 1)
-
-            # Gather the mask row for current position
-            # causal_mask shape: [B, 1, seq_len, seq_len]
-            # We want: [B, 1, 1, seq_len] for the current position row
-            mask_row_idx = pos_idx.expand(causal_mask.shape[0], 1, 1, causal_mask.shape[3])
-            mask_slice = causal_mask.gather(2, mask_row_idx)  # [B, 1, 1, seq_len]
-            attn_weights = attn_weights + mask_slice.to(query_states.dtype)
+            # causal_mask should be [B, 1, 1, seq_len] pre-sliced for current position
+            # Just add it directly - no gather needed
+            q_seq_len = query_states.shape[-2]
+            k_seq_len = key_states.shape[-2]
+            attn_weights = attn_weights + causal_mask.to(query_states.dtype)[:, :, :q_seq_len, :k_seq_len]
 
         # NOTE: Gemma3n does NOT use attention softcapping (HF uses softcap=None)
 
@@ -722,17 +749,12 @@ class Gemma3nTextAttention(nn.Module):
         # Gemma3n uses scaling=1.0 (no attention scaling) because QKV are normalized
         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
 
-        # Apply causal mask with dynamic position indexing
-        # Always use tensor operations - no branching for ANE compatibility
+        # Apply causal mask - use simple slicing to avoid tracing issues
+        # For prefill, the mask should be pre-positioned or use [:,:,:q_len,:k_len] slicing
         if causal_mask is not None:
-            pos_idx = current_pos.long().view(1, 1, 1, 1)
-
-            # For prefill with q_len > 1, we need multiple rows from the mask
-            # Gather rows [pos, pos+1, ..., pos+q_len-1] from the mask
-            row_indices = pos_idx + torch.arange(q_len, device=causal_mask.device).view(1, 1, -1, 1)
-            row_indices = row_indices.expand(causal_mask.shape[0], 1, q_len, causal_mask.shape[3])
-            mask_slice = causal_mask.gather(2, row_indices)  # [B, 1, q_len, seq_len]
-            attn_weights = attn_weights + mask_slice.to(query_states.dtype)
+            q_seq_len = query_states.shape[-2]
+            k_seq_len = key_states.shape[-2]
+            attn_weights = attn_weights + causal_mask.to(query_states.dtype)[:, :, :q_seq_len, :k_seq_len]
 
         # NOTE: Gemma3n does NOT use attention softcapping (HF uses softcap=None)
 
@@ -1489,11 +1511,13 @@ class Gemma3nModel(nn.Module):
         self.kv_cache_0.zero_()
 
     def _get_rotary_embedding_single(self, current_pos, use_local, device, dtype):
-        pos = int(current_pos) if current_pos is not None else 0
+        # NOTE: Do NOT use int(current_pos) - it becomes a constant during JIT trace!
+        # Use tensor indexing directly for dynamic position support (like Qwen model)
         cos_cache = self.cos_cached_local if use_local else self.cos_cached_global
         sin_cache = self.sin_cached_local if use_local else self.sin_cached_global
-        cos = cos_cache[:, pos].view(1, 1, -1).to(device=device, dtype=dtype)
-        sin = sin_cache[:, pos].view(1, 1, -1).to(device=device, dtype=dtype)
+        # Index with tensor directly - this traces correctly with dynamic positions
+        cos = cos_cache[:, current_pos.long()].view(1, 1, -1).to(device=device, dtype=dtype)
+        sin = sin_cache[:, current_pos.long()].view(1, 1, -1).to(device=device, dtype=dtype)
         return cos, sin
 
     def _get_rotary_embedding_prefill(self, positions, use_local, device, dtype):
@@ -1512,7 +1536,7 @@ class Gemma3nModel(nn.Module):
         value_idx = layer_in_group_idx + layers_per_group
         return kv_cache, key_idx, value_idx, layers_per_group
 
-    def _process_layer_regular(self, layer_idx, hidden_states, per_layer_input, causal_mask, current_pos):
+    def _process_layer_regular(self, layer_idx, hidden_states, per_layer_input, causal_mask, current_pos, position_one_hot=None, rotary_cos_local=None, rotary_sin_local=None, rotary_cos_global=None, rotary_sin_global=None):
         layer = self.layers[layer_idx]
 
         predictions = layer.altup.predict(hidden_states)
@@ -1522,49 +1546,70 @@ class Gemma3nModel(nn.Module):
         laurel_output = layer.laurel(active_prediction_normed)
 
         use_local = layer.attention_type == "sliding_attention"
-        rotary_emb = self._get_rotary_embedding_single(
-            current_pos,
-            use_local,
-            device=active_prediction_normed.device,
-            dtype=active_prediction_normed.dtype,
-        )
+
+        # Use provided rotary embeddings if available (for CoreML), otherwise compute
+        # CoreML needs pre-computed rotary because tensor indexing becomes constant during conversion
+        if rotary_cos_local is not None and rotary_sin_local is not None:
+            # Select based on layer attention type (this selection is static per-layer)
+            if use_local:
+                rotary_emb = (rotary_cos_local, rotary_sin_local)
+            else:
+                rotary_emb = (rotary_cos_global, rotary_sin_global)
+        else:
+            rotary_emb = self._get_rotary_embedding_single(
+                current_pos,
+                use_local,
+                device=active_prediction_normed.device,
+                dtype=active_prediction_normed.dtype,
+            )
 
         query_states, key_states, value_states = layer.attention.get_new_kv_cache(
             active_prediction_normed, current_pos, rotary_emb
         )
 
-        kv_cache, key_idx, value_idx, _ = self._get_kv_cache_layer(layer_idx)
+        if layer.attention.is_kv_shared_layer and layer.attention.kv_shared_layer_index is not None:
+            # Shared KV: reuse the cache from the earlier layer index.
+            kv_cache, key_idx, value_idx, _ = self._get_kv_cache_layer(
+                layer.attention.kv_shared_layer_index
+            )
+            key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+            value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+        else:
+            kv_cache, key_idx, value_idx, _ = self._get_kv_cache_layer(layer_idx)
 
-        # Dynamic position update using element-wise one-hot mask (traces well in CoreML)
-        # This avoids scatter operations which may not trace dynamic indices correctly
-        num_kv_heads = key_states.shape[1]
-        head_dim = key_states.shape[3]
-        seq_len = kv_cache.shape[2]
+            # Dynamic position update using element-wise one-hot mask
+            # NOTE: position_one_hot must be passed as input (not computed here) for CoreML
+            # because comparisons with dynamic values become constants during conversion
+            seq_len = kv_cache.shape[2]
 
-        # Create one-hot position mask: [1, 1, seq_len, 1]
-        # This is 1.0 at current_pos, 0.0 elsewhere
-        positions = torch.arange(seq_len, device=kv_cache.device, dtype=torch.long)
-        one_hot = (positions == current_pos.long()).float().view(1, 1, seq_len, 1)
+            # Use provided one-hot or create it (for non-CoreML use)
+            if position_one_hot is None:
+                # Fallback for PyTorch-only execution
+                positions = torch.arange(seq_len, device=kv_cache.device, dtype=torch.long)
+                one_hot = (positions == current_pos.long()).float().view(1, 1, seq_len, 1)
+            else:
+                # Use the pre-computed one-hot passed from outside (for CoreML)
+                one_hot = position_one_hot
 
-        # Broadcast key_states from [1, heads, 1, dim] to [1, heads, seq_len, dim]
-        key_states_expanded = key_states.expand(-1, -1, seq_len, -1).half()
-        value_states_expanded = value_states.expand(-1, -1, seq_len, -1).half()
+            # Broadcast key_states from [1, heads, 1, dim] to [1, heads, seq_len, dim]
+            key_states_expanded = key_states.expand(-1, -1, seq_len, -1).half()
+            value_states_expanded = value_states.expand(-1, -1, seq_len, -1).half()
 
-        # Get current cache slices
-        kv_key_slice = kv_cache[key_idx:key_idx + 1]  # [1, heads, seq_len, dim]
-        kv_value_slice = kv_cache[value_idx:value_idx + 1]
+            # Get current cache slices
+            kv_key_slice = kv_cache[key_idx:key_idx + 1]  # [1, heads, seq_len, dim]
+            kv_value_slice = kv_cache[value_idx:value_idx + 1]
 
-        # Update only at current position using element-wise operations
-        # result[pos] = new_value if pos == current_pos else old_value[pos]
-        updated_keys = kv_key_slice * (1.0 - one_hot) + key_states_expanded * one_hot
-        updated_values = kv_value_slice * (1.0 - one_hot) + value_states_expanded * one_hot
+            # Update only at current position using element-wise operations
+            # result[pos] = new_value if pos == current_pos else old_value[pos]
+            updated_keys = kv_key_slice * (1.0 - one_hot) + key_states_expanded * one_hot
+            updated_values = kv_value_slice * (1.0 - one_hot) + value_states_expanded * one_hot
 
-        # Write back to kv_cache (CoreML state update)
-        kv_cache[key_idx:key_idx + 1] = updated_keys.half()
-        kv_cache[value_idx:value_idx + 1] = updated_values.half()
+            # Write back to kv_cache (CoreML state update)
+            kv_cache[key_idx:key_idx + 1] = updated_keys.half()
+            kv_cache[value_idx:value_idx + 1] = updated_values.half()
 
-        key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
-        value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+            key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+            value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
 
         attn = layer.attention.forward_regular(
             hidden_states=active_prediction_normed,
@@ -1620,46 +1665,51 @@ class Gemma3nModel(nn.Module):
             active_prediction_normed, current_pos, rotary_emb
         )
 
-        kv_cache, key_idx, value_idx, _ = self._get_kv_cache_layer(layer_idx)
-        prefill_seq_len = key_states.shape[2]  # Number of tokens in this prefill batch
-        num_kv_heads = key_states.shape[1]
-        head_dim = key_states.shape[3]
-        cache_seq_len = kv_cache.shape[2]
+        if layer.attention.is_kv_shared_layer and layer.attention.kv_shared_layer_index is not None:
+            kv_cache, key_idx, value_idx, _ = self._get_kv_cache_layer(
+                layer.attention.kv_shared_layer_index
+            )
+            key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+            value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+        else:
+            kv_cache, key_idx, value_idx, _ = self._get_kv_cache_layer(layer_idx)
+            prefill_seq_len = key_states.shape[2]  # Number of tokens in this prefill batch
+            cache_seq_len = kv_cache.shape[2]
 
-        # Dynamic position update using element-wise range mask (traces well in CoreML)
-        # For prefill, we write prefill_seq_len tokens starting at current_pos
-        positions = torch.arange(cache_seq_len, device=kv_cache.device, dtype=torch.long)
-        pos_start = current_pos.long()
-        pos_end = pos_start + prefill_seq_len
+            # Dynamic position update using element-wise range mask (traces well in CoreML)
+            # For prefill, we write prefill_seq_len tokens starting at current_pos
+            positions = torch.arange(cache_seq_len, device=kv_cache.device, dtype=torch.long)
+            pos_start = current_pos.long()
+            pos_end = pos_start + prefill_seq_len
 
-        # Create range mask: 1.0 for positions in [current_pos, current_pos + prefill_seq_len)
-        range_mask = ((positions >= pos_start) & (positions < pos_end)).float().view(1, 1, cache_seq_len, 1)
+            # Create range mask: 1.0 for positions in [current_pos, current_pos + prefill_seq_len)
+            range_mask = ((positions >= pos_start) & (positions < pos_end)).float().view(1, 1, cache_seq_len, 1)
 
-        # Get current cache slices
-        kv_key_slice = kv_cache[key_idx:key_idx + 1]  # [1, heads, cache_seq_len, dim]
-        kv_value_slice = kv_cache[value_idx:value_idx + 1]
+            # Get current cache slices
+            kv_key_slice = kv_cache[key_idx:key_idx + 1]  # [1, heads, cache_seq_len, dim]
+            kv_value_slice = kv_cache[value_idx:value_idx + 1]
 
-        # Pad key_states to cache_seq_len by creating a full-size tensor
-        # and placing key_states at the appropriate positions
-        key_states_padded = torch.zeros_like(kv_key_slice)
-        value_states_padded = torch.zeros_like(kv_value_slice)
+            # Pad key_states to cache_seq_len by creating a full-size tensor
+            # and placing key_states at the appropriate positions
+            key_states_padded = torch.zeros_like(kv_key_slice)
+            value_states_padded = torch.zeros_like(kv_value_slice)
 
-        # For prefill, use slice assignment (position is known at trace time for prefill)
-        # This is acceptable because prefill position is typically 0
-        pos = current_pos.item()  # OK for prefill - position is constant
-        key_states_padded[:, :, pos:pos + prefill_seq_len, :] = key_states.half()
-        value_states_padded[:, :, pos:pos + prefill_seq_len, :] = value_states.half()
+            # For prefill, use slice assignment (position is known at trace time for prefill)
+            # This is acceptable because prefill position is typically 0
+            pos = current_pos.item()  # OK for prefill - position is constant
+            key_states_padded[:, :, pos:pos + prefill_seq_len, :] = key_states.half()
+            value_states_padded[:, :, pos:pos + prefill_seq_len, :] = value_states.half()
 
-        # Update using mask (positions in range get new values, others keep old)
-        updated_keys = kv_key_slice * (1.0 - range_mask) + key_states_padded * range_mask
-        updated_values = kv_value_slice * (1.0 - range_mask) + value_states_padded * range_mask
+            # Update using mask (positions in range get new values, others keep old)
+            updated_keys = kv_key_slice * (1.0 - range_mask) + key_states_padded * range_mask
+            updated_values = kv_value_slice * (1.0 - range_mask) + value_states_padded * range_mask
 
-        # Write back to kv_cache (CoreML state update)
-        kv_cache[key_idx:key_idx + 1] = updated_keys.half()
-        kv_cache[value_idx:value_idx + 1] = updated_values.half()
+            # Write back to kv_cache (CoreML state update)
+            kv_cache[key_idx:key_idx + 1] = updated_keys.half()
+            kv_cache[value_idx:value_idx + 1] = updated_values.half()
 
-        key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
-        value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+            key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+            value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
 
         attn = layer.attention.forward_prefill(
             hidden_states=active_prediction_normed,
@@ -1704,8 +1754,22 @@ class Gemma3nModel(nn.Module):
         end_layer: Optional[int] = None,
         prefill: bool = False,
         position_ids: Optional[torch.Tensor] = None,
+        position_one_hot: Optional[torch.Tensor] = None,
+        rotary_cos_local: Optional[torch.Tensor] = None,
+        rotary_sin_local: Optional[torch.Tensor] = None,
+        rotary_cos_global: Optional[torch.Tensor] = None,
+        rotary_sin_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Process a range of layers for infer/prefill (chunk-friendly)."""
+        """Process a range of layers for infer/prefill (chunk-friendly).
+
+        Args:
+            position_one_hot: Pre-computed one-hot tensor [1, 1, seq_len, 1] for KV cache position.
+                              Required for CoreML (comparisons become constants during conversion).
+                              If None, computed inside _process_layer_regular (PyTorch-only).
+            rotary_cos/sin_local/global: Pre-computed rotary embeddings for current position.
+                            Required for CoreML (tensor indexing becomes constant during conversion).
+                            If None, computed inside _process_layer_regular (PyTorch-only).
+        """
         if end_layer is None:
             end_layer = len(self.layers)
         if prefill and position_ids is None:
@@ -1731,6 +1795,11 @@ class Gemma3nModel(nn.Module):
                     per_layer_input,
                     causal_mask,
                     current_pos,
+                    position_one_hot,
+                    rotary_cos_local,
+                    rotary_sin_local,
+                    rotary_cos_global,
+                    rotary_sin_global,
                 )
         return hidden_states
 

@@ -10,6 +10,12 @@ from pathlib import Path
 import numpy as np
 import coremltools as ct
 
+from gemma3n_coreml_inputs import (
+    create_position_mask,
+    create_position_one_hot,
+    create_rotary_embeddings,
+)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -29,11 +35,6 @@ def main():
     print(f"Loading: {init_path}")
     infer_init = ct.models.MLModel(str(init_path))
 
-    # Build causal mask
-    causal = np.zeros((1, 1, args.context_length, args.context_length), dtype=np.float16)
-    i_idx, j_idx = np.triu_indices(args.context_length, k=1)
-    causal[:, :, i_idx, j_idx] = float("-inf")
-
     # Create state
     state = model.make_state()
 
@@ -42,9 +43,14 @@ def main():
     print("Inspecting KV cache state")
     print("="*60)
 
+    ctx_len = args.context_length
+    head_dim = 256
+
     # Try to read the KV cache state
     try:
         kv_cache = state.read_state(name="model_kv_cache_0")
+        ctx_len = kv_cache.shape[2]
+        head_dim = kv_cache.shape[3]
         print(f"\nKV cache shape: {kv_cache.shape}")
         print(f"KV cache dtype: {kv_cache.dtype}")
         print(f"KV cache stats: min={kv_cache.min():.6f}, max={kv_cache.max():.6f}, mean={kv_cache.mean():.6f}")
@@ -66,14 +72,23 @@ def main():
     init_out = infer_init.predict({"input_ids": np.array([[2]], dtype=np.int32)})
     hidden = init_out["hidden_states"]
     pli = init_out["per_layer_inputs"]
+    pos = 0
+    mask = create_position_mask(pos, ctx_len)
+    one_hot = create_position_one_hot(pos, ctx_len)
+    cos_local, sin_local, cos_global, sin_global = create_rotary_embeddings(pos, head_dim)
 
     # Run chunk 0 at position 0
     out = model.predict(
         {
             "hidden_states": hidden,
             "per_layer_inputs": pli,
-            "causal_mask": causal,
-            "current_pos": np.array([0], dtype=np.int32),
+            "causal_mask": mask,
+            "current_pos": np.array([pos], dtype=np.int32),
+            "position_one_hot": one_hot,
+            "rotary_cos_local": cos_local,
+            "rotary_sin_local": sin_local,
+            "rotary_cos_global": cos_global,
+            "rotary_sin_global": sin_global,
         },
         state,
     )
@@ -103,13 +118,22 @@ def main():
     init_out = infer_init.predict({"input_ids": np.array([[563]], dtype=np.int32)})
     hidden = init_out["hidden_states"]
     pli = init_out["per_layer_inputs"]
+    pos = 5
+    mask = create_position_mask(pos, ctx_len)
+    one_hot = create_position_one_hot(pos, ctx_len)
+    cos_local, sin_local, cos_global, sin_global = create_rotary_embeddings(pos, head_dim)
 
     out = model.predict(
         {
             "hidden_states": hidden,
             "per_layer_inputs": pli,
-            "causal_mask": causal,
-            "current_pos": np.array([5], dtype=np.int32),
+            "causal_mask": mask,
+            "current_pos": np.array([pos], dtype=np.int32),
+            "position_one_hot": one_hot,
+            "rotary_cos_local": cos_local,
+            "rotary_sin_local": sin_local,
+            "rotary_cos_global": cos_global,
+            "rotary_sin_global": sin_global,
         },
         state,
     )

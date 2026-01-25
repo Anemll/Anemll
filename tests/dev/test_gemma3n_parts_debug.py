@@ -18,6 +18,12 @@ import numpy as np
 import coremltools as ct
 from transformers import AutoTokenizer
 
+from gemma3n_coreml_inputs import (
+    create_position_mask,
+    create_position_one_hot,
+    create_rotary_embeddings,
+)
+
 
 def load_model(path: Path) -> ct.models.MLModel:
     """Load a CoreML model with error handling."""
@@ -76,14 +82,6 @@ def summarize_array(arr: np.ndarray, name: str, max_vals: int = 5):
         print(f"  first {max_vals}: {flat[:max_vals]}")
 
 
-def build_causal_mask(context_length: int, dtype=np.float16) -> np.ndarray:
-    """Build standard causal attention mask."""
-    causal = np.zeros((1, 1, context_length, context_length), dtype=dtype)
-    i_idx, j_idx = np.triu_indices(context_length, k=1)
-    causal[:, :, i_idx, j_idx] = float("-inf")
-    return causal
-
-
 def test_infer_init(bundle: Path, token_id: int = 2, verbose: bool = True):
     """Test infer_init model independently."""
     print("\n" + "="*60)
@@ -138,11 +136,15 @@ def test_infer_chunks(bundle: Path, hidden_states: np.ndarray, per_layer_inputs:
         chunks = [chunks[chunk_idx]]
         print(f"Testing only chunk {chunk_idx}")
 
-    causal = build_causal_mask(context_length)
-
     # Create shared state
     model0 = load_model(chunks[0])
     state = model0.make_state()
+    kv_cache = state.read_state("model_kv_cache_0")
+    ctx_len = kv_cache.shape[2]
+    head_dim = kv_cache.shape[3]
+    pos_mask = create_position_mask(current_pos, ctx_len)
+    pos_one_hot = create_position_one_hot(current_pos, ctx_len)
+    cos_local, sin_local, cos_global, sin_global = create_rotary_embeddings(current_pos, head_dim)
 
     if verbose:
         print_model_spec(model0, f"infer_chunk")
@@ -161,8 +163,13 @@ def test_infer_chunks(bundle: Path, hidden_states: np.ndarray, per_layer_inputs:
             {
                 "hidden_states": current_hidden,
                 "per_layer_inputs": per_layer_inputs,
-                "causal_mask": causal,
+                "causal_mask": pos_mask,
                 "current_pos": np.array([current_pos], dtype=np.int32),
+                "position_one_hot": pos_one_hot,
+                "rotary_cos_local": cos_local,
+                "rotary_sin_local": sin_local,
+                "rotary_cos_global": cos_global,
+                "rotary_sin_global": sin_global,
             },
             state,
         )

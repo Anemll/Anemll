@@ -812,7 +812,9 @@ class Gemma3nConverter(BaseConverter):
                 self.start_layer = start_layer
                 self.end_layer = end_layer
 
-            def forward(self, hidden_states, per_layer_inputs, causal_mask, current_pos):
+            def forward(self, hidden_states, per_layer_inputs, causal_mask, current_pos, position_one_hot, rotary_cos_local, rotary_sin_local, rotary_cos_global, rotary_sin_global):
+                # position_one_hot and rotary embeddings must be passed as inputs for CoreML
+                # because comparisons and tensor indexing with dynamic values become constants during conversion
                 hidden_states = self.model.process_layers(
                     hidden_states,
                     per_layer_inputs,
@@ -821,6 +823,11 @@ class Gemma3nConverter(BaseConverter):
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                     prefill=False,
+                    position_one_hot=position_one_hot,
+                    rotary_cos_local=rotary_cos_local,
+                    rotary_sin_local=rotary_sin_local,
+                    rotary_cos_global=rotary_cos_global,
+                    rotary_sin_global=rotary_sin_global,
                 )
                 return hidden_states
 
@@ -841,10 +848,21 @@ class Gemma3nConverter(BaseConverter):
             (1, 1, self.context_length, self.context_length), dtype=torch.float16
         )
         sample_current_pos = torch.zeros((1,), dtype=torch.int32)
+        # Position one-hot: [1, 1, seq_len, 1] with 1.0 at current_pos
+        sample_position_one_hot = torch.zeros((1, 1, self.context_length, 1), dtype=torch.float16)
+        sample_position_one_hot[0, 0, 0, 0] = 1.0  # Sample with position 0
+        # Rotary embeddings: [1, 1, head_dim] for both local and global
+        head_dim = self.config.head_dim
+        sample_rotary_cos_local = torch.zeros((1, 1, head_dim), dtype=torch.float16)
+        sample_rotary_sin_local = torch.zeros((1, 1, head_dim), dtype=torch.float16)
+        sample_rotary_cos_global = torch.zeros((1, 1, head_dim), dtype=torch.float16)
+        sample_rotary_sin_global = torch.zeros((1, 1, head_dim), dtype=torch.float16)
 
         traced_model = torch.jit.trace(
             wrapper,
-            (sample_hidden_states, sample_per_layer_inputs, sample_causal_mask, sample_current_pos),
+            (sample_hidden_states, sample_per_layer_inputs, sample_causal_mask, sample_current_pos,
+             sample_position_one_hot, sample_rotary_cos_local, sample_rotary_sin_local,
+             sample_rotary_cos_global, sample_rotary_sin_global),
         )
 
         outputs = [
@@ -872,6 +890,31 @@ class Gemma3nConverter(BaseConverter):
                     dtype=np.float16,
                 ),
                 ct.TensorType(name="current_pos", shape=(1,), dtype=np.int32),
+                ct.TensorType(
+                    name="position_one_hot",
+                    shape=(1, 1, self.context_length, 1),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(
+                    name="rotary_cos_local",
+                    shape=(1, 1, head_dim),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(
+                    name="rotary_sin_local",
+                    shape=(1, 1, head_dim),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(
+                    name="rotary_cos_global",
+                    shape=(1, 1, head_dim),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(
+                    name="rotary_sin_global",
+                    shape=(1, 1, head_dim),
+                    dtype=np.float16,
+                ),
             ],
             outputs=outputs,
             states=states,

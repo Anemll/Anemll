@@ -56,7 +56,10 @@ def build_full_input_ids(token_ids: List[int], context_length: int, pad_token_id
 
 def concat_logits(outputs: dict) -> np.ndarray:
     # Prefer split logits if present.
-    split_keys = sorted([k for k in outputs.keys() if k.startswith("logits_split_")])
+    split_keys = sorted(
+        [k for k in outputs.keys() if k.startswith("logits_split_")],
+        key=lambda k: int(k.split("_")[-1]),
+    )
     if split_keys:
         parts = [outputs[k] for k in split_keys]
         return np.concatenate(parts, axis=-1)

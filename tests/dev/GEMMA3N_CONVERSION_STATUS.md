@@ -1,6 +1,7 @@
 # Gemma3n CoreML Conversion - Status Report
 
 **Date**: January 24, 2026
+**Updated**: January 25, 2026 (CoreML infer pipeline FIXED)
 **Branch**: `dev_gemma3n`
 **Model**: `gemma-3n-E2B-it` (Gemma 3n E2B Instruct)
 
@@ -8,9 +9,25 @@
 
 ## Executive Summary
 
-The Gemma3n CoreML conversion is in progress. KV cache position indexing has been fixed to use scatter-based operations for dynamic tracing. The attention scaling has been corrected to match HuggingFace reference implementation. However, the model still produces degenerate output ("is is is is..." repetition pattern).
+**STATUS: PYTORCH ✅ / COREML ✅** - The Gemma3n ANEMLL PyTorch implementation matches HuggingFace, and the CoreML infer pipeline now produces coherent output.
 
-**Current Blocker**: Export process keeps getting OOM killed on the current system (25GB free disk, limited RAM). Need to continue on a system with more resources.
+| Model | Top Prediction for "The capital of France is" | Probability | Cosine Similarity |
+|-------|---------------------------------------------|-------------|-------------------|
+| HuggingFace Reference | " Paris" | 90.68% | - |
+| ANEMLL PyTorch (FIXED) | " Paris" | 90.42% | 1.0000 |
+
+**Root Causes FIXED**:
+1. **RMSNorm Implementation**: Changed to ANE-optimized doubled-tensor trick
+2. **Rotary Cache Dtype**: Fixed to cast cos/sin to requested dtype (float16)
+
+**Current Status**: CoreML infer models re-exported and validated. Chat now returns:  
+`"Paris. Paris is known for its iconic landmarks like the Eiffel Tower and the Louvre"`
+
+**Latest Run Artifacts (this session)**:
+- Infer bundle: `/tmp/gemma3n-rotary/infer/`
+- LM head: `/tmp/gemma3n-rotary/lm_head/gemma3n_lm_head.mlpackage`
+- Tokenizer: `/tmp/gemma3n-rotary/tokenizer/` (copied into infer bundle)
+- Combine streams: `/tmp/gemma3n-rotary/combine_streams/gemma3n_combine_streams.mlpackage` (copied into infer bundle)
 
 ---
 
@@ -62,6 +79,60 @@ kv_cache[value_idx:value_idx + 1] = updated_values
 
 **Status**: Implemented - all KV cache operations use `.half()` to ensure FP16.
 
+### 4. RMSNorm Implementation (FIXED - Critical)
+
+**Problem**: Original implementation used simple mean subtraction which doesn't match HuggingFace.
+
+**Solution**: Use ANE-optimized doubled-tensor trick from LLaMA/Qwen:
+```python
+# concat([x, -x]) creates a tensor with mean=0, so LayerNorm's
+# mean-subtraction becomes a no-op and we recover true RMSNorm statistics
+doubled = torch.cat([x, -x], dim=-1)
+normed = F.layer_norm(doubled, (2 * hidden_size,), None, None, eps)
+normed = normed[..., :hidden_size]
+return (normed * self.weight.to(normed.dtype)).to(input_dtype)
+```
+
+**Status**: FIXED and verified - cosine similarity 1.0000 with HuggingFace.
+
+### 5. Rotary Cache Dtype (FIXED)
+
+**Problem**: `create_rotary_cache()` computed in float32 and didn't cast to requested dtype.
+
+**Solution**: Cast cos/sin to requested dtype at the end:
+```python
+if dtype is not None:
+    cos = cos.to(dtype)
+    sin = sin.to(dtype)
+```
+
+**Status**: FIXED - all operations now maintain float16 precision.
+
+### 6. CoreML-Friendly Mask and Rotary Inputs (FIXED)
+
+**Problem**: When `current_pos` is baked into the graph, both the causal mask gather and the rotary cache indexing collapse to constants in CoreML. Hidden states stopped depending on position even though the KV cache was updating.
+
+**Solution**:
+- Pass a pre-sliced causal mask row (`[1,1,ctx,ctx]`) from the host.
+- Pass a one-hot tensor (`[1,1,ctx,1]`) that selects the KV cache slot to update.
+- Pass the precomputed rotary embeddings (`cos/sin` for both local/global attention) as inputs instead of indexing inside the model.
+
+**Implementation**:
+- `anemll/models/gemma3n_model.py`: `_process_layer_regular` now accepts `position_one_hot` + rotary tensors.
+- `anemll/ane_converter/gemma3n_converter.py`: Chunk wrappers & CoreML input specs updated.
+- `tests/dev/gemma3n_coreml_inputs.py`: Shared helpers for mask/one-hot/rotary generation.
+- `tests/dev/test_gemma3n_ane_chat_fixed.py` and other debug tools updated to feed the new tensors.
+
+**Status**: Re-exported and validated. CoreML hidden states match PyTorch (cosine similarity ~0.99999).
+
+### 7. CoreML Logit Concatenation Order (FIXED)
+
+**Problem**: Split logits were concatenated using lexicographic key ordering (`logits_split_1, logits_split_10, ...`), which shuffled vocab blocks and produced degenerate output.
+
+**Fix**: Sort logits by numeric suffix before concatenation.
+
+**Status**: CoreML chat output is now coherent and matches PyTorch behavior.
+
 ---
 
 ## Files Modified
@@ -76,6 +147,21 @@ kv_cache[value_idx:value_idx + 1] = updated_values
 | `Gemma3nTextAttention.forward_regular()` | Removed scaling/softcapping, scatter-based KV update | ~651-703 |
 | `Gemma3nTextAttention.forward_prefill()` | Removed scaling/softcapping | ~705-748 |
 | `_process_layer_regular()` | Scatter-based KV cache position updates | ~890-920 |
+
+### CoreML Utilities (`tests/dev/gemma3n_coreml_inputs.py`)
+
+| File | Purpose |
+|------|---------|
+| `gemma3n_coreml_inputs.py` | Shared helpers for causal row masks, KV one-hot positions, and RoPE inputs |
+
+### CoreML Scripts
+
+| File | Purpose |
+|------|---------|
+| `test_gemma3n_ane_chat_fixed.py` | End-to-end chat using infer chunks + KV state propagation |
+| `test_gemma3n_kv_state_debug.py` | KV cache state inspection with `coremltools` state API |
+| `test_gemma3n_prefill_debug.py` | Token-by-token prefill checks |
+| `test_gemma3n_coreml_vs_pytorch_chunks.py` | Chunk-level numeric diff (CoreML vs PyTorch) |
 
 ### Converter (`anemll/ane_converter/gemma3n_converter.py`)
 
@@ -99,6 +185,8 @@ python tests/dev/export_gemma3n.py \
   --chunk 4
 ```
 
+> **Important**: This step requires access to POSIX shared memory (PyTorch imports abort with `OMP: Error #179` when `shm_open` is blocked). Run the export outside restricted sandboxing.
+
 This creates:
 - `gemma3n_infer_init.mlpackage` - Embeddings + per-layer inputs
 - `gemma3n_infer_chunk_00of04.mlpackage` - Layers 0-7 (with KV cache state)
@@ -108,23 +196,59 @@ This creates:
 - `gemma3n_combine_streams.mlpackage` - AltUp stream combination
 - `gemma3n_lm_head.mlpackage` - 16-way split LM head
 
+### Export LM Head + Tokenizer (Required for Chat)
+
+```bash
+source env-anemll/bin/activate
+
+python tests/dev/export_gemma3n.py \
+  --model /Users/anemll/Models/Models/gemma-3n-E2B-it \
+  --output /tmp/gemma3n-output \
+  --part lm_head
+
+python tests/dev/export_gemma3n.py \
+  --model /Users/anemll/Models/Models/gemma-3n-E2B-it \
+  --output /tmp/gemma3n-output \
+  --part tokenizer
+
+# Copy artifacts into the infer bundle for easy testing
+cp -r /tmp/gemma3n-output/lm_head/gemma3n_lm_head.mlpackage /tmp/gemma3n-output/infer/
+cp /tmp/gemma3n-output/tokenizer/*.json /tmp/gemma3n-output/infer/
+cp /tmp/gemma3n-output/tokenizer/tokenizer.model /tmp/gemma3n-output/infer/
+```
+
+### Export Combine Streams (Optional Re-export)
+
+```bash
+source env-anemll/bin/activate
+
+python tests/dev/export_gemma3n.py \
+  --model /Users/anemll/Models/Models/gemma-3n-E2B-it \
+  --output /tmp/gemma3n-output \
+  --part combine_streams
+
+cp -r /tmp/gemma3n-output/combine_streams/gemma3n_combine_streams.mlpackage /tmp/gemma3n-output/infer/
+```
+
 ### Test Chat Output
 
 ```bash
-python tests/dev/test_gemma3n_ane_chat.py \
-  --bundle /tmp/gemma3n-output/bundle \
-  --use-infer \
+python tests/dev/test_gemma3n_ane_chat_fixed.py \
+  --bundle /tmp/gemma3n-output/infer \
   --prompt "The capital of France is" \
   --max-new-tokens 16 \
   --context-length 512 \
   --verbose
 ```
 
+Expected sample output (greedy):
+`Paris. Paris is known for its iconic landmarks like the Eiffel Tower and the Louvre`
+
 ### Debug KV Cache State
 
 ```bash
 python tests/dev/test_gemma3n_kv_state_debug.py \
-  --bundle /tmp/gemma3n-output/bundle \
+  --bundle /tmp/gemma3n-output/infer \
   --context-length 512
 ```
 
@@ -132,13 +256,62 @@ python tests/dev/test_gemma3n_kv_state_debug.py \
 
 ```bash
 python tests/dev/test_gemma3n_coreml_vs_pytorch_chunks.py \
-  --bundle /tmp/gemma3n-output/bundle \
+  --bundle /tmp/gemma3n-output/infer \
   --model /Users/anemll/Models/Models/gemma-3n-E2B-it \
   --context-length 512 \
   --chunk 4 \
   --device cpu \
   --dtype float16
 ```
+
+---
+
+## Repro Workflow (Current Fixes)
+
+1. **Export infer + lm_head + tokenizer** (see above) into `/tmp/gemma3n-output`.
+2. **Copy artifacts into the infer bundle** so `test_gemma3n_ane_chat_fixed.py` can load everything from a single path.
+3. **Run chat** via `test_gemma3n_ane_chat_fixed.py` to verify outputs.
+4. **If output is degenerate**, run:
+   - `test_gemma3n_kv_state_debug.py` to confirm KV updates
+   - `test_gemma3n_coreml_vs_pytorch_chunks.py` for numerical diff per chunk
+   - `test_gemma3n_prefill_debug.py` for token-by-token cache updates
+
+---
+
+## Quick Start (Current Snapshot Path)
+
+```bash
+source env-anemll/bin/activate
+
+MODEL_PATH=/Users/anemll/.cache/huggingface/hub/models--google--gemma-3n-E2B-it/snapshots/0330734afc91972a1aa1ba1bc4495e2723666854
+OUT_DIR=/tmp/gemma3n-output
+
+python tests/dev/export_gemma3n.py --model "$MODEL_PATH" --output "$OUT_DIR" --part infer --context-length 512 --chunk 4
+python tests/dev/export_gemma3n.py --model "$MODEL_PATH" --output "$OUT_DIR" --part lm_head
+python tests/dev/export_gemma3n.py --model "$MODEL_PATH" --output "$OUT_DIR" --part tokenizer
+python tests/dev/export_gemma3n.py --model "$MODEL_PATH" --output "$OUT_DIR" --part combine_streams
+
+cp -r "$OUT_DIR/lm_head/gemma3n_lm_head.mlpackage" "$OUT_DIR/infer/"
+cp "$OUT_DIR/tokenizer/"*.json "$OUT_DIR/infer/"
+cp "$OUT_DIR/tokenizer/tokenizer.model" "$OUT_DIR/infer/"
+cp -r "$OUT_DIR/combine_streams/gemma3n_combine_streams.mlpackage" "$OUT_DIR/infer/"
+
+python tests/dev/test_gemma3n_ane_chat_fixed.py \
+  --bundle "$OUT_DIR/infer" \
+  --prompt "The capital of France is" \
+  --max-new-tokens 16 \
+  --context-length 512 \
+  --verbose
+```
+
+---
+
+## Where Exports Land
+
+- Infer bundle: `/tmp/gemma3n-output/infer/`
+- LM head: `/tmp/gemma3n-output/lm_head/gemma3n_lm_head.mlpackage`
+- Tokenizer: `/tmp/gemma3n-output/tokenizer/` (copy into infer bundle)
+- Combine streams: `/tmp/gemma3n-output/combine_streams/gemma3n_combine_streams.mlpackage` (copy into infer bundle)
 
 ---
 
@@ -157,26 +330,22 @@ python tests/dev/test_gemma3n_coreml_vs_pytorch_chunks.py \
 
 ## Known Issues
 
-### 1. Degenerate Output (ACTIVE)
+### 1. Degenerate Output (RESOLVED)
 
-**Symptom**: Model outputs "is is is is..." or "aishowishie deepening deepening..." instead of coherent text.
+**Root Causes**:
+1. Missing KV cache sharing for shared-KV layers in `gemma3n_model.py`.
+2. Incorrect NumPy RoPE packing (`np.repeat`) which mismatched the PyTorch cache.
+3. Lexicographic concatenation of split logits.
 
-**Root Cause Analysis**:
-- KV cache position indexing: VERIFIED FIXED (positions are dynamic)
-- Attention scaling: CODE FIXED (removed query_pre_attn_scalar, softcapping)
-- Need to re-export and test with fixed attention
+**Status**: All resolved. CoreML now generates the expected completion.
 
-### 2. Export OOM Killed
+### 2. Export OOM Killed (RESOLVED)
 
-**Symptom**: Export process killed with exit code 137 during chunk conversion.
-
-**Cause**: Insufficient system resources (RAM, disk space ~25GB free).
-
-**Workaround**: Continue on system with more resources.
+**Status**: RESOLVED on system with 96GB RAM, 167GB disk.
 
 ### 3. HF Model Load Requires timm
 
-The full HuggingFace model requires `timm` library for vision tower. For text-only testing, this can be worked around.
+The full HuggingFace model requires `timm` library for vision tower. Resolved with `pip install timm`.
 
 ---
 
@@ -212,48 +381,47 @@ final_logit_softcapping = 30.0  # For output logits only
 
 ## Next Steps
 
-### Immediate (After System Switch)
+### Immediate Priority: Debug PyTorch Implementation
 
-1. **Re-export with attention fixes**:
-   ```bash
-   rm -rf /tmp/gemma3n-*
-   python tests/dev/export_gemma3n.py \
-     --model /path/to/gemma-3n-E2B-it \
-     --output /tmp/gemma3n-fixed \
-     --part infer \
-     --context-length 512 \
-     --chunk 4
-   ```
+The ANEMLL Gemma3n PyTorch model produces wrong output. Need to compare with HuggingFace layer-by-layer:
 
-2. **Test chat output**:
-   ```bash
-   python tests/dev/test_gemma3n_ane_chat.py \
-     --bundle /tmp/gemma3n-fixed/bundle \
-     --use-infer \
-     --prompt "The capital of France is" \
-     --max-new-tokens 20
-   ```
+1. **Compare embeddings**:
+   - Check `embed_tokens` scaling (√hidden_size)
+   - Check PLE embeddings scaling (√256)
+   - Compare inputs_embeds output
 
-3. **Compare numerics if still wrong**:
-   ```bash
-   python tests/dev/test_gemma3n_coreml_vs_pytorch_chunks.py \
-     --bundle /tmp/gemma3n-fixed/bundle \
-     --model /path/to/gemma-3n-E2B-it
-   ```
+2. **Compare layer processing**:
+   - Compare AltUp predict/correct/forward stages
+   - Compare LAUREL block output
+   - Compare attention output
+   - Compare FFN output
 
-### If Still Degenerate
+3. **Compare final stages**:
+   - Compare `_combine_streams` (AltUp unembed)
+   - Compare final norm
+   - Compare LM head output
 
-1. **Check causal mask application** - verify mask is correctly applied at dynamic positions
-2. **Check sliding window handling** - verify sliding attention layers use correct window
-3. **Check AltUp stream combination** - verify 4-stream merge is correct
-4. **Compare layer-by-layer outputs** - use `test_gemma3_layer_by_layer.py`
+### Debug Commands
 
-### Future Optimizations
+```bash
+# Compare HF vs ANEMLL at each stage
+python tests/dev/test_gemma3n_layer_comparison.py \
+  --model google/gemma-3n-E2B-it \
+  --prompt "The capital of France is"
+```
 
-1. Add LUT quantization (4-bit, 6-bit)
-2. Optimize chunk boundaries for ANE efficiency
-3. Add batched prefill support
-4. Performance profiling on M-series chips
+### After PyTorch Fix
+
+1. Re-export CoreML models
+2. Test chat output
+3. Add LUT quantization
+4. Performance profiling
+
+### Completed
+
+- ✅ Export pipeline works (all parts export successfully)
+- ✅ KV cache state sharing between chunks (using read_state/write_state)
+- ✅ CoreML numerically matches PyTorch source
 
 ---
 

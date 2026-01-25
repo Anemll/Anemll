@@ -11,18 +11,17 @@ import numpy as np
 import coremltools as ct
 from transformers import AutoTokenizer
 
+from gemma3n_coreml_inputs import (
+    create_position_mask,
+    create_position_one_hot,
+    create_rotary_embeddings,
+)
+
 
 def load_model(path: Path) -> ct.models.MLModel:
     if not path.exists():
         raise FileNotFoundError(f"Model not found: {path}")
     return ct.models.MLModel(str(path))
-
-
-def build_causal_mask(context_length: int, dtype=np.float16) -> np.ndarray:
-    causal = np.zeros((1, 1, context_length, context_length), dtype=dtype)
-    i_idx, j_idx = np.triu_indices(context_length, k=1)
-    causal[:, :, i_idx, j_idx] = float("-inf")
-    return causal
 
 
 def summarize(arr: np.ndarray, name: str):
@@ -56,9 +55,11 @@ def main():
     infer_chunks = [load_model(p) for p in chunks]
     print(f"Loaded {len(infer_chunks)} chunks")
 
-    # Create causal mask and KV state
-    causal = build_causal_mask(args.context_length)
+    # Create KV state and derive dimensions
     state = infer_chunks[0].make_state()
+    kv_cache = state.read_state("model_kv_cache_0")
+    ctx_len = kv_cache.shape[2]
+    head_dim = kv_cache.shape[3]
 
     print("\n" + "="*60)
     print("PREFILL: Processing prompt tokens one-by-one")
@@ -73,14 +74,23 @@ def main():
         hidden = init_out["hidden_states"]
         pli = init_out["per_layer_inputs"]
 
+        pos_mask = create_position_mask(pos, ctx_len)
+        pos_one_hot = create_position_one_hot(pos, ctx_len)
+        cos_local, sin_local, cos_global, sin_global = create_rotary_embeddings(pos, head_dim)
+
         # Process through all chunks (with KV cache)
         for i, chunk in enumerate(infer_chunks):
             out = chunk.predict(
                 {
                     "hidden_states": hidden,
                     "per_layer_inputs": pli,
-                    "causal_mask": causal,
+                    "causal_mask": pos_mask,
                     "current_pos": np.array([pos], dtype=np.int32),
+                    "position_one_hot": pos_one_hot,
+                    "rotary_cos_local": cos_local,
+                    "rotary_sin_local": sin_local,
+                    "rotary_cos_global": cos_global,
+                    "rotary_sin_global": sin_global,
                 },
                 state,
             )
@@ -123,13 +133,22 @@ def main():
     hidden = init_out["hidden_states"]
     pli = init_out["per_layer_inputs"]
 
+    pos_mask = create_position_mask(pos, ctx_len)
+    pos_one_hot = create_position_one_hot(pos, ctx_len)
+    cos_local, sin_local, cos_global, sin_global = create_rotary_embeddings(pos, head_dim)
+
     for i, chunk in enumerate(infer_chunks):
         out = chunk.predict(
             {
                 "hidden_states": hidden,
                 "per_layer_inputs": pli,
-                "causal_mask": causal,
+                "causal_mask": pos_mask,
                 "current_pos": np.array([pos], dtype=np.int32),
+                "position_one_hot": pos_one_hot,
+                "rotary_cos_local": cos_local,
+                "rotary_sin_local": sin_local,
+                "rotary_cos_global": cos_global,
+                "rotary_sin_global": sin_global,
             },
             state,
         )

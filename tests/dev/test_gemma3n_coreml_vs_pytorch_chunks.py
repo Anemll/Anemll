@@ -13,6 +13,12 @@ import anemll.models.gemma3n_model as gemma3n_mod
 from anemll.models.gemma3n_model import Gemma3nModel, Gemma3nConfig
 from transformers import AutoConfig
 
+from gemma3n_coreml_inputs import (
+    create_position_mask,
+    create_position_one_hot,
+    create_rotary_embeddings,
+)
+
 
 def load_mlpackage(path: Path) -> ct.models.MLModel:
     if not path.exists():
@@ -62,11 +68,16 @@ def main() -> None:
     infer_chunk_models = [load_mlpackage(p) for p in infer_chunks]
 
     # CoreML run
-    causal = build_causal_mask(args.context_length, dtype=np.float16)
     init_out = infer_init.predict({"input_ids": np.array([[args.token_id]], dtype=np.int32)})
     cm_hidden = init_out["hidden_states"]
     cm_per_layer = init_out["per_layer_inputs"]
     state = infer_chunk_models[0].make_state()
+    kv_cache = state.read_state("model_kv_cache_0")
+    ctx_len = kv_cache.shape[2]
+    head_dim = kv_cache.shape[3]
+    pos_mask = create_position_mask(args.pos, ctx_len)
+    pos_one_hot = create_position_one_hot(args.pos, ctx_len)
+    cos_local, sin_local, cos_global, sin_global = create_rotary_embeddings(args.pos, head_dim)
 
     cm_chunk_outputs = []
     for model in infer_chunk_models:
@@ -74,8 +85,13 @@ def main() -> None:
             {
                 "hidden_states": cm_hidden,
                 "per_layer_inputs": cm_per_layer,
-                "causal_mask": causal,
+                "causal_mask": pos_mask,
                 "current_pos": np.array([args.pos], dtype=np.int32),
+                "position_one_hot": pos_one_hot,
+                "rotary_cos_local": cos_local,
+                "rotary_sin_local": sin_local,
+                "rotary_cos_global": cos_global,
+                "rotary_sin_global": sin_global,
             },
             state,
         )
