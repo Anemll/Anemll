@@ -22,7 +22,8 @@ from transformers import AutoTokenizer
 def load_mlpackage(path: Path) -> ct.models.MLModel:
     if not path.exists():
         raise FileNotFoundError(f"Missing model: {path}")
-    return ct.models.MLModel(str(path))
+    # Prefer ANE with CPU fallback; avoid GPU unless explicitly requested.
+    return ct.models.MLModel(str(path), compute_units=ct.ComputeUnit.CPU_AND_NE)
 
 def describe_model_io(label: str, model: ct.models.MLModel) -> None:
     spec = model.get_spec()

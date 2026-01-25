@@ -158,6 +158,7 @@ if dtype is not None:
 
 | File | Purpose |
 |------|---------|
+| `chat_coreml_only.py` | CoreML-only chat runner (single infer or chunked infer) |
 | `test_gemma3n_ane_chat_fixed.py` | End-to-end chat using infer chunks + KV state propagation |
 | `test_gemma3n_kv_state_debug.py` | KV cache state inspection with `coremltools` state API |
 | `test_gemma3n_prefill_debug.py` | Token-by-token prefill checks |
@@ -177,9 +178,12 @@ if dtype is not None:
 ```bash
 source env-anemll/bin/activate
 
+MODEL_PATH=$(ls -td ~/.cache/huggingface/hub/models--google--gemma-3n-E2B-it/snapshots/* | head -1)
+echo "$MODEL_PATH"
+
 python tests/dev/export_gemma3n.py \
-  --model /Users/anemll/Models/Models/gemma-3n-E2B-it \
-  --output /tmp/gemma3n-output \
+  --model "$MODEL_PATH" \
+  --output ~/Models/ANE/gemma3n \
   --part infer \
   --context-length 512 \
   --chunk 4
@@ -202,19 +206,19 @@ This creates:
 source env-anemll/bin/activate
 
 python tests/dev/export_gemma3n.py \
-  --model /Users/anemll/Models/Models/gemma-3n-E2B-it \
-  --output /tmp/gemma3n-output \
+  --model "$MODEL_PATH" \
+  --output ~/Models/ANE/gemma3n \
   --part lm_head
 
 python tests/dev/export_gemma3n.py \
-  --model /Users/anemll/Models/Models/gemma-3n-E2B-it \
-  --output /tmp/gemma3n-output \
+  --model "$MODEL_PATH" \
+  --output ~/Models/ANE/gemma3n \
   --part tokenizer
 
 # Copy artifacts into the infer bundle for easy testing
-cp -r /tmp/gemma3n-output/lm_head/gemma3n_lm_head.mlpackage /tmp/gemma3n-output/infer/
-cp /tmp/gemma3n-output/tokenizer/*.json /tmp/gemma3n-output/infer/
-cp /tmp/gemma3n-output/tokenizer/tokenizer.model /tmp/gemma3n-output/infer/
+cp -r ~/Models/ANE/gemma3n/lm_head/gemma3n_lm_head.mlpackage ~/Models/ANE/gemma3n/infer/
+cp ~/Models/ANE/gemma3n/tokenizer/*.json ~/Models/ANE/gemma3n/infer/
+cp ~/Models/ANE/gemma3n/tokenizer/tokenizer.model ~/Models/ANE/gemma3n/infer/
 ```
 
 ### Export Combine Streams (Optional Re-export)
@@ -223,22 +227,32 @@ cp /tmp/gemma3n-output/tokenizer/tokenizer.model /tmp/gemma3n-output/infer/
 source env-anemll/bin/activate
 
 python tests/dev/export_gemma3n.py \
-  --model /Users/anemll/Models/Models/gemma-3n-E2B-it \
-  --output /tmp/gemma3n-output \
+  --model "$MODEL_PATH" \
+  --output ~/Models/ANE/gemma3n \
   --part combine_streams
 
-cp -r /tmp/gemma3n-output/combine_streams/gemma3n_combine_streams.mlpackage /tmp/gemma3n-output/infer/
+cp -r ~/Models/ANE/gemma3n/combine_streams/gemma3n_combine_streams.mlpackage ~/Models/ANE/gemma3n/infer/
 ```
 
 ### Test Chat Output
 
 ```bash
 python tests/dev/test_gemma3n_ane_chat_fixed.py \
-  --bundle /tmp/gemma3n-output/infer \
+  --bundle ~/Models/ANE/gemma3n/infer \
   --prompt "The capital of France is" \
   --max-new-tokens 16 \
   --context-length 512 \
   --verbose
+```
+
+CoreML-only runner (no PyTorch dependencies):
+
+```bash
+python tests/dev/chat_coreml_only.py \
+  --bundle ~/Models/ANE/gemma3n/infer \
+  --prompt "The capital of France is" \
+  --max-new-tokens 16 \
+  --context-length 512
 ```
 
 Expected sample output (greedy):
@@ -248,7 +262,7 @@ Expected sample output (greedy):
 
 ```bash
 python tests/dev/test_gemma3n_kv_state_debug.py \
-  --bundle /tmp/gemma3n-output/infer \
+  --bundle ~/Models/ANE/gemma3n/infer \
   --context-length 512
 ```
 
@@ -256,8 +270,8 @@ python tests/dev/test_gemma3n_kv_state_debug.py \
 
 ```bash
 python tests/dev/test_gemma3n_coreml_vs_pytorch_chunks.py \
-  --bundle /tmp/gemma3n-output/infer \
-  --model /Users/anemll/Models/Models/gemma-3n-E2B-it \
+  --bundle ~/Models/ANE/gemma3n/infer \
+  --model "$MODEL_PATH" \
   --context-length 512 \
   --chunk 4 \
   --device cpu \
