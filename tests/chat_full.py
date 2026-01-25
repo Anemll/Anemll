@@ -31,6 +31,7 @@ WARMUP_TOKEN_LIMIT = 10  # Maximum tokens to generate during warmup
 THINKING_MODE = False
 THINKING_PROMPT = """You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem."""
 DEBUG_LEVEL = 0  # Default debug level
+COMPUTE_UNIT = ct.ComputeUnit.CPU_AND_NE  # Default to ANE + CPU
 
 class TokenPrinter:
     """Handles background printing of generated tokens."""
@@ -192,7 +193,7 @@ def find_all_chunks(base_path):
 def load_model(path, function_name=None):
     """Load a CoreML model, handling both .mlmodelc and .mlpackage formats."""
     path = Path(path)
-    compute_unit = ct.ComputeUnit.CPU_AND_NE
+    compute_unit = COMPUTE_UNIT
     
     try:
         if path.suffix == '.mlmodelc':
@@ -243,6 +244,10 @@ def parse_args():
     # Add no-warmup flag
     parser.add_argument('--nw', action='store_true',
                        help='Skip warmup phase')
+
+    # Force CPU execution
+    parser.add_argument('--cpu', action='store_true',
+                       help='Run CoreML models on CPU only (disable ANE/GPU)')
 
     # Add debug level
     parser.add_argument('--debug-level', type=int, default=0,
@@ -1299,8 +1304,10 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
 
 def main():
     args = parse_args()
-    global DEBUG_LEVEL
+    global DEBUG_LEVEL, COMPUTE_UNIT
     DEBUG_LEVEL = args.debug_level
+    if args.cpu:
+        COMPUTE_UNIT = ct.ComputeUnit.CPU_ONLY
 
     # Convert directory to absolute path
     model_dir = Path(args.d).resolve()

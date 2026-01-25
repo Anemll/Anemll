@@ -1,0 +1,32 @@
+## Per-Channel Group Size Support for LUT Quantization
+
+Adds support for configurable per-channel group sizes in LUT quantization.
+Default per_channel value is 8 if not specified.
+
+**Format:** `bits` or `bits,per_channel`
+**Example:** `--lut2 4,4` (4 bits with group size 4) or `--lut2 4` (4 bits with default group size 8)
+
+### Core Converter Updates
+- `qwen2_5_converter.py` - Added `parse_lut_arg()` function
+- `llama_converter.py` - Added `parse_lut_arg()` function
+- `qwen_converter.py` - Added `parse_lut_arg()` function
+
+### Utility Scripts
+- `convert_model.sh` - Enhanced with per-channel support and updated help text
+- `combine_models.py` - Enhanced with per-channel support
+- `compile_models.py` - Enhanced with per-channel support
+- `generate_meta_yaml.py` - Updated to handle per-channel parameters
+- `prepare_hf.sh` - Added copy of `chat_template.jinja` file
+
+### Documentation Updates
+- `CLAUDE.md` - Added examples for custom per-channel group sizes
+- `docs/ANE_converter.md` - Updated with per-channel information
+- `docs/combine_models.md` - Updated with per-channel information
+- `docs/compile_models.md` - Updated with per-channel information
+- `docs/convert_model.md` - Updated with per-channel information
+- `docs/model_conversion_guide_for_AI_agents.md` - Enhanced with per-channel examples
+
+### Evaluation & Configuration
+- `evaluate/ane/run_eval.sh` - Added formatted results display (`print_combined_results()`)
+- `.gitignore` - Added patterns for `ane_*.log` and test result directories
+
