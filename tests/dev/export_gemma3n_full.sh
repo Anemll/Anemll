@@ -3,13 +3,17 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: export_gemma3n_full.sh [--model PATH] [--output DIR] [--context-length N] [--chunk N]
+Usage: export_gemma3n_full.sh [--model PATH] [--output DIR] [--context-length N] [--chunk N] [--lut N] [--lut-per-channel N] [--lut-workers N] [--flat]
 
 Defaults:
   --model: latest HF snapshot for google/gemma-3n-E2B-it
   --output: ~/Models/ANE/gemma3n
   --context-length: 512
   --chunk: 4
+  --lut: disabled
+  --lut-per-channel: 8
+  --lut-workers: 1
+  --flat: disabled (write parts into subfolders)
 
 Example:
   tests/dev/export_gemma3n_full.sh --output ~/Models/ANE/gemma3n
@@ -20,6 +24,10 @@ MODEL_PATH=""
 OUTPUT_DIR="${HOME}/Models/ANE/gemma3n"
 CONTEXT_LENGTH="512"
 CHUNK="4"
+LUT=""
+LUT_PER_CHANNEL="8"
+LUT_WORKERS="1"
+FLAT="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,6 +46,22 @@ while [[ $# -gt 0 ]]; do
     --chunk)
       CHUNK="$2"
       shift 2
+      ;;
+    --lut)
+      LUT="$2"
+      shift 2
+      ;;
+    --lut-per-channel)
+      LUT_PER_CHANNEL="$2"
+      shift 2
+      ;;
+    --lut-workers)
+      LUT_WORKERS="$2"
+      shift 2
+      ;;
+    --flat)
+      FLAT="1"
+      shift 1
       ;;
     -h|--help)
       usage
@@ -59,6 +83,19 @@ echo "Model: ${MODEL_PATH}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Context length: ${CONTEXT_LENGTH}"
 echo "Chunk: ${CHUNK}"
+if [[ -n "${LUT}" ]]; then
+  echo "LUT: ${LUT}"
+  echo "LUT per-channel group size: ${LUT_PER_CHANNEL}"
+  echo "LUT workers: ${LUT_WORKERS}"
+fi
+if [[ "${FLAT}" == "1" ]]; then
+  echo "Flat layout: enabled"
+fi
+
+NO_SUBDIR_FLAG=""
+if [[ "${FLAT}" == "1" ]]; then
+  NO_SUBDIR_FLAG="--no-subdir"
+fi
 
 source env-anemll/bin/activate
 
@@ -67,26 +104,42 @@ python tests/dev/export_gemma3n.py \
   --output "${OUTPUT_DIR}" \
   --part infer \
   --context-length "${CONTEXT_LENGTH}" \
-  --chunk "${CHUNK}"
+  --chunk "${CHUNK}" \
+  ${LUT:+--lut "${LUT}"} \
+  --lut-per-channel "${LUT_PER_CHANNEL}" \
+  --lut-workers "${LUT_WORKERS}" \
+  ${NO_SUBDIR_FLAG}
 
 python tests/dev/export_gemma3n.py \
   --model "${MODEL_PATH}" \
   --output "${OUTPUT_DIR}" \
-  --part lm_head
+  --part lm_head \
+  ${LUT:+--lut "${LUT}"} \
+  --lut-per-channel "${LUT_PER_CHANNEL}" \
+  --lut-workers "${LUT_WORKERS}" \
+  ${NO_SUBDIR_FLAG}
 
 python tests/dev/export_gemma3n.py \
   --model "${MODEL_PATH}" \
   --output "${OUTPUT_DIR}" \
-  --part tokenizer
+  --part tokenizer \
+  ${NO_SUBDIR_FLAG}
 
 python tests/dev/export_gemma3n.py \
   --model "${MODEL_PATH}" \
   --output "${OUTPUT_DIR}" \
-  --part combine_streams
+  --part combine_streams \
+  ${NO_SUBDIR_FLAG}
 
-cp -r "${OUTPUT_DIR}/lm_head/gemma3n_lm_head.mlpackage" "${OUTPUT_DIR}/infer/"
-cp -r "${OUTPUT_DIR}/combine_streams/gemma3n_combine_streams.mlpackage" "${OUTPUT_DIR}/infer/"
-cp "${OUTPUT_DIR}/tokenizer/"*.json "${OUTPUT_DIR}/infer/"
-cp "${OUTPUT_DIR}/tokenizer/tokenizer.model" "${OUTPUT_DIR}/infer/"
+if [[ "${FLAT}" != "1" ]]; then
+  cp -r "${OUTPUT_DIR}/lm_head/gemma3n_lm_head.mlpackage" "${OUTPUT_DIR}/infer/"
+  cp -r "${OUTPUT_DIR}/combine_streams/gemma3n_combine_streams.mlpackage" "${OUTPUT_DIR}/infer/"
+  cp "${OUTPUT_DIR}/tokenizer/"*.json "${OUTPUT_DIR}/infer/"
+  cp "${OUTPUT_DIR}/tokenizer/tokenizer.model" "${OUTPUT_DIR}/infer/"
+fi
 
-echo "Done. Bundle ready at: ${OUTPUT_DIR}/infer/"
+if [[ "${FLAT}" == "1" ]]; then
+  echo "Done. Bundle ready at: ${OUTPUT_DIR}"
+else
+  echo "Done. Bundle ready at: ${OUTPUT_DIR}/infer/"
+fi

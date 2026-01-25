@@ -158,10 +158,13 @@ def main() -> None:
 
     infer_chunk_paths = find_infer_chunks(bundle)
     if not infer_chunk_paths:
-        raise FileNotFoundError("No infer chunks found")
+        infer_single = bundle / "gemma3n_infer.mlpackage"
+        if not infer_single.exists():
+            raise FileNotFoundError("No infer chunks found and gemma3n_infer.mlpackage is missing")
+        infer_chunk_paths = [infer_single]
 
     infer_chunk_models = [load_mlpackage(p) for p in infer_chunk_paths]
-    print(f"Loaded {len(infer_chunk_models)} infer chunks")
+    print(f"Loaded {len(infer_chunk_models)} infer {'chunk' if len(infer_chunk_models) > 1 else 'model'}")
 
     # Create inference manager with proper state sharing
     print("\nInitializing chunked inference manager with state sharing...")
@@ -244,7 +247,7 @@ def main() -> None:
     prefill_time = time.time() - prefill_start
     if token_ids:
         prefill_tps = len(token_ids) / max(prefill_time, 1e-6)
-        print(f"Prefill: {len(token_ids)} tokens in {prefill_time:.2f}s ({prefill_tps:.2f} t/s)")
+        print(f"Prefill: {len(token_ids)} tokens in {prefill_time:.2f}s ({int(round(prefill_tps))} t/s)")
 
     eos_id = tokenizer.eos_token_id
 
@@ -265,7 +268,7 @@ def main() -> None:
     if eos_id is not None and next_id == eos_id:
         decode_time = time.time() - decode_start
         decode_tps = decode_tokens / max(decode_time, 1e-6)
-        print(f"\nDecode: {decode_tokens} tokens in {decode_time:.2f}s ({decode_tps:.2f} t/s)")
+        print(f"\nDecode: {decode_tokens} tokens in {decode_time:.2f}s ({int(round(decode_tps))} t/s)")
         print("\n\nDone.")
         return
 
@@ -330,25 +333,35 @@ def main() -> None:
     decode_time = time.time() - decode_start
     if decode_tokens > 0:
         decode_tps = decode_tokens / max(decode_time, 1e-6)
-        print(f"\nDecode: {decode_tokens} tokens in {decode_time:.2f}s ({decode_tps:.2f} t/s)")
+        print(f"\nDecode: {decode_tokens} tokens in {decode_time:.2f}s ({int(round(decode_tps))} t/s)")
 
     if args.verbose:
         total_time = timing["infer_init"] + sum(timing["infer_chunks"]) + timing["combine"] + timing["lm_head"]
         if total_time <= 0:
             total_time = 1e-9
         print("\nPer-model time breakdown:")
+        infer_init_calls = timing_counts["infer_init"]
+        infer_init_ms = (timing["infer_init"] * 1000.0 / infer_init_calls) if infer_init_calls else 0.0
         print(f"  infer_init: {timing['infer_init']:.3f}s ({timing['infer_init']/total_time*100:.1f}%) "
-              f"[{timing_counts['infer_init']} calls]")
+              f"| {infer_init_ms:.2f} ms/call | [{infer_init_calls} calls]")
         chunk_total = sum(timing["infer_chunks"])
-        print(f"  infer_chunks (all): {chunk_total:.3f}s ({chunk_total/total_time*100:.1f}%)")
+        chunk_calls = timing_counts["infer_chunks"][0] if timing_counts["infer_chunks"] else 0
+        chunk_ms = (chunk_total * 1000.0 / chunk_calls) if chunk_calls else 0.0
+        print(f"  infer_chunks (all): {chunk_total:.3f}s ({chunk_total/total_time*100:.1f}%) "
+              f"| {chunk_ms:.2f} ms/call | [{chunk_calls} calls]")
         for i, t in enumerate(timing["infer_chunks"]):
             calls = timing_counts["infer_chunks"][i]
             pct = (t / total_time * 100.0) if total_time > 0 else 0.0
-            print(f"    chunk {i:02d}: {t:.3f}s ({pct:.1f}%) [{calls} calls]")
+            ms_call = (t * 1000.0 / calls) if calls else 0.0
+            print(f"    chunk {i:02d}: {t:.3f}s ({pct:.1f}%) | {ms_call:.2f} ms/call | [{calls} calls]")
+        combine_calls = timing_counts["combine"]
+        combine_ms = (timing["combine"] * 1000.0 / combine_calls) if combine_calls else 0.0
         print(f"  combine: {timing['combine']:.3f}s ({timing['combine']/total_time*100:.1f}%) "
-              f"[{timing_counts['combine']} calls]")
+              f"| {combine_ms:.2f} ms/call | [{combine_calls} calls]")
+        lm_calls = timing_counts["lm_head"]
+        lm_ms = (timing["lm_head"] * 1000.0 / lm_calls) if lm_calls else 0.0
         print(f"  lm_head: {timing['lm_head']:.3f}s ({timing['lm_head']/total_time*100:.1f}%) "
-              f"[{timing_counts['lm_head']} calls]")
+              f"| {lm_ms:.2f} ms/call | [{lm_calls} calls]")
 
     print("\n\nDone.")
 

@@ -161,6 +161,7 @@ if dtype is not None:
 | `chat_coreml_only.py` | CoreML-only chat runner (single infer or chunked infer) |
 | `test_gemma3n_ane_chat_fixed.py` | End-to-end chat using infer chunks + KV state propagation |
 | `test_gemma3n_kv_state_debug.py` | KV cache state inspection with `coremltools` state API |
+| `test_gemma3n_kv_prefill_compare.py` | Compare CoreML vs PyTorch KV cache after prefill |
 | `test_gemma3n_prefill_debug.py` | Token-by-token prefill checks |
 | `test_gemma3n_coreml_vs_pytorch_chunks.py` | Chunk-level numeric diff (CoreML vs PyTorch) |
 
@@ -189,6 +190,43 @@ python tests/dev/export_gemma3n.py \
   --chunk 4
 ```
 
+Single-step export script (all parts):
+
+```bash
+tests/dev/export_gemma3n_full.sh \
+  --model "$MODEL_PATH" \
+  --output ~/Models/ANE/gemma3n \
+  --context-length 512 \
+  --chunk 4
+```
+
+With LUT6 (FFN + LM head):
+
+```bash
+tests/dev/export_gemma3n_full.sh \
+  --model "$MODEL_PATH" \
+  --output ~/Models/ANE/gemma3n \
+  --context-length 512 \
+  --chunk 4 \
+  --lut 6 \
+  --lut-per-channel 8 \
+  --lut-workers 1
+```
+
+Flat layout (all artifacts in one folder, no subdirs):
+
+```bash
+tests/dev/export_gemma3n_full.sh \
+  --model "$MODEL_PATH" \
+  --output ~/Models/ANE/gemma3n_lut6 \
+  --context-length 512 \
+  --chunk 2 \
+  --lut 6 \
+  --lut-per-channel 8 \
+  --lut-workers 1 \
+  --flat
+```
+
 > **Important**: This step requires access to POSIX shared memory (PyTorch imports abort with `OMP: Error #179` when `shm_open` is blocked). Run the export outside restricted sandboxing.
 
 This creates:
@@ -208,7 +246,9 @@ source env-anemll/bin/activate
 python tests/dev/export_gemma3n.py \
   --model "$MODEL_PATH" \
   --output ~/Models/ANE/gemma3n \
-  --part lm_head
+  --part lm_head \
+  --lut 6 \
+  --lut-per-channel 8
 
 python tests/dev/export_gemma3n.py \
   --model "$MODEL_PATH" \
@@ -266,6 +306,16 @@ python tests/dev/test_gemma3n_kv_state_debug.py \
   --context-length 512
 ```
 
+### Compare KV Cache (CoreML vs PyTorch)
+
+```bash
+python tests/dev/test_gemma3n_kv_prefill_compare.py \
+  --bundle ~/Models/ANE/gemma3n_lut6/infer \
+  --model "$MODEL_PATH" \
+  --prompt "What is Apple Neural Engine?" \
+  --context-length 512
+```
+
 ### Compare CoreML vs PyTorch
 
 ```bash
@@ -287,6 +337,7 @@ python tests/dev/test_gemma3n_coreml_vs_pytorch_chunks.py \
 3. **Run chat** via `test_gemma3n_ane_chat_fixed.py` to verify outputs.
 4. **If output is degenerate**, run:
    - `test_gemma3n_kv_state_debug.py` to confirm KV updates
+   - `test_gemma3n_kv_prefill_compare.py` to compare CoreML vs PyTorch KV cache after prefill
    - `test_gemma3n_coreml_vs_pytorch_chunks.py` for numerical diff per chunk
    - `test_gemma3n_prefill_debug.py` for token-by-token cache updates
 

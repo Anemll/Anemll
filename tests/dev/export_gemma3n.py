@@ -40,6 +40,8 @@ def test_gemma3n_conversion(
     batch_size: int = 1,
     lut2: int = None,
     lut3: int = None,
+    lut_per_channel: int = 8,
+    lut_workers: int = 1,
     chunk_size: int = 2,
     vocab_split_factor: int = 16,
     part: str = "full",
@@ -59,6 +61,8 @@ def test_gemma3n_conversion(
         batch_size=batch_size,
         lut2=lut2,
         lut3=lut3,
+        lut_per_channel=lut_per_channel,
+        lut_num_workers=lut_workers,
         chunk_size=chunk_size,
         enable_laurel=enable_laurel,
         enable_per_layer_embeddings=enable_per_layer_embeddings,
@@ -111,8 +115,11 @@ def main():
                        default="full", help="Part to convert")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
     parser.add_argument("--context-length", type=int, default=256, help="Context length")
+    parser.add_argument("--lut", type=int, default=None, help="LUT quantization level for both FFN and LM head")
     parser.add_argument("--lut2", type=int, default=None, help="LUT quantization for Part 2 (FFN)")
     parser.add_argument("--lut3", type=int, default=None, help="LUT quantization for Part 3 (LM head)")
+    parser.add_argument("--lut-per-channel", type=int, default=8, help="LUT group size (per-grouped-channel), default 8")
+    parser.add_argument("--lut-workers", type=int, default=1, help="LUT k-means worker count (default: 1)")
     parser.add_argument("--chunk", type=int, default=4, help="Number of FFN chunks")
     parser.add_argument("--vocab-split", type=int, default=16, help="Vocabulary split factor for LM head (default: 16)")
     parser.add_argument("--output", default="/tmp/gemma3n-test/", help="Output directory")
@@ -127,6 +134,12 @@ def main():
                        help="Disable activation sparsity (conversion-friendly)")
     
     args = parser.parse_args()
+
+    if args.lut is not None:
+        if args.lut2 is None:
+            args.lut2 = args.lut
+        if args.lut3 is None:
+            args.lut3 = args.lut
     
     print("🚀 Starting Gemma3n CoreML export (IDE debuggable version)")
     print("=" * 70)
@@ -158,8 +171,12 @@ def main():
     print(f"  Chunk size: {args.chunk}")
     print(f"  Vocab split factor: {args.vocab_split} (for LM head memory efficiency)")
     print(f"  Output directory: {output_dir}")
+    if args.lut is not None:
+        print(f"  LUT quantization: {args.lut}")
     print(f"  LUT2 quantization: {args.lut2 if args.lut2 else 'disabled'}")
     print(f"  LUT3 quantization: {args.lut3 if args.lut3 else 'disabled'}")
+    print(f"  LUT per-channel group size: {args.lut_per_channel}")
+    print(f"  LUT workers: {args.lut_workers}")
     print(f"  LAUREL blocks: {'disabled' if args.disable_laurel else 'enabled'}")
     print(f"  Per-layer embeddings: {'disabled' if args.disable_per_layer_embeddings else 'enabled'}")
     print(f"  Multimodal mode: {'enabled' if args.enable_multimodal else 'text-only'}")
@@ -197,6 +214,8 @@ def main():
             batch_size=args.batch_size,
             lut2=args.lut2,
             lut3=args.lut3,
+            lut_per_channel=args.lut_per_channel,
+            lut_workers=args.lut_workers,
             chunk_size=args.chunk,
             vocab_split_factor=args.vocab_split,
             part=args.part,
@@ -220,7 +239,7 @@ def main():
         print(f"  Infer (KV):     python export_gemma3n.py --part infer")
         print(f"  Combine:        python export_gemma3n.py --part combine_streams")
         print(f"  LM head:        python export_gemma3n.py --part lm_head")
-        print(f"  With LUT:       python export_gemma3n.py --lut2 4 --lut3 6")
+        print(f"  With LUT:       python export_gemma3n.py --lut 6 --lut-per-channel 8")
         print(f"  No LAUREL:      python export_gemma3n.py --disable-laurel")
         print(f"  Custom model:   python export_gemma3n.py --model /path/to/model")
         

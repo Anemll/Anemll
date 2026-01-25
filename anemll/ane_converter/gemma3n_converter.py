@@ -8,6 +8,7 @@ import os
 import torch
 import torch.nn as nn
 import coremltools as ct
+import coremltools.optimize as cto
 from coremltools.converters.mil import Builder as mb
 import numpy as np
 from typing import Dict, Optional, Tuple
@@ -38,6 +39,8 @@ class Gemma3nConverter(BaseConverter):
         batch_size: int = 1,
         lut2: Optional[int] = None,
         lut3: Optional[int] = None,
+        lut_per_channel: int = 8,
+        lut_num_workers: int = 1,
         chunk_size: int = 4,
         enable_laurel: bool = True,
         enable_per_layer_embeddings: bool = True,
@@ -52,24 +55,43 @@ class Gemma3nConverter(BaseConverter):
         self.batch_size = batch_size
         self.lut2 = lut2
         self.lut3 = lut3
+        self.lut_per_channel = lut_per_channel
+        self.lut_num_workers = lut_num_workers
         self.chunk_size = chunk_size
         self.enable_laurel = enable_laurel
         self.enable_per_layer_embeddings = enable_per_layer_embeddings
         self.text_only_mode = text_only_mode
         self.disable_sparsity = disable_sparsity
-        
+
         # Load config
         hf_config = AutoConfig.from_pretrained(model_path)
         self.config = Gemma3nConfig.from_pretrained_config(hf_config)
         if self.disable_sparsity:
             self.config.activation_sparsity_pattern = [0.0] * self.config.num_hidden_layers
-        
+
         # Update config with conversion parameters
         self.config.context_length = context_length
         self.config.state_length = max(context_length, self.config.state_length)
-        
+
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
+
+    def _apply_lut(self, mlmodel: ct.models.MLModel, bits: Optional[int]) -> ct.models.MLModel:
+        if not bits:
+            return mlmodel
+        print(
+            f"Applying LUT quantization with {bits} bits and {self.lut_per_channel} channels per group using {self.lut_num_workers} worker(s)..."
+        )
+        config = cto.coreml.OptimizationConfig(
+            global_config=cto.coreml.OpPalettizerConfig(
+                mode="kmeans",
+                nbits=bits,
+                granularity="per_grouped_channel",
+                group_size=self.lut_per_channel,
+                num_kmeans_workers=self.lut_num_workers,
+            ),
+        )
+        return cto.coreml.palettize_weights(mlmodel, config)
 
     def _get_kv_cache_states(self, prefix: str = "model.") -> list:
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
@@ -261,14 +283,7 @@ class Gemma3nConverter(BaseConverter):
         
         # Apply LUT quantization if specified
         if self.lut2:
-            from coremltools.optimize.coreml import OpLinearQuantizerConfig, OptimizationConfig
-            config = OptimizationConfig(
-                global_config=OpLinearQuantizerConfig(
-                    mode="linear_symmetric",
-                    weight_threshold=self.lut2
-                )
-            )
-            mlmodel = ct.optimize.coreml.linear_quantize_weights(mlmodel, config)
+            mlmodel = self._apply_lut(mlmodel, self.lut2)
         
         # Save model
         output_path = os.path.join(self.output_dir, "gemma3n_embeddings.mlpackage")
@@ -386,14 +401,7 @@ class Gemma3nConverter(BaseConverter):
             
             # Apply LUT quantization if specified
             if self.lut2:
-                from coremltools.optimize.coreml import OpLinearQuantizerConfig, OptimizationConfig
-                config = OptimizationConfig(
-                    global_config=OpLinearQuantizerConfig(
-                        mode="linear_symmetric",
-                        weight_threshold=self.lut2
-                    )
-                )
-                mlmodel = ct.optimize.coreml.linear_quantize_weights(mlmodel, config)
+                mlmodel = self._apply_lut(mlmodel, self.lut2)
             
             # Save model
             output_path = os.path.join(
@@ -620,14 +628,7 @@ class Gemma3nConverter(BaseConverter):
             
             # Apply LUT quantization if specified
             if self.lut3:
-                from coremltools.optimize.coreml import OpLinearQuantizerConfig, OptimizationConfig
-                config = OptimizationConfig(
-                    global_config=OpLinearQuantizerConfig(
-                        mode="linear_symmetric",
-                        weight_threshold=self.lut3
-                    )
-                )
-                mlmodel = ct.optimize.coreml.linear_quantize_weights(mlmodel, config)
+                mlmodel = self._apply_lut(mlmodel, self.lut3)
 
             # Save model
             output_path = os.path.join(self.output_dir, "gemma3n_lm_head.mlpackage")
@@ -677,8 +678,10 @@ class Gemma3nConverter(BaseConverter):
             "chunk_size": self.chunk_size,
             "enable_laurel": self.enable_laurel,
             "enable_per_layer_embeddings": self.enable_per_layer_embeddings,
+            "lut": self.lut2 if self.lut2 == self.lut3 else None,
             "lut2": self.lut2,
             "lut3": self.lut3,
+            "lut_per_channel": self.lut_per_channel,
             # Gemma3n specific
             "low_rank_dim": getattr(self.config, "low_rank_dim", 256),
             "activation_topk": getattr(self.config, "activation_topk", None),
@@ -923,6 +926,10 @@ class Gemma3nConverter(BaseConverter):
             minimum_deployment_target=ct.target.iOS18,
             convert_to="mlprogram",
         )
+
+        # Apply LUT quantization if specified (same as FFN)
+        if self.lut2:
+            mlmodel = self._apply_lut(mlmodel, self.lut2)
 
         if total_chunks > 1:
             output_path = os.path.join(
