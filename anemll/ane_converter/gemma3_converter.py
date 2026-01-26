@@ -426,23 +426,41 @@ class Gemma3Converter(BaseConverter):
             print("Converting embeddings...")
             mlmodel = self.convert_part_1(self.model)
         elif part in ("prefill", "2_prefill"):
-            print("Converting prefill...")
+            print("Converting prefill (fill mode)...")
             if self.num_chunks > 1:
                 mlmodel = [
-                    self.convert_part_2_prefill(self.model, i, self.num_chunks)
+                    self.convert_part_2_prefill(self.model, i, self.num_chunks, force_rotation=False)
                     for i in range(self.num_chunks)
                 ]
             else:
-                mlmodel = self.convert_part_2_prefill(self.model)
+                mlmodel = self.convert_part_2_prefill(self.model, force_rotation=False)
         elif part == "2":
-            print("Converting FFN...")
+            print("Converting FFN (infer - fill mode)...")
             if self.num_chunks > 1:
                 mlmodel = [
-                    self.convert_part_2(self.model, i, self.num_chunks)
+                    self.convert_part_2(self.model, i, self.num_chunks, force_rotation=False)
                     for i in range(self.num_chunks)
                 ]
             else:
-                mlmodel = self.convert_part_2(self.model)
+                mlmodel = self.convert_part_2(self.model, force_rotation=False)
+        elif part == "2_rotate":
+            print("Converting FFN (infer_rotate - rotation mode)...")
+            if self.num_chunks > 1:
+                mlmodel = [
+                    self.convert_part_2(self.model, i, self.num_chunks, force_rotation=True)
+                    for i in range(self.num_chunks)
+                ]
+            else:
+                mlmodel = self.convert_part_2(self.model, force_rotation=True)
+        elif part == "2_prefill_rotate":
+            print("Converting prefill (prefill_rotate - rotation mode)...")
+            if self.num_chunks > 1:
+                mlmodel = [
+                    self.convert_part_2_prefill(self.model, i, self.num_chunks, force_rotation=True)
+                    for i in range(self.num_chunks)
+                ]
+            else:
+                mlmodel = self.convert_part_2_prefill(self.model, force_rotation=True)
         elif part == "3":
             print("Converting LM head...")
             mlmodel = self.convert_part_3(self.model)
@@ -984,10 +1002,27 @@ class Gemma3Converter(BaseConverter):
         return mlmodel
 
     def convert_part_2(
-        self, model: Gemma3ForCausalLM, chunk_idx: int = 0, total_chunks: int = 1
+        self, model: Gemma3ForCausalLM, chunk_idx: int = 0, total_chunks: int = 1,
+        force_rotation: bool = False
     ) -> ct.models.MLModel:
-        """Convert transformer layers for generation (FFN)."""
+        """Convert transformer layers for generation (FFN).
+
+        Args:
+            model: The Gemma3 model to convert
+            chunk_idx: Index of the chunk (0-based)
+            total_chunks: Total number of chunks
+            force_rotation: If True, force rotation mode for local cache updates.
+                          False = fill mode (positions < sliding_window)
+                          True = rotate mode (positions >= sliding_window)
+        """
         require_coreml()
+        mode_str = "infer_rotate (rotation mode)" if force_rotation else "infer (fill mode)"
+        print(f"\nConverting chunked FFN for {mode_str}...")
+
+        # Set force_rotation_mode on model config before tracing
+        model.model.config.force_rotation_mode = force_rotation
+        print(f"  force_rotation_mode = {force_rotation}")
+
         total_layers = model.config.num_hidden_layers
         if total_chunks > 1:
             layers_per_chunk = total_layers // total_chunks
@@ -1009,6 +1044,7 @@ class Gemma3Converter(BaseConverter):
 
             def forward(self, hidden_states, position_ids, causal_mask, current_pos):
                 # RoPE is now retrieved per-layer inside process_layers
+                # force_rotation_mode is read from config inside process_layers
                 out = self.model.model.process_layers(
                     hidden_states,
                     position_ids,
@@ -1077,10 +1113,27 @@ class Gemma3Converter(BaseConverter):
         return mlmodel
 
     def convert_part_2_prefill(
-        self, model: Gemma3ForCausalLM, chunk_idx: int = 0, total_chunks: int = 1
+        self, model: Gemma3ForCausalLM, chunk_idx: int = 0, total_chunks: int = 1,
+        force_rotation: bool = False
     ) -> ct.models.MLModel:
-        """Convert transformer layers for prefill mode."""
+        """Convert transformer layers for prefill mode.
+
+        Args:
+            model: The Gemma3 model to convert
+            chunk_idx: Index of the chunk (0-based)
+            total_chunks: Total number of chunks
+            force_rotation: If True, force rotation mode for local cache updates.
+                          False = fill mode (prefill, positions < sliding_window)
+                          True = rotate mode (prefill_rotate, positions >= sliding_window)
+        """
         require_coreml()
+        mode_str = "prefill_rotate (rotation mode)" if force_rotation else "prefill (fill mode)"
+        print(f"\nConverting chunked prefill for {mode_str}...")
+
+        # Set force_rotation_mode on model config before tracing
+        model.model.config.force_rotation_mode = force_rotation
+        print(f"  force_rotation_mode = {force_rotation}")
+
         total_layers = model.config.num_hidden_layers
         if total_chunks > 1:
             layers_per_chunk = total_layers // total_chunks
@@ -1090,18 +1143,24 @@ class Gemma3Converter(BaseConverter):
             start_layer = 0
             end_layer = None
 
+        # Determine if this is prefill with rotation
+        is_prefill_rotate = force_rotation
+
         class PrefillWrapper(torch.nn.Module):
-            def __init__(self, model: Gemma3ForCausalLM, start_layer=0, end_layer=None):
+            def __init__(self, model: Gemma3ForCausalLM, start_layer=0, end_layer=None,
+                        is_prefill_rotate=False):
                 super().__init__()
                 self.model = model  # Use Gemma3ForCausalLM as root
                 self.start_layer = start_layer
                 self.end_layer = end_layer
+                self.is_prefill_rotate = is_prefill_rotate
                 self.states = Gemma3Converter.GetTransformerStates(
                     model, part="2_prefill", prefix="model.model."
                 )
 
             def forward(self, hidden_states, position_ids, causal_mask, current_pos):
                 # RoPE is now retrieved per-layer inside process_layers
+                # force_rotation_mode is read from config inside process_layers
                 out = self.model.model.process_layers(
                     hidden_states,
                     position_ids,
@@ -1110,6 +1169,7 @@ class Gemma3Converter(BaseConverter):
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                     IN_PREFILL=True,
+                    IN_PREFILL_ROTATE=self.is_prefill_rotate,
                 )
 
                 # Skip normalization for prefill - data not used, only KV cache is updated!
@@ -1121,7 +1181,7 @@ class Gemma3Converter(BaseConverter):
 
                 return out
 
-        wrapper = PrefillWrapper(model, start_layer, end_layer)
+        wrapper = PrefillWrapper(model, start_layer, end_layer, is_prefill_rotate)
         wrapper.eval()
 
         # Check if this is the last chunk in a multi-chunk model
@@ -1429,7 +1489,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--part",
         type=str,
-        choices=["1", "2", "2_prefill", "3", "all", "full", "prefill", "embeddings", "monolithic", "monolithic_rotate", "monolithic_prefill", "monolithic_prefill_rotate"],
+        choices=["1", "2", "2_rotate", "2_prefill", "2_prefill_rotate", "3", "all", "full", "prefill", "embeddings", "monolithic", "monolithic_rotate", "monolithic_prefill", "monolithic_prefill_rotate"],
         default="all",
         help="Model part to convert",
     )
@@ -1670,15 +1730,27 @@ def test_conversion(
                     fname += f"_LUT{lut_bits}_CTX{context_length}_ATT{att_size}"
                 else:
                     fname += f"_FP16_CTX{context_length}_ATT{att_size}"
-        elif part in ["2", "2_prefill"]:
-            base = "FFN" if part == "2" else "prefill"
+        elif part in ["2", "2_rotate", "2_prefill", "2_prefill_rotate"]:
+            # Map part to base name:
+            # 2 -> FFN (infer, fill mode)
+            # 2_rotate -> FFN_rotate (infer_rotate, rotation mode)
+            # 2_prefill -> prefill (prefill, fill mode)
+            # 2_prefill_rotate -> prefill_rotate (prefill_rotate, rotation mode)
+            if part == "2":
+                base = "FFN"
+            elif part == "2_rotate":
+                base = "FFN_rotate"
+            elif part == "2_prefill":
+                base = "prefill"
+            else:  # 2_prefill_rotate
+                base = "prefill_rotate"
             fname += f"_{base}"
             if lut_bits is not None:
                 fname += f"_lut{lut_bits}"
             fname += f"_chunk_{i+1:02d}of{num_chunks:02d}"
         if part in ["full", "all", "123"]:
             fname += ""
-        if part not in ["2", "2_prefill"]:
+        if part not in ["2", "2_rotate", "2_prefill", "2_prefill_rotate"]:
             # Skip lut suffix if already included in decoration
             if lut_bits is not None and not (decorate and part in ["monolithic", "monolithic_rotate", "monolithic_prefill", "monolithic_prefill_rotate"]):
                 fname += f"_lut{lut_bits}"

@@ -9,6 +9,7 @@ import os
 import re
 import glob
 from pathlib import Path
+import json
 import coremltools as ct
 from transformers import LlamaTokenizer, AutoTokenizer
 import torch
@@ -448,10 +449,20 @@ def load_models(args,metadata):
                     print(f"\nLoading FFN+PREFILL chunk: {Path(chunk_path).name}")
                 try:
                     # For chunked models, we need both infer and prefill functions
-                    ffn_models.append({
+                    chunk_dict = {
                         'infer': load_model(chunk_path, function_name='infer', compute_unit=compute_unit),
                         'prefill': load_model(chunk_path, function_name='prefill', compute_unit=compute_unit)
-                    })
+                    }
+                    # Try to load rotation functions (Gemma3 with context > 512)
+                    try:
+                        chunk_dict['infer_rotate'] = load_model(chunk_path, function_name='infer_rotate', compute_unit=compute_unit)
+                        chunk_dict['prefill_rotate'] = load_model(chunk_path, function_name='prefill_rotate', compute_unit=compute_unit)
+                        if not args.eval:
+                            print("  Rotation functions loaded (4-function model)")
+                    except Exception:
+                        # Rotation functions not available - standard 2-function model
+                        pass
+                    ffn_models.append(chunk_dict)
                     if not args.eval:
                         print("Chunk loaded successfully")
                     _maybe_report_mem(f"after FFN chunk load {Path(chunk_path).name}", getattr(args, "mem_report", False))
@@ -492,6 +503,26 @@ def initialize_tokenizer(model_path=None, eval_mode=False):
             use_fast=False,
             trust_remote_code=True
         )
+
+        # Try to load a chat template if the tokenizer doesn't have one.
+        if getattr(tokenizer, "chat_template", None) in (None, "") and model_path:
+            template = None
+            config_path = Path(model_path) / "tokenizer_config.json"
+            if config_path.exists():
+                try:
+                    config_data = json.loads(config_path.read_text())
+                    template = config_data.get("chat_template")
+                except Exception as e:
+                    if not eval_mode:
+                        print(f"Warning: Failed to read tokenizer_config.json chat_template: {e}")
+            if template is None:
+                jinja_path = Path(model_path) / "chat_template.jinja"
+                if jinja_path.exists():
+                    template = jinja_path.read_text()
+            if template:
+                tokenizer.chat_template = template
+                if not eval_mode:
+                    print("Loaded chat_template from model files")
         
         if not eval_mode:
             print("\nTokenizer Configuration:")
@@ -552,40 +583,56 @@ def initialize_causal_mask(context_length, eval_mode=False):
         print(f"\nInitialized causal mask for context length {context_length}")
     return causal_mask
 
-def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None, causal_mask=None):
-    """Run prefill on the input sequence."""
+def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None, causal_mask=None, sliding_window=None):
+    """Run prefill on the input sequence.
+
+    For Gemma3 with 4-function models:
+    - Uses 'prefill' for positions < sliding_window
+    - Uses 'prefill_rotate' for positions >= sliding_window (if available)
+    """
     # Use provided causal mask or create one if not provided
     if causal_mask is None:
         causal_mask = make_causal_mask(context_length, 0)
         causal_mask = torch.tensor(causal_mask, dtype=torch.float16)
-    
+
+    # Check if rotation functions are available
+    has_rotation = isinstance(ffn_models[0], dict) and 'prefill_rotate' in ffn_models[0]
+
+    # If no rotation or no sliding_window, use standard prefill
+    if not has_rotation or sliding_window is None:
+        sliding_window = context_length  # Effectively disables rotation mode
+
     # Process in batches
     batch_pos = 0
     while batch_pos < context_pos:
         batch_end = min(batch_pos + batch_size, context_pos)
         current_batch_size = batch_end - batch_pos
-        
+
         # Get current batch
         batch_input = input_ids[:, batch_pos:batch_end]
-        
+
         # Always pad to full batch size for prefill
         batch_input = F.pad(
             batch_input,
             (0, batch_size - current_batch_size),
             value=0
         )
-        
+
         # Generate position IDs for full batch size
         position_ids = torch.arange(batch_pos, batch_pos+batch_size, dtype=torch.int32)  # Changed: Always use full batch size
         batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos+batch_size, :]  # Changed: Use full batch size
-        
+
         # Run embeddings
         hidden_states = torch.from_numpy(
             embed_model.predict({
                 'input_ids': batch_input.numpy().astype(np.int32)
             })['hidden_states']
         )
-        
+
+        # Determine which prefill function to use based on position
+        # Use prefill_rotate for positions >= sliding_window
+        prefill_func_name = 'prefill_rotate' if batch_pos >= sliding_window and has_rotation else 'prefill'
+
         # Run through FFN chunks with state
         for ffn_model in ffn_models:
             if isinstance(ffn_model, dict):
@@ -595,38 +642,61 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
                     'causal_mask': batch_causal_mask.numpy().astype(np.float16), # [1, 1, 64, context_length]
                     'current_pos': np.array([batch_pos], dtype=np.int32)  # [1]
                 }
-                output = ffn_model['prefill'].predict(inputs, state)
+                output = ffn_model[prefill_func_name].predict(inputs, state)
                 hidden_states = torch.from_numpy(output['output_hidden_states'])
-        
+
         batch_pos = batch_end
-    
+
     return torch.tensor([context_pos], dtype=torch.int32)
 
 def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, metadata, state=None, causal_mask=None, temperature=0.0):
-    """Generate the next token."""
+    """Generate the next token.
+
+    For Gemma3 with 4-function models:
+    - Uses 'infer' for positions < sliding_window
+    - Uses 'infer_rotate' for positions >= sliding_window (if available)
+    """
+    debug = metadata.get('debug', False)
+    attention_size = metadata.get('attention_size', context_length)
+    sliding_window = metadata.get('sliding_window', None)
+
+    # Check if rotation functions are available
+    has_rotation = isinstance(ffn_models[0], dict) and 'infer_rotate' in ffn_models[0]
+
+    # Determine which infer function to use
+    # Use infer_rotate for positions >= sliding_window (0-indexed, so pos-1 is the actual position)
+    use_rotation = has_rotation and sliding_window is not None and (pos - 1) >= sliding_window
+    infer_func_name = 'infer_rotate' if use_rotation else 'infer'
+
     # Get current token
     current_token = input_ids[:, pos-1:pos]  # [1, 1]
-    
+
     # Ensure proper data type for CoreML
     current_token_array = current_token.numpy().astype(np.int32)
-    
+
     # Run embeddings
     hidden_states = torch.from_numpy(
         embed_model.predict({'input_ids': current_token_array})['hidden_states']
     )  # [1, 1, hidden_size]
-    
+
     # Create masks
     update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
     update_mask[0, 0, pos-1, 0] = 1.0
     position_ids = torch.tensor([pos-1], dtype=torch.int32)  # [1]
-    
+
     # Use provided causal mask or create one if not provided
     if causal_mask is None:
         causal_mask_data = make_causal_mask(context_length, 0)
         single_causal_mask = torch.tensor(causal_mask_data[:, :, pos-1:pos, :], dtype=torch.float16)  # [1, 1, 1, context_length]
     else:
         single_causal_mask = causal_mask[:, :, pos-1:pos, :]
-    
+
+    if debug:
+        print(f"\n[DEBUG] generate_next_token: pos={pos}, context_length={context_length}, attention_size={attention_size}")
+        print(f"[DEBUG]   position_ids={position_ids.item()}, current_token={current_token.item()}")
+        print(f"[DEBUG]   causal_mask shape={single_causal_mask.shape}")
+        print(f"[DEBUG]   hidden_states shape={hidden_states.shape}")
+
     # Run through FFN chunks with state
     for ffn_model in ffn_models:
         if isinstance(ffn_model, dict):
@@ -640,12 +710,22 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
             # Add update_mask only if model expects it (older models)
             # Get model input names from the spec
             try:
-                model_inputs = {inp.name for inp in ffn_model['infer'].get_spec().description.input}
+                model_inputs = {inp.name for inp in ffn_model[infer_func_name].get_spec().description.input}
             except:
                 model_inputs = set()
             if 'update_mask' in model_inputs:
                 inputs['update_mask'] = update_mask.numpy().astype(np.float16)
-            output = ffn_model['infer'].predict(inputs, state)
+            if debug:
+                print(f"[DEBUG]   FFN {infer_func_name} inputs: position_ids={inputs['position_ids']}, current_pos={inputs['current_pos']}")
+                print(f"[DEBUG]   FFN {infer_func_name} causal_mask shape={inputs['causal_mask'].shape}")
+            try:
+                output = ffn_model[infer_func_name].predict(inputs, state)
+            except Exception as e:
+                print(f"\n[ERROR] FFN {infer_func_name} failed at pos={pos}, position_ids={position_ids.item()}")
+                print(f"[ERROR]   context_length={context_length}, attention_size={attention_size}")
+                print(f"[ERROR]   causal_mask shape={single_causal_mask.shape}")
+                print(f"[ERROR]   Exception: {e}")
+                raise
             hidden_states = torch.from_numpy(output['output_hidden_states'])
     
     # Run LM head
@@ -786,6 +866,9 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     if not eval_mode:
                         print(f"Warning: batch_size was None, using default: {batch_size}")
                 
+                # Get sliding_window for rotation support (Gemma3)
+                sliding_window = metadata.get('sliding_window', None)
+
                 _ = run_prefill(
                     embed_model,
                     ffn_models,
@@ -794,7 +877,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     context_length,
                     batch_size,
                     state,
-                    causal_mask
+                    causal_mask,
+                    sliding_window
                 )
                 
                 # Calculate prefill timing
@@ -965,6 +1049,8 @@ def parse_args():
                        help='Number of logits splits from LM head (default: 8 for llama, 16 for qwen)')
     parser.add_argument('--debug-argmax', action='store_true',
                        help='Enable debug output for argmax mode (print indices and values)')
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable debug output (position, state, shapes)')
 
     args = parser.parse_args()
 
@@ -1083,6 +1169,15 @@ def parse_args():
                     args.num_logits = int(params['num_logits'])
                 # attention_size is used for causal mask (sliding window for Gemma3)
                 args.attention_size = int(params.get('attention_size', args.context_length))
+
+                # sliding_window for Gemma3 rotation support (default 512 for Gemma3)
+                # Only set if the model has a sliding window configured or if prefix is gemma3
+                if 'sliding_window' in params:
+                    args.sliding_window = int(params['sliding_window'])
+                elif prefix.lower().startswith('gemma3'):
+                    args.sliding_window = 512  # Default Gemma3 sliding window
+                else:
+                    args.sliding_window = None  # No rotation for other models
 
                 # Set split_lm_head, but allow CLI override
                 if args.split_lm_head is None:
@@ -1637,6 +1732,7 @@ def main():
             metadata['split_lm_head'] = getattr(args, 'split_lm_head', 16)
             metadata['argmax_in_model'] = getattr(args, 'argmax_in_model', False)
             metadata['debug_argmax'] = getattr(args, 'debug_argmax', False)
+            metadata['debug'] = getattr(args, 'debug', False)
             metadata['sliding_window'] = 512  # Local attention window for Gemma3
 
             if not args.eval:
@@ -1713,6 +1809,9 @@ def main():
             # Add split_lm_head to metadata (preferred)
             metadata['split_lm_head'] = getattr(args, 'split_lm_head', getattr(args, 'num_logits', 8))
 
+            # Add debug flag
+            metadata['debug'] = getattr(args, 'debug', False)
+
             if not args.eval:
                 print(f"\nMetadata after load_models: {metadata}")
                 print(f"Using split_lm_head value: {metadata.get('split_lm_head', 8)}")
@@ -1725,6 +1824,13 @@ def main():
             # For Gemma3 with split cache, use attention_size (sliding window) for causal mask
             attention_size = getattr(args, 'attention_size', metadata['context_length'])
             metadata['attention_size'] = attention_size
+
+            # Add sliding_window for Gemma3 rotation support
+            sliding_window = getattr(args, 'sliding_window', None)
+            metadata['sliding_window'] = sliding_window
+            if sliding_window is not None and not args.eval:
+                print(f"Sliding window: {sliding_window} (rotation enabled for pos >= {sliding_window})")
+
             causal_mask = initialize_causal_mask(attention_size, args.eval)
 
             # Warmup runs to prevent Python GIL issues with CoreML

@@ -351,7 +351,8 @@ struct AnemllCLIAdv: AsyncParsableCommand {
             splitLMHead: config.splitLMHead,
             debugLevel: debugLevel,
             v110: config.configVersion == "0.1.1",  // Set v110 flag based on version
-            argmaxInModel: config.argmaxInModel
+            argmaxInModel: config.argmaxInModel,
+            slidingWindow: config.slidingWindow  // Gemma3 rotation support
         )
         
         // *** SET SAMPLING CONFIGURATION ***

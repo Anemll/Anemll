@@ -339,18 +339,59 @@ else
     echo "Skipping step 4: Converting Prefill"
 fi
 
+# Step 4a: Convert FFN Rotate (Part 2_rotate) - Gemma3 only
+# For Gemma3 models with context > sliding_window (512), we need rotation versions
+if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
+    if [ $CONTEXT_LENGTH -gt 512 ]; then
+        if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+            run_step 4 "Converting FFN Rotate" "$CONVERTER \
+                --part 2_rotate \
+                $LUT2_PARAM \
+                --chunk $NUM_CHUNKS \
+                --context-length $CONTEXT_LENGTH \
+                --batch-size $BATCH_SIZE \
+                --prefix \"$PREFIX\" \
+                --model \"$MODEL_PATH\" \
+                --output \"$OUTPUT_DIR\""
+        fi
+
+        # Step 4b: Convert Prefill Rotate (Part 2_prefill_rotate) - Gemma3 only
+        if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+            run_step 4 "Converting Prefill Rotate" "$CONVERTER \
+                --part 2_prefill_rotate \
+                $LUT2_PARAM \
+                --chunk $NUM_CHUNKS \
+                --context-length $CONTEXT_LENGTH \
+                --batch-size $BATCH_SIZE \
+                --prefix \"$PREFIX\" \
+                --model \"$MODEL_PATH\" \
+                --output \"$OUTPUT_DIR\""
+        fi
+    fi
+fi
+
 # Step 5: Combine Models
+# For Gemma3 with context > 512, use --gemma3 flag to combine 4 functions
+GEMMA3_FLAG=""
+if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
+    if [ $CONTEXT_LENGTH -gt 512 ]; then
+        GEMMA3_FLAG="--gemma3"
+    fi
+fi
+
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
     if [ ! -z "$LUT_PART2" ]; then
         run_step 5 "Combining Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
             --chunk $NUM_CHUNKS \
             $LUT2_PARAM \
+            $GEMMA3_FLAG \
             --prefix \"$PREFIX\" \
             --input \"$OUTPUT_DIR\" \
             --output \"$OUTPUT_DIR\""
     else
         run_step 5 "Combining Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
             --chunk $NUM_CHUNKS \
+            $GEMMA3_FLAG \
             --prefix \"$PREFIX\" \
             --input \"$OUTPUT_DIR\" \
             --output \"$OUTPUT_DIR\""

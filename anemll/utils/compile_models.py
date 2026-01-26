@@ -154,12 +154,13 @@ def parse_lut_arg(lut_value):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Compile models to MLModelC format')
-    parser.add_argument('part', type=str, help='Model part to compile (1, 2, or 3)')
+    parser.add_argument('part', type=str, help='Model part to compile (1, 2, 3, monolithic, or all)')
     parser.add_argument('--lut', type=str, help='LUT bits used in quantization (optional). Format: "bits" or "bits,per_channel" (e.g., "6" or "6,4")')
     parser.add_argument('--chunk', type=int, help='Number of chunks (for part 2)')
     parser.add_argument('--prefix', type=str, default='llama', help='Model name prefix')
     parser.add_argument('--input', type=str, default='.', help='Input directory containing models')
     parser.add_argument('--output', type=str, default=None, help='Output directory (default: same as input)')
+    parser.add_argument('--recursive', action='store_true', help='When part=all, search for .mlpackage recursively')
     return parser.parse_args()
 
 def main():
@@ -170,6 +171,22 @@ def main():
 
     # Set output dir to input dir if not specified
     output_dir = args.output if args.output else args.input
+    os.makedirs(output_dir, exist_ok=True)
+
+    if args.part == "all":
+        # Compile every .mlpackage under input (optionally recursive).
+        pattern = "**/*.mlpackage" if args.recursive else "*.mlpackage"
+        search_root = os.path.abspath(args.input)
+        models = sorted(glob.glob(os.path.join(search_root, pattern), recursive=args.recursive))
+        if not models:
+            print(f"Error: No .mlpackage files found under {search_root} (recursive={args.recursive})")
+            return 1
+        print(f"Found {len(models)} .mlpackage files under {search_root}")
+        success = True
+        for model_path in models:
+            if not compile_model(model_path, output_dir):
+                success = False
+        return 0 if success else 1
 
     # Construct input filename based on part and parameters
     if args.part == '1':

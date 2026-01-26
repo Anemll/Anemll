@@ -444,6 +444,15 @@ def parse_args():
                     else:
                         args.split_lm_head = 8  # Default value
 
+                # sliding_window for Gemma3 rotation support (default 512 for Gemma3)
+                # Only set if the model has a sliding window configured or if prefix is gemma3
+                if 'sliding_window' in params:
+                    args.sliding_window = int(params['sliding_window'])
+                elif prefix.lower().startswith('gemma3'):
+                    args.sliding_window = 512  # Default Gemma3 sliding window
+                else:
+                    args.sliding_window = None  # No rotation for other models
+
                 print(f"\nLoaded parameters from {args.meta}:")
                 print(f"  Context Length: {args.context_length}")
                 print(f"  Batch Size: {args.batch_size}")
@@ -604,10 +613,19 @@ def load_models(args,metadata):
                 print(f"\nLoading FFN+PREFILL chunk: {Path(chunk_path).name}")
                 try:
                     # For chunked models, we need both infer and prefill functions
-                    ffn_models.append({
+                    chunk_dict = {
                         'infer': load_model(chunk_path, function_name='infer', compute_unit=compute_unit),
                         'prefill': load_model(chunk_path, function_name='prefill', compute_unit=compute_unit)
-                    })
+                    }
+                    # Try to load rotation functions (Gemma3 with context > 512)
+                    try:
+                        chunk_dict['infer_rotate'] = load_model(chunk_path, function_name='infer_rotate', compute_unit=compute_unit)
+                        chunk_dict['prefill_rotate'] = load_model(chunk_path, function_name='prefill_rotate', compute_unit=compute_unit)
+                        print("  Rotation functions loaded (4-function model)")
+                    except Exception:
+                        # Rotation functions not available - standard 2-function model
+                        pass
+                    ffn_models.append(chunk_dict)
                     print("Chunk loaded successfully")
                 except Exception as e:
                     print(f"Error loading chunk {chunk_path}: {str(e)}")
@@ -684,39 +702,55 @@ def make_causal_mask(length, start):
     mask[:, :, col_indices <= (row_indices + start)] = 0
     return mask
 
-def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length, batch_size, state, causal_mask):
-    """Run prefill on the input sequence."""
+def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length, batch_size, state, causal_mask, sliding_window=None):
+    """Run prefill on the input sequence.
+
+    For Gemma3 with 4-function models:
+    - Uses 'prefill' for positions < sliding_window
+    - Uses 'prefill_rotate' for positions >= sliding_window (if available)
+    """
     #print(f"[DEBUG] Running prefill from 0 to {current_pos}")
-    
+
+    # Check if rotation functions are available
+    has_rotation = isinstance(ffn_models[0], dict) and 'prefill_rotate' in ffn_models[0]
+
+    # If no rotation or no sliding_window, use standard prefill
+    if not has_rotation or sliding_window is None:
+        sliding_window = context_length  # Effectively disables rotation mode
+
     # Process in batches
     batch_pos = 0
     while batch_pos < current_pos:
         batch_end = min(batch_pos + batch_size, current_pos)
         current_batch_size = batch_end - batch_pos
-        
+
         #print(f"[DEBUG] Prefill batch {batch_pos}-{batch_end} (size={current_batch_size})")
-        
+
         # Get current batch
         batch_input = input_ids[:, batch_pos:batch_end]
-        
+
         # Pad to full batch size
         batch_input = F.pad(
             batch_input,
             (0, batch_size - current_batch_size),
             value=0
         )
-        
+
         # Generate position IDs for this batch
         position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
-        
+
         # Use the pre-initialized causal mask and extract the batch portion
         batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
-        
+
         # Run embeddings
         hidden_states = torch.from_numpy(
             embed_model.predict({'input_ids': batch_input.numpy()})['hidden_states']
         )
-        
+
+        # Determine which prefill function to use based on position
+        # Use prefill_rotate for positions >= sliding_window
+        prefill_func_name = 'prefill_rotate' if batch_pos >= sliding_window and has_rotation else 'prefill'
+
         # Run through FFN chunks
         for ffn_model in ffn_models:
             if isinstance(ffn_model, dict):
@@ -726,42 +760,63 @@ def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length,
                     'causal_mask': batch_causal_mask.numpy(),
                     'current_pos': np.array([batch_pos], dtype=np.int32)
                 }
-                output = ffn_model['prefill'].predict(inputs, state)
+                output = ffn_model[prefill_func_name].predict(inputs, state)
                 hidden_states = torch.from_numpy(output['output_hidden_states'])
-        
+
         batch_pos = batch_end
-    
+
     return torch.tensor([current_pos], dtype=torch.int32)
 
 def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state, causal_mask, metadata=None, temperature=0.0):
-    """Generate the next token."""
+    """Generate the next token.
+
+    For Gemma3 with 4-function models:
+    - Uses 'infer' for positions < sliding_window
+    - Uses 'infer_rotate' for positions >= sliding_window (if available)
+    """
+    sliding_window = metadata.get('sliding_window', None) if metadata else None
+
+    # Check if rotation functions are available
+    has_rotation = isinstance(ffn_models[0], dict) and 'infer_rotate' in ffn_models[0]
+
+    # Determine which infer function to use
+    # Use infer_rotate for positions >= sliding_window (0-indexed, so pos-1 is the actual position)
+    use_rotation = has_rotation and sliding_window is not None and (pos - 1) >= sliding_window
+    infer_func_name = 'infer_rotate' if use_rotation else 'infer'
+
     # Get current token
     current_token = input_ids[:, pos-1:pos]
-    
+
     # Run embeddings
     hidden_states = torch.from_numpy(
         embed_model.predict({'input_ids': current_token.numpy()})['hidden_states']
     )
-    
+
     # Create masks
     update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
     update_mask[0, 0, pos-1, 0] = 1.0
     position_ids = torch.tensor([pos-1], dtype=torch.int32)
-    
+
     # Use the pre-initialized causal mask and extract the single position portion
     single_causal_mask = causal_mask[:, :, pos-1:pos, :]
-    
+
     # Run through FFN chunks
     for ffn_model in ffn_models:
         if isinstance(ffn_model, dict):
             inputs = {
                 'hidden_states': hidden_states.numpy(),
-                'update_mask': update_mask.numpy(),
                 'position_ids': position_ids.numpy(),
                 'causal_mask': single_causal_mask.numpy(),
                 'current_pos': position_ids.numpy()
             }
-            output = ffn_model['infer'].predict(inputs, state)
+            # Add update_mask only if model expects it (older models)
+            try:
+                model_inputs = {inp.name for inp in ffn_model[infer_func_name].get_spec().description.input}
+            except Exception:
+                model_inputs = set()
+            if 'update_mask' in model_inputs:
+                inputs['update_mask'] = update_mask.numpy()
+            output = ffn_model[infer_func_name].predict(inputs, state)
             hidden_states = torch.from_numpy(output['output_hidden_states'])
     
     # Run LM head and get next token
@@ -1284,12 +1339,18 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                 # Generation loop
                 pos = context_pos
                 tokens_generated = 0
+                max_tokens_this_turn = (
+                    max_tokens
+                    if max_tokens is not None
+                    else max(0, context_length - context_pos)
+                )
                 inference_start = time.time()  # Start inference timing
 
                 while True:
                     # Check if we need to shift window
                     if pos >= context_length - 2:
-                        print_system(f"Context window reached {context_length} tokens; shifting context to continue.")
+                        if DEBUG_LEVEL >= 1:
+                            print_system(f"Context window reached {context_length} tokens; shifting context to continue.")
                         # Calculate shift to maintain full batches
                         batch_size = metadata.get('batch_size', 64)
                         # Calculate max batches that fit in context
@@ -1353,7 +1414,7 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                     # In warmup mode, limit tokens
                     if warmup and tokens_generated >= WARMUP_TOKEN_LIMIT:
                         break
-                    if not warmup and max_tokens is not None and tokens_generated >= max_tokens:
+                    if not warmup and max_tokens_this_turn is not None and tokens_generated >= max_tokens_this_turn:
                         break
 
                     if next_token in stop_token_ids:
@@ -1581,6 +1642,9 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
             generation_start_time = time.time()
             
             try:
+                # Get sliding_window for rotation support (Gemma3)
+                sliding_window = metadata.get('sliding_window', None)
+
                 # Run prefill on entire context
                 current_pos = run_prefill(
                     embed_model,
@@ -1590,7 +1654,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     context_length,
                     batch_size,
                     state,
-                    causal_mask
+                    causal_mask,
+                    sliding_window
                 )
                 #print(f"\n[DEBUG] After initial prefill - current_pos: {current_pos}")
 
@@ -1600,12 +1665,18 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 # Generation loop
                 pos = context_pos
                 tokens_generated = 0
+                max_tokens_this_turn = (
+                    max_tokens
+                    if max_tokens is not None
+                    else max(0, context_length - context_pos)
+                )
                 inference_start = time.time()  # Start inference timing
                 
                 while True:
                     # Check if we need to shift window
                     if pos >= context_length - 2:
-                        print_system(f"Context window reached {context_length} tokens; shifting context to continue.")
+                        if DEBUG_LEVEL >= 1:
+                            print_system(f"Context window reached {context_length} tokens; shifting context to continue.")
                         # Calculate shift to maintain full batches
                         batch_size = metadata.get('batch_size', 64)
                         # Calculate max batches that fit in context
@@ -1629,7 +1700,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                             context_length,
                             batch_size,
                             state,
-                            causal_mask
+                            causal_mask,
+                            sliding_window
                         )
 
                         # Start generating from the next position
@@ -1666,7 +1738,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     # In warmup mode, limit tokens
                     if warmup and tokens_generated >= WARMUP_TOKEN_LIMIT:
                         break
-                    if not warmup and max_tokens is not None and tokens_generated >= max_tokens:
+                    if not warmup and max_tokens_this_turn is not None and tokens_generated >= max_tokens_this_turn:
                         break
                     
                     if next_token in stop_token_ids:
@@ -1822,6 +1894,12 @@ def main():
 
             # Add split_lm_head to metadata for generate_next_token
             metadata['split_lm_head'] = getattr(args, 'split_lm_head', 8)
+
+            # Add sliding_window for Gemma3 rotation support
+            sliding_window = getattr(args, 'sliding_window', None)
+            metadata['sliding_window'] = sliding_window
+            if sliding_window is not None:
+                print(f"Sliding window: {sliding_window} (rotation enabled for pos >= {sliding_window})")
 
             # Warmup runs to prevent Python GIL issues with CoreML !
             if not args.nw:

@@ -335,7 +335,7 @@ public actor ModelLoader {
                 
                 print("Loading inference chunk \(i): \(chunkPath)")
                 modelConfig.functionName = "infer"
-                
+
                 // Load inference model and fail immediately if it fails
                 var inferModel: MLModel
                 do {
@@ -345,23 +345,23 @@ public actor ModelLoader {
                     print("❌ Error loading inference chunk \(i): \(error)")
                     throw ModelError.inferenceError("Failed to load inference chunk \(i): \(String(reflecting: error))")
                 }
-                
+
                 try await progressTracker.updateProgress(
                     increment: chunkProgressIncrement,
                     stage: "FFN Chunk Loaded",
                     detail: "Inference \(i)/\(configCopy.numChunks)"
                 )
-                
+
                 // Load prefill model for this chunk
                 try await progressTracker.updateProgress(
                     increment: 0.0,
                     stage: "Loading FFN Chunk",
                     detail: "Prefill \(i)/\(configCopy.numChunks)"
                 )
-                
+
                 print("Loading prefill chunk \(i): \(chunkPath)")
                 modelConfig.functionName = "prefill"
-                
+
                 // Load prefill model and fail immediately if it fails
                 var prefillModel: MLModel
                 do {
@@ -371,14 +371,47 @@ public actor ModelLoader {
                     print("❌ Error loading prefill chunk \(i): \(error)")
                     throw ModelError.inferenceError("Failed to load prefill chunk \(i): \(String(reflecting: error))")
                 }
-                
+
                 try await progressTracker.updateProgress(
                     increment: chunkProgressIncrement,
                     stage: "FFN Chunk Loaded",
                     detail: "Prefill \(i)/\(configCopy.numChunks)"
                 )
-                
-                ffnChunks.append(FFNChunk(inferModel: inferModel, prefillModel: prefillModel))
+
+                // Try to load rotation functions (4-function model for Gemma3 with sliding window)
+                var inferRotateModel: MLModel? = nil
+                var prefillRotateModel: MLModel? = nil
+
+                // Only try loading rotation functions if sliding window is configured
+                if configCopy.slidingWindow != nil {
+                    print("Sliding window configured, attempting to load rotation functions...")
+                    modelConfig.functionName = "infer_rotate"
+                    do {
+                        inferRotateModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                        print("✅ Inference rotate chunk \(i) loaded")
+                    } catch {
+                        print("ℹ️ Inference rotate function not available (2-function model)")
+                    }
+
+                    modelConfig.functionName = "prefill_rotate"
+                    do {
+                        prefillRotateModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                        print("✅ Prefill rotate chunk \(i) loaded")
+                    } catch {
+                        print("ℹ️ Prefill rotate function not available (2-function model)")
+                    }
+
+                    if inferRotateModel != nil && prefillRotateModel != nil {
+                        print("✅ Chunk \(i) loaded as 4-function model (with rotation support)")
+                    }
+                }
+
+                ffnChunks.append(FFNChunk(
+                    inferModel: inferModel,
+                    prefillModel: prefillModel,
+                    inferRotateModel: inferRotateModel,
+                    prefillRotateModel: prefillRotateModel
+                ))
             }
             
             // Verify that we loaded all expected chunks

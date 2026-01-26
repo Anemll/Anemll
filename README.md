@@ -34,10 +34,11 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 ./install_dependencies.sh
 
 # 3. Test conversion pipeline
-python tests/test_qwen_model.py     # Test Qwen 3 models
-python tests/test_qwen2.5_model.py  # Test Qwen 2.5 models
-python tests/test_llama_model.py    # Test LLaMA models
-python tests/test_gemma3_model.py   # Test Gemma 3 models
+python tests/test_qwen_model.py       # Test Qwen 3 models
+python tests/test_qwen2.5_model.py    # Test Qwen 2.5 models
+python tests/test_llama_model.py      # Test LLaMA models
+python tests/test_gemma3_model.py     # Test Gemma 3 270M (monolithic + argmax)
+python tests/test_gemma3_1B_model.py  # Test Gemma 3 1B (chunked, LUT6, 4096 ctx)
 
 # 4. Convert your own models
 ./anemll/utils/convert_model.sh --model <path> --output <dir>
@@ -130,16 +131,16 @@ Gemma 3 models use a split KV cache architecture with interleaved local (sliding
     --lut3 6 \
     --chunk 1
 
-# Convert Gemma 3 1B with LUT6 and 4K context
+# Convert Gemma 3 1B with LUT6 and 4K context (single chunk)
 ./anemll/utils/convert_model.sh \
     --model google/gemma-3-1b-it \
-    --output /path/to/output/gemma3_1b \
+    --output /path/to/output/gemma3_1b_lut6_ctx4096 \
     --context 4096 \
     --batch 64 \
     --lut1 6 \
     --lut2 6 \
     --lut3 6 \
-    --chunk 4
+    --chunk 1
 
 # Test the converted model
 python3 tests/chat.py --meta /path/to/output/gemma3_270m/meta.yaml --prompt "Hello!"
@@ -147,8 +148,11 @@ python3 tests/chat.py --meta /path/to/output/gemma3_270m/meta.yaml --prompt "Hel
 
 **Gemma 3 Notes:**
 - HuggingFace model names (e.g., `google/gemma-3-1b-it`) are auto-detected and downloaded
+- **270M model**: Uses monolithic format (single CoreML file) with argmax - ideal for quick testing
+- **1B model**: Uses standard chunked format (separate embeddings, FFN, LM head)
 - Uses split KV cache: local layers (sliding window 512) + global layers (full context)
-- Recommended: `--chunk 1` for 270M, `--chunk 4` for 1B+ models
+- For context > 512: 4-function models (infer, infer_rotate, prefill, prefill_rotate) enable automatic cache rotation
+- Recommended: `--chunk 1` for all Gemma 3 models (1B fits in single chunk)
 - Supports context lengths up to 4096 (512-2048 recommended for optimal ANE performance)
 - Large vocabulary (262K tokens) uses 16-way LM head splitting
 - Requires HuggingFace login for gated models: `huggingface-cli login`

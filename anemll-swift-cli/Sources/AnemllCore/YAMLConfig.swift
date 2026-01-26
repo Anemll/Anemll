@@ -22,6 +22,9 @@ public struct YAMLConfig: Sendable {
     public let isMonolithic: Bool
     public let monolithicModelPath: String?
     public let argmaxInModel: Bool  // If true, model outputs argmax_idx/val pairs instead of logits
+
+    // Gemma3 sliding window support (for 4-function models with rotation)
+    public let slidingWindow: Int?  // nil means no rotation needed, 512 for Gemma3
     
     public init(from yamlString: String) throws {
         // Load YAML
@@ -59,6 +62,9 @@ public struct YAMLConfig: Sendable {
         self.isMonolithic = yaml["is_monolithic"] as? Bool ?? false
         self.monolithicModelPath = yaml["monolithic_model_path"] as? String
         self.argmaxInModel = yaml["argmax_in_model"] as? Bool ?? false
+
+        // Sliding window support for Gemma3
+        self.slidingWindow = yaml["sliding_window"] as? Int
 
         // Get the ffn_path
         let rawFFNPath = yaml["ffn_path"] as? String ?? ""
@@ -210,6 +216,25 @@ public struct YAMLConfig: Sendable {
             // Check for argmax_in_model flag
             let argmaxInModel = params["argmax_in_model"] as? Bool ?? false
 
+            // Check for sliding_window (Gemma3 rotation support)
+            // If sliding_window is explicitly set in params, use it
+            // Otherwise, detect Gemma3 prefix and use 512 if context > 512
+            let slidingWindow: Int?
+            if let sw = params["sliding_window"] as? Int {
+                slidingWindow = sw
+                print("Sliding window from meta.yaml: \(sw)")
+            } else if modelPrefix.lowercased().hasPrefix("gemma3") {
+                let contextLength = params["context_length"] as? Int ?? 2048
+                if contextLength > 512 {
+                    slidingWindow = 512
+                    print("Gemma3 detected with context > 512, defaulting sliding_window to 512")
+                } else {
+                    slidingWindow = nil
+                }
+            } else {
+                slidingWindow = nil
+            }
+
             // Build monolithic model path if applicable
             let monolithicModelPath: String?
             if isMonolithic {
@@ -263,6 +288,9 @@ public struct YAMLConfig: Sendable {
             if let monolithicPath = monolithicModelPath {
                 configDict["monolithic_model_path"] = monolithicPath
             }
+            if let sw = slidingWindow {
+                configDict["sliding_window"] = sw
+            }
             
             let yamlString = try Yams.dump(object: configDict)
             return try YAMLConfig(from: yamlString)
@@ -291,7 +319,8 @@ public struct YAMLConfig: Sendable {
         splitLMHead: Int,
         isMonolithic: Bool = false,
         monolithicModelPath: String? = nil,
-        argmaxInModel: Bool = false
+        argmaxInModel: Bool = false,
+        slidingWindow: Int? = nil
     ) throws -> YAMLConfig {
         // Create YAML string for init(from:)
         var configDict: [String: Any] = [
@@ -316,6 +345,9 @@ public struct YAMLConfig: Sendable {
         ]
         if let monolithicPath = monolithicModelPath {
             configDict["monolithic_model_path"] = monolithicPath
+        }
+        if let sw = slidingWindow {
+            configDict["sliding_window"] = sw
         }
 
         let yamlString = try Yams.dump(object: configDict)

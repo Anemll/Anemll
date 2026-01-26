@@ -23,6 +23,7 @@ import Accelerate
     private let splitLMHead: Int
     private let isMonolithic: Bool  // Monolithic model support
     private let argmaxInModel: Bool  // If true, model outputs argmax_idx/val pairs instead of logits
+    private let slidingWindow: Int?  // Gemma3 sliding window - if set, use rotation functions when position >= slidingWindow
 
     private var lmheadOutputBackings: [String: MLMultiArray]?
     private var hiddenStatesBackings_emb: [String: MLMultiArray]?  // For embed output
@@ -97,10 +98,11 @@ import Accelerate
     }
 
 
-    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false) throws {  // Make init throwing
+    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil) throws {  // Make init throwing
         self.debugLevel = debugLevel
         self.isMonolithic = models.isMonolithic
         self.argmaxInModel = argmaxInModel
+        self.slidingWindow = slidingWindow
         self.embedModel = models.embedModel
         self.lmheadModel = models.lmheadModel
         // Assume models.ffnChunks is available (see note below)
@@ -110,7 +112,9 @@ import Accelerate
         self.splitLMHead = splitLMHead
         self.v110 = v110 // Set the v110 flag based on the parameter
 
-        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel)")
+        // Check if rotation functions are available
+        let hasRotation = ffnChunks.first?.hasRotationSupport ?? false
+        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation)")
         self.fullCausalMask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: contextLength)], dataType: .float16)
 
         self.initState()
@@ -753,20 +757,28 @@ import Accelerate
             var currentHiddenStates = hiddenStates  // Shape: [1, 128, hidden_states]
             let chunkCount = ffnChunks.count
             
+            // Determine if we should use rotation mode (for Gemma3 with sliding window)
+            let useRotation = slidingWindow != nil && batchPos >= slidingWindow!
+            if useRotation && debugLevel >= 1 {
+                print("Using prefill rotation mode for batchPos \(batchPos) >= slidingWindow \(slidingWindow!)")
+            }
+
             for (index, chunk) in ffnChunks.enumerated() {
                 let isLastChunk = index == chunkCount - 1
                 let ffnOptions = MLPredictionOptions()
-                
+
                 if debugLevel >= 1 {
                     print("\nFFN chunk \(index + 1)/\(chunkCount), isLastChunk: \(isLastChunk)")
                     print("Current hidden states shape:", currentHiddenStates.shape.map { $0.intValue })
                 }
-                
+
                 // Assign output backing BEFORE predict
                 // Check what shape the model expects by looking at its OUTPUT description
                 var useLastChunkBacking = false
-                
-                if let outputDesc = chunk.prefillModel.modelDescription.outputDescriptionsByName["output_hidden_states"],
+
+                // Use the appropriate model to check output description based on rotation mode
+                let modelToCheck = useRotation ? (chunk.prefillRotateModel ?? chunk.prefillModel) : chunk.prefillModel
+                if let outputDesc = modelToCheck.modelDescription.outputDescriptionsByName["output_hidden_states"],
                    let constraint = outputDesc.multiArrayConstraint {
                     let expectedBatchDim = constraint.shape[1].intValue
                     if debugLevel >= 1 {
@@ -775,7 +787,7 @@ import Accelerate
                     // If model expects output batch dim of 1, use last chunk backing
                     useLastChunkBacking = (expectedBatchDim == 1)
                 }
-                
+
                 if useLastChunkBacking && !v110 {
                     if let backings = hiddenStatesBackings_last {
                         ffnOptions.outputBackings = backings  // Shape: [1, 1, hidden_states]
@@ -792,24 +804,33 @@ import Accelerate
                         }
                     }
                 }
-                
+
                 let currentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
                 currentPosArray[0] = NSNumber(value: batchPos)
-                
+
                 let prefillInput = try MLDictionaryFeatureProvider(dictionary: [
                     "hidden_states": currentHiddenStates,  // Shape: [1, 128, hidden_states]
                     "position_ids": positionIds,
                     "causal_mask": batchCausalMask,
                     "current_pos": currentPosArray
                 ])
-                
-                // Run prediction with the assigned output backing
-                _ = try await chunk.prefillModel.prediction(
-                    from: prefillInput,
-                    using: state,
-                    options: ffnOptions
-                )
-                
+
+                // Use rotation function if available and batchPos >= slidingWindow
+                if useRotation, let prefillRotateModel = chunk.prefillRotateModel {
+                    _ = try await prefillRotateModel.prediction(
+                        from: prefillInput,
+                        using: state,
+                        options: ffnOptions
+                    )
+                } else {
+                    // Run prediction with the assigned output backing
+                    _ = try await chunk.prefillModel.prediction(
+                        from: prefillInput,
+                        using: state,
+                        options: ffnOptions
+                    )
+                }
+
                 // Update currentHiddenStates - use the appropriate backing based on what model expects
                 if useLastChunkBacking && !v110 {
                     guard let nextHiddenStates = hiddenStatesBackings_last?["output_hidden_states"] else {
@@ -822,7 +843,7 @@ import Accelerate
                     }
                     currentHiddenStates = nextHiddenStates  // Shape: [1, batch_size, hidden_states]
                 }
-                
+
                 if debugLevel >= 2 {
                     debugTensor(currentHiddenStates, prefix: "FFN chunk \(index + 1) output")
                 }
@@ -1152,21 +1173,33 @@ import Accelerate
         // Run through FFN chunks using FFN backing
         var currentHiddenStates = hiddenStates
 
+        // Determine if we should use rotation mode (for Gemma3 with sliding window)
+        // Position is currentPos-1 since currentPos is 1-indexed
+        let useRotation = slidingWindow != nil && (currentPos - 1) >= slidingWindow!
+        if useRotation && debugLevel >= 1 {
+            print("Using rotation mode for position \(currentPos - 1) >= slidingWindow \(slidingWindow!)")
+        }
+
         for chunk in ffnChunks {
             let ffnOptions = MLPredictionOptions()
             if let backings = hiddenStatesBackings_ffn {
                 ffnOptions.outputBackings = backings
             }
-            
+
             let inferInput = try MLDictionaryFeatureProvider(dictionary: [
                 "hidden_states": currentHiddenStates,
                 "position_ids": positionIds,
                 "causal_mask": causalMask,
                 "current_pos": currentPosArray
             ])
-            
-            let _ = try await chunk.inferModel.prediction(from: inferInput, using: state, options: ffnOptions)
-            
+
+            // Use rotation function if available and position >= slidingWindow
+            if useRotation, let inferRotateModel = chunk.inferRotateModel {
+                let _ = try await inferRotateModel.prediction(from: inferInput, using: state, options: ffnOptions)
+            } else {
+                let _ = try await chunk.inferModel.prediction(from: inferInput, using: state, options: ffnOptions)
+            }
+
             guard let nextHiddenStates = hiddenStatesBackings_ffn?["output_hidden_states"] else {
                 throw InferenceError.inferenceError("Missing FFN output backing")
             }

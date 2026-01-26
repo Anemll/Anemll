@@ -205,6 +205,118 @@ def combine_chunks(num_chunks, lut_bits=None, mode=None, prefix='llama'):
         traceback.print_exc()
         return False
 
+def combine_chunks_gemma3(num_chunks, lut_bits=None, prefix='gemma3'):
+    """Combine FFN, FFN_rotate, prefill, and prefill_rotate models into chunks with 4 functions.
+
+    This is for Gemma3 models that require rotation support for positions >= sliding_window.
+    Creates a combined model with 4 functions:
+    - 'infer': Single token inference (fill mode, positions < sliding_window)
+    - 'infer_rotate': Single token inference (rotation mode, positions >= sliding_window)
+    - 'prefill': Batch prefill (fill mode, positions < sliding_window)
+    - 'prefill_rotate': Batch prefill (rotation mode, positions >= sliding_window)
+
+    Args:
+        num_chunks: Number of chunks
+        lut_bits: LUT quantization bits (or None)
+        prefix: Model name prefix
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    import shutil
+
+    try:
+        # Build file name templates
+        if lut_bits:
+            ffn_template = f"{prefix}_FFN_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            ffn_rotate_template = f"{prefix}_FFN_rotate_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            pf_template = f"{prefix}_prefill_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            pf_rotate_template = f"{prefix}_prefill_rotate_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            combined_template = f"{prefix}_FFN_PF_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+        else:
+            ffn_template = f"{prefix}_FFN_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            ffn_rotate_template = f"{prefix}_FFN_rotate_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            pf_template = f"{prefix}_prefill_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            pf_rotate_template = f"{prefix}_prefill_rotate_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            combined_template = f"{prefix}_FFN_PF_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+
+        for chunk_idx in range(num_chunks):
+            try:
+                # Get input model paths
+                ffn_path = ffn_template.format(chunk_idx + 1)
+                ffn_rotate_path = ffn_rotate_template.format(chunk_idx + 1)
+                prefill_path = pf_template.format(chunk_idx + 1)
+                prefill_rotate_path = pf_rotate_template.format(chunk_idx + 1)
+                output_path = combined_template.format(chunk_idx + 1)
+                temp_path = f"temp_{output_path}"
+
+                print(f"\nProcessing Gemma3 chunk {chunk_idx+1}:")
+                print(f"  FFN: {ffn_path}")
+                print(f"  FFN_rotate: {ffn_rotate_path}")
+                print(f"  Prefill: {prefill_path}")
+                print(f"  Prefill_rotate: {prefill_rotate_path}")
+                print(f"  Output: {output_path}")
+
+                # Check all input files exist
+                missing = []
+                for path in [ffn_path, ffn_rotate_path, prefill_path, prefill_rotate_path]:
+                    if not os.path.exists(path):
+                        missing.append(path)
+                if missing:
+                    print(f"Error: Missing input files:")
+                    for f in missing:
+                        print(f"  - {f}")
+                    return False
+
+                # Load models
+                ffn_model = ct.models.MLModel(ffn_path)
+                ffn_rotate_model = ct.models.MLModel(ffn_rotate_path)
+                prefill_model = ct.models.MLModel(prefill_path)
+                prefill_rotate_model = ct.models.MLModel(prefill_rotate_path)
+
+                # Create combined model with 4 functions
+                desc = ct.utils.MultiFunctionDescriptor()
+                desc.add_function(ffn_path, "main", "infer")
+                desc.add_function(ffn_rotate_path, "main", "infer_rotate")
+                desc.add_function(prefill_path, "main", "prefill")
+                desc.add_function(prefill_rotate_path, "main", "prefill_rotate")
+                desc.default_function_name = "infer"
+
+                print("Creating 4-function combined model...")
+                ct.utils.save_multifunction(desc, temp_path)
+
+                # Load the temp model to add metadata
+                print("Loading combined model...")
+                combined_model = ct.models.MLModel(temp_path)
+                if combined_model is None:
+                    raise ValueError(f"Failed to load combined model")
+
+                # Add metadata and save final
+                print("Adding metadata...")
+                AddCombinedMetadata(combined_model, [ffn_model, ffn_rotate_model, prefill_model, prefill_rotate_model])
+                print(f"Saving final model to: {output_path}")
+                combined_model.save(output_path)
+
+                # Clean up temp file
+                shutil.rmtree(temp_path, ignore_errors=True)
+
+                print(f"Successfully combined Gemma3 chunk {chunk_idx+1} with 4 functions")
+
+            except Exception as e:
+                print(f"\nError processing chunk {chunk_idx+1}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                return False
+
+        return True
+
+    except Exception as e:
+        print(f"\nError during Gemma3 combination process: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def parse_lut_arg(lut_value):
     """Parse LUT argument and extract just the bits value.
 
@@ -323,6 +435,9 @@ def parse_args():
                       help='Number of chunks (required for chunked mode)')
     parser.add_argument('--monolithic', action='store_true',
                       help='Combine monolithic infer and prefill models')
+    parser.add_argument('--gemma3', action='store_true',
+                      help='Combine Gemma3 models with 4 functions (infer, infer_rotate, prefill, prefill_rotate). '
+                           'Required for Gemma3 models with context > 512 (sliding window)')
     parser.add_argument('--input', type=str, default='.',
                       help='Input directory containing model files (default: current directory)')
     parser.add_argument('--output', type=str, default=None,
@@ -390,8 +505,13 @@ def main():
         orig_dir = os.getcwd()
         os.chdir(args.input)
 
-        # Run combination
-        success = combine_models(args)
+        # Handle Gemma3 mode (4 functions)
+        if args.gemma3:
+            print(f"\nCombining Gemma3 models with 4 functions (infer, infer_rotate, prefill, prefill_rotate)...")
+            success = combine_chunks_gemma3(args.chunk, args.lut, args.prefix)
+        else:
+            # Run standard 2-function combination
+            success = combine_models(args)
 
         # Move files if needed
         if success and args.output and args.input != args.output:
