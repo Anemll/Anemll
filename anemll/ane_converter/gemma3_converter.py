@@ -63,8 +63,12 @@ class Gemma3Converter(BaseConverter):
         self.num_chunks = num_chunks
         self.argmax_in_model = argmax_in_model
         # attention_size controls the attention computation span
-        # If None, uses model's default. Smaller values = faster inference
-        self.attention_size = attention_size if attention_size is not None else model.model.config.sliding_window
+        # For Gemma3, must be at least sliding_window for local attention to work
+        if attention_size is not None:
+            self.attention_size = attention_size
+        else:
+            # Default to max of context_length and sliding_window
+            self.attention_size = max(context_length, model.model.config.sliding_window)
 
     def load_weights_from_hf(self, hf_model_path: str) -> bool:
         """Load weights from Hugging Face model and transform them for ANEMLL.
@@ -746,13 +750,14 @@ class Gemma3Converter(BaseConverter):
         print(f"Monolithic wrapper created (LM head mode: {wrapper.lm_head_mode}{argmax_str})")
 
         # Determine mask size based on cache mode
-        # For split cache: mask sized to state_length (global cache), local layers slice to sliding_window
+        # For split cache: mask must be large enough for BOTH local (sliding_window) and global (state_length) layers
         # For unified cache: mask sized to attention_size
         use_split_cache = getattr(model.model.config, 'use_split_cache', ENABLE_SPLIT_CACHE)
         if use_split_cache:
-            # For split cache, mask must cover global attention (state_length)
-            mask_size = model.model.config.state_length
-            print(f"Split cache mode: mask size = {mask_size} (global cache size)")
+            # For split cache, mask must cover the larger of sliding_window and state_length
+            # Local layers need sliding_window, global layers need state_length
+            mask_size = max(model.model.config.sliding_window, model.model.config.state_length)
+            print(f"Split cache mode: mask size = {mask_size} (max of sliding_window and state_length)")
             print(f"  Local cache: {model.model.config.sliding_window} (sliding window)")
             print(f"  Global cache: {model.model.config.state_length} (full context)")
         else:
@@ -1564,8 +1569,13 @@ def test_conversion(
         config.state_length = state_length if state_length is not None else context_length
         # Set attention_size for ANE optimization (separate from Gemma3's sliding_window)
         # sliding_window stays unchanged - it's Gemma3's architectural feature
-        # attention_size controls causal_mask dimension only (can be smaller than state_length)
-        config.attention_size = attention_size if attention_size is not None else context_length
+        # attention_size controls causal_mask dimension - must be at least sliding_window
+        # for local attention layers to work properly
+        if attention_size is not None:
+            config.attention_size = attention_size
+        else:
+            # For Gemma3, attention_size must be >= sliding_window for local attention
+            config.attention_size = max(context_length, config.sliding_window)
         # Set batch_size for prefill operations (needed for prefill_rotate tracing)
         config.batch_size = batch_size
         print(

@@ -43,9 +43,17 @@ STATE_LENGTH = CONTEXT_LENGTH   # match config.state_length by default
 DISABLE_KV_CACHE = False  # Disable KV cache for simple testing
 
 # Layer type constants for Gemma3 split cache
-GLOBAL_ATTENTION_LAYER_INDICES = [5, 11, 17]  # 0-indexed layers with full attention
-NUM_GLOBAL_LAYERS = 3
-NUM_LOCAL_LAYERS = 15  # 18 total - 3 global = 15 local
+# NOTE: These defaults are for Gemma3-270M. Larger models will have different patterns.
+# The actual layer types are now read from config.layer_types at runtime.
+# These constants are kept for backwards compatibility but should not be used directly.
+_DEFAULT_GLOBAL_ATTENTION_LAYER_INDICES = [5, 11, 17]  # 0-indexed layers with full attention (270M model)
+_DEFAULT_NUM_GLOBAL_LAYERS = 3
+_DEFAULT_NUM_LOCAL_LAYERS = 15  # 18 total - 3 global = 15 local
+
+# Backward compatibility aliases (deprecated - use config.layer_types instead)
+GLOBAL_ATTENTION_LAYER_INDICES = _DEFAULT_GLOBAL_ATTENTION_LAYER_INDICES
+NUM_GLOBAL_LAYERS = _DEFAULT_NUM_GLOBAL_LAYERS
+NUM_LOCAL_LAYERS = _DEFAULT_NUM_LOCAL_LAYERS
 
 # LM head configuration constants (following llama_model.py pattern)
 ENABLE_CONV2D = bool(1)      # Use Conv2d for LM head
@@ -90,12 +98,27 @@ class Gemma3Config:
         self.context_length = kwargs.get("context_length", 256)
         self.state_length = kwargs.get("state_length", self.context_length)
 
-        # Interleaved attention (Gemma3 architectural feature - don't modify)
+        # Interleaved attention (Gemma3 architectural feature)
+        # layer_types should be read from HuggingFace config.json which defines
+        # the exact pattern for each model size (270M, 1B, 4B, 12B, 27B)
         self.sliding_window = kwargs.get("sliding_window", 512)
-        default_layer_types = ["sliding_attention"] * self.num_hidden_layers
-        for i in (5, 11, 17):  # 0-indexed -> layers 6, 12, 18 are global
-            if i < len(default_layer_types): default_layer_types[i] = "full_attention"
-        self.layer_types = kwargs.get("layer_types", default_layer_types)
+
+        if "layer_types" in kwargs:
+            # Use layer_types from config (preferred - supports all model sizes)
+            self.layer_types = kwargs["layer_types"]
+        else:
+            # Fallback: compute default pattern based on model architecture
+            # Gemma3 pattern: global attention every 6 layers, starting at layer 5 (0-indexed)
+            # This works for 270M (18 layers) and should approximate larger models
+            default_layer_types = ["sliding_attention"] * self.num_hidden_layers
+            global_interval = 6  # Global attention every 6 layers
+            first_global_layer = 5  # First global layer is at index 5 (0-indexed)
+            for i in range(first_global_layer, self.num_hidden_layers, global_interval):
+                default_layer_types[i] = "full_attention"
+            self.layer_types = default_layer_types
+            # Warn that we're using computed defaults
+            print(f"WARNING: layer_types not in config, using computed defaults for {self.num_hidden_layers} layers")
+            print(f"  Global attention at: {[i for i, t in enumerate(default_layer_types) if t == 'full_attention']}")
 
         # Attention window for ANE optimization (separate from sliding_window)
         # Controls: KV cache size (state_length), causal_mask dimension, KV slice
@@ -121,6 +144,22 @@ class Gemma3Config:
 
         self.use_cache = kwargs.get("use_cache", True)
         self.context_length = kwargs.get("context_length", 256)
+
+    def get_global_layer_indices(self) -> list:
+        """Get indices of global (full attention) layers from config.layer_types."""
+        return [i for i, t in enumerate(self.layer_types) if t == "full_attention"]
+
+    def get_local_layer_indices(self) -> list:
+        """Get indices of local (sliding attention) layers from config.layer_types."""
+        return [i for i, t in enumerate(self.layer_types) if t == "sliding_attention"]
+
+    def get_num_global_layers(self) -> int:
+        """Get count of global (full attention) layers."""
+        return sum(1 for t in self.layer_types if t == "full_attention")
+
+    def get_num_local_layers(self) -> int:
+        """Get count of local (sliding attention) layers."""
+        return sum(1 for t in self.layer_types if t == "sliding_attention")
 
     @classmethod
     def from_json(cls, json_file):
@@ -155,8 +194,10 @@ def get_layer_cache_mapping(layer_idx: int, layer_types: list) -> tuple:
         - cache_index is the layer's position within that cache (0-based)
     """
     if layer_types[layer_idx] == "full_attention":
-        # Global layers: 5->0, 11->1, 17->2
-        global_idx = GLOBAL_ATTENTION_LAYER_INDICES.index(layer_idx)
+        # Global layers: count full_attention layers before this one
+        # This works for any model size with any global layer pattern
+        global_idx = sum(1 for i in range(layer_idx)
+                        if layer_types[i] == "full_attention")
         return 'global', global_idx
     else:
         # Local layers: count sliding_attention layers before this one
@@ -628,7 +669,7 @@ class Gemma3Attention(nn.Module):
         if causal_mask is not None:
             # Slice causal mask to match actual query and key sequence lengths
             q_seq_len = query_states.shape[2]  # Query sequence length
-            k_seq_len = min(key_states.shape[2], self.config.context_length)  # Key sequence length
+            k_seq_len = key_states.shape[2]  # Key sequence length matches window_size
             mask_slice = causal_mask.to(MODEL_DTYPE)[:, :, :q_seq_len, :k_seq_len]
             attn_weights = attn_weights + mask_slice
         

@@ -19,6 +19,27 @@ import threading
 import time
 import yaml
 import sys
+import resource
+
+
+def _get_rss_mb() -> float:
+    """Best-effort RSS in MB (macOS/Linux)."""
+    try:
+        # On macOS ru_maxrss is bytes; on Linux it is kilobytes.
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if rss > 10_000_000:  # heuristic: likely bytes
+            return rss / (1024 * 1024)
+        return rss / 1024  # kB -> MB
+    except Exception:
+        return -1.0
+
+
+def _maybe_report_mem(label: str, enabled: bool):
+    if not enabled:
+        return
+    rss_mb = _get_rss_mb()
+    if rss_mb >= 0:
+        print(f"[mem] {label}: rss≈{rss_mb:.1f} MB")
 
 # ANSI color codes
 LIGHT_BLUE = "\033[94m"
@@ -225,9 +246,13 @@ def build_stop_token_ids(tokenizer):
 def parse_ffn_filename(path):
     """Parse FFN model filename to extract chunk information."""
     path = Path(path)
-    pattern = r'FFN_PF.*_chunk_(\d+)of(\d+)'
+    # Support multiple naming conventions:
+    # - FFN_PF_lut6_chunk_01of04 (legacy/prefill style)
+    # - gemma3_1b_FFN_lut6_chunk_01of04 (new Gemma3 style)
+    # - any_prefix_FFN_*_chunk_NNofNN
+    pattern = r'FFN[^/]*_chunk_(\d+)of(\d+)'
     match = re.search(pattern, path.name)
-    
+
     if match:
         current_chunk = int(match.group(1))
         total_chunks = int(match.group(2))
@@ -370,6 +395,7 @@ def load_models(args,metadata):
     """Load all required models and extract metadata."""
     if not args.eval:
         print("\nLoading models...")
+    _maybe_report_mem("start load_models", getattr(args, "mem_report", False))
 
     # Determine compute unit
     compute_unit = ct.ComputeUnit.CPU_ONLY if getattr(args, 'cpu', False) else ct.ComputeUnit.CPU_AND_NE
@@ -386,6 +412,7 @@ def load_models(args,metadata):
         embed_model = load_model(embed_path, compute_unit=compute_unit)
         if not args.eval:
             print("Embeddings model loaded successfully")
+        _maybe_report_mem("after embeddings load", getattr(args, "mem_report", False))
         metadata = load_metadata(embed_model,args)
         
 
@@ -399,6 +426,7 @@ def load_models(args,metadata):
         lmhead_model = load_model(lmhead_path, compute_unit=compute_unit)
         if not args.eval:
             print("LM head model loaded successfully")
+        _maybe_report_mem("after lmhead load", getattr(args, "mem_report", False))
         
         # Parse FFN path and find chunks if needed
         if not args.eval:
@@ -426,6 +454,7 @@ def load_models(args,metadata):
                     })
                     if not args.eval:
                         print("Chunk loaded successfully")
+                    _maybe_report_mem(f"after FFN chunk load {Path(chunk_path).name}", getattr(args, "mem_report", False))
                 except Exception as e:
                     if not args.eval:
                         print(f"Error loading chunk {chunk_path}: {str(e)}")
@@ -438,6 +467,7 @@ def load_models(args,metadata):
             ffn_models.append(load_model(ffn_path, compute_unit=compute_unit))
             if not args.eval:
                 print("FFN model loaded successfully")
+            _maybe_report_mem("after FFN load", getattr(args, "mem_report", False))
         
         return embed_model, ffn_models, lmhead_model, metadata
         
@@ -600,13 +630,21 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     # Run through FFN chunks with state
     for ffn_model in ffn_models:
         if isinstance(ffn_model, dict):
+            # Build inputs dict - only include inputs that the model expects
             inputs = {
                 'hidden_states': hidden_states.numpy().astype(np.float16),
-                'update_mask': update_mask.numpy().astype(np.float16),
                 'position_ids': position_ids.numpy().astype(np.int32),
                 'causal_mask': single_causal_mask.numpy().astype(np.float16),
                 'current_pos': position_ids.numpy().astype(np.int32)
             }
+            # Add update_mask only if model expects it (older models)
+            # Get model input names from the spec
+            try:
+                model_inputs = {inp.name for inp in ffn_model['infer'].get_spec().description.input}
+            except:
+                model_inputs = set()
+            if 'update_mask' in model_inputs:
+                inputs['update_mask'] = update_mask.numpy().astype(np.float16)
             output = ffn_model['infer'].predict(inputs, state)
             hidden_states = torch.from_numpy(output['output_hidden_states'])
     
@@ -913,6 +951,8 @@ def parse_args():
     # Add CPU-only mode
     parser.add_argument('--cpu', action='store_true',
                        help='Run on CPU only (no ANE/GPU)')
+    parser.add_argument('--mem-report', action='store_true',
+                       help='Print approximate RSS after large steps (debugging)')
 
     # Model configuration
     parser.add_argument('--context-length', type=int,
@@ -1041,6 +1081,8 @@ def parse_args():
                 args.num_chunks = num_chunks
                 if 'num_logits' in params:
                     args.num_logits = int(params['num_logits'])
+                # attention_size is used for causal mask (sliding window for Gemma3)
+                args.attention_size = int(params.get('attention_size', args.context_length))
 
                 # Set split_lm_head, but allow CLI override
                 if args.split_lm_head is None:
@@ -1077,6 +1119,7 @@ def load_monolithic_model(args, metadata):
     """Load monolithic model with infer, infer_rotate, and prefill functions."""
     if not args.eval:
         print("\nLoading monolithic model...")
+    _maybe_report_mem("start load_monolithic_model", getattr(args, "mem_report", False))
 
     # Determine compute unit
     compute_unit = ct.ComputeUnit.CPU_ONLY if getattr(args, 'cpu', False) else ct.ComputeUnit.CPU_AND_NE
@@ -1092,6 +1135,7 @@ def load_monolithic_model(args, metadata):
     # Load all functions
     infer_model = load_model(model_path, function_name='infer', compute_unit=compute_unit)
     prefill_model = load_model(model_path, function_name='prefill', compute_unit=compute_unit)
+    _maybe_report_mem("after load monolithic infer+prefill", getattr(args, "mem_report", False))
 
     # Try to load infer_rotate (optional, for models with split cache rotation)
     infer_rotate_model = None
@@ -1100,6 +1144,7 @@ def load_monolithic_model(args, metadata):
     except Exception:
         if not args.eval:
             print("  Note: infer_rotate not available - using infer for all positions")
+    _maybe_report_mem("after load monolithic infer_rotate (if any)", getattr(args, "mem_report", False))
 
     # Try to load prefill_rotate (optional, for long context prefill with rotation)
     prefill_rotate_model = None
@@ -1107,6 +1152,7 @@ def load_monolithic_model(args, metadata):
         prefill_rotate_model = load_model(model_path, function_name='prefill_rotate', compute_unit=compute_unit)
     except Exception:
         pass  # prefill_rotate is optional
+    _maybe_report_mem("after load monolithic prefill_rotate (if any)", getattr(args, "mem_report", False))
 
     # Report loaded functions
     if not args.eval:
@@ -1600,6 +1646,7 @@ def main():
             state = infer_model.make_state()
             if not args.eval:
                 print("\nCreated unified transformer state for monolithic model")
+            _maybe_report_mem("after monolithic make_state", getattr(args, "mem_report", False))
 
             # Initialize causal mask - use state_length for split cache models
             causal_mask = initialize_causal_mask(metadata['state_length'], args.eval)
@@ -1672,9 +1719,13 @@ def main():
 
             # Create unified state once
             state = create_unified_state(ffn_models, metadata['context_length'], args.eval)
+            _maybe_report_mem("after chunked make_state", getattr(args, "mem_report", False))
 
             # Initialize causal mask once
-            causal_mask = initialize_causal_mask(metadata['context_length'], args.eval)
+            # For Gemma3 with split cache, use attention_size (sliding window) for causal mask
+            attention_size = getattr(args, 'attention_size', metadata['context_length'])
+            metadata['attention_size'] = attention_size
+            causal_mask = initialize_causal_mask(attention_size, args.eval)
 
             # Warmup runs to prevent Python GIL issues with CoreML
             if not args.nw and not args.eval:

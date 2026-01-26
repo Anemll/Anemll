@@ -129,6 +129,42 @@ if [ -z "$MODEL_PATH" ] || [ -z "$OUTPUT_DIR" ]; then
     print_usage
 fi
 
+# Check if MODEL_PATH looks like a HuggingFace model name (e.g., "google/gemma-3-1b-it")
+# HuggingFace names contain "/" but don't start with "/" or "~" or "."
+if [[ "$MODEL_PATH" == *"/"* ]] && [[ ! "$MODEL_PATH" =~ ^[/~.] ]]; then
+    echo "Detected HuggingFace model name: $MODEL_PATH"
+
+    # Convert model name to cache path format (e.g., google/gemma-3-1b-it -> models--google--gemma-3-1b-it)
+    HF_CACHE_NAME="models--$(echo "$MODEL_PATH" | sed 's|/|--|g')"
+    HF_CACHE_DIR="$HOME/.cache/huggingface/hub/$HF_CACHE_NAME"
+
+    if [ -d "$HF_CACHE_DIR/snapshots" ]; then
+        # Model exists in cache, find the latest snapshot
+        SNAPSHOT_DIR=$(find "$HF_CACHE_DIR/snapshots" -maxdepth 1 -type d | tail -1)
+        if [ -d "$SNAPSHOT_DIR" ] && [ "$SNAPSHOT_DIR" != "$HF_CACHE_DIR/snapshots" ]; then
+            echo "Found cached model at: $SNAPSHOT_DIR"
+            MODEL_PATH="$SNAPSHOT_DIR"
+        else
+            echo "Cache directory exists but no snapshots found. Downloading model..."
+            huggingface-cli download "$MODEL_PATH"
+            SNAPSHOT_DIR=$(find "$HF_CACHE_DIR/snapshots" -maxdepth 1 -type d | tail -1)
+            MODEL_PATH="$SNAPSHOT_DIR"
+        fi
+    else
+        echo "Model not in cache. Downloading from HuggingFace..."
+        huggingface-cli download "$MODEL_PATH"
+        if [ $? -ne 0 ]; then
+            echo "Error: Failed to download model from HuggingFace"
+            echo "Make sure you're logged in: huggingface-cli login"
+            exit 1
+        fi
+        SNAPSHOT_DIR=$(find "$HF_CACHE_DIR/snapshots" -maxdepth 1 -type d | tail -1)
+        MODEL_PATH="$SNAPSHOT_DIR"
+    fi
+
+    echo "Using model path: $MODEL_PATH"
+fi
+
 # Check if model path exists
 if [ ! -d "$MODEL_PATH" ]; then
     echo "Error: Model directory does not exist: $MODEL_PATH"

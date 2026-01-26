@@ -37,6 +37,7 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 python tests/test_qwen_model.py     # Test Qwen 3 models
 python tests/test_qwen2.5_model.py  # Test Qwen 2.5 models
 python tests/test_llama_model.py    # Test LLaMA models
+python tests/test_gemma3_model.py   # Test Gemma 3 models
 
 # 4. Convert your own models
 ./anemll/utils/convert_model.sh --model <path> --output <dir>
@@ -85,6 +86,7 @@ We provide sample converted models ready for use:
 - **LLAMA 3.1/3.2** (1B and B variants) including iOS "friendly builds"
 - **🆕 Qwen 3** (0.6B and 4B) - **New in 0.3.3!** Initial support with custom converter
 - **🆕 Qwen 2.5** (0.5B-Instruct) - **New in 0.3.3!** Initial support with custom converter
+- **🆕 Gemma 3** (270M, 1B) - **New in 0.3.5!** Split KV cache for efficient sliding window attention
 - **DeepSeek** distilled models
 - **DeepHermes** distilled models
 
@@ -98,6 +100,7 @@ We provide sample converted models ready for use:
 - **LLaMA Testing**: `python tests/test_llama_model.py`
 - **Qwen 3 Testing**: `python tests/test_qwen_model.py`
 - **Qwen 2.5 Testing**: `python tests/test_qwen2.5_model.py`
+- **Gemma 3 Testing**: `python tests/test_gemma3_model.py`
 
 #### Test Any HuggingFace Model
 ```bash
@@ -110,6 +113,45 @@ We provide sample converted models ready for use:
 # Test larger models with chunks
 ./tests/conv/test_hf_model.sh meta-llama/Llama-3.2-8B-Instruct /tmp/llama8b 4
 ```
+
+#### Gemma 3 Model Conversion
+Gemma 3 models use a split KV cache architecture with interleaved local (sliding window) and global attention layers.
+
+> **Note:** The conversion script now auto-detects HuggingFace model names and downloads them automatically!
+
+```bash
+# Convert Gemma 3 270M (small, good for testing)
+./anemll/utils/convert_model.sh \
+    --model google/gemma-3-270m-it \
+    --output /path/to/output/gemma3_270m \
+    --context 512 \
+    --batch 64 \
+    --lut2 4 \
+    --lut3 6 \
+    --chunk 1
+
+# Convert Gemma 3 1B with LUT6 and 4K context
+./anemll/utils/convert_model.sh \
+    --model google/gemma-3-1b-it \
+    --output /path/to/output/gemma3_1b \
+    --context 4096 \
+    --batch 64 \
+    --lut1 6 \
+    --lut2 6 \
+    --lut3 6 \
+    --chunk 4
+
+# Test the converted model
+python3 tests/chat.py --meta /path/to/output/gemma3_270m/meta.yaml --prompt "Hello!"
+```
+
+**Gemma 3 Notes:**
+- HuggingFace model names (e.g., `google/gemma-3-1b-it`) are auto-detected and downloaded
+- Uses split KV cache: local layers (sliding window 512) + global layers (full context)
+- Recommended: `--chunk 1` for 270M, `--chunk 4` for 1B+ models
+- Supports context lengths up to 4096 (512-2048 recommended for optimal ANE performance)
+- Large vocabulary (262K tokens) uses 16-way LM head splitting
+- Requires HuggingFace login for gated models: `huggingface-cli login`
 
 #### Features
 - **Auto-downloads models**: No manual setup required, downloads models from HuggingFace
@@ -295,6 +337,13 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 - **Context lengths**: Up to 32K (512-2048 recommended for ANE, 4K verified)
 - **Status**: Experimental - please report issues, needs TopK and Temperature support
 
+**🆕 Gemma 3 Family (Alpha - New in 0.3.5!)**
+- **Gemma 3** (270M, 1B, 4B) - Split KV cache support for sliding window attention
+- **Architecture**: Transformer with interleaved local (512 sliding window) and global attention
+- **Context lengths**: Up to 4096 tokens (512-2048 recommended for ANE)
+- **Special features**: Split KV cache for efficient memory usage, 16-way LM head splitting for 262K vocabulary
+- **Status**: Experimental - please report issues
+
 ### 🔧 **Model Specifications**
 
 | Model Family | Sizes | Context | ANE Optimized | Status |
@@ -304,6 +353,7 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 | DeepHermes | 3B, 8B | 512-1024 | ✅ Yes | 🟢 Stable |
 | Qwen 3 | 0.6B, 4B | 512-2048 | ⚠️ Experimental | 🟡 Alpha |
 | Qwen 2.5 | 0.5B, 1.5B, 3B, 7B | 512-2048 | ⚠️ Experimental | 🟡 Alpha |
+| Gemma 3 | 270M, 1B, 4B | 512-4096 | ⚠️ Experimental | 🟡 Alpha |
 
 ### 🎯 **ANE Performance Notes**
 - **Recommended context**: 512-1024 tokens for best performance
@@ -314,9 +364,8 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 ### 🚀 **Coming Soon**
 - **Additional Qwen 2.5 variants** (14B, 32B)
 - **Mistral family** support
-- **Gemma models**
 - **Enhanced quantization** (GPTQ, SpinQuant integration)
-- **Larger context lengths** (4K, 8K optimization)
+- **Larger context lengths** (8K, 16K optimization)
 
 ### 📥 **Pre-converted Models**
 Ready-to-use models available at [Hugging Face](https://huggingface.co/anemll):
