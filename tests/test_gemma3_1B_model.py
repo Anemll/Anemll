@@ -164,10 +164,15 @@ def main():
                        help="Context length (default: 4096)")
     parser.add_argument("--batch", type=int, default=64,
                        help="Batch size (default: 64)")
-    parser.add_argument("--skip-check", action="store_true",
-                       help="Skip dependency check (useful with uv or non-standard pip)")
+    parser.add_argument("--skip-check", action="store_true", default=True,
+                       help="Skip dependency check (default: True, useful with uv or non-standard pip)")
+    parser.add_argument("--run-check", action="store_true",
+                       help="Run dependency check (overrides default skip)")
 
     args = parser.parse_args()
+
+    # Skip check is default True, but --run-check overrides it
+    skip_check = args.skip_check and not args.run_check
 
     return run_gemma3_1b_tests(
         model_name=args.model,
@@ -176,7 +181,7 @@ def main():
         lut_bits=args.lut,
         context_length=args.context,
         batch_size=args.batch,
-        skip_check=args.skip_check
+        skip_check=skip_check
     )
 
 

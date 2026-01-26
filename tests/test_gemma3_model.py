@@ -151,10 +151,15 @@ def main():
                        help="Batch size (default: 64)")
     parser.add_argument("--no-argmax", action="store_true",
                        help="Disable argmax in model (output full logits)")
-    parser.add_argument("--skip-check", action="store_true",
-                       help="Skip dependency check (useful with uv or non-standard pip)")
+    parser.add_argument("--skip-check", action="store_true", default=True,
+                       help="Skip dependency check (default: True, useful with uv or non-standard pip)")
+    parser.add_argument("--run-check", action="store_true",
+                       help="Run dependency check (overrides default skip)")
 
     args = parser.parse_args()
+
+    # Skip check is default True, but --run-check overrides it
+    skip_check = args.skip_check and not args.run_check
 
     return run_gemma3_tests(
         model_name=args.model,
@@ -163,7 +168,7 @@ def main():
         context_length=args.context,
         batch_size=args.batch,
         use_argmax=not args.no_argmax,
-        skip_check=args.skip_check
+        skip_check=skip_check
     )
 
 
