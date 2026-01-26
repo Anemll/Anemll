@@ -26,9 +26,6 @@ SKIP_CHECK=false
 # Default converter; may be overridden after parsing config.json
 CONVERTER="python3 -m anemll.ane_converter.llama_converter"
 
-# Initialize SKIP_CHECK before parsing arguments
-SKIP_CHECK=false
-
 # Function to print usage
 print_usage() {
     echo "Usage: $0 --model <path_to_model> --output <output_directory> [options]"
@@ -107,10 +104,6 @@ while [[ $# -gt 0 ]]; do
         --chunk)
             NUM_CHUNKS="$2"
             shift 2
-            ;;
-        --skip-check)
-            SKIP_CHECK=true
-            shift
             ;;
         --skip-check)
             SKIP_CHECK=true
@@ -213,15 +206,6 @@ if [ -f "$CONFIG_FILE" ]; then
         fi
     else
         CONVERTER="python3 -m anemll.ane_converter.llama_converter"
-    fi
-fi
-
-# Step 0: Check dependencies
-if [ "$SKIP_CHECK" = false ]; then
-    "$SCRIPT_DIR/check_dependencies.sh" --model "$MODEL_PATH" --output "$OUTPUT_DIR" "$@"
-    if [ $? -ne 0 ]; then
-        echo "Dependency check failed. Aborting."
-        exit 1
     fi
 fi
 

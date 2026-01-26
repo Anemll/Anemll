@@ -55,17 +55,44 @@ if [ "$SKIP_CHECK" = false ]; then
     command -v python >/dev/null 2>&1 || { echo >&2 "Python is required but it's not installed. Aborting. (Issue #1)"; echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."; exit 1; }
 
     echo "Checking if pip is installed..."
-    command -v pip >/dev/null 2>&1 || { echo >&2 "pip is required but it's not installed. Aborting. (Issue #2)"; echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."; exit 1; }
+    # Try multiple methods to check pip (handles uv environments)
+    PIP_CMD=""
+    if command -v pip >/dev/null 2>&1; then
+        PIP_CMD="pip"
+    elif python -m pip --version >/dev/null 2>&1; then
+        PIP_CMD="python -m pip"
+    elif command -v uv >/dev/null 2>&1 && uv pip --version >/dev/null 2>&1; then
+        PIP_CMD="uv pip"
+    fi
 
-    echo "Checking if coremltools is installed via pip..."
-    if ! pip show coremltools >/dev/null 2>&1; then
-        echo "coremltools is required but not installed via pip. Aborting. (Issue #3)"
+    if [ -z "$PIP_CMD" ]; then
+        echo >&2 "pip is required but it's not installed. Aborting. (Issue #2)"
+        echo "If using uv, try: uv pip install coremltools"
+        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+        exit 1
+    fi
+    echo "Using: $PIP_CMD"
+
+    echo "Checking if coremltools is installed..."
+    # Try pip show first, fall back to Python import check
+    coremltools_version=""
+    if $PIP_CMD show coremltools >/dev/null 2>&1; then
+        coremltools_version=$($PIP_CMD show coremltools | grep Version | awk '{print $2}')
+    elif python -c "import coremltools; print(coremltools.__version__)" >/dev/null 2>&1; then
+        # Fallback: check via Python import (works with uv and other package managers)
+        coremltools_version=$(python -c "import coremltools; print(coremltools.__version__)" 2>/dev/null)
+        echo "Note: coremltools found via Python import (uv/conda environment detected)"
+    fi
+
+    if [ -z "$coremltools_version" ]; then
+        echo "coremltools is required but not installed. Aborting. (Issue #3)"
+        echo "If using uv: uv pip install coremltools>=8.2"
+        echo "If using pip: pip install coremltools>=8.2"
         echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
         exit 1
     fi
 
     # Check coremltools version
-    coremltools_version=$(pip show coremltools | grep Version | awk '{print $2}')
     coremltools_major_version=$(echo "$coremltools_version" | cut -d. -f1)
     if [ "$coremltools_major_version" -lt 8 ]; then
         echo "coremltools version 8.x or higher is required. Aborting. (Issue #9)"
