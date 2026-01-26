@@ -250,6 +250,11 @@ tests/dev/export_gemma3n_full.sh \
   --lut-report
 ```
 
+With `--lut-report`, the converter prints:
+- matched weights count (pre-quant)
+- post-quant unique-value count (<= 2^bits)
+- `weight.bin` size for each saved `.mlpackage` (helps verify compression)
+
 Flat layout (all artifacts in one folder, no subdirs):
 
 ```bash
@@ -262,6 +267,17 @@ tests/dev/export_gemma3n_full.sh \
   --lut-per-channel 8 \
   --lut-workers 1 \
   --flat
+```
+
+If you export only `infer` (no tokenizer/LM head), pass a tokenizer path when testing:
+
+```bash
+python tests/dev/test_gemma3n_ane_chat_fixed.py \
+  --bundle /Users/anemll/Models/ANE/gemma3n_lut8 \
+  --tokenizer "$MODEL_PATH" \
+  --prompt "History of ancient egypt" \
+  --max-new-tokens 256 \
+  --context-length 512 --verbose
 ```
 
 > **Important**: This step requires access to POSIX shared memory (PyTorch imports abort with `OMP: Error #179` when `shm_open` is blocked). Run the export outside restricted sandboxing.

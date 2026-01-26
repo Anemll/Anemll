@@ -144,6 +144,24 @@ class Gemma3nConverter(BaseConverter):
                 print(f"⚠️ LUT report failed to compute unique values: {e}")
         return mlmodel
 
+    def _maybe_report_weight_bin_size(self, output_path: str) -> None:
+        if not self.lut_report:
+            return
+        weight_path = os.path.join(
+            output_path, "Data", "com.apple.CoreML", "weights", "weight.bin"
+        )
+        if os.path.isfile(weight_path):
+            size_bytes = os.path.getsize(weight_path)
+            size_mb = size_bytes / (1024 * 1024)
+            print(f"📦 weight.bin size: {size_mb:.1f} MB ({weight_path})")
+            return
+        if os.path.isfile(output_path):
+            size_bytes = os.path.getsize(output_path)
+            size_mb = size_bytes / (1024 * 1024)
+            print(f"📦 model file size: {size_mb:.1f} MB ({output_path})")
+            return
+        print(f"⚠️ LUT report: weight.bin not found at {weight_path}")
+
     def _get_kv_cache_states(self, prefix: str = "model.") -> list:
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         # Must be FP16 for ANE compatibility - persistent buffers are FP16 only
@@ -355,6 +373,7 @@ class Gemma3nConverter(BaseConverter):
         output_path = os.path.join(self.output_dir, "gemma3n_embeddings.mlpackage")
         mlmodel.save(output_path)
         print(f"Embeddings saved to {output_path}")
+        self._maybe_report_weight_bin_size(output_path)
         
     def convert_ffn(self, chunk_idx: int, total_chunks: int):
         """Convert FFN layers (Part 2) with LAUREL blocks"""
@@ -474,6 +493,7 @@ class Gemma3nConverter(BaseConverter):
             )
             mlmodel.save(output_path)
             print(f"FFN chunk saved to {output_path}")
+            self._maybe_report_weight_bin_size(output_path)
         finally:
             # Restore original ENABLE_COREML value
             anemll.models.gemma3n_model.ENABLE_COREML = original_coreml
@@ -554,6 +574,7 @@ class Gemma3nConverter(BaseConverter):
         output_path = os.path.join(self.output_dir, "gemma3n_attention_prefill.mlpackage")
         mlmodel.save(output_path)
         print(f"Attention prefill saved to {output_path}")
+        self._maybe_report_weight_bin_size(output_path)
         
     def convert_lm_head(self, vocab_split_factor=16):
         """Convert LM head (Part 3) with vocabulary splitting for memory efficiency
@@ -698,6 +719,7 @@ class Gemma3nConverter(BaseConverter):
             output_path = os.path.join(self.output_dir, "gemma3n_lm_head.mlpackage")
             mlmodel.save(output_path)
             print(f"LM head saved to {output_path}")
+            self._maybe_report_weight_bin_size(output_path)
         finally:
             # Restore original ENABLE_COREML value
             anemll.models.gemma3n_model.ENABLE_COREML = original_coreml
@@ -822,6 +844,7 @@ class Gemma3nConverter(BaseConverter):
         output_path = os.path.join(self.output_dir, "gemma3n_infer_init.mlpackage")
         mlmodel.save(output_path)
         print(f"Infer init model saved to {output_path}")
+        self._maybe_report_weight_bin_size(output_path)
 
     def convert_combine_streams(self):
         """Convert Gemma3n combine-streams model (4-stream -> single stream)."""
@@ -865,6 +888,7 @@ class Gemma3nConverter(BaseConverter):
         output_path = os.path.join(self.output_dir, "gemma3n_combine_streams.mlpackage")
         mlmodel.save(output_path)
         print(f"Combine-streams model saved to {output_path}")
+        self._maybe_report_weight_bin_size(output_path)
 
     def convert_infer(self, chunk_idx: int = 0, total_chunks: int = 1):
         """Convert a stateful single-token infer model with KV cache (chunked)."""
@@ -1005,6 +1029,7 @@ class Gemma3nConverter(BaseConverter):
             output_path = os.path.join(self.output_dir, "gemma3n_infer.mlpackage")
         mlmodel.save(output_path)
         print(f"Infer model saved to {output_path}")
+        self._maybe_report_weight_bin_size(output_path)
         
     def convert(self):
         """Run full conversion pipeline"""

@@ -133,6 +133,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Gemma3n ANE chat with fixed state sharing")
     parser.add_argument("--bundle", default="/tmp/gemma3n-fixed/infer", help="Directory with .mlpackage files")
     parser.add_argument("--prompt", default="The capital of France is", help="Prompt text")
+    parser.add_argument("--tokenizer", default=None, help="Tokenizer path or HF model id (optional)")
     parser.add_argument("--max-new-tokens", type=int, default=20, help="Max tokens to generate")
     parser.add_argument("--context-length", type=int, default=512, help="Context length")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
@@ -145,20 +146,40 @@ def main() -> None:
     bundle = Path(args.bundle)
     print(f"Bundle: {bundle}")
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(str(bundle), use_fast=False, trust_remote_code=True)
+    model_dir = bundle
+    infer_dir = bundle / "infer"
+    if infer_dir.is_dir() and (infer_dir / "gemma3n_infer_init.mlpackage").exists():
+        model_dir = infer_dir
+
+    # Load tokenizer (prefer explicit path, then bundle/model_dir)
+    tokenizer_source = args.tokenizer
+    if tokenizer_source is None:
+        for candidate in (bundle, model_dir):
+            if (candidate / "tokenizer.model").exists() or (candidate / "tokenizer.json").exists():
+                tokenizer_source = str(candidate)
+                break
+    if tokenizer_source is None:
+        raise FileNotFoundError(
+            "Tokenizer not found in bundle. Provide --tokenizer or run full export to include tokenizer files."
+        )
+    tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_source), use_fast=False, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id or 0
 
     # Load models
     print("Loading CoreML models...")
-    infer_init = load_mlpackage(bundle / "gemma3n_infer_init.mlpackage")
-    combine_model = load_mlpackage(bundle / "gemma3n_combine_streams.mlpackage")
-    lm_head = load_mlpackage(bundle / "gemma3n_lm_head.mlpackage")
+    infer_init = load_mlpackage(model_dir / "gemma3n_infer_init.mlpackage")
+    combine_model = load_mlpackage(model_dir / "gemma3n_combine_streams.mlpackage")
+    lm_head_path = model_dir / "gemma3n_lm_head.mlpackage"
+    if not lm_head_path.exists():
+        raise FileNotFoundError(
+            f"Missing LM head: {lm_head_path}. Run full export or copy lm_head into the bundle."
+        )
+    lm_head = load_mlpackage(lm_head_path)
 
-    infer_chunk_paths = find_infer_chunks(bundle)
+    infer_chunk_paths = find_infer_chunks(model_dir)
     if not infer_chunk_paths:
-        infer_single = bundle / "gemma3n_infer.mlpackage"
+        infer_single = model_dir / "gemma3n_infer.mlpackage"
         if not infer_single.exists():
             raise FileNotFoundError("No infer chunks found and gemma3n_infer.mlpackage is missing")
         infer_chunk_paths = [infer_single]
