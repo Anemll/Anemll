@@ -33,7 +33,7 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 # 2. Install dependencies (auto-detects virtual environment)
 ./install_dependencies.sh
 
-# 3. Test conversion pipeline
+# 3. Test conversion pipeline (add --skip-check if using uv or non-standard pip)
 python tests/test_qwen_model.py       # Test Qwen 3 models
 python tests/test_qwen2.5_model.py    # Test Qwen 2.5 models
 python tests/test_llama_model.py      # Test LLaMA models
