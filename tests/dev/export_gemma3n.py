@@ -42,6 +42,10 @@ def test_gemma3n_conversion(
     lut3: int = None,
     lut_per_channel: int = 8,
     lut_workers: int = 1,
+    lut_scope: str = "all",
+    lut_include: str = None,
+    lut_exclude: str = None,
+    lut_report: bool = False,
     chunk_size: int = 2,
     vocab_split_factor: int = 16,
     part: str = "full",
@@ -63,6 +67,10 @@ def test_gemma3n_conversion(
         lut3=lut3,
         lut_per_channel=lut_per_channel,
         lut_num_workers=lut_workers,
+        lut_scope=lut_scope,
+        lut_include=lut_include,
+        lut_exclude=lut_exclude,
+        lut_report=lut_report,
         chunk_size=chunk_size,
         enable_laurel=enable_laurel,
         enable_per_layer_embeddings=enable_per_layer_embeddings,
@@ -120,6 +128,11 @@ def main():
     parser.add_argument("--lut3", type=int, default=None, help="LUT quantization for Part 3 (LM head)")
     parser.add_argument("--lut-per-channel", type=int, default=8, help="LUT group size (per-grouped-channel), default 8")
     parser.add_argument("--lut-workers", type=int, default=1, help="LUT k-means worker count (default: 1)")
+    parser.add_argument("--lut-scope", choices=["all", "linear", "conv", "none"], default="all",
+                        help="Which CoreML op types to palettize (default: all)")
+    parser.add_argument("--lut-include", type=str, default=None, help="Regex for weight names to include in LUT")
+    parser.add_argument("--lut-exclude", type=str, default=None, help="Regex for weight names to exclude from LUT")
+    parser.add_argument("--lut-report", action="store_true", help="Print LUT match + unique-values report")
     parser.add_argument("--chunk", type=int, default=4, help="Number of FFN chunks")
     parser.add_argument("--vocab-split", type=int, default=16, help="Vocabulary split factor for LM head (default: 16)")
     parser.add_argument("--output", default="/tmp/gemma3n-test/", help="Output directory")
@@ -177,6 +190,13 @@ def main():
     print(f"  LUT3 quantization: {args.lut3 if args.lut3 else 'disabled'}")
     print(f"  LUT per-channel group size: {args.lut_per_channel}")
     print(f"  LUT workers: {args.lut_workers}")
+    print(f"  LUT scope: {args.lut_scope}")
+    if args.lut_include:
+        print(f"  LUT include: {args.lut_include}")
+    if args.lut_exclude:
+        print(f"  LUT exclude: {args.lut_exclude}")
+    if args.lut_report:
+        print("  LUT report: enabled")
     print(f"  LAUREL blocks: {'disabled' if args.disable_laurel else 'enabled'}")
     print(f"  Per-layer embeddings: {'disabled' if args.disable_per_layer_embeddings else 'enabled'}")
     print(f"  Multimodal mode: {'enabled' if args.enable_multimodal else 'text-only'}")
@@ -216,6 +236,10 @@ def main():
             lut3=args.lut3,
             lut_per_channel=args.lut_per_channel,
             lut_workers=args.lut_workers,
+            lut_scope=args.lut_scope,
+            lut_include=args.lut_include,
+            lut_exclude=args.lut_exclude,
+            lut_report=args.lut_report,
             chunk_size=args.chunk,
             vocab_split_factor=args.vocab_split,
             part=args.part,
@@ -239,7 +263,8 @@ def main():
         print(f"  Infer (KV):     python export_gemma3n.py --part infer")
         print(f"  Combine:        python export_gemma3n.py --part combine_streams")
         print(f"  LM head:        python export_gemma3n.py --part lm_head")
-        print(f"  With LUT:       python export_gemma3n.py --lut 6 --lut-per-channel 8")
+        print(f"  With LUT:       python export_gemma3n.py --lut 6 --lut-per-channel 8 --lut-scope all")
+        print(f"  With LUT (FFN): python export_gemma3n.py --lut 6 --lut-scope linear --lut-include \"gate_proj|up_proj|down_proj\" --lut-exclude \"q_proj|k_proj|v_proj|o_proj|router|per_layer_input_gate\" --lut-report")
         print(f"  No LAUREL:      python export_gemma3n.py --disable-laurel")
         print(f"  Custom model:   python export_gemma3n.py --model /path/to/model")
         

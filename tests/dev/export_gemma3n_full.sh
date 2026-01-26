@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: export_gemma3n_full.sh [--model PATH] [--output DIR] [--context-length N] [--chunk N] [--lut N] [--lut-per-channel N] [--lut-workers N] [--flat]
+Usage: export_gemma3n_full.sh [--model PATH] [--output DIR] [--context-length N] [--chunk N] [--lut N] [--lut-per-channel N] [--lut-workers N] [--lut-scope all|linear|conv|none] [--lut-include REGEX] [--lut-exclude REGEX] [--lut-report] [--flat]
 
 Defaults:
   --model: latest HF snapshot for google/gemma-3n-E2B-it
@@ -13,6 +13,10 @@ Defaults:
   --lut: disabled
   --lut-per-channel: 8
   --lut-workers: 1
+  --lut-scope: all
+  --lut-include: none
+  --lut-exclude: none
+  --lut-report: disabled
   --flat: disabled (write parts into subfolders)
 
 Example:
@@ -27,6 +31,10 @@ CHUNK="4"
 LUT=""
 LUT_PER_CHANNEL="8"
 LUT_WORKERS="1"
+LUT_SCOPE="all"
+LUT_INCLUDE=""
+LUT_EXCLUDE=""
+LUT_REPORT="0"
 FLAT="0"
 
 while [[ $# -gt 0 ]]; do
@@ -59,6 +67,22 @@ while [[ $# -gt 0 ]]; do
       LUT_WORKERS="$2"
       shift 2
       ;;
+    --lut-scope)
+      LUT_SCOPE="$2"
+      shift 2
+      ;;
+    --lut-include)
+      LUT_INCLUDE="$2"
+      shift 2
+      ;;
+    --lut-exclude)
+      LUT_EXCLUDE="$2"
+      shift 2
+      ;;
+    --lut-report)
+      LUT_REPORT="1"
+      shift 1
+      ;;
     --flat)
       FLAT="1"
       shift 1
@@ -87,6 +111,16 @@ if [[ -n "${LUT}" ]]; then
   echo "LUT: ${LUT}"
   echo "LUT per-channel group size: ${LUT_PER_CHANNEL}"
   echo "LUT workers: ${LUT_WORKERS}"
+  echo "LUT scope: ${LUT_SCOPE}"
+  if [[ -n "${LUT_INCLUDE}" ]]; then
+    echo "LUT include: ${LUT_INCLUDE}"
+  fi
+  if [[ -n "${LUT_EXCLUDE}" ]]; then
+    echo "LUT exclude: ${LUT_EXCLUDE}"
+  fi
+  if [[ "${LUT_REPORT}" == "1" ]]; then
+    echo "LUT report: enabled"
+  fi
 fi
 if [[ "${FLAT}" == "1" ]]; then
   echo "Flat layout: enabled"
@@ -108,6 +142,10 @@ python tests/dev/export_gemma3n.py \
   ${LUT:+--lut "${LUT}"} \
   --lut-per-channel "${LUT_PER_CHANNEL}" \
   --lut-workers "${LUT_WORKERS}" \
+  --lut-scope "${LUT_SCOPE}" \
+  ${LUT_INCLUDE:+--lut-include "${LUT_INCLUDE}"} \
+  ${LUT_EXCLUDE:+--lut-exclude "${LUT_EXCLUDE}"} \
+  $([[ "${LUT_REPORT}" == "1" ]] && echo --lut-report) \
   ${NO_SUBDIR_FLAG}
 
 python tests/dev/export_gemma3n.py \
@@ -117,6 +155,10 @@ python tests/dev/export_gemma3n.py \
   ${LUT:+--lut "${LUT}"} \
   --lut-per-channel "${LUT_PER_CHANNEL}" \
   --lut-workers "${LUT_WORKERS}" \
+  --lut-scope "${LUT_SCOPE}" \
+  ${LUT_INCLUDE:+--lut-include "${LUT_INCLUDE}"} \
+  ${LUT_EXCLUDE:+--lut-exclude "${LUT_EXCLUDE}"} \
+  $([[ "${LUT_REPORT}" == "1" ]] && echo --lut-report) \
   ${NO_SUBDIR_FLAG}
 
 python tests/dev/export_gemma3n.py \

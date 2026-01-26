@@ -41,6 +41,10 @@ class Gemma3nConverter(BaseConverter):
         lut3: Optional[int] = None,
         lut_per_channel: int = 8,
         lut_num_workers: int = 1,
+        lut_scope: str = "all",
+        lut_include: Optional[str] = None,
+        lut_exclude: Optional[str] = None,
+        lut_report: bool = False,
         chunk_size: int = 4,
         enable_laurel: bool = True,
         enable_per_layer_embeddings: bool = True,
@@ -57,6 +61,10 @@ class Gemma3nConverter(BaseConverter):
         self.lut3 = lut3
         self.lut_per_channel = lut_per_channel
         self.lut_num_workers = lut_num_workers
+        self.lut_scope = lut_scope
+        self.lut_include = lut_include
+        self.lut_exclude = lut_exclude
+        self.lut_report = lut_report
         self.chunk_size = chunk_size
         self.enable_laurel = enable_laurel
         self.enable_per_layer_embeddings = enable_per_layer_embeddings
@@ -82,16 +90,59 @@ class Gemma3nConverter(BaseConverter):
         print(
             f"Applying LUT quantization with {bits} bits and {self.lut_per_channel} channels per group using {self.lut_num_workers} worker(s)..."
         )
-        config = cto.coreml.OptimizationConfig(
-            global_config=cto.coreml.OpPalettizerConfig(
-                mode="kmeans",
-                nbits=bits,
-                granularity="per_grouped_channel",
-                group_size=self.lut_per_channel,
-                num_kmeans_workers=self.lut_num_workers,
-            ),
+        op_config = cto.coreml.OpPalettizerConfig(
+            mode="kmeans",
+            nbits=bits,
+            granularity="per_grouped_channel",
+            group_size=self.lut_per_channel,
+            num_kmeans_workers=self.lut_num_workers,
         )
-        return cto.coreml.palettize_weights(mlmodel, config)
+        if self.lut_scope == "none":
+            return mlmodel
+
+        if self.lut_include or self.lut_exclude:
+            import re
+            from coremltools.optimize.coreml import get_weights_metadata
+
+            include_re = re.compile(self.lut_include) if self.lut_include else None
+            exclude_re = re.compile(self.lut_exclude) if self.lut_exclude else None
+
+            meta = get_weights_metadata(mlmodel, weight_threshold=0)
+            selected = []
+            for name in meta.keys():
+                if include_re and not include_re.search(name):
+                    continue
+                if exclude_re and exclude_re.search(name):
+                    continue
+                selected.append(name)
+
+            if not selected:
+                print("⚠️ LUT include/exclude patterns matched no weights. Skipping palettization.")
+                return mlmodel
+
+            if self.lut_report:
+                matched = len(selected)
+                total = len(meta)
+                print(f"🔎 LUT report: matched {matched}/{total} weights for palettization")
+
+            config = cto.coreml.OptimizationConfig(op_name_configs={name: op_config for name in selected})
+        else:
+            if self.lut_scope == "all":
+                config = cto.coreml.OptimizationConfig(global_config=op_config)
+            elif self.lut_scope in ("linear", "conv"):
+                config = cto.coreml.OptimizationConfig(op_type_configs={self.lut_scope: op_config})
+            else:
+                raise ValueError(f"Unsupported lut_scope: {self.lut_scope}")
+        mlmodel = cto.coreml.palettize_weights(mlmodel, config)
+        if self.lut_report:
+            try:
+                from coremltools.optimize.coreml._post_training_quantization import get_weights_metadata
+                meta = get_weights_metadata(mlmodel, weight_threshold=0)
+                palettized = [k for k, v in meta.items() if v.unique_values <= (2 ** bits)]
+                print(f"✅ LUT report: {len(palettized)}/{len(meta)} weights have <= {2 ** bits} unique values")
+            except Exception as e:
+                print(f"⚠️ LUT report failed to compute unique values: {e}")
+        return mlmodel
 
     def _get_kv_cache_states(self, prefix: str = "model.") -> list:
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
@@ -110,6 +161,21 @@ class Gemma3nConverter(BaseConverter):
                 name=f"{prefix}kv_cache_0",
             )
         ]
+
+    def _get_chunk_range(self, chunk_idx: int, total_chunks: int) -> tuple[int, int]:
+        """Compute layer start/end for a chunk, distributing remainders to early chunks."""
+        total_layers = self.config.num_hidden_layers
+        if total_chunks <= 0:
+            raise ValueError("total_chunks must be > 0")
+        base = total_layers // total_chunks
+        rem = total_layers % total_chunks
+        if chunk_idx < rem:
+            start = chunk_idx * (base + 1)
+            end = start + (base + 1)
+        else:
+            start = rem * (base + 1) + (chunk_idx - rem) * base
+            end = start + base
+        return start, end
         
     def _is_multimodal_weight(self, key: str) -> bool:
         """Check if a weight belongs to multimodal components (vision/audio)"""
@@ -301,9 +367,7 @@ class Gemma3nConverter(BaseConverter):
         
         try:
             # Calculate which layers belong to this chunk
-            layers_per_chunk = self.config.num_hidden_layers // total_chunks
-            start_layer = chunk_idx * layers_per_chunk
-            end_layer = start_layer + layers_per_chunk if chunk_idx < total_chunks - 1 else self.config.num_hidden_layers
+            start_layer, end_layer = self._get_chunk_range(chunk_idx, total_chunks)
             
             class FFNChunkModel(nn.Module):
                 def __init__(self, config, layers, enable_laurel):
@@ -682,6 +746,9 @@ class Gemma3nConverter(BaseConverter):
             "lut2": self.lut2,
             "lut3": self.lut3,
             "lut_per_channel": self.lut_per_channel,
+            "lut_scope": self.lut_scope,
+            "lut_include": self.lut_include,
+            "lut_exclude": self.lut_exclude,
             # Gemma3n specific
             "low_rank_dim": getattr(self.config, "low_rank_dim", 256),
             "activation_topk": getattr(self.config, "activation_topk", None),
@@ -803,9 +870,7 @@ class Gemma3nConverter(BaseConverter):
         """Convert a stateful single-token infer model with KV cache (chunked)."""
         print(f"Converting stateful Gemma3n infer chunk {chunk_idx}/{total_chunks}...")
 
-        layers_per_chunk = self.config.num_hidden_layers // total_chunks
-        start_layer = chunk_idx * layers_per_chunk
-        end_layer = start_layer + layers_per_chunk if chunk_idx < total_chunks - 1 else self.config.num_hidden_layers
+        start_layer, end_layer = self._get_chunk_range(chunk_idx, total_chunks)
         print(f"  Layers: {start_layer}..{end_layer-1}")
 
         class Gemma3nInferChunkWrapper(nn.Module):

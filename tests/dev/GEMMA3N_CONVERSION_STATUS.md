@@ -118,6 +118,12 @@ if dtype is not None:
 - Pass the precomputed rotary embeddings (`cos/sin` for both local/global attention) as inputs instead of indexing inside the model.
 
 **Implementation**:
+
+### 7. Chunk Layer Splits (FIXED)
+
+**Problem**: Layer chunking used integer division, which dropped remainder layers when `num_hidden_layers` is not divisible by `chunk_size`.
+
+**Fix**: Use remainder-aware split (early chunks get +1 layer) so all layers are covered in both FFN and infer conversions.
 - `anemll/models/gemma3n_model.py`: `_process_layer_regular` now accepts `position_one_hot` + rotary tensors.
 - `anemll/ane_converter/gemma3n_converter.py`: Chunk wrappers & CoreML input specs updated.
 - `tests/dev/gemma3n_coreml_inputs.py`: Shared helpers for mask/one-hot/rotary generation.
@@ -211,6 +217,37 @@ tests/dev/export_gemma3n_full.sh \
   --lut 6 \
   --lut-per-channel 8 \
   --lut-workers 1
+```
+
+LUT scope (limit palettization to specific CoreML ops):
+
+```bash
+tests/dev/export_gemma3n_full.sh \
+  --model "$MODEL_PATH" \
+  --output ~/Models/ANE/gemma3n_lut6 \
+  --context-length 512 \
+  --chunk 2 \
+  --lut 6 \
+  --lut-per-channel 8 \
+  --lut-workers 1 \
+  --lut-scope conv
+```
+
+FFN-only LUT (skip attention + router/gates):
+
+```bash
+tests/dev/export_gemma3n_full.sh \
+  --model "$MODEL_PATH" \
+  --output ~/Models/ANE/gemma3n_lut6 \
+  --context-length 512 \
+  --chunk 2 \
+  --lut 6 \
+  --lut-per-channel 8 \
+  --lut-workers 1 \
+  --lut-scope linear \
+  --lut-include "gate_proj|up_proj|down_proj" \
+  --lut-exclude "q_proj|k_proj|v_proj|o_proj|router|per_layer_input_gate" \
+  --lut-report
 ```
 
 Flat layout (all artifacts in one folder, no subdirs):
