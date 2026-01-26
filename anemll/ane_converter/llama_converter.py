@@ -628,12 +628,12 @@ class LlamaConverter(BaseConverter):
         total_layers = model.config.num_hidden_layers
         
         if chunk_idx is not None:
-            layers_per_chunk = total_layers // self.num_chunks
-            start_layer = chunk_idx * layers_per_chunk
-            end_layer = min((chunk_idx + 1) * layers_per_chunk, total_layers)
+            base, rem = divmod(total_layers, self.num_chunks)
+            start_layer = chunk_idx * base + min(chunk_idx, rem)
+            end_layer = start_layer + base + (1 if chunk_idx < rem else 0)
             print(f"Processing chunk {chunk_idx + 1}/{self.num_chunks}")
             print(f"  Total layers: {total_layers}")
-            print(f"  Layers per chunk: {layers_per_chunk}")
+            print(f"  Layers per chunk: {base} (+1 for first {rem} chunks)")
             print(f"  This chunk: layers [{start_layer}..{end_layer-1}]")
             if chunk_idx == 0:
                 print("  First chunk: includes input layer")
@@ -737,9 +737,9 @@ class LlamaConverter(BaseConverter):
         total_layers = model.config.num_hidden_layers
         
         if chunk_idx is not None:
-            layers_per_chunk = total_layers // self.num_chunks
-            start_layer = chunk_idx * layers_per_chunk
-            end_layer = min((chunk_idx + 1) * layers_per_chunk, total_layers)
+            base, rem = divmod(total_layers, self.num_chunks)
+            start_layer = chunk_idx * base + min(chunk_idx, rem)
+            end_layer = start_layer + base + (1 if chunk_idx < rem else 0)
             print(f"Processing chunk {chunk_idx + 1}/{self.num_chunks} (layers {start_layer} to {end_layer-1})")
         else:
             start_layer = 0
