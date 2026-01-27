@@ -22,6 +22,7 @@ NUM_CHUNKS=2   # Default number of chunks
 
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
+ARGMAX_IN_MODEL=false
 
 # Default converter; may be overridden after parsing config.json
 CONVERTER="python3 -m anemll.ane_converter.llama_converter"
@@ -48,6 +49,7 @@ print_usage() {
     echo "  --prefix        Prefix for model names (default: llama)"
     echo "  --chunk         Number of chunks to split FFN/prefill (default: 2)"
     echo "  --skip-check    Skip the dependency check step"
+    echo "  --argmax        Compute argmax inside LM head (outputs idx+val pairs instead of logits)"
     echo ""
     echo "Examples:"
     echo "  # Use default per_channel (8) for all parts"
@@ -107,6 +109,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-check)
             SKIP_CHECK=true
+            shift
+            ;;
+        --argmax)
+            ARGMAX_IN_MODEL=true
             shift
             ;;
         *)
@@ -276,10 +282,17 @@ if [ ! -z "$LUT_PART3" ]; then
     LUT3_PARAM="--lut $LUT_PART3"
 fi
 
+# Prepare argmax parameter for LM head
+ARGMAX_PARAM=""
+if [ "$ARGMAX_IN_MODEL" = true ]; then
+    ARGMAX_PARAM="--argmax"
+fi
+
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
     run_step 2 "Converting LM Head" "$CONVERTER \
         --part 3 \
         $LUT3_PARAM \
+        $ARGMAX_PARAM \
         --context-length $CONTEXT_LENGTH \
         --context-length $CONTEXT_LENGTH \
         --prefix \"$PREFIX\" \
@@ -436,10 +449,14 @@ EOF_CONFIG
         fi && \
         
         # Create meta.yaml with correct LUT values based on actual file existence
+        ARGMAX_META_FLAG=\"\"
+        if [ \"$ARGMAX_IN_MODEL\" = true ]; then
+            ARGMAX_META_FLAG=\"--argmax\"
+        fi
         python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
-            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\"
+            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \$ARGMAX_META_FLAG
     "
 fi
 

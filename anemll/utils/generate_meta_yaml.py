@@ -146,7 +146,7 @@ def main():
         return
 
     if len(sys.argv) != 11:
-        print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_emb> <lut_ffn> <lut_lmh> <num_chunks> <prefix> <arch> <output_dir>")
+        print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_emb> <lut_ffn> <lut_lmh> <num_chunks> <prefix> <arch> <output_dir> [--argmax]")
         sys.exit(1)
 
     MODEL_NAME = sys.argv[1]
@@ -221,12 +221,15 @@ def main():
     if lut_lmh_per_channel is not None:
         meta_parts.append(f'    lut_lmhead_per_channel: {lut_lmh_per_channel}')
 
+    # Add argmax_in_model if requested
+    argmax_line = '\n    argmax_in_model: true' if argmax_in_model else ''
+
     meta_parts.append(f'''    num_chunks: {NUM_CHUNKS}
     model_prefix: {PREFIX}
     embeddings: {embeddings_path}
     lm_head: {lmhead_path}
     ffn: {ffn_path}
-    split_lm_head: {split_lm_head}
+    split_lm_head: {split_lm_head}{argmax_line}
 ''')
 
     meta = '\n'.join(meta_parts)

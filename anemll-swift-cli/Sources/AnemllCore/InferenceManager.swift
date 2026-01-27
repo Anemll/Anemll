@@ -264,18 +264,36 @@ import Accelerate
     
     private func initializeLMHeadOutputBackings() throws {
         let outputDescription = lmheadModel.modelDescription.outputDescriptionsByName
-        let featureNames = (1...splitLMHead).map { i in "logits\(i)" }
         var outputBackingsDict: [String: MLMultiArray] = [:]
-        
+
+        // For argmax mode: LM head outputs argmax_idx and argmax_val instead of logits
+        if argmaxInModel {
+            print("Initializing LM head output backings for argmax mode (non-monolithic)")
+
+            // Create argmax_idx backing (int32) - model outputs int32 indices
+            let idxArray = try MLMultiArray(shape: [NSNumber(value: splitLMHead)], dataType: .int32)
+            outputBackingsDict["argmax_idx"] = idxArray
+
+            // Create argmax_val backing (fp16) - model outputs fp16 values
+            let valArray = try MLMultiArray(shape: [NSNumber(value: splitLMHead)], dataType: .float16)
+            outputBackingsDict["argmax_val"] = valArray
+
+            lmheadOutputBackings = outputBackingsDict
+            return
+        }
+
+        // Standard logits mode: LM head outputs logits1..logitsN
+        let featureNames = (1...splitLMHead).map { i in "logits\(i)" }
+
         for featureName in featureNames {
             guard let featureDesc = outputDescription[featureName] else {
                 throw InferenceError.inferenceError("Missing feature description for \(featureName)")
             }
-            
+
             if debugLevel >= 1 {
                 print("\nFeature \(featureName) type: \(featureDesc.type)")
             }
-            
+
             // Check if it's a multiarray feature and get its constraint
             guard featureDesc.type.rawValue == 5,
                   let constraint = featureDesc.multiArrayConstraint else {
@@ -284,19 +302,19 @@ import Accelerate
                 print("- Description: \(featureDesc.type)")
                 throw InferenceError.inferenceError("Feature \(featureName) is not a multiarray")
             }
-            
+
             let shape = constraint.shape
-            
+
             // Calculate dimensions for pixel buffer
             let lastDim = shape.last?.intValue ?? 1
             let otherDims = shape.dropLast().reduce(1) { $0 * $1.intValue }
-            
+
             // Create IOSurface-backed pixel buffer
             let attributes: [String: Any] = [
                 //kCVPixelBufferIOSurfacePropertiesKey as String: [:],
                 kCVPixelBufferMetalCompatibilityKey as String: true
             ]
-            
+
             var pixelBuffer: CVPixelBuffer?
             let status = CVPixelBufferCreate(
                 kCFAllocatorDefault,
@@ -315,12 +333,12 @@ import Accelerate
             guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
                 throw InferenceError.inferenceError("Failed to create pixel buffer for \(featureName)")
             }
-            
+
             // Create MLMultiArray from pixel buffer
             let outputBacking = MLMultiArray(pixelBuffer: buffer, shape: shape)
             outputBackingsDict[featureName] = outputBacking
         }
-        
+
         lmheadOutputBackings = outputBackingsDict
     }
     
@@ -1221,7 +1239,40 @@ import Accelerate
             throw InferenceError.inferenceError("Output backings not initialized")
         }
 
-    
+        // For argmax mode (non-monolithic): LM head already computed argmax, just read the results
+        if argmaxInModel && !isMonolithic {
+            guard let idxArray = outputBackings["argmax_idx"],
+                  let valArray = outputBackings["argmax_val"] else {
+                throw InferenceError.inferenceError("Missing argmax_idx or argmax_val in LM head output backings")
+            }
+
+            let numChunks = splitLMHead
+            let chunkSize = 16384  // 262144 / 16 for Gemma3
+
+            // Find the chunk with highest value
+            var bestChunk = 0
+            var bestVal: Float = -Float.infinity
+            for i in 0..<numChunks {
+                let val = Float(valArray[i].floatValue)
+                if val > bestVal {
+                    bestVal = val
+                    bestChunk = i
+                }
+            }
+
+            // Get the local index from the best chunk and convert to global index
+            let localIdx = idxArray[bestChunk].intValue
+            let globalIdx = bestChunk * chunkSize + localIdx
+
+            if debugLevel >= 1 {
+                print("\nLM head argmax mode:")
+                print("  Best chunk: \(bestChunk), local_idx: \(localIdx), global_idx: \(globalIdx)")
+                print("  Best value: \(bestVal)")
+            }
+
+            return globalIdx
+        }
+
         // Decide between greedy (argmax) vs. top-p sampling:
         if GreedySearch {
             // --- Argmax branch: process each logits part in parallel ---

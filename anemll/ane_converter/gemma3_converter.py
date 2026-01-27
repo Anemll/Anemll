@@ -463,7 +463,7 @@ class Gemma3Converter(BaseConverter):
                 mlmodel = self.convert_part_2_prefill(self.model, force_rotation=True)
         elif part == "3":
             print("Converting LM head...")
-            mlmodel = self.convert_part_3(self.model)
+            mlmodel = self.convert_part_3(self.model, argmax_in_model=self.argmax_in_model)
         elif part == "monolithic":
             print("Converting monolithic model (infer - fill mode)...")
             mlmodel = self.convert_monolithic(self.model, is_prefill=False, argmax_in_model=self.argmax_in_model, force_rotation=False)
@@ -903,75 +903,121 @@ class Gemma3Converter(BaseConverter):
         require_coreml()
         return self.convert_embeddings(model)
 
-    def convert_part_3(self, model: Gemma3ForCausalLM) -> ct.models.MLModel:
-        """Convert LM head only."""
+    def convert_part_3(self, model: Gemma3ForCausalLM, argmax_in_model: bool = False) -> ct.models.MLModel:
+        """Convert LM head only.
+
+        Args:
+            model: The Gemma3 model
+            argmax_in_model: If True, compute argmax per chunk inside the model.
+                            Outputs argmax_idx[num_chunks] and argmax_val[num_chunks]
+                            instead of num_chunks logits tensors.
+        """
         require_coreml()
 
         class LMHeadWrapper(torch.nn.Module):
-            def __init__(self, model: Gemma3ForCausalLM) -> None:
+            def __init__(self, model: Gemma3ForCausalLM, argmax_mode: bool = False) -> None:
                 super().__init__()
+                self.argmax_mode = argmax_mode
                 if hasattr(model, "lm_head16_1"):
                     self.heads = [
                         getattr(model, f"lm_head16_{i}") for i in range(1, 17)
                     ]
                     self.mode = "16"
+                    self.num_chunks = 16
+                    self.chunk_size = 16384  # 262144 / 16
                 elif hasattr(model, "lm_head8_1"):
                     self.heads = [getattr(model, f"lm_head8_{i}") for i in range(1, 9)]
                     self.mode = "8"
+                    self.num_chunks = 8
+                    self.chunk_size = 32768  # 262144 / 8
                 elif hasattr(model, "lm_head2_1"):
                     self.heads = [model.lm_head2_1, model.lm_head2_2]
                     self.mode = "2"
+                    self.num_chunks = 2
+                    self.chunk_size = 131072  # 262144 / 2
                 elif hasattr(model, "lm_head1"):
                     self.head = model.lm_head1
                     self.mode = "1"
+                    self.num_chunks = 1
+                    self.chunk_size = 262144
                 else:
                     self.head = model.lm_head
                     self.mode = "linear"
+                    self.num_chunks = 1
+                    self.chunk_size = 262144
 
             def forward(self, hidden_states: torch.Tensor):
                 if self.mode != "linear":
                     hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
 
-                if self.mode == "16":
-                    return tuple(
+                # Compute logits for each chunk
+                if self.mode in ("16", "8", "2"):
+                    logits_list = [
                         h(hidden_states).squeeze(2).transpose(1, 2) for h in self.heads
-                    )
-                if self.mode == "8":
-                    return tuple(
-                        h(hidden_states).squeeze(2).transpose(1, 2) for h in self.heads
-                    )
-                if self.mode == "2":
-                    logits1 = self.heads[0](hidden_states).squeeze(2).transpose(1, 2)
-                    logits2 = self.heads[1](hidden_states).squeeze(2).transpose(1, 2)
-                    return logits1, logits2
-                if self.mode == "1":
-                    return self.head(hidden_states).squeeze(2).transpose(1, 2)
-                return self.head(hidden_states)
+                    ]
+                elif self.mode == "1":
+                    logits_list = [self.head(hidden_states).squeeze(2).transpose(1, 2)]
+                else:
+                    logits_list = [self.head(hidden_states)]
 
-        wrapper = LMHeadWrapper(model)
+                # If argmax_mode, compute argmax per chunk and return 2 tensors
+                # NOTE: We return LOCAL indices (0 to chunk_size-1), not global indices.
+                # The Swift/Python inference code must add (chunk_idx * chunk_size) to get global index.
+                # NOTE: Using int32 for ANE compatibility - ANE doesn't support int64 for argmax.
+                if self.argmax_mode:
+                    all_idx = []
+                    all_val = []
+                    for logits in logits_list:
+                        # logits: [1, 1, chunk_size]
+                        # Get argmax index within chunk (0 to chunk_size-1)
+                        chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)  # [1, 1, 1], int64
+                        chunk_max_val = torch.gather(logits, -1, chunk_argmax)  # [1, 1, 1], fp16
+                        # Convert to int32 for ANE compatibility
+                        local_idx = chunk_argmax.to(torch.int32)  # [1, 1, 1]
+                        all_idx.append(local_idx)
+                        all_val.append(chunk_max_val)
+                    # Stack into single tensors
+                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], int32 (LOCAL indices)
+                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], fp16
+                    return (argmax_idx, argmax_val)
+                else:
+                    # Return logits as tuple
+                    return tuple(logits_list)
+
+        wrapper = LMHeadWrapper(model, argmax_mode=argmax_in_model)
         wrapper.eval()
-        
+
         # Ensure no gradients
         for param in wrapper.parameters():
             param.requires_grad = False
 
+        argmax_str = ", argmax_in_model=True" if argmax_in_model else ""
+        print(f"LM head wrapper created (mode: {wrapper.mode}, chunks: {wrapper.num_chunks}{argmax_str})")
+
         sample_input = torch.zeros(
             (1, 1, model.config.hidden_size), dtype=MODEL_DTYPE, device=TEST_DEVICE
         )
-        
+
         # Trace with no_grad context
         with torch.no_grad():
             traced = torch.jit.trace(wrapper, sample_input)
 
-        if getattr(wrapper, "mode") == "16":
+        if argmax_in_model:
+            # Output 2 tensors: argmax_idx[num_chunks] and argmax_val[num_chunks]
+            outputs = [
+                ct.TensorType(name="argmax_idx", dtype=np.int32),
+                ct.TensorType(name="argmax_val", dtype=np.float16)
+            ]
+            print(f"Outputs: argmax_idx[{wrapper.num_chunks}] (int32) + argmax_val[{wrapper.num_chunks}] (fp16)")
+        elif wrapper.mode == "16":
             outputs = [
                 ct.TensorType(name=f"logits{i}", dtype=np.float16) for i in range(1, 17)
             ]
-        elif getattr(wrapper, "mode") == "8":
+        elif wrapper.mode == "8":
             outputs = [
                 ct.TensorType(name=f"logits{i}", dtype=np.float16) for i in range(1, 9)
             ]
-        elif getattr(wrapper, "mode") == "2":
+        elif wrapper.mode == "2":
             outputs = [
                 ct.TensorType(name="logits1", dtype=np.float16),
                 ct.TensorType(name="logits2", dtype=np.float16),

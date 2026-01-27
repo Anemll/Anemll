@@ -444,6 +444,9 @@ def parse_args():
                     else:
                         args.split_lm_head = 8  # Default value
 
+                # Check for argmax_in_model flag (for chunked models)
+                args.argmax_in_model = params.get('argmax_in_model', False)
+
                 # sliding_window for Gemma3 rotation support (default 512 for Gemma3)
                 # Only set if the model has a sliding window configured or if prefix is gemma3
                 if 'sliding_window' in params:
@@ -458,6 +461,7 @@ def parse_args():
                 print(f"  Batch Size: {args.batch_size}")
                 print(f"  Num Chunks: {args.num_chunks}")
                 print(f"  Split LM Head: {args.split_lm_head}")
+                print(f"  Argmax in Model: {args.argmax_in_model}")
                 print(f"  Models Directory: {args.d}")
                 print(f"  Embeddings: {args.embed}")
                 print(f"  LM Head: {args.lmhead}")
@@ -821,7 +825,36 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     
     # Run LM head and get next token
     lm_output = lmhead_model.predict({'hidden_states': hidden_states.numpy()})
-    
+
+    # Check if model uses argmax_in_model mode (outputs argmax_idx/argmax_val instead of logits)
+    argmax_in_model = metadata.get('argmax_in_model', False) if metadata else False
+
+    if argmax_in_model and 'argmax_idx' in lm_output:
+        # Model outputs argmax_idx and argmax_val (split across num_chunks chunks)
+        argmax_idx = lm_output['argmax_idx']  # shape: [num_chunks], LOCAL indices within chunk
+        argmax_val = lm_output['argmax_val']  # shape: [num_chunks], max logit values
+
+        # Flatten in case of extra dimensions
+        argmax_idx_flat = argmax_idx.flatten()
+        argmax_val_flat = argmax_val.flatten()
+
+        # Find the chunk with the highest value
+        best_chunk = int(np.argmax(argmax_val_flat))
+        local_idx = int(argmax_idx_flat[best_chunk])
+
+        # Calculate global token index: local_idx + chunk_offset
+        num_chunks = len(argmax_idx_flat)
+        vocab_size = 262144  # Standard for Gemma3
+        chunk_size = vocab_size // num_chunks
+        next_token = local_idx + (best_chunk * chunk_size)
+
+        return next_token
+
+    # Warn if argmax expected but not found
+    if argmax_in_model and 'argmax_idx' not in lm_output:
+        print(f"\n[WARNING] argmax_in_model=True but model outputs: {list(lm_output.keys())}")
+        print("Model may need reconversion with --argmax flag")
+
     if 'logits1' in lm_output:
         logit_indices = [
             int(k[6:]) for k in lm_output.keys()
@@ -1894,6 +1927,9 @@ def main():
 
             # Add split_lm_head to metadata for generate_next_token
             metadata['split_lm_head'] = getattr(args, 'split_lm_head', 8)
+
+            # Add argmax_in_model flag for chunked models
+            metadata['argmax_in_model'] = getattr(args, 'argmax_in_model', False)
 
             # Add sliding_window for Gemma3 rotation support
             sliding_window = getattr(args, 'sliding_window', None)

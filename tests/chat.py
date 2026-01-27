@@ -730,13 +730,49 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     
     # Run LM head
     lm_output = lmhead_model.predict({'hidden_states': hidden_states.numpy().astype(np.float16)})
-    # Debug print
-    #print("\nLM Head output keys:", list(lm_output.keys()))
-    
+
+    # Check if model uses argmax_in_model mode (outputs argmax_idx/argmax_val instead of logits)
+    argmax_in_model = metadata.get('argmax_in_model', False)
+
+    # Debug: show LM head output keys if argmax mode expected but not found
+    if argmax_in_model and 'argmax_idx' not in lm_output:
+        print(f"\n[WARNING] argmax_in_model=True but model outputs: {list(lm_output.keys())}")
+        print("[WARNING] Model may need to be reconverted with --argmax flag")
+        # Fall through to logits processing
+
+    if argmax_in_model and 'argmax_idx' in lm_output:
+        # Argmax-in-model mode: find the chunk with highest value and compute global index
+        # Model outputs LOCAL indices (0 to chunk_size-1) for each chunk
+        # We compute: global_idx = local_idx + (best_chunk * chunk_size)
+        argmax_idx = lm_output['argmax_idx']  # shape: [num_chunks], LOCAL indices
+        argmax_val = lm_output['argmax_val']  # shape: [num_chunks]
+
+        # Flatten arrays
+        argmax_idx_flat = argmax_idx.flatten()
+        argmax_val_flat = argmax_val.flatten()
+
+        # Find best chunk (highest value)
+        best_chunk = int(np.argmax(argmax_val_flat))
+        local_idx = int(argmax_idx_flat[best_chunk])
+
+        # Compute global index: local_idx + (best_chunk * chunk_size)
+        num_chunks = len(argmax_idx_flat)
+        chunk_size = 262144 // num_chunks  # Gemma3 vocab = 262144
+        global_idx = local_idx + (best_chunk * chunk_size)
+
+        if metadata.get('debug_argmax', False):
+            print(f"\nLM head argmax mode (chunked):")
+            print(f"  argmax_idx shape: {argmax_idx.shape}, dtype: {argmax_idx.dtype}")
+            print(f"  argmax_val shape: {argmax_val.shape}, dtype: {argmax_val.dtype}")
+            print(f"  best_chunk={best_chunk}, local_idx={local_idx}, global_idx={global_idx}")
+            print(f"  best_val={argmax_val_flat[best_chunk]:.4f}")
+
+        return global_idx
+
     # Get number of logits from metadata, using split_lm_head if available
     # First check for split_lm_head (new), then num_logits (legacy), default to 8
     num_logits = metadata.get('split_lm_head', metadata.get('num_logits', 8))
-    
+
     # Combine logits1-N if they exist
     if 'logits1' in lm_output:
         # Concatenate all logits parts
@@ -749,7 +785,7 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     else:
         # Try output_logits as fallback
         logits = torch.from_numpy(lm_output['output_logits'])
-    
+
     # Apply temperature and sample
     if temperature > 0:
         logits = logits / temperature
@@ -757,7 +793,7 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
         next_token = torch.multinomial(probs, num_samples=1).item()
     else:
         next_token = torch.argmax(logits[0, -1, :]).item()
-    
+
     return next_token
 
 def create_unified_state(ffn_models, context_length, eval_mode=False):
@@ -1186,6 +1222,9 @@ def parse_args():
                     else:
                         args.split_lm_head = 8
 
+                # Check for argmax_in_model flag (for chunked models)
+                args.argmax_in_model = params.get('argmax_in_model', False)
+
                 if not args.eval:
                     print(f"\nLoaded parameters from {args.meta}:")
                     print(f"  Context Length: {args.context_length}")
@@ -1193,6 +1232,7 @@ def parse_args():
                     print(f"  Num Chunks: {args.num_chunks}")
                     print(f"  Num Logits: {args.num_logits}")
                     print(f"  Split LM Head: {args.split_lm_head}")
+                    print(f"  Argmax in Model: {args.argmax_in_model}")
                     print(f"  Models Directory: {args.d}")
                     print(f"  Embeddings: {args.embed}")
                     print(f"  LM Head: {args.lmhead}")
@@ -1812,9 +1852,15 @@ def main():
             # Add debug flag
             metadata['debug'] = getattr(args, 'debug', False)
 
+            # Add argmax_in_model flag for chunked models
+            metadata['argmax_in_model'] = getattr(args, 'argmax_in_model', False)
+            metadata['debug_argmax'] = getattr(args, 'debug_argmax', False)
+
             if not args.eval:
                 print(f"\nMetadata after load_models: {metadata}")
                 print(f"Using split_lm_head value: {metadata.get('split_lm_head', 8)}")
+                if metadata.get('argmax_in_model'):
+                    print("Argmax mode enabled for LM head")
 
             # Create unified state once
             state = create_unified_state(ffn_models, metadata['context_length'], args.eval)
