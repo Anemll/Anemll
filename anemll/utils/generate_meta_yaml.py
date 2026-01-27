@@ -40,7 +40,7 @@ def check_file_exists(output_dir, base_name, lut_value):
         print(f"Warning: {lut_name}.mlmodelc not found, using {base_name}.mlmodelc instead")
         return base_name, 'none', None
 
-def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch, output_dir, argmax_in_model=False):
+def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch, output_dir, argmax_in_model=False, rotate=False):
     """Generate meta.yaml for monolithic model format.
 
     Args:
@@ -52,6 +52,7 @@ def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch,
         arch: Architecture type
         output_dir: Output directory
         argmax_in_model: If True, model computes argmax internally
+        rotate: If True, include rotation functions (4-function model for context >= 512)
     """
     # Parse LUT value
     lut_value, lut_per_channel, _ = parse_lut_value(lut_bits)
@@ -98,12 +99,22 @@ def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch,
 
     argmax_line = f'\n    argmax_in_model: true' if argmax_in_model else ''
 
+    # Build functions list based on rotate flag
+    if rotate:
+        functions_yaml = '''    functions:
+      - infer
+      - infer_rotate
+      - prefill
+      - prefill_rotate'''
+    else:
+        functions_yaml = '''    functions:
+      - infer
+      - prefill'''
+
     meta_parts.append(f'''    model_prefix: {prefix}
     monolithic_model: {model_name_file}
     split_lm_head: {split_lm_head}{argmax_line}
-    functions:
-      - infer
-      - prefill
+{functions_yaml}
 ''')
 
     meta = '\n'.join(meta_parts)
@@ -128,9 +139,14 @@ def main():
     if argmax_in_model:
         sys.argv.remove('--argmax')
 
+    # Check for --rotate flag (4-function model for context >= 512)
+    rotate = '--rotate' in sys.argv
+    if rotate:
+        sys.argv.remove('--rotate')
+
     if is_monolithic:
         if len(sys.argv) != 11:
-            print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_bits> <lut_bits> <lut_bits> <num_chunks> <prefix> <arch> <output_dir> --monolithic [--argmax]")
+            print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_bits> <lut_bits> <lut_bits> <num_chunks> <prefix> <arch> <output_dir> --monolithic [--argmax] [--rotate]")
             sys.exit(1)
         # For monolithic, all LUT values should be the same (use the first one)
         generate_monolithic_meta(
@@ -141,7 +157,8 @@ def main():
             prefix=sys.argv[8],
             arch=sys.argv[9],
             output_dir=sys.argv[10],
-            argmax_in_model=argmax_in_model
+            argmax_in_model=argmax_in_model,
+            rotate=rotate
         )
         return
 

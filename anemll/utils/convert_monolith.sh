@@ -19,6 +19,7 @@ PREFIX=""           # Auto-detect based on architecture
 MODEL_PATH=""
 OUTPUT_DIR=""
 RESTART_STEP=1
+RESTART_STEP_NUM=1
 ONLY_STEP=""
 SKIP_CHECK=false
 ARGMAX_IN_MODEL=false
@@ -42,8 +43,8 @@ print_usage() {
     echo "  --lut           LUT bits for all components (default: 4)"
     echo "                  Format: 'bits' or 'bits,per_channel' (e.g., '4' or '4,8')"
     echo "  --prefix        Prefix for model names (default: auto-detect)"
-    echo "  --restart       Restart from specific step (1-6, default: 1)"
-    echo "  --only          Run only specified step and exit (1-6)"
+    echo "  --restart       Restart from specific step (1-6, 2b, 2c; default: 1)"
+    echo "  --only          Run only specified step and exit (1-6, 2b, 2c)"
     echo "  --skip-check    Skip the dependency check step"
     echo "  --argmax        Compute argmax inside model (outputs idx+val pairs instead of logits)"
     echo ""
@@ -116,6 +117,12 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Normalize restart step for numeric comparisons (allow values like 2b/2c)
+RESTART_STEP_NUM="${RESTART_STEP//[^0-9]/}"
+if [ -z "$RESTART_STEP_NUM" ]; then
+    RESTART_STEP_NUM="$RESTART_STEP"
+fi
 
 # Validate required parameters
 if [ -z "$MODEL_PATH" ] || [ -z "$OUTPUT_DIR" ]; then
@@ -242,7 +249,12 @@ run_step() {
     local description=$2
     local cmd=$3
 
-    if [ $RESTART_STEP -le $step ]; then
+    local step_num="${step//[^0-9]/}"
+    if [ -z "$step_num" ]; then
+        step_num="$step"
+    fi
+
+    if [ "$RESTART_STEP_NUM" -le "$step_num" ]; then
         # Skip if ONLY_STEP is set and doesn't match current step
         if [ ! -z "$ONLY_STEP" ] && [ "$ONLY_STEP" != "$step" ]; then
             return
@@ -302,10 +314,43 @@ run_step 2 "Converting Monolithic Prefill Model" "$CONVERTER \
     --model \"$MODEL_PATH\" \
     --output \"$OUTPUT_DIR\""
 
+# For context > 512, also convert rotation functions (4-function model for Gemma3)
+if [ "$CONTEXT_LENGTH" -gt 512 ]; then
+    echo "Context > 512: Converting rotation functions for 4-function model support..."
+
+    # Step 2b: Convert Monolithic Inference Rotate Model
+    run_step "2b" "Converting Monolithic Inference Rotate Model" "$CONVERTER \
+        --part monolithic_rotate \
+        $LUT_PARAM \
+        $ARGMAX_PARAM \
+        --context-length $CONTEXT_LENGTH \
+        --batch-size $BATCH_SIZE \
+        --prefix \"$PREFIX\" \
+        --model \"$MODEL_PATH\" \
+        --output \"$OUTPUT_DIR\""
+
+    # Step 2c: Convert Monolithic Prefill Rotate Model
+    run_step "2c" "Converting Monolithic Prefill Rotate Model" "$CONVERTER \
+        --part monolithic_prefill_rotate \
+        $LUT_PARAM \
+        $ARGMAX_PARAM \
+        --context-length $CONTEXT_LENGTH \
+        --batch-size $BATCH_SIZE \
+        --prefix \"$PREFIX\" \
+        --model \"$MODEL_PATH\" \
+        --output \"$OUTPUT_DIR\""
+fi
+
 # Step 3: Combine into Multi-Function Model
+# Includes rotation functions if context > 512
+ROTATE_FLAG=""
+if [ "$CONTEXT_LENGTH" -gt 512 ]; then
+    ROTATE_FLAG="--rotate"
+fi
 run_step 3 "Combining Monolithic Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
     --monolithic \
     $LUT_PARAM \
+    $ROTATE_FLAG \
     --prefix \"$PREFIX\" \
     --input \"$OUTPUT_DIR\" \
     --output \"$OUTPUT_DIR\""
@@ -361,11 +406,16 @@ EOF_CONFIG
         fi && \
 
         # Create meta.yaml for monolithic model
+        # Add --rotate flag if context > 512 (4-function model)
+        ROTATE_META_FLAG=\"\"
+        if [ \"$CONTEXT_LENGTH\" -gt 512 ]; then
+            ROTATE_META_FLAG=\"--rotate\"
+        fi
         python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \
             1 \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \
-            --monolithic $ARGMAX_PARAM
+            --monolithic $ARGMAX_PARAM $ROTATE_META_FLAG
     "
 fi
 

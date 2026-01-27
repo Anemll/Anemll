@@ -428,6 +428,109 @@ def combine_monolithic(lut_bits=None, prefix='qwen', input_dir='.', output_dir='
         return False
 
 
+def combine_monolithic_rotate(lut_bits=None, prefix='gemma3', input_dir='.', output_dir='.'):
+    """Combine monolithic models with rotation support into 4-function model.
+
+    This creates a combined model with four functions for context >= 512:
+    - 'infer': Single token inference (positions < sliding_window)
+    - 'infer_rotate': Single token inference (positions >= sliding_window)
+    - 'prefill': Batch prefill (positions < sliding_window)
+    - 'prefill_rotate': Batch prefill (positions >= sliding_window)
+
+    Args:
+        lut_bits: LUT quantization bits (or None)
+        prefix: Model name prefix
+        input_dir: Directory containing the input models
+        output_dir: Directory to save the combined model
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    import shutil
+
+    # Build file names
+    if lut_bits:
+        infer_name = f"{prefix}_monolithic_lut{lut_bits}.mlpackage"
+        infer_rotate_name = f"{prefix}_monolithic_rotate_lut{lut_bits}.mlpackage"
+        prefill_name = f"{prefix}_monolithic_prefill_lut{lut_bits}.mlpackage"
+        prefill_rotate_name = f"{prefix}_monolithic_prefill_rotate_lut{lut_bits}.mlpackage"
+        output_name = f"{prefix}_monolithic_full_lut{lut_bits}.mlpackage"
+    else:
+        infer_name = f"{prefix}_monolithic.mlpackage"
+        infer_rotate_name = f"{prefix}_monolithic_rotate.mlpackage"
+        prefill_name = f"{prefix}_monolithic_prefill.mlpackage"
+        prefill_rotate_name = f"{prefix}_monolithic_prefill_rotate.mlpackage"
+        output_name = f"{prefix}_monolithic_full.mlpackage"
+
+    infer_path = os.path.join(input_dir, infer_name)
+    infer_rotate_path = os.path.join(input_dir, infer_rotate_name)
+    prefill_path = os.path.join(input_dir, prefill_name)
+    prefill_rotate_path = os.path.join(input_dir, prefill_rotate_name)
+    output_path = os.path.join(output_dir, output_name)
+    temp_path = os.path.join(output_dir, f"temp_{output_name}")
+
+    print(f"\nCombining monolithic models with rotation (4 functions):")
+    print(f"  Infer:          {infer_path}")
+    print(f"  Infer_rotate:   {infer_rotate_path}")
+    print(f"  Prefill:        {prefill_path}")
+    print(f"  Prefill_rotate: {prefill_rotate_path}")
+    print(f"  Output:         {output_path}")
+
+    # Check input files exist
+    missing = []
+    for path in [infer_path, infer_rotate_path, prefill_path, prefill_rotate_path]:
+        if not os.path.exists(path):
+            missing.append(path)
+    if missing:
+        print(f"Error: Missing input files:")
+        for f in missing:
+            print(f"  - {f}")
+        return False
+
+    try:
+        # Load models
+        print("Loading models...")
+        infer_model = ct.models.MLModel(infer_path)
+        infer_rotate_model = ct.models.MLModel(infer_rotate_path)
+        prefill_model = ct.models.MLModel(prefill_path)
+        prefill_rotate_model = ct.models.MLModel(prefill_rotate_path)
+
+        # Create combined model with 4 functions
+        print("Creating 4-function multi-function model...")
+        desc = ct.utils.MultiFunctionDescriptor()
+        desc.add_function(infer_path, "main", "infer")
+        desc.add_function(infer_rotate_path, "main", "infer_rotate")
+        desc.add_function(prefill_path, "main", "prefill")
+        desc.add_function(prefill_rotate_path, "main", "prefill_rotate")
+        desc.default_function_name = "infer"
+
+        ct.utils.save_multifunction(desc, temp_path)
+
+        # Load and add metadata
+        print("Adding metadata...")
+        combined_model = ct.models.MLModel(temp_path)
+        AddCombinedMetadata(combined_model, [infer_model, infer_rotate_model, prefill_model, prefill_rotate_model])
+
+        # Save final model
+        print(f"Saving to: {output_path}")
+        combined_model.save(output_path)
+
+        # Clean up temp file
+        shutil.rmtree(temp_path, ignore_errors=True)
+
+        print("Monolithic 4-function model combination complete!")
+        return True
+
+    except Exception as e:
+        print(f"Error combining monolithic models with rotation: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        # Clean up temp file on error
+        if os.path.exists(temp_path):
+            shutil.rmtree(temp_path, ignore_errors=True)
+        return False
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Combine FFN and prefill models')
     parser.add_argument('--lut', type=str, help='LUT bits used in quantization (optional). Format: "bits" or "bits,per_channel" (e.g., "6" or "6,4")')
@@ -438,6 +541,9 @@ def parse_args():
     parser.add_argument('--gemma3', action='store_true',
                       help='Combine Gemma3 models with 4 functions (infer, infer_rotate, prefill, prefill_rotate). '
                            'Required for Gemma3 models with context > 512 (sliding window)')
+    parser.add_argument('--rotate', action='store_true',
+                      help='Include rotation functions (infer_rotate, prefill_rotate) for context >= 512. '
+                           'Creates 4-function model instead of 2-function model.')
     parser.add_argument('--input', type=str, default='.',
                       help='Input directory containing model files (default: current directory)')
     parser.add_argument('--output', type=str, default=None,
@@ -488,12 +594,22 @@ def main():
         if args.monolithic:
             input_dir = args.input
             output_dir = args.output if args.output else args.input
-            success = combine_monolithic(
-                lut_bits=args.lut,
-                prefix=args.prefix,
-                input_dir=input_dir,
-                output_dir=output_dir
-            )
+            if args.rotate:
+                # 4-function model with rotation support (context >= 512)
+                success = combine_monolithic_rotate(
+                    lut_bits=args.lut,
+                    prefix=args.prefix,
+                    input_dir=input_dir,
+                    output_dir=output_dir
+                )
+            else:
+                # 2-function model (context < 512)
+                success = combine_monolithic(
+                    lut_bits=args.lut,
+                    prefix=args.prefix,
+                    input_dir=input_dir,
+                    output_dir=output_dir
+                )
             sys.exit(0 if success else 1)
 
         # Chunked mode requires --chunk
