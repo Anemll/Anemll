@@ -21,6 +21,7 @@ This directory contains development, testing, and debugging files organized to s
 - `test_pytorch_vs_coreml.py` - PyTorch vs CoreML validation
 - `test_coreml_vs_pytorch.py` - CoreML vs PyTorch validation
 - `test_fair_single_token_comparison.py` - Fair single token comparison
+- `test_gemma3_coreml_chunks_vs_pytorch.py` - Gemma3 single‑token embedding + chunk‑by‑chunk CoreML vs PyTorch diff to pinpoint divergence (also a good pattern for Qwen3). Useful when conversions silently go wrong due to missing/renamed weights in multimodal checkpoints (e.g., `language_model.*` vs `vision_tower.*`).
 
 ## Core Component Testing
 

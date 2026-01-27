@@ -1725,10 +1725,15 @@ class Gemma3Model(nn.Module):
         # Filter out unexpected keys that are actually expected from HF format differences
         # (none expected currently - all layer norms should now be present)
 
-        if missing or unexpected:
+        if missing:
             print("Missing keys", missing)
+            if unexpected:
+                print("Unexpected keys", unexpected)
+            # Highlight actionable TODO in red for conversion logs
+            print("\033[91mTODO: Weights not found or renamed. Check checkpoint prefixes (e.g., language_model.*) and config.\033[0m")
+            raise RuntimeError("Failed to load Gemma3 weights: missing keys.")
+        if unexpected:
             print("Unexpected keys", unexpected)
-            raise RuntimeError("Failed to load Gemma3 weights: missing or unexpected keys.")
         return True
 
 

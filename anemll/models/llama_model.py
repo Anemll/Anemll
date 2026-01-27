@@ -1228,6 +1228,8 @@ class LlamaForCausalLM(nn.Module):
         missing_keys, unexpected_keys = self.load_state_dict(filtered_state_dict, strict=False)
         if missing_keys:
             print(f"Missing keys: {missing_keys}")
+            # Highlight actionable TODO in red for conversion logs
+            print("\033[91mTODO: Weights not found or renamed. Check checkpoint prefixes and model config.\033[0m")
         if unexpected_keys:
             print(f"Unexpected keys: {unexpected_keys}")
 
@@ -1275,6 +1277,8 @@ class LlamaForCausalLM(nn.Module):
             print("Pretrained weights loaded with some issues:")
             if actual_missing:
                 print(f"Missing keys: {actual_missing}")
+                # Highlight actionable TODO in red for conversion logs
+                print("\033[91mTODO: Weights not found or renamed. Check checkpoint prefixes and model config.\033[0m")
             if unexpected_keys:
                 print(f"Unexpected keys: {unexpected_keys}")
             return False

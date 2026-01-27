@@ -929,10 +929,16 @@ class Qwen25Model(nn.Module):
         # Filter out expected missing keys including KV cache buffer
         expected_missing = ['kv_cache_0']  # KV cache buffer is initialized separately
         missing = [m for m in missing if m not in expected_missing]
-        if missing or unexpected:
+        if missing:
             print("Missing keys", missing)
+            if unexpected:
+                print("Unexpected keys", unexpected)
+            # Highlight actionable TODO in red for conversion logs
+            print("\033[91mTODO: Weights not found or renamed. Check checkpoint prefixes and model config.\033[0m")
+            return False
+        if unexpected:
             print("Unexpected keys", unexpected)
-        return not missing and not unexpected
+        return True
 
 
 class Qwen25ForCausalLM(nn.Module):
