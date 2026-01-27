@@ -288,6 +288,9 @@ This creates:
 - `gemma3n_infer_chunk_01of04.mlpackage` - Layers 8-14
 - `gemma3n_infer_chunk_02of04.mlpackage` - Layers 15-22
 - `gemma3n_infer_chunk_03of04.mlpackage` - Layers 23-29
+- `gemma3n_infer_rotate_chunk_XXofYY.mlpackage` - Rotation chunks for sliding-window inference
+- `gemma3n_prefill_chunk_XXofYY.mlpackage` - Prefill chunks (batch, fill mode)
+- `gemma3n_prefill_rotate_chunk_XXofYY.mlpackage` - Prefill chunks (rotation mode)
 - `gemma3n_combine_streams.mlpackage` - AltUp stream combination
 - `gemma3n_lm_head.mlpackage` - 16-way split LM head
 

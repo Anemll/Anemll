@@ -139,6 +139,11 @@ class Gemma3nConfig:
         self.rope_theta = kwargs.get("rope_theta", 1000000.0)  # Gemma3n uses 1M theta
         self.rope_local_base_freq = kwargs.get("rope_local_base_freq", 10000.0)
         self.sliding_window = kwargs.get("sliding_window", 512)  # Gemma3n sliding window
+        # Sliding-window rotation control for local KV cache
+        # None: auto (pos < sliding_window => fill, else rotate)
+        # False: force fill (infer)
+        # True: force rotate (infer_rotate)
+        self.force_rotation_mode = kwargs.get("force_rotation_mode", None)
         self.final_logit_softcapping = kwargs.get("final_logit_softcapping", 30.0)  # Gemma3n uses 30.0
         self.model_type = kwargs.get("model_type", "gemma")
         self.architectures = kwargs.get("architectures", ["GemmaForCausalLM"])
@@ -694,10 +699,14 @@ class Gemma3nTextAttention(nn.Module):
             K_layer_cache = K_layer_cache.unsqueeze(0)
             V_layer_cache = V_layer_cache.unsqueeze(0)
 
-        # Use full KV cache - causal mask handles position masking
-        # This avoids dynamic slicing issues with JIT tracing
+        # Use full KV cache by default; for sliding layers, restrict to window
         key_states = repeat_kv(K_layer_cache, self.num_key_value_groups)
         value_states = repeat_kv(V_layer_cache, self.num_key_value_groups)
+
+        if self.is_sliding and self.config.sliding_window is not None:
+            window_size = min(self.config.sliding_window, key_states.shape[-2])
+            key_states = key_states[:, :, :window_size, :]
+            value_states = value_states[:, :, :window_size, :]
 
         # Match dtypes to avoid matmul dtype errors during tracing.
         if query_states.dtype != key_states.dtype:
@@ -739,9 +748,14 @@ class Gemma3nTextAttention(nn.Module):
             K_layer_cache = K_layer_cache.unsqueeze(0)
             V_layer_cache = V_layer_cache.unsqueeze(0)
 
-        # Use full KV cache - causal mask handles position masking
+        # Use full KV cache by default; for sliding layers, restrict to window
         key_states = repeat_kv(K_layer_cache, self.num_key_value_groups)
         value_states = repeat_kv(V_layer_cache, self.num_key_value_groups)
+
+        if self.is_sliding and self.config.sliding_window is not None:
+            window_size = min(self.config.sliding_window, key_states.shape[-2])
+            key_states = key_states[:, :, :window_size, :]
+            value_states = value_states[:, :, :window_size, :]
 
         if query_states.dtype != key_states.dtype:
             query_states = query_states.to(key_states.dtype)
@@ -1536,6 +1550,181 @@ class Gemma3nModel(nn.Module):
         value_idx = layer_in_group_idx + layers_per_group
         return kv_cache, key_idx, value_idx, layers_per_group
 
+    def _get_local_window(self) -> int:
+        """Return sliding window size bounded by cache length."""
+        sliding = getattr(self.config, "sliding_window", None)
+        if not sliding or sliding <= 0:
+            return 0
+        return int(sliding)
+
+    def _fill_kv_local(
+        self,
+        kv_cache: torch.Tensor,
+        key_idx: int,
+        value_idx: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        current_pos: torch.Tensor,
+        position_one_hot: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Fill local KV cache at current_pos (no rotation)."""
+        sw = self._get_local_window()
+        if sw <= 0:
+            return
+        window_len = min(sw, kv_cache.shape[2])
+
+        if position_one_hot is None:
+            positions = torch.arange(window_len, device=kv_cache.device, dtype=torch.long)
+            one_hot = (positions == current_pos.long()).float().view(1, 1, window_len, 1)
+        else:
+            one_hot = position_one_hot[:, :, :window_len, :]
+
+        key_states_expanded = key_states.expand(-1, -1, window_len, -1).half()
+        value_states_expanded = value_states.expand(-1, -1, window_len, -1).half()
+
+        kv_key_slice = kv_cache[key_idx:key_idx + 1, :, :window_len, :]
+        kv_value_slice = kv_cache[value_idx:value_idx + 1, :, :window_len, :]
+
+        updated_keys = kv_key_slice * (1.0 - one_hot) + key_states_expanded * one_hot
+        updated_values = kv_value_slice * (1.0 - one_hot) + value_states_expanded * one_hot
+
+        kv_cache[key_idx:key_idx + 1, :, :window_len, :] = updated_keys.half()
+        kv_cache[value_idx:value_idx + 1, :, :window_len, :] = updated_values.half()
+
+    def _update_kv_local(
+        self,
+        kv_cache: torch.Tensor,
+        key_idx: int,
+        value_idx: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> None:
+        """Rotate local KV cache (shift left by 1, append new token)."""
+        sw = self._get_local_window()
+        if sw <= 0:
+            return
+        window_len = min(sw, kv_cache.shape[2])
+
+        key_slice = kv_cache[key_idx:key_idx + 1, :, :window_len, :]
+        value_slice = kv_cache[value_idx:value_idx + 1, :, :window_len, :]
+
+        key_tail = torch.narrow(key_slice, 2, 1, window_len - 1)
+        value_tail = torch.narrow(value_slice, 2, 1, window_len - 1)
+
+        shifted_key = torch.cat([key_tail, key_states], dim=2)
+        shifted_value = torch.cat([value_tail, value_states], dim=2)
+
+        kv_cache[key_idx:key_idx + 1, :, :window_len, :] = shifted_key.half()
+        kv_cache[value_idx:value_idx + 1, :, :window_len, :] = shifted_value.half()
+
+    def _store_kv_local(
+        self,
+        kv_cache: torch.Tensor,
+        key_idx: int,
+        value_idx: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        current_pos: torch.Tensor,
+        position_one_hot: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Store local KV cache with optional rotation."""
+        force_rotation = getattr(self.config, "force_rotation_mode", None)
+        if force_rotation is True:
+            self._update_kv_local(kv_cache, key_idx, value_idx, key_states, value_states)
+            return
+        if force_rotation is False:
+            self._fill_kv_local(kv_cache, key_idx, value_idx, key_states, value_states, current_pos, position_one_hot)
+            return
+
+        sliding = self._get_local_window()
+        if sliding <= 0:
+            return
+        if current_pos.long() < sliding:
+            self._fill_kv_local(kv_cache, key_idx, value_idx, key_states, value_states, current_pos, position_one_hot)
+        else:
+            self._update_kv_local(kv_cache, key_idx, value_idx, key_states, value_states)
+
+    def _store_kv_local_prefill(
+        self,
+        kv_cache: torch.Tensor,
+        key_idx: int,
+        value_idx: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        current_pos: torch.Tensor,
+    ) -> None:
+        """Store local KV cache for prefill with optional rotation."""
+        sw = self._get_local_window()
+        if sw <= 0:
+            return
+        window_len = min(sw, kv_cache.shape[2])
+        seq_len = key_states.shape[2]
+
+        force_rotation = getattr(self.config, "force_rotation_mode", None)
+        if force_rotation is True:
+            self._update_kv_local_prefill(kv_cache, key_idx, value_idx, key_states, value_states, seq_len)
+            return
+        if force_rotation is False:
+            self._fill_kv_local_prefill(kv_cache, key_idx, value_idx, key_states, value_states, current_pos, seq_len, window_len)
+            return
+
+        if current_pos.long() + seq_len <= window_len:
+            self._fill_kv_local_prefill(kv_cache, key_idx, value_idx, key_states, value_states, current_pos, seq_len, window_len)
+        else:
+            self._update_kv_local_prefill(kv_cache, key_idx, value_idx, key_states, value_states, seq_len)
+
+    def _fill_kv_local_prefill(
+        self,
+        kv_cache: torch.Tensor,
+        key_idx: int,
+        value_idx: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        current_pos: torch.Tensor,
+        seq_len: int,
+        window_len: int,
+    ) -> None:
+        """Fill local KV cache for prefill (no rotation)."""
+        start_pos = int(current_pos.item())
+        end_pos = min(start_pos + seq_len, window_len)
+        if end_pos <= start_pos:
+            return
+        kv_cache[key_idx:key_idx + 1, :, start_pos:end_pos, :] = key_states[:, :, :end_pos - start_pos, :].half()
+        kv_cache[value_idx:value_idx + 1, :, start_pos:end_pos, :] = value_states[:, :, :end_pos - start_pos, :].half()
+
+    def _update_kv_local_prefill(
+        self,
+        kv_cache: torch.Tensor,
+        key_idx: int,
+        value_idx: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        seq_len: int,
+    ) -> None:
+        """Rotate local KV cache for prefill (shift left by seq_len, append)."""
+        sw = self._get_local_window()
+        if sw <= 0:
+            return
+        window_len = min(sw, kv_cache.shape[2])
+
+        if seq_len >= window_len:
+            # Keep only the last window_len tokens
+            kv_cache[key_idx:key_idx + 1, :, :window_len, :] = key_states[:, :, -window_len:, :].half()
+            kv_cache[value_idx:value_idx + 1, :, :window_len, :] = value_states[:, :, -window_len:, :].half()
+            return
+
+        key_slice = kv_cache[key_idx:key_idx + 1, :, :window_len, :]
+        value_slice = kv_cache[value_idx:value_idx + 1, :, :window_len, :]
+
+        key_tail = torch.narrow(key_slice, 2, seq_len, window_len - seq_len)
+        value_tail = torch.narrow(value_slice, 2, seq_len, window_len - seq_len)
+
+        shifted_key = torch.cat([key_tail, key_states], dim=2)
+        shifted_value = torch.cat([value_tail, value_states], dim=2)
+
+        kv_cache[key_idx:key_idx + 1, :, :window_len, :] = shifted_key.half()
+        kv_cache[value_idx:value_idx + 1, :, :window_len, :] = shifted_value.half()
+
     def _process_layer_regular(self, layer_idx, hidden_states, per_layer_input, causal_mask, current_pos, position_one_hot=None, rotary_cos_local=None, rotary_sin_local=None, rotary_cos_global=None, rotary_sin_global=None):
         layer = self.layers[layer_idx]
 
@@ -1577,36 +1766,48 @@ class Gemma3nModel(nn.Module):
         else:
             kv_cache, key_idx, value_idx, _ = self._get_kv_cache_layer(layer_idx)
 
-            # Dynamic position update using element-wise one-hot mask
-            # NOTE: position_one_hot must be passed as input (not computed here) for CoreML
-            # because comparisons with dynamic values become constants during conversion
-            seq_len = kv_cache.shape[2]
-
-            # Use provided one-hot or create it (for non-CoreML use)
-            if position_one_hot is None:
-                # Fallback for PyTorch-only execution
-                positions = torch.arange(seq_len, device=kv_cache.device, dtype=torch.long)
-                one_hot = (positions == current_pos.long()).float().view(1, 1, seq_len, 1)
+            if use_local and self.config.sliding_window is not None:
+                # Sliding-window local cache with optional rotation
+                self._store_kv_local(
+                    kv_cache,
+                    key_idx,
+                    value_idx,
+                    key_states,
+                    value_states,
+                    current_pos,
+                    position_one_hot=position_one_hot,
+                )
             else:
-                # Use the pre-computed one-hot passed from outside (for CoreML)
-                one_hot = position_one_hot
+                # Dynamic position update using element-wise one-hot mask
+                # NOTE: position_one_hot must be passed as input (not computed here) for CoreML
+                # because comparisons with dynamic values become constants during conversion
+                seq_len = kv_cache.shape[2]
 
-            # Broadcast key_states from [1, heads, 1, dim] to [1, heads, seq_len, dim]
-            key_states_expanded = key_states.expand(-1, -1, seq_len, -1).half()
-            value_states_expanded = value_states.expand(-1, -1, seq_len, -1).half()
+                # Use provided one-hot or create it (for non-CoreML use)
+                if position_one_hot is None:
+                    # Fallback for PyTorch-only execution
+                    positions = torch.arange(seq_len, device=kv_cache.device, dtype=torch.long)
+                    one_hot = (positions == current_pos.long()).float().view(1, 1, seq_len, 1)
+                else:
+                    # Use the pre-computed one-hot passed from outside (for CoreML)
+                    one_hot = position_one_hot
 
-            # Get current cache slices
-            kv_key_slice = kv_cache[key_idx:key_idx + 1]  # [1, heads, seq_len, dim]
-            kv_value_slice = kv_cache[value_idx:value_idx + 1]
+                # Broadcast key_states from [1, heads, 1, dim] to [1, heads, seq_len, dim]
+                key_states_expanded = key_states.expand(-1, -1, seq_len, -1).half()
+                value_states_expanded = value_states.expand(-1, -1, seq_len, -1).half()
 
-            # Update only at current position using element-wise operations
-            # result[pos] = new_value if pos == current_pos else old_value[pos]
-            updated_keys = kv_key_slice * (1.0 - one_hot) + key_states_expanded * one_hot
-            updated_values = kv_value_slice * (1.0 - one_hot) + value_states_expanded * one_hot
+                # Get current cache slices
+                kv_key_slice = kv_cache[key_idx:key_idx + 1]  # [1, heads, seq_len, dim]
+                kv_value_slice = kv_cache[value_idx:value_idx + 1]
 
-            # Write back to kv_cache (CoreML state update)
-            kv_cache[key_idx:key_idx + 1] = updated_keys.half()
-            kv_cache[value_idx:value_idx + 1] = updated_values.half()
+                # Update only at current position using element-wise operations
+                # result[pos] = new_value if pos == current_pos else old_value[pos]
+                updated_keys = kv_key_slice * (1.0 - one_hot) + key_states_expanded * one_hot
+                updated_values = kv_value_slice * (1.0 - one_hot) + value_states_expanded * one_hot
+
+                # Write back to kv_cache (CoreML state update)
+                kv_cache[key_idx:key_idx + 1] = updated_keys.half()
+                kv_cache[value_idx:value_idx + 1] = updated_values.half()
 
             key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
             value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
@@ -1644,7 +1845,19 @@ class Gemma3nModel(nn.Module):
         corrected_predictions[1:] += first_prediction
         return corrected_predictions
 
-    def _process_layer_prefill(self, layer_idx, hidden_states, per_layer_input, causal_mask, current_pos, position_ids):
+    def _process_layer_prefill(
+        self,
+        layer_idx,
+        hidden_states,
+        per_layer_input,
+        causal_mask,
+        current_pos,
+        position_ids,
+        rotary_cos_local=None,
+        rotary_sin_local=None,
+        rotary_cos_global=None,
+        rotary_sin_global=None,
+    ):
         layer = self.layers[layer_idx]
 
         predictions = layer.altup.predict(hidden_states)
@@ -1654,12 +1867,18 @@ class Gemma3nModel(nn.Module):
         laurel_output = layer.laurel(active_prediction_normed)
 
         use_local = layer.attention_type == "sliding_attention"
-        rotary_emb = self._get_rotary_embedding_prefill(
-            position_ids,
-            use_local,
-            device=active_prediction_normed.device,
-            dtype=active_prediction_normed.dtype,
-        )
+        if rotary_cos_local is not None and rotary_sin_local is not None:
+            if use_local:
+                rotary_emb = (rotary_cos_local, rotary_sin_local)
+            else:
+                rotary_emb = (rotary_cos_global, rotary_sin_global)
+        else:
+            rotary_emb = self._get_rotary_embedding_prefill(
+                position_ids,
+                use_local,
+                device=active_prediction_normed.device,
+                dtype=active_prediction_normed.dtype,
+            )
 
         query_states, key_states, value_states = layer.attention.get_new_kv_cache_prefill(
             active_prediction_normed, current_pos, rotary_emb
@@ -1676,37 +1895,48 @@ class Gemma3nModel(nn.Module):
             prefill_seq_len = key_states.shape[2]  # Number of tokens in this prefill batch
             cache_seq_len = kv_cache.shape[2]
 
-            # Dynamic position update using element-wise range mask (traces well in CoreML)
-            # For prefill, we write prefill_seq_len tokens starting at current_pos
-            positions = torch.arange(cache_seq_len, device=kv_cache.device, dtype=torch.long)
-            pos_start = current_pos.long()
-            pos_end = pos_start + prefill_seq_len
+            if use_local and self.config.sliding_window is not None:
+                # Sliding-window local cache with optional rotation
+                self._store_kv_local_prefill(
+                    kv_cache,
+                    key_idx,
+                    value_idx,
+                    key_states,
+                    value_states,
+                    current_pos,
+                )
+            else:
+                # Dynamic position update using element-wise range mask (traces well in CoreML)
+                # For prefill, we write prefill_seq_len tokens starting at current_pos
+                positions = torch.arange(cache_seq_len, device=kv_cache.device, dtype=torch.long)
+                pos_start = current_pos.long()
+                pos_end = pos_start + prefill_seq_len
 
-            # Create range mask: 1.0 for positions in [current_pos, current_pos + prefill_seq_len)
-            range_mask = ((positions >= pos_start) & (positions < pos_end)).float().view(1, 1, cache_seq_len, 1)
+                # Create range mask: 1.0 for positions in [current_pos, current_pos + prefill_seq_len)
+                range_mask = ((positions >= pos_start) & (positions < pos_end)).float().view(1, 1, cache_seq_len, 1)
 
-            # Get current cache slices
-            kv_key_slice = kv_cache[key_idx:key_idx + 1]  # [1, heads, cache_seq_len, dim]
-            kv_value_slice = kv_cache[value_idx:value_idx + 1]
+                # Get current cache slices
+                kv_key_slice = kv_cache[key_idx:key_idx + 1]  # [1, heads, cache_seq_len, dim]
+                kv_value_slice = kv_cache[value_idx:value_idx + 1]
 
-            # Pad key_states to cache_seq_len by creating a full-size tensor
-            # and placing key_states at the appropriate positions
-            key_states_padded = torch.zeros_like(kv_key_slice)
-            value_states_padded = torch.zeros_like(kv_value_slice)
+                # Pad key_states to cache_seq_len by creating a full-size tensor
+                # and placing key_states at the appropriate positions
+                key_states_padded = torch.zeros_like(kv_key_slice)
+                value_states_padded = torch.zeros_like(kv_value_slice)
 
-            # For prefill, use slice assignment (position is known at trace time for prefill)
-            # This is acceptable because prefill position is typically 0
-            pos = current_pos.item()  # OK for prefill - position is constant
-            key_states_padded[:, :, pos:pos + prefill_seq_len, :] = key_states.half()
-            value_states_padded[:, :, pos:pos + prefill_seq_len, :] = value_states.half()
+                # For prefill, use slice assignment (position is known at trace time for prefill)
+                # This is acceptable because prefill position is typically 0
+                pos = current_pos.item()  # OK for prefill - position is constant
+                key_states_padded[:, :, pos:pos + prefill_seq_len, :] = key_states.half()
+                value_states_padded[:, :, pos:pos + prefill_seq_len, :] = value_states.half()
 
-            # Update using mask (positions in range get new values, others keep old)
-            updated_keys = kv_key_slice * (1.0 - range_mask) + key_states_padded * range_mask
-            updated_values = kv_value_slice * (1.0 - range_mask) + value_states_padded * range_mask
+                # Update using mask (positions in range get new values, others keep old)
+                updated_keys = kv_key_slice * (1.0 - range_mask) + key_states_padded * range_mask
+                updated_values = kv_value_slice * (1.0 - range_mask) + value_states_padded * range_mask
 
-            # Write back to kv_cache (CoreML state update)
-            kv_cache[key_idx:key_idx + 1] = updated_keys.half()
-            kv_cache[value_idx:value_idx + 1] = updated_values.half()
+                # Write back to kv_cache (CoreML state update)
+                kv_cache[key_idx:key_idx + 1] = updated_keys.half()
+                kv_cache[value_idx:value_idx + 1] = updated_values.half()
 
             key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
             value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
@@ -1772,8 +2002,8 @@ class Gemma3nModel(nn.Module):
         """
         if end_layer is None:
             end_layer = len(self.layers)
-        if prefill and position_ids is None:
-            raise ValueError("process_layers(prefill=True) requires position_ids")
+        if prefill and position_ids is None and rotary_cos_local is None:
+            raise ValueError("process_layers(prefill=True) requires position_ids or rotary embeddings")
 
         for layer_idx in range(start_layer, end_layer):
             per_layer_input = per_layer_inputs[:, :, layer_idx, :].to(
@@ -1787,6 +2017,10 @@ class Gemma3nModel(nn.Module):
                     causal_mask,
                     current_pos,
                     position_ids,
+                    rotary_cos_local,
+                    rotary_sin_local,
+                    rotary_cos_global,
+                    rotary_sin_global,
                 )
             else:
                 hidden_states = self._process_layer_regular(

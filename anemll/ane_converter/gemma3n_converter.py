@@ -819,6 +819,9 @@ class Gemma3nConverter(BaseConverter):
         model.load_weights(self.model_path, config=self.config)
         model.to(device=TEST_DEVICE, dtype=MODEL_DTYPE)
         model.eval()
+        # Avoid dynamic branches in CoreML tracing for sliding-window rotation.
+        # Rotation-specific models can set this to True before tracing.
+        model.config.force_rotation_mode = False
 
         wrapper = InferInitWrapper(model)
         wrapper.eval()
@@ -890,9 +893,10 @@ class Gemma3nConverter(BaseConverter):
         print(f"Combine-streams model saved to {output_path}")
         self._maybe_report_weight_bin_size(output_path)
 
-    def convert_infer(self, chunk_idx: int = 0, total_chunks: int = 1):
+    def _convert_infer_chunk(self, chunk_idx: int, total_chunks: int, rotate: bool) -> None:
         """Convert a stateful single-token infer model with KV cache (chunked)."""
-        print(f"Converting stateful Gemma3n infer chunk {chunk_idx}/{total_chunks}...")
+        label = "infer_rotate" if rotate else "infer"
+        print(f"Converting stateful Gemma3n {label} chunk {chunk_idx}/{total_chunks}...")
 
         start_layer, end_layer = self._get_chunk_range(chunk_idx, total_chunks)
         print(f"  Layers: {start_layer}..{end_layer-1}")
@@ -927,6 +931,7 @@ class Gemma3nConverter(BaseConverter):
         model.load_weights(self.model_path, config=self.config)
         model.to(device=TEST_DEVICE, dtype=MODEL_DTYPE)
         model.eval()
+        model.config.force_rotation_mode = True if rotate else False
 
         wrapper = Gemma3nInferChunkWrapper(model, start_layer, end_layer)
         wrapper.eval()
@@ -1023,13 +1028,166 @@ class Gemma3nConverter(BaseConverter):
         if total_chunks > 1:
             output_path = os.path.join(
                 self.output_dir,
-                f"gemma3n_infer_chunk_{chunk_idx:02d}of{total_chunks:02d}.mlpackage",
+                f"gemma3n_{label}_chunk_{chunk_idx:02d}of{total_chunks:02d}.mlpackage",
             )
         else:
-            output_path = os.path.join(self.output_dir, "gemma3n_infer.mlpackage")
+            output_path = os.path.join(self.output_dir, f"gemma3n_{label}.mlpackage")
         mlmodel.save(output_path)
         print(f"Infer model saved to {output_path}")
         self._maybe_report_weight_bin_size(output_path)
+
+    def convert_infer(self, chunk_idx: int = 0, total_chunks: int = 1):
+        self._convert_infer_chunk(chunk_idx, total_chunks, rotate=False)
+
+    def convert_infer_rotate(self, chunk_idx: int = 0, total_chunks: int = 1):
+        self._convert_infer_chunk(chunk_idx, total_chunks, rotate=True)
+
+    def _convert_prefill_chunk(self, chunk_idx: int, total_chunks: int, rotate: bool) -> None:
+        """Convert a stateful prefill model (chunked)."""
+        label = "prefill_rotate" if rotate else "prefill"
+        print(f"Converting Gemma3n {label} chunk {chunk_idx}/{total_chunks}...")
+
+        start_layer, end_layer = self._get_chunk_range(chunk_idx, total_chunks)
+        print(f"  Layers: {start_layer}..{end_layer-1}")
+
+        class Gemma3nPrefillChunkWrapper(nn.Module):
+            def __init__(self, model, start_layer, end_layer):
+                super().__init__()
+                self.model = model
+                self.start_layer = start_layer
+                self.end_layer = end_layer
+
+            def forward(self, hidden_states, per_layer_inputs, causal_mask, current_pos, position_ids, rotary_cos_local, rotary_sin_local, rotary_cos_global, rotary_sin_global):
+                hidden_states = self.model.process_layers(
+                    hidden_states,
+                    per_layer_inputs,
+                    causal_mask,
+                    current_pos,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    prefill=True,
+                    position_ids=position_ids,
+                    rotary_cos_local=rotary_cos_local,
+                    rotary_sin_local=rotary_sin_local,
+                    rotary_cos_global=rotary_cos_global,
+                    rotary_sin_global=rotary_sin_global,
+                )
+                return hidden_states
+
+        model = Gemma3nModel(self.config)
+        model.load_weights(self.model_path, config=self.config)
+        model.to(device=TEST_DEVICE, dtype=MODEL_DTYPE)
+        model.eval()
+        model.config.force_rotation_mode = True if rotate else False
+
+        wrapper = Gemma3nPrefillChunkWrapper(model, start_layer, end_layer)
+        wrapper.eval()
+
+        prefill_len = max(1, int(self.batch_size))
+        sample_hidden_states = torch.zeros((4, 1, prefill_len, self.config.hidden_size), dtype=MODEL_DTYPE)
+        sample_per_layer_inputs = torch.zeros(
+            (1, prefill_len, self.config.num_hidden_layers, self.config.hidden_size_per_layer_input),
+            dtype=MODEL_DTYPE,
+        )
+        sample_causal_mask = torch.zeros((1, 1, self.context_length, self.context_length), dtype=torch.float16)
+        sample_current_pos = torch.zeros((1,), dtype=torch.int32)
+        sample_position_ids = torch.arange(prefill_len, dtype=torch.int32).view(1, -1)
+        head_dim = self.config.head_dim
+        sample_rotary_cos_local = torch.zeros((1, prefill_len, head_dim), dtype=torch.float16)
+        sample_rotary_sin_local = torch.zeros((1, prefill_len, head_dim), dtype=torch.float16)
+        sample_rotary_cos_global = torch.zeros((1, prefill_len, head_dim), dtype=torch.float16)
+        sample_rotary_sin_global = torch.zeros((1, prefill_len, head_dim), dtype=torch.float16)
+
+        traced_model = torch.jit.trace(
+            wrapper,
+            (
+                sample_hidden_states,
+                sample_per_layer_inputs,
+                sample_causal_mask,
+                sample_current_pos,
+                sample_position_ids,
+                sample_rotary_cos_local,
+                sample_rotary_sin_local,
+                sample_rotary_cos_global,
+                sample_rotary_sin_global,
+            ),
+        )
+
+        outputs = [ct.TensorType(name="output_hidden_states", dtype=np.float16)]
+        states = self._get_kv_cache_states(prefix="model.")
+
+        mlmodel = ct.convert(
+            traced_model,
+            inputs=[
+                ct.TensorType(
+                    name="hidden_states",
+                    shape=(4, 1, prefill_len, self.config.hidden_size),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(
+                    name="per_layer_inputs",
+                    shape=(1, prefill_len, self.config.num_hidden_layers, self.config.hidden_size_per_layer_input),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(
+                    name="causal_mask",
+                    shape=(1, 1, self.context_length, self.context_length),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(name="current_pos", shape=(1,), dtype=np.int32),
+                ct.TensorType(
+                    name="position_ids",
+                    shape=(1, prefill_len),
+                    dtype=np.int32,
+                ),
+                ct.TensorType(
+                    name="rotary_cos_local",
+                    shape=(1, prefill_len, head_dim),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(
+                    name="rotary_sin_local",
+                    shape=(1, prefill_len, head_dim),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(
+                    name="rotary_cos_global",
+                    shape=(1, prefill_len, head_dim),
+                    dtype=np.float16,
+                ),
+                ct.TensorType(
+                    name="rotary_sin_global",
+                    shape=(1, prefill_len, head_dim),
+                    dtype=np.float16,
+                ),
+            ],
+            outputs=outputs,
+            states=states,
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram",
+        )
+
+        if self.lut2:
+            mlmodel = self._apply_lut(mlmodel, self.lut2)
+
+        if total_chunks > 1:
+            output_path = os.path.join(
+                self.output_dir,
+                f"gemma3n_{label}_chunk_{chunk_idx:02d}of{total_chunks:02d}.mlpackage",
+            )
+        else:
+            output_path = os.path.join(self.output_dir, f"gemma3n_{label}.mlpackage")
+        mlmodel.save(output_path)
+        print(f"Prefill model saved to {output_path}")
+        self._maybe_report_weight_bin_size(output_path)
+
+    def convert_prefill(self, chunk_idx: int = 0, total_chunks: int = 1):
+        self._convert_prefill_chunk(chunk_idx, total_chunks, rotate=False)
+
+    def convert_prefill_rotate(self, chunk_idx: int = 0, total_chunks: int = 1):
+        self._convert_prefill_chunk(chunk_idx, total_chunks, rotate=True)
         
     def convert(self):
         """Run full conversion pipeline"""

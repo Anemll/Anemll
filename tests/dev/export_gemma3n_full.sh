@@ -151,6 +151,51 @@ python tests/dev/export_gemma3n.py \
 python tests/dev/export_gemma3n.py \
   --model "${MODEL_PATH}" \
   --output "${OUTPUT_DIR}" \
+  --part infer_rotate \
+  --context-length "${CONTEXT_LENGTH}" \
+  --chunk "${CHUNK}" \
+  ${LUT:+--lut "${LUT}"} \
+  --lut-per-channel "${LUT_PER_CHANNEL}" \
+  --lut-workers "${LUT_WORKERS}" \
+  --lut-scope "${LUT_SCOPE}" \
+  ${LUT_INCLUDE:+--lut-include "${LUT_INCLUDE}"} \
+  ${LUT_EXCLUDE:+--lut-exclude "${LUT_EXCLUDE}"} \
+  $([[ "${LUT_REPORT}" == "1" ]] && echo --lut-report) \
+  ${NO_SUBDIR_FLAG}
+
+python tests/dev/export_gemma3n.py \
+  --model "${MODEL_PATH}" \
+  --output "${OUTPUT_DIR}" \
+  --part prefill \
+  --context-length "${CONTEXT_LENGTH}" \
+  --chunk "${CHUNK}" \
+  ${LUT:+--lut "${LUT}"} \
+  --lut-per-channel "${LUT_PER_CHANNEL}" \
+  --lut-workers "${LUT_WORKERS}" \
+  --lut-scope "${LUT_SCOPE}" \
+  ${LUT_INCLUDE:+--lut-include "${LUT_INCLUDE}"} \
+  ${LUT_EXCLUDE:+--lut-exclude "${LUT_EXCLUDE}"} \
+  $([[ "${LUT_REPORT}" == "1" ]] && echo --lut-report) \
+  ${NO_SUBDIR_FLAG}
+
+python tests/dev/export_gemma3n.py \
+  --model "${MODEL_PATH}" \
+  --output "${OUTPUT_DIR}" \
+  --part prefill_rotate \
+  --context-length "${CONTEXT_LENGTH}" \
+  --chunk "${CHUNK}" \
+  ${LUT:+--lut "${LUT}"} \
+  --lut-per-channel "${LUT_PER_CHANNEL}" \
+  --lut-workers "${LUT_WORKERS}" \
+  --lut-scope "${LUT_SCOPE}" \
+  ${LUT_INCLUDE:+--lut-include "${LUT_INCLUDE}"} \
+  ${LUT_EXCLUDE:+--lut-exclude "${LUT_EXCLUDE}"} \
+  $([[ "${LUT_REPORT}" == "1" ]] && echo --lut-report) \
+  ${NO_SUBDIR_FLAG}
+
+python tests/dev/export_gemma3n.py \
+  --model "${MODEL_PATH}" \
+  --output "${OUTPUT_DIR}" \
   --part lm_head \
   ${LUT:+--lut "${LUT}"} \
   --lut-per-channel "${LUT_PER_CHANNEL}" \
@@ -176,6 +221,9 @@ python tests/dev/export_gemma3n.py \
 if [[ "${FLAT}" != "1" ]]; then
   cp -r "${OUTPUT_DIR}/lm_head/gemma3n_lm_head.mlpackage" "${OUTPUT_DIR}/infer/"
   cp -r "${OUTPUT_DIR}/combine_streams/gemma3n_combine_streams.mlpackage" "${OUTPUT_DIR}/infer/"
+  cp -r "${OUTPUT_DIR}/infer_rotate/"*.mlpackage "${OUTPUT_DIR}/infer/" 2>/dev/null || true
+  cp -r "${OUTPUT_DIR}/prefill/"*.mlpackage "${OUTPUT_DIR}/infer/" 2>/dev/null || true
+  cp -r "${OUTPUT_DIR}/prefill_rotate/"*.mlpackage "${OUTPUT_DIR}/infer/" 2>/dev/null || true
   cp "${OUTPUT_DIR}/tokenizer/"*.json "${OUTPUT_DIR}/infer/"
   cp "${OUTPUT_DIR}/tokenizer/tokenizer.model" "${OUTPUT_DIR}/infer/"
 fi

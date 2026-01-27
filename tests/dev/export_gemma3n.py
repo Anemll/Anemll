@@ -100,6 +100,21 @@ def test_gemma3n_conversion(
         for chunk_idx in range(chunk_size):
             converter.convert_infer(chunk_idx, chunk_size)
         converter.convert_combine_streams()
+    elif part == "infer_rotate":
+        converter.convert_infer_init()
+        for chunk_idx in range(chunk_size):
+            converter.convert_infer_rotate(chunk_idx, chunk_size)
+        converter.convert_combine_streams()
+    elif part == "prefill":
+        converter.convert_infer_init()
+        for chunk_idx in range(chunk_size):
+            converter.convert_prefill(chunk_idx, chunk_size)
+        converter.convert_combine_streams()
+    elif part == "prefill_rotate":
+        converter.convert_infer_init()
+        for chunk_idx in range(chunk_size):
+            converter.convert_prefill_rotate(chunk_idx, chunk_size)
+        converter.convert_combine_streams()
     elif part == "lm_head":
         converter.convert_lm_head(vocab_split_factor)
     elif part == "tokenizer":
@@ -119,7 +134,7 @@ def main():
     parser = argparse.ArgumentParser(description="Export Gemma3n CoreML model")
     parser.add_argument("--model", default="google/gemma-3n-E2B-it", 
                        help="Path to model directory or HuggingFace model ID")
-    parser.add_argument("--part", choices=["full", "embeddings", "ffn", "attention", "infer_init", "infer", "combine_streams", "lm_head", "tokenizer"], 
+    parser.add_argument("--part", choices=["full", "embeddings", "ffn", "attention", "infer_init", "infer", "infer_rotate", "prefill", "prefill_rotate", "combine_streams", "lm_head", "tokenizer"], 
                        default="full", help="Part to convert")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
     parser.add_argument("--context-length", type=int, default=256, help="Context length")
@@ -261,6 +276,9 @@ def main():
         print(f"  Attention:      python export_gemma3n.py --part attention")
         print(f"  Infer init:     python export_gemma3n.py --part infer_init")
         print(f"  Infer (KV):     python export_gemma3n.py --part infer")
+        print(f"  Infer rotate:   python export_gemma3n.py --part infer_rotate")
+        print(f"  Prefill:        python export_gemma3n.py --part prefill")
+        print(f"  Prefill rotate: python export_gemma3n.py --part prefill_rotate")
         print(f"  Combine:        python export_gemma3n.py --part combine_streams")
         print(f"  LM head:        python export_gemma3n.py --part lm_head")
         print(f"  With LUT:       python export_gemma3n.py --lut 6 --lut-per-channel 8 --lut-scope all")
@@ -275,20 +293,24 @@ def main():
             print(f"  ✓ Attention (prefill mode)")
             print(f"  ✓ Infer init (token -> hidden_states + per-layer inputs)")
             print(f"  ✓ Infer (KV cache stateful)")
+            print(f"  ✓ (Rotation variants not included; export infer_rotate/prefill_rotate separately)")
             print(f"  ✓ Combine streams (AltUp)")
             print(f"  ✓ LM head (with soft-capping)")
             print(f"  ✓ Tokenizer and meta.yaml")
             
-        elif args.part in ["embeddings", "ffn", "attention", "infer_init", "infer", "combine_streams", "lm_head"]:
+        elif args.part in ["embeddings", "ffn", "attention", "infer_init", "infer", "infer_rotate", "prefill", "prefill_rotate", "combine_streams", "lm_head"]:
             print(f"\n📝 For complete workflow, you need all parts:")
             print(f"  1. Embeddings: python export_gemma3n.py --part embeddings")
             print(f"  2. FFN:        python export_gemma3n.py --part ffn")
             print(f"  3. Attention:  python export_gemma3n.py --part attention")
             print(f"  4. Infer init: python export_gemma3n.py --part infer_init")
             print(f"  5. Infer KV:   python export_gemma3n.py --part infer")
-            print(f"  6. Combine:    python export_gemma3n.py --part combine_streams")
-            print(f"  7. LM head:    python export_gemma3n.py --part lm_head")
-            print(f"  8. Tokenizer:  python export_gemma3n.py --part tokenizer")
+            print(f"  6. Infer rot:  python export_gemma3n.py --part infer_rotate (optional)")
+            print(f"  7. Prefill:    python export_gemma3n.py --part prefill (optional)")
+            print(f"  8. Prefill rot:python export_gemma3n.py --part prefill_rotate (optional)")
+            print(f"  9. Combine:    python export_gemma3n.py --part combine_streams")
+            print(f"  10. LM head:   python export_gemma3n.py --part lm_head")
+            print(f"  11. Tokenizer: python export_gemma3n.py --part tokenizer")
             
         # Show file structure
         print(f"\n📁 Expected output structure:")
