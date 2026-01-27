@@ -165,6 +165,17 @@ class Gemma3Config:
     def from_json(cls, json_file):
         with open(json_file, "r") as f:
             config_dict = json.load(f)
+        # Newer Gemma3 configs (e.g., multimodal) nest text params under text_config
+        if "text_config" in config_dict:
+            text_cfg = dict(config_dict.get("text_config", {}))
+            # Map HF field names to this implementation
+            if "hidden_activation" in text_cfg and "hidden_act" not in text_cfg:
+                text_cfg["hidden_act"] = text_cfg["hidden_activation"]
+            # Carry over token IDs if defined at top-level
+            for key in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id", "eos_token_ids"):
+                if key in config_dict and key not in text_cfg:
+                    text_cfg[key] = config_dict[key]
+            config_dict = text_cfg
         return cls(**config_dict)
 
 
@@ -1678,7 +1689,15 @@ class Gemma3Model(nn.Module):
 
         conv_state = {}
         for k, v in state_dict.items():
-            new_k = k.replace("model.", "") if k.startswith("model.") else k
+            # Handle HF checkpoints that wrap weights under language_model.model.*
+            if k.startswith("language_model."):
+                k = k[len("language_model."):]
+            elif not k.startswith("model."):
+                # Skip non-language weights (e.g., vision_tower.*)
+                continue
+            if k.startswith("model."):
+                k = k[len("model."):]
+            new_k = k
             if "lm_head.weight" in new_k:
                 continue
             if any(
@@ -1709,7 +1728,8 @@ class Gemma3Model(nn.Module):
         if missing or unexpected:
             print("Missing keys", missing)
             print("Unexpected keys", unexpected)
-        return not missing and not unexpected
+            raise RuntimeError("Failed to load Gemma3 weights: missing or unexpected keys.")
+        return True
 
 
 class Gemma3ForCausalLM(nn.Module):
