@@ -101,6 +101,15 @@ LUT_FFN=$(grep "lut_ffn:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6)
 LUT_LMHEAD=$(grep "lut_lmhead:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6)
 LUT_EMBEDDINGS=$(grep "lut_embeddings:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6 2>/dev/null || echo "")
 
+# Check if this is a monolithic model
+MODEL_TYPE_YAML=$(grep "model_type:" "$INPUT_DIR/meta.yaml" | awk '{print $2}')
+MONOLITHIC_MODEL=$(grep "monolithic_model:" "$INPUT_DIR/meta.yaml" | awk '{print $2}')
+IS_MONOLITHIC=false
+if [ "$MODEL_TYPE_YAML" = "monolithic" ] && [ -n "$MONOLITHIC_MODEL" ]; then
+    IS_MONOLITHIC=true
+    echo "Detected monolithic model: $MONOLITHIC_MODEL"
+fi
+
 # Detect architecture for tokenizer config
 ARCH=$(grep "architecture:" "$INPUT_DIR/meta.yaml" | awk '{print $2}')
 MODEL_TYPE="llama"
@@ -274,21 +283,33 @@ if [ "$PREPARE_IOS" = true ]; then
     echo "============================================================"
     mkdir -p "$OUTPUT_DIR/ios"
     prepare_common_files "$OUTPUT_DIR/ios"
-    
-    # Copy all mlmodelc files uncompressed for iOS
-    embeddings_file=$(get_model_filename_with_fallback "$MODEL_PREFIX" "embeddings" "$LUT_EMBEDDINGS" "" "$INPUT_DIR")
-    copy_mlmodelc "$embeddings_file" "$OUTPUT_DIR/ios"
-    
-    lmhead_file=$(get_model_filename "$MODEL_PREFIX" "lm_head" "$LUT_LMHEAD")
-    copy_mlmodelc "$lmhead_file" "$OUTPUT_DIR/ios"
-    
-    for ((i=1; i<=NUM_CHUNKS; i++)); do
-        chunk_num=$(printf "%02d" $i)
-        chunk_info="_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)"
-        ffn_file=$(get_model_filename "$MODEL_PREFIX" "FFN_PF" "$LUT_FFN" "$chunk_info")
-        copy_mlmodelc "$ffn_file" "$OUTPUT_DIR/ios"
-    done
-    
+
+    if [ "$IS_MONOLITHIC" = true ]; then
+        # Copy monolithic model for iOS
+        echo "[iOS] Copying monolithic model: $MONOLITHIC_MODEL (uncompressed)..."
+        if [ -d "$INPUT_DIR/$MONOLITHIC_MODEL" ]; then
+            cp -r "$INPUT_DIR/$MONOLITHIC_MODEL" "$OUTPUT_DIR/ios/"
+            echo "[iOS] Monolithic model copied successfully"
+        else
+            echo "Error: Monolithic model not found: $INPUT_DIR/$MONOLITHIC_MODEL"
+            exit 1
+        fi
+    else
+        # Copy all mlmodelc files uncompressed for iOS (standard chunked model)
+        embeddings_file=$(get_model_filename_with_fallback "$MODEL_PREFIX" "embeddings" "$LUT_EMBEDDINGS" "" "$INPUT_DIR")
+        copy_mlmodelc "$embeddings_file" "$OUTPUT_DIR/ios"
+
+        lmhead_file=$(get_model_filename "$MODEL_PREFIX" "lm_head" "$LUT_LMHEAD")
+        copy_mlmodelc "$lmhead_file" "$OUTPUT_DIR/ios"
+
+        for ((i=1; i<=NUM_CHUNKS; i++)); do
+            chunk_num=$(printf "%02d" $i)
+            chunk_info="_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)"
+            ffn_file=$(get_model_filename "$MODEL_PREFIX" "FFN_PF" "$LUT_FFN" "$chunk_info")
+            copy_mlmodelc "$ffn_file" "$OUTPUT_DIR/ios"
+        done
+    fi
+
     # No need to zip iOS distribution - it should be used directly
     echo "[iOS] Distribution ready in: $OUTPUT_DIR/ios"
 else
@@ -298,21 +319,33 @@ else
     echo "============================================================"
     mkdir -p "$OUTPUT_DIR/standard"
     prepare_common_files "$OUTPUT_DIR/standard"
-    
-    # Compress all mlmodelc files for standard distribution
-    embeddings_file=$(get_model_filename_with_fallback "$MODEL_PREFIX" "embeddings" "$LUT_EMBEDDINGS" "" "$INPUT_DIR")
-    compress_mlmodelc "$embeddings_file" "$OUTPUT_DIR/standard"
-    
-    lmhead_file=$(get_model_filename "$MODEL_PREFIX" "lm_head" "$LUT_LMHEAD")
-    compress_mlmodelc "$lmhead_file" "$OUTPUT_DIR/standard"
-    
-    for ((i=1; i<=NUM_CHUNKS; i++)); do
-        chunk_num=$(printf "%02d" $i)
-        chunk_info="_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)"
-        ffn_file=$(get_model_filename "$MODEL_PREFIX" "FFN_PF" "$LUT_FFN" "$chunk_info")
-        compress_mlmodelc "$ffn_file" "$OUTPUT_DIR/standard"
-    done
-    
+
+    if [ "$IS_MONOLITHIC" = true ]; then
+        # Compress monolithic model for standard distribution
+        echo "[STANDARD] Compressing monolithic model: $MONOLITHIC_MODEL..."
+        if [ -d "$INPUT_DIR/$MONOLITHIC_MODEL" ]; then
+            (cd "$INPUT_DIR" && zip -r "$OUTPUT_DIR/standard/${MONOLITHIC_MODEL}.zip" "$MONOLITHIC_MODEL")
+            echo "[STANDARD] Monolithic model compressed successfully"
+        else
+            echo "Error: Monolithic model not found: $INPUT_DIR/$MONOLITHIC_MODEL"
+            exit 1
+        fi
+    else
+        # Compress all mlmodelc files for standard distribution (standard chunked model)
+        embeddings_file=$(get_model_filename_with_fallback "$MODEL_PREFIX" "embeddings" "$LUT_EMBEDDINGS" "" "$INPUT_DIR")
+        compress_mlmodelc "$embeddings_file" "$OUTPUT_DIR/standard"
+
+        lmhead_file=$(get_model_filename "$MODEL_PREFIX" "lm_head" "$LUT_LMHEAD")
+        compress_mlmodelc "$lmhead_file" "$OUTPUT_DIR/standard"
+
+        for ((i=1; i<=NUM_CHUNKS; i++)); do
+            chunk_num=$(printf "%02d" $i)
+            chunk_info="_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)"
+            ffn_file=$(get_model_filename "$MODEL_PREFIX" "FFN_PF" "$LUT_FFN" "$chunk_info")
+            compress_mlmodelc "$ffn_file" "$OUTPUT_DIR/standard"
+        done
+    fi
+
     # Create standard distribution zip
     (cd "$OUTPUT_DIR" && zip -r "${FULL_MODEL_NAME}.zip" standard/)
 fi
@@ -359,13 +392,13 @@ fi
 echo
 echo "To upload to Hugging Face, use:"
 if [ "$PREPARE_IOS" = true ]; then
-    echo "huggingface-cli upload $HF_ORG/$FULL_MODEL_NAME $OUTPUT_DIR/ios"
+    echo "hf upload $HF_ORG/$FULL_MODEL_NAME $OUTPUT_DIR/ios"
     echo
     echo "Example:"
-    echo "huggingface-cli upload $HF_ORG/$FULL_MODEL_NAME $(realpath "$OUTPUT_DIR/ios")"
+    echo "hf upload $HF_ORG/$FULL_MODEL_NAME $(realpath "$OUTPUT_DIR/ios")"
 else
-    echo "huggingface-cli upload $HF_ORG/$FULL_MODEL_NAME $OUTPUT_DIR/standard"
+    echo "hf upload $HF_ORG/$FULL_MODEL_NAME $OUTPUT_DIR/standard"
     echo
     echo "Example:"
-    echo "huggingface-cli upload $HF_ORG/$FULL_MODEL_NAME $(realpath "$OUTPUT_DIR/standard")"
+    echo "hf upload $HF_ORG/$FULL_MODEL_NAME $(realpath "$OUTPUT_DIR/standard")"
 fi 

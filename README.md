@@ -155,7 +155,7 @@ python3 tests/chat.py --meta /path/to/output/gemma3_270m/meta.yaml --prompt "Hel
 - Recommended: `--chunk 1` for all Gemma 3 models (1B fits in single chunk)
 - Supports context lengths up to 4096 (512-2048 recommended for optimal ANE performance)
 - Large vocabulary (262K tokens) uses 16-way LM head splitting
-- Requires HuggingFace login for gated models: `huggingface-cli login`
+- Requires HuggingFace login for gated models: `hf login`
 
 #### Features
 - **Auto-downloads models**: No manual setup required, downloads models from HuggingFace

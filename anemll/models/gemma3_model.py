@@ -1725,12 +1725,17 @@ class Gemma3Model(nn.Module):
         # Filter out unexpected keys that are actually expected from HF format differences
         # (none expected currently - all layer norms should now be present)
 
+        allow_missing = os.environ.get("ANEMLL_ALLOW_MISSING_WEIGHTS", "").lower() in ("1", "true", "yes")
         if missing:
             print("Missing keys", missing)
             if unexpected:
                 print("Unexpected keys", unexpected)
             # Highlight actionable TODO in red for conversion logs
             print("\033[91mTODO: Weights not found or renamed. Check checkpoint prefixes (e.g., language_model.*) and config.\033[0m")
+            print("Hint: set ANEMLL_ALLOW_MISSING_WEIGHTS=1 (or --allow-missing-weights in convert scripts) to continue anyway.")
+            if allow_missing:
+                print("Continuing despite missing weights (ANEMLL_ALLOW_MISSING_WEIGHTS=1).")
+                return True
             raise RuntimeError("Failed to load Gemma3 weights: missing keys.")
         if unexpected:
             print("Unexpected keys", unexpected)

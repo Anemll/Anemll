@@ -22,6 +22,8 @@ RESTART_STEP=1
 RESTART_STEP_NUM=1
 ONLY_STEP=""
 SKIP_CHECK=false
+FORCE_MLPROGRAM_COMPILE=false
+ALLOW_MISSING_WEIGHTS=false
 ARGMAX_IN_MODEL=false
 ATTENTION_WINDOW=""
 
@@ -46,6 +48,8 @@ print_usage() {
     echo "  --restart       Restart from specific step (1-6, 2b, 2c; default: 1)"
     echo "  --only          Run only specified step and exit (1-6, 2b, 2c)"
     echo "  --skip-check    Skip the dependency check step"
+    echo "  --force-mlprogram-compile  Force ML Program when compiling .mlpackage models"
+    echo "  --allow-missing-weights  Continue conversion even if some weights are missing"
     echo "  --argmax        Compute argmax inside model (outputs idx+val pairs instead of logits)"
     echo ""
     echo "Steps:"
@@ -104,6 +108,14 @@ while [[ $# -gt 0 ]]; do
             SKIP_CHECK=true
             shift
             ;;
+        --force-mlprogram-compile)
+            FORCE_MLPROGRAM_COMPILE=true
+            shift
+            ;;
+        --allow-missing-weights)
+            ALLOW_MISSING_WEIGHTS=true
+            shift
+            ;;
         --argmax)
             ARGMAX_IN_MODEL=true
             shift
@@ -128,6 +140,12 @@ fi
 if [ -z "$MODEL_PATH" ] || [ -z "$OUTPUT_DIR" ]; then
     echo "Error: Model path and output directory are required"
     print_usage
+fi
+
+# Allow continuing when some weights are missing (use with caution)
+if [ "$ALLOW_MISSING_WEIGHTS" = true ]; then
+    export ANEMLL_ALLOW_MISSING_WEIGHTS=1
+    echo "Warning: ANEMLL_ALLOW_MISSING_WEIGHTS=1 (missing weights will be ignored)"
 fi
 
 # Check if MODEL_PATH looks like a HuggingFace model name (e.g., "google/gemma-3-270m-it")
@@ -356,9 +374,14 @@ run_step 3 "Combining Monolithic Models" "python3 \"$PROJECT_ROOT/anemll/utils/c
     --output \"$OUTPUT_DIR\""
 
 # Step 4: Compile to .mlmodelc
+FORCE_MLPROG_FLAG=""
+if [ "$FORCE_MLPROGRAM_COMPILE" = true ]; then
+    FORCE_MLPROG_FLAG="--force-mlprogram"
+fi
 run_step 4 "Compiling Monolithic Model" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" \
     monolithic \
     $LUT_PARAM \
+    $FORCE_MLPROG_FLAG \
     --prefix \"$PREFIX\" \
     --input \"$OUTPUT_DIR\" \
     --output \"$OUTPUT_DIR\""

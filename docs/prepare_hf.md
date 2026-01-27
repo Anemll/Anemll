@@ -13,7 +13,7 @@ The `prepare_hf.sh` script automates the preparation of converted ANEMLL models 
      export HUGGING_FACE_HUB_TOKEN=your_token_here
      
      # Option 2: Login via CLI
-     huggingface-cli login
+     hf login
      ```
 
 2. **Hugging Face CLI**
@@ -121,21 +121,21 @@ After running the script, you can upload the model using:
 
 ```bash
 # First, ensure you're logged in
-huggingface-cli login
+hf login
 
 # For standard distribution:
-huggingface-cli upload <org>/<model-name>_<version> <output_directory>/standard
+hf upload <org>/<model-name>_<version> <output_directory>/standard
 
 # For iOS distribution:
-huggingface-cli upload <org>/<model-name>_<version> <output_directory>/ios
+hf upload <org>/<model-name>_<version> <output_directory>/ios
 
 # Example with real paths:
-# Standard: huggingface-cli upload anemll/anemll-Meta-Llama-3.2-1B-ctx512_0.3.0 /path/to/hf_dist/standard
-# iOS: huggingface-cli upload anemll/anemll-Meta-Llama-3.2-1B-ctx512_0.3.0 /path/to/hf_dist/ios
+# Standard: hf upload anemll/anemll-Meta-Llama-3.2-1B-ctx512_0.3.0 /path/to/hf_dist/standard
+# iOS: hf upload anemll/anemll-Meta-Llama-3.2-1B-ctx512_0.3.0 /path/to/hf_dist/ios
 
 # To update just the README file in an existing repository:
-huggingface-cli upload <org>/<model-name>_<version> <output_directory>/standard/README.md  # For standard distribution
-huggingface-cli upload <org>/<model-name>_<version> <output_directory>/ios/README.md      # For iOS distribution
+hf upload <org>/<model-name>_<version> <output_directory>/standard/README.md  # For standard distribution
+hf upload <org>/<model-name>_<version> <output_directory>/ios/README.md      # For iOS distribution
 ```
 
 ### Creating a New Model Repository
@@ -154,9 +154,9 @@ If this is your first time uploading this model:
    ```bash
    # Check if token is set
    echo $HUGGING_FACE_HUB_TOKEN
-   
+
    # Re-login if needed
-   huggingface-cli login
+   hf login
    ```
 
 2. **Permission Issues**

@@ -434,42 +434,78 @@ def load_models(args,metadata):
             print("\nLoading FFN+PREFILL model(s)...")
         ffn_path = parse_model_path(args.ffn)
         chunk_no, total_chunks = parse_ffn_filename(ffn_path)
-        
+
         ffn_models = []
         if chunk_no and total_chunks:
             if not args.eval:
-                print(f"\nDetected chunked FFN+PREFILL model ({total_chunks} chunks)")
+                if getattr(args, "split_rotate", False):
+                    print(f"\nDetected split-rotate chunked FFN+PF models ({total_chunks} chunks)")
+                else:
+                    print(f"\nDetected chunked FFN+PREFILL model ({total_chunks} chunks)")
             # Find and load all chunks
-            chunk_paths = find_all_chunks(ffn_path)
-            if len(chunk_paths) != total_chunks:
-                raise ValueError(f"Found {len(chunk_paths)} chunks but filename indicates {total_chunks} chunks")
-                
-            for chunk_path in chunk_paths:
-                if not args.eval:
-                    print(f"\nLoading FFN+PREFILL chunk: {Path(chunk_path).name}")
-                try:
-                    # For chunked models, we need both infer and prefill functions
-                    chunk_dict = {
-                        'infer': load_model(chunk_path, function_name='infer', compute_unit=compute_unit),
-                        'prefill': load_model(chunk_path, function_name='prefill', compute_unit=compute_unit)
-                    }
-                    # Try to load rotation functions (Gemma3 with context > 512)
+            ffn_chunk_paths = find_all_chunks(ffn_path)
+            if len(ffn_chunk_paths) != total_chunks:
+                raise ValueError(f"Found {len(ffn_chunk_paths)} chunks but filename indicates {total_chunks} chunks")
+
+            if getattr(args, "split_rotate", False):
+                if not args.pf:
+                    raise ValueError("split-rotate requires --pf (prefill model path)")
+                pf_path = parse_model_path(args.pf)
+                pf_chunk_paths = find_all_chunks(pf_path)
+                if len(pf_chunk_paths) != total_chunks:
+                    raise ValueError(f"Found {len(pf_chunk_paths)} PF chunks but filename indicates {total_chunks} chunks")
+                for ffn_chunk_path, pf_chunk_path in zip(ffn_chunk_paths, pf_chunk_paths):
+                    if not args.eval:
+                        print(f"\nLoading FFN chunk: {Path(ffn_chunk_path).name}")
+                        print(f"Loading PF chunk: {Path(pf_chunk_path).name}")
                     try:
-                        chunk_dict['infer_rotate'] = load_model(chunk_path, function_name='infer_rotate', compute_unit=compute_unit)
-                        chunk_dict['prefill_rotate'] = load_model(chunk_path, function_name='prefill_rotate', compute_unit=compute_unit)
+                        chunk_dict = {
+                            'infer': load_model(ffn_chunk_path, function_name='infer', compute_unit=compute_unit),
+                            'prefill': load_model(pf_chunk_path, function_name='prefill', compute_unit=compute_unit)
+                        }
+                        try:
+                            chunk_dict['infer_rotate'] = load_model(ffn_chunk_path, function_name='infer_rotate', compute_unit=compute_unit)
+                        except Exception:
+                            pass
+                        try:
+                            chunk_dict['prefill_rotate'] = load_model(pf_chunk_path, function_name='prefill_rotate', compute_unit=compute_unit)
+                        except Exception:
+                            pass
+                        ffn_models.append(chunk_dict)
                         if not args.eval:
-                            print("  Rotation functions loaded (4-function model)")
-                    except Exception:
-                        # Rotation functions not available - standard 2-function model
-                        pass
-                    ffn_models.append(chunk_dict)
+                            print("Chunk loaded successfully")
+                        _maybe_report_mem(f"after split-rotate chunk load {Path(ffn_chunk_path).name}", getattr(args, "mem_report", False))
+                    except Exception as e:
+                        if not args.eval:
+                            print(f"Error loading split-rotate chunk {ffn_chunk_path}: {str(e)}")
+                        raise
+            else:
+                for chunk_path in ffn_chunk_paths:
                     if not args.eval:
-                        print("Chunk loaded successfully")
-                    _maybe_report_mem(f"after FFN chunk load {Path(chunk_path).name}", getattr(args, "mem_report", False))
-                except Exception as e:
-                    if not args.eval:
-                        print(f"Error loading chunk {chunk_path}: {str(e)}")
-                    raise
+                        print(f"\nLoading FFN+PREFILL chunk: {Path(chunk_path).name}")
+                    try:
+                        # For chunked models, we need both infer and prefill functions
+                        chunk_dict = {
+                            'infer': load_model(chunk_path, function_name='infer', compute_unit=compute_unit),
+                            'prefill': load_model(chunk_path, function_name='prefill', compute_unit=compute_unit)
+                        }
+                        # Try to load rotation functions (Gemma3 with context > 512)
+                        try:
+                            chunk_dict['infer_rotate'] = load_model(chunk_path, function_name='infer_rotate', compute_unit=compute_unit)
+                            chunk_dict['prefill_rotate'] = load_model(chunk_path, function_name='prefill_rotate', compute_unit=compute_unit)
+                            if not args.eval:
+                                print("  Rotation functions loaded (4-function model)")
+                        except Exception:
+                            # Rotation functions not available - standard 2-function model
+                            pass
+                        ffn_models.append(chunk_dict)
+                        if not args.eval:
+                            print("Chunk loaded successfully")
+                        _maybe_report_mem(f"after FFN chunk load {Path(chunk_path).name}", getattr(args, "mem_report", False))
+                    except Exception as e:
+                        if not args.eval:
+                            print(f"Error loading chunk {chunk_path}: {str(e)}")
+                        raise
             metadata = load_metadata(ffn_models[0],args)
 
         else:
@@ -489,6 +525,8 @@ def load_models(args,metadata):
         print(f"  Embeddings: {args.embed}")
         print(f"  LM Head: {args.lmhead}")
         print(f"  FFN: {args.ffn}")
+        if getattr(args, "split_rotate", False):
+            print(f"  PF: {args.pf}")
         raise
 
 # At the top of the file, make this a default path
@@ -1039,6 +1077,8 @@ def parse_args():
                        help='Path to embeddings model (relative to --dir)')
     parser.add_argument('--ffn', type=str, required=False,
                        help='Path to FFN model (can be chunked, relative to --dir)')
+    parser.add_argument('--pf', type=str, required=False,
+                       help='Path to prefill model (split-rotate, relative to --dir)')
     parser.add_argument('--lmhead', type=str, required=False,
                        help='Path to LM head model (relative to --dir)')
     parser.add_argument('--tokenizer', type=str, required=False,
@@ -1087,6 +1127,8 @@ def parse_args():
                        help='Enable debug output for argmax mode (print indices and values)')
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug output (position, state, shapes)')
+    parser.add_argument('--split-rotate', action='store_true',
+                       help='Split rotate mode: FFN and PF are separate model files')
 
     args = parser.parse_args()
 
@@ -1162,6 +1204,7 @@ def parse_args():
                 lut_lmhead = f"_lut{params['lut_lmhead']}" if params['lut_lmhead'] != 'none' else ''
                 lut_embeddings = f"_lut{params['lut_embeddings']}" if params['lut_embeddings'] != 'none' else ''
                 num_chunks = int(params['num_chunks'])
+                args.split_rotate = bool(params.get('split_rotate', False)) or getattr(args, 'split_rotate', False)
 
                 # Set model paths if not specified
                 if not args.lmhead:
@@ -1174,21 +1217,33 @@ def parse_args():
                         args.embed = _strip_model_ext(params['embeddings'])
                     else:
                         args.embed = f'{prefix}_embeddings{lut_embeddings}'
-                if not args.ffn:
-                    if 'ffn' in params:
-                        ffn_candidate = _strip_model_ext(params['ffn'])
-                        ffn_path = Path(ffn_candidate)
-                        if "_chunk_" not in ffn_candidate:
-                            default_ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
-                            base_dir = ffn_path.parent if ffn_path.is_absolute() else Path(args.d)
-                            if (base_dir / f"{default_ffn}.mlmodelc").exists() or (base_dir / f"{default_ffn}.mlpackage").exists():
-                                args.ffn = str(base_dir / default_ffn) if ffn_path.is_absolute() else default_ffn
+                if args.split_rotate:
+                    if not args.ffn:
+                        if 'ffn' in params:
+                            args.ffn = _strip_model_ext(params['ffn'])
+                        else:
+                            args.ffn = f'{prefix}_FFN{lut_ffn}_chunk_01of{num_chunks:02d}_combined'
+                    if not args.pf:
+                        if 'pf' in params:
+                            args.pf = _strip_model_ext(params['pf'])
+                        else:
+                            args.pf = f'{prefix}_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
+                else:
+                    if not args.ffn:
+                        if 'ffn' in params:
+                            ffn_candidate = _strip_model_ext(params['ffn'])
+                            ffn_path = Path(ffn_candidate)
+                            if "_chunk_" not in ffn_candidate:
+                                default_ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
+                                base_dir = ffn_path.parent if ffn_path.is_absolute() else Path(args.d)
+                                if (base_dir / f"{default_ffn}.mlmodelc").exists() or (base_dir / f"{default_ffn}.mlpackage").exists():
+                                    args.ffn = str(base_dir / default_ffn) if ffn_path.is_absolute() else default_ffn
+                                else:
+                                    args.ffn = ffn_candidate
                             else:
                                 args.ffn = ffn_candidate
                         else:
-                            args.ffn = ffn_candidate
-                    else:
-                        args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
+                            args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
                 if not args.tokenizer:
                     if 'tokenizer_path' in params:
                         args.tokenizer = params['tokenizer_path']
@@ -1233,6 +1288,9 @@ def parse_args():
                     print(f"  Num Logits: {args.num_logits}")
                     print(f"  Split LM Head: {args.split_lm_head}")
                     print(f"  Argmax in Model: {args.argmax_in_model}")
+                    if args.split_rotate:
+                        print("  Split Rotate: True")
+                        print(f"  PF: {args.pf}")
                     print(f"  Models Directory: {args.d}")
                     print(f"  Embeddings: {args.embed}")
                     print(f"  LM Head: {args.lmhead}")

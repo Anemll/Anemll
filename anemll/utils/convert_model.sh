@@ -22,7 +22,10 @@ NUM_CHUNKS=2   # Default number of chunks
 
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
+FORCE_MLPROGRAM_COMPILE=false
+ALLOW_MISSING_WEIGHTS=false
 ARGMAX_IN_MODEL=false
+SPLIT_ROTATE=false
 
 # Default converter; may be overridden after parsing config.json
 CONVERTER="python3 -m anemll.ane_converter.llama_converter"
@@ -49,7 +52,10 @@ print_usage() {
     echo "  --prefix        Prefix for model names (default: llama)"
     echo "  --chunk         Number of chunks to split FFN/prefill (default: 2)"
     echo "  --skip-check    Skip the dependency check step"
+    echo "  --force-mlprogram-compile  Force ML Program when compiling .mlpackage models"
+    echo "  --allow-missing-weights  Continue conversion even if some weights are missing"
     echo "  --argmax        Compute argmax inside LM head (outputs idx+val pairs instead of logits)"
+    echo "  --split-rotate  Combine rotate/non-rotate into two files per chunk (FFN + PF)"
     echo ""
     echo "Examples:"
     echo "  # Use default per_channel (8) for all parts"
@@ -111,8 +117,20 @@ while [[ $# -gt 0 ]]; do
             SKIP_CHECK=true
             shift
             ;;
+        --force-mlprogram-compile)
+            FORCE_MLPROGRAM_COMPILE=true
+            shift
+            ;;
+        --allow-missing-weights)
+            ALLOW_MISSING_WEIGHTS=true
+            shift
+            ;;
         --argmax)
             ARGMAX_IN_MODEL=true
+            shift
+            ;;
+        --split-rotate)
+            SPLIT_ROTATE=true
             shift
             ;;
         *)
@@ -126,6 +144,12 @@ done
 if [ -z "$MODEL_PATH" ] || [ -z "$OUTPUT_DIR" ]; then
     echo "Error: Model path and output directory are required"
     print_usage
+fi
+
+# Allow continuing when some weights are missing (use with caution)
+if [ "$ALLOW_MISSING_WEIGHTS" = true ]; then
+    export ANEMLL_ALLOW_MISSING_WEIGHTS=1
+    echo "Warning: ANEMLL_ALLOW_MISSING_WEIGHTS=1 (missing weights will be ignored)"
 fi
 
 # Check if MODEL_PATH looks like a HuggingFace model name (e.g., "google/gemma-3-1b-it")
@@ -370,10 +394,15 @@ fi
 # Step 5: Combine Models
 # For Gemma3 with context > 512, use --gemma3 flag to combine 4 functions
 GEMMA3_FLAG=""
+SPLIT_ROTATE_FLAG=""
 if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
     if [ $CONTEXT_LENGTH -gt 512 ]; then
         GEMMA3_FLAG="--gemma3"
     fi
+fi
+if [ "$SPLIT_ROTATE" = true ]; then
+    SPLIT_ROTATE_FLAG="--split-rotate"
+    GEMMA3_FLAG=""
 fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
@@ -381,6 +410,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
         run_step 5 "Combining Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
             --chunk $NUM_CHUNKS \
             $LUT2_PARAM \
+            $SPLIT_ROTATE_FLAG \
             $GEMMA3_FLAG \
             --prefix \"$PREFIX\" \
             --input \"$OUTPUT_DIR\" \
@@ -388,6 +418,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
     else
         run_step 5 "Combining Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
             --chunk $NUM_CHUNKS \
+            $SPLIT_ROTATE_FLAG \
             $GEMMA3_FLAG \
             --prefix \"$PREFIX\" \
             --input \"$OUTPUT_DIR\" \
@@ -398,10 +429,14 @@ else
 fi
 
 # Step 6: Compile Models - Always run compilation for all parts that have LUT specified
-run_step 6 "Compiling Models Part 1" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 1 ${LUT_PART1:+--lut $LUT_PART1} --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
-run_step 6 "Compiling Models Part 3" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 3 ${LUT_PART3:+--lut $LUT_PART3} --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+FORCE_MLPROG_FLAG=""
+if [ "$FORCE_MLPROGRAM_COMPILE" = true ]; then
+    FORCE_MLPROG_FLAG="--force-mlprogram"
+fi
+run_step 6 "Compiling Models Part 1" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 1 ${LUT_PART1:+--lut $LUT_PART1} $FORCE_MLPROG_FLAG --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+run_step 6 "Compiling Models Part 3" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 3 ${LUT_PART3:+--lut $LUT_PART3} $FORCE_MLPROG_FLAG --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
-    run_step 6 "Compiling Models Part 2" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 2 ${LUT_PART2:+--lut $LUT_PART2} --chunk $NUM_CHUNKS --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+    run_step 6 "Compiling Models Part 2" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 2 ${LUT_PART2:+--lut $LUT_PART2} $FORCE_MLPROG_FLAG $SPLIT_ROTATE_FLAG --chunk $NUM_CHUNKS --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
 fi
 
 # Step 7: Copy tokenizer files and create meta.yaml
@@ -453,10 +488,14 @@ EOF_CONFIG
         if [ \"$ARGMAX_IN_MODEL\" = true ]; then
             ARGMAX_META_FLAG=\"--argmax\"
         fi
+        SPLIT_ROTATE_META_FLAG=\"\"
+        if [ \"$SPLIT_ROTATE\" = true ]; then
+            SPLIT_ROTATE_META_FLAG=\"--split-rotate\"
+        fi
         python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
-            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \$ARGMAX_META_FLAG
+            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \$ARGMAX_META_FLAG \$SPLIT_ROTATE_META_FLAG
     "
 fi
 
@@ -479,12 +518,20 @@ echo "    --meta \"$OUTPUT_DIR/meta.yaml\""
 echo -e "\nOption 2 - Manual configuration:"
 EMBEDDINGS_NAME="${PREFIX}_embeddings${LUT_PART1:+_lut$LUT_PART1}"
 LMHEAD_NAME="${PREFIX}_lm_head${LUT_PART3:+_lut$LUT_PART3}"
-FFN_BASE="${PREFIX}_FFN_PF${LUT_PART2:+_lut$LUT_PART2}"
 
 echo "python3 $PROJECT_ROOT/tests/chat.py \\"
 echo "    --embed $EMBEDDINGS_NAME \\"
 echo "    --lmhead $LMHEAD_NAME \\"
-echo "    --ffn ${FFN_BASE}_chunk_01of$(printf "%02d" $NUM_CHUNKS) \\"
+if [ "$SPLIT_ROTATE" = true ]; then
+    FFN_BASE="${PREFIX}_FFN${LUT_PART2:+_lut$LUT_PART2}"
+    PF_BASE="${PREFIX}_PF${LUT_PART2:+_lut$LUT_PART2}"
+    echo "    --ffn ${FFN_BASE}_chunk_01of$(printf "%02d" $NUM_CHUNKS)_combined \\"
+    echo "    --pf ${PF_BASE}_chunk_01of$(printf "%02d" $NUM_CHUNKS) \\"
+    echo "    --split-rotate \\"
+else
+    FFN_BASE="${PREFIX}_FFN_PF${LUT_PART2:+_lut$LUT_PART2}"
+    echo "    --ffn ${FFN_BASE}_chunk_01of$(printf "%02d" $NUM_CHUNKS) \\"
+fi
 echo "    --tokenizer \"$OUTPUT_DIR\" \\"
 echo "    --context-length $CONTEXT_LENGTH \\"
 echo "    --d \"$OUTPUT_DIR\""

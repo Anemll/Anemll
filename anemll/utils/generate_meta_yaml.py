@@ -144,6 +144,11 @@ def main():
     if rotate:
         sys.argv.remove('--rotate')
 
+    # Check for --split-rotate flag (2 files per chunk: FFN and PF)
+    split_rotate = '--split-rotate' in sys.argv
+    if split_rotate:
+        sys.argv.remove('--split-rotate')
+
     if is_monolithic:
         if len(sys.argv) != 11:
             print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_bits> <lut_bits> <lut_bits> <num_chunks> <prefix> <arch> <output_dir> --monolithic [--argmax] [--rotate]")
@@ -191,16 +196,30 @@ def main():
 
     # Check FFN (always use LUT if specified, as it's required for ANE) - use only bits for filename
     # FFN files include chunk suffix: e.g., qwen_FFN_PF_lut4_chunk_01of01.mlmodelc
-    ffn_base = f'{PREFIX}_FFN_PF'
-    if lut_ffn_bits != 'none':
-        ffn_name = f'{ffn_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}'
+    if split_rotate:
+        # Split-rotate mode: separate FFN and PF files
+        ffn_base = f'{PREFIX}_FFN'
+        pf_base = f'{PREFIX}_PF'
+        if lut_ffn_bits != 'none':
+            ffn_name = f'{ffn_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}_combined'
+            pf_name = f'{pf_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}'
+        else:
+            ffn_name = f'{ffn_base}_chunk_01of{int(NUM_CHUNKS):02d}_combined'
+            pf_name = f'{pf_base}_chunk_01of{int(NUM_CHUNKS):02d}'
     else:
-        ffn_name = f'{ffn_base}_chunk_01of{int(NUM_CHUNKS):02d}'
+        # Standard mode: combined FFN_PF file
+        ffn_base = f'{PREFIX}_FFN_PF'
+        if lut_ffn_bits != 'none':
+            ffn_name = f'{ffn_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}'
+        else:
+            ffn_name = f'{ffn_base}_chunk_01of{int(NUM_CHUNKS):02d}'
 
     # Add .mlmodelc extension to model paths
     embeddings_path = f'{embeddings_name}.mlmodelc'
     lmhead_path = f'{lmhead_name}.mlmodelc'
     ffn_path = f'{ffn_name}.mlmodelc'
+    if split_rotate:
+        pf_path = f'{pf_name}.mlmodelc'
     
     # Set split_lm_head based on architecture
     if ARCH.startswith('qwen') or ARCH.startswith('gemma'):
@@ -241,12 +260,16 @@ def main():
     # Add argmax_in_model if requested
     argmax_line = '\n    argmax_in_model: true' if argmax_in_model else ''
 
+    # Add split_rotate field if in split-rotate mode
+    split_rotate_line = '\n    split_rotate: true' if split_rotate else ''
+    pf_line = f'\n    pf: {pf_path}' if split_rotate else ''
+
     meta_parts.append(f'''    num_chunks: {NUM_CHUNKS}
     model_prefix: {PREFIX}
     embeddings: {embeddings_path}
     lm_head: {lmhead_path}
-    ffn: {ffn_path}
-    split_lm_head: {split_lm_head}{argmax_line}
+    ffn: {ffn_path}{pf_line}
+    split_lm_head: {split_lm_head}{argmax_line}{split_rotate_line}
 ''')
 
     meta = '\n'.join(meta_parts)

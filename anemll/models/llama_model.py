@@ -1226,10 +1226,12 @@ class LlamaForCausalLM(nn.Module):
 
         # Load filtered weights
         missing_keys, unexpected_keys = self.load_state_dict(filtered_state_dict, strict=False)
+        allow_missing = os.environ.get("ANEMLL_ALLOW_MISSING_WEIGHTS", "").lower() in ("1", "true", "yes")
         if missing_keys:
             print(f"Missing keys: {missing_keys}")
             # Highlight actionable TODO in red for conversion logs
             print("\033[91mTODO: Weights not found or renamed. Check checkpoint prefixes and model config.\033[0m")
+            print("Hint: set ANEMLL_ALLOW_MISSING_WEIGHTS=1 (or --allow-missing-weights in convert scripts) to continue anyway.")
         if unexpected_keys:
             print(f"Unexpected keys: {unexpected_keys}")
 
@@ -1266,12 +1268,14 @@ class LlamaForCausalLM(nn.Module):
         expected_missing.extend([f'layers.{i}.self_attn.rotary_emb.inv_freq' for i in range(self.config.num_hidden_layers)])
         
         actual_missing = [k for k in missing_keys if k not in expected_missing]
-        if not actual_missing and not unexpected_keys:
+        if not actual_missing:
             print("Pretrained weights loaded successfully")
             if missing_keys:
                 print("Note: The following expected buffers were initialized:")
                 for k in missing_keys:
                     print(f"  - {k}")
+            if unexpected_keys:
+                print("Note: Unexpected keys were ignored (not treated as failure).")
             return True
         else:
             print("Pretrained weights loaded with some issues:")
@@ -1279,6 +1283,10 @@ class LlamaForCausalLM(nn.Module):
                 print(f"Missing keys: {actual_missing}")
                 # Highlight actionable TODO in red for conversion logs
                 print("\033[91mTODO: Weights not found or renamed. Check checkpoint prefixes and model config.\033[0m")
+                print("Hint: set ANEMLL_ALLOW_MISSING_WEIGHTS=1 (or --allow-missing-weights in convert scripts) to continue anyway.")
+                if allow_missing:
+                    print("Continuing despite missing weights (ANEMLL_ALLOW_MISSING_WEIGHTS=1).")
+                    return True
             if unexpected_keys:
                 print(f"Unexpected keys: {unexpected_keys}")
             return False
