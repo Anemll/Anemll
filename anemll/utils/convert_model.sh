@@ -40,12 +40,15 @@ print_usage() {
     echo "  --batch         Batch size (default: 64)"
     echo "  --lut1          LUT bits for embeddings (default: none)"
     echo "                  Format: 'bits' or 'bits,per_channel' (e.g., '6' or '6,4')"
+    echo "                  Use 'bits,0' or 'bits,tensor' for per-tensor quantization"
     echo "                  Default per_channel is 8 if not specified"
     echo "  --lut2          LUT bits for FFN/prefill (default: 4)"
     echo "                  Format: 'bits' or 'bits,per_channel' (e.g., '4,8' or '6,4')"
+    echo "                  Use 'bits,0' or 'bits,tensor' for per-tensor quantization"
     echo "                  Default per_channel is 8 if not specified"
     echo "  --lut3          LUT bits for LM head (default: 6)"
     echo "                  Format: 'bits' or 'bits,per_channel' (e.g., '6' or '6,4')"
+    echo "                  Use 'bits,0' or 'bits,tensor' for per-tensor quantization"
     echo "                  Default per_channel is 8 if not specified"
     echo "  --restart       Restart from specific step (1-8, default: 1)"
     echo "  --only          Run only specified step and exit (1-8)"
@@ -63,6 +66,9 @@ print_usage() {
     echo ""
     echo "  # Specify custom per_channel values"
     echo "  $0 --model ./model --output ./output --lut2 4,16 --lut3 6,4"
+    echo ""
+    echo "  # Use per-tensor quantization (no channel grouping)"
+    echo "  $0 --model ./model --output ./output --lut2 4,0 --lut3 6,0"
     exit 1
 }
 
@@ -332,7 +338,7 @@ if [ ! -z "$LUT_PART2" ]; then
     LUT2_PARAM="--lut $LUT_PART2"
 fi
 
-if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "3" ]; then
     run_step 3 "Converting FFN" "$CONVERTER \
         --part 2 \
         $LUT2_PARAM \
@@ -346,7 +352,7 @@ else
     echo "Skipping step 3: Converting FFN"
 fi
 
-if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "4" ]; then
     run_step 4 "Converting Prefill" "$CONVERTER \
         --part 2_prefill \
         $LUT2_PARAM \
@@ -364,7 +370,7 @@ fi
 # For Gemma3 models with context > sliding_window (512), we need rotation versions
 if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
     if [ $CONTEXT_LENGTH -gt 512 ]; then
-        if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+        if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "4" ]; then
             run_step 4 "Converting FFN Rotate" "$CONVERTER \
                 --part 2_rotate \
                 $LUT2_PARAM \
@@ -377,7 +383,7 @@ if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
         fi
 
         # Step 4b: Convert Prefill Rotate (Part 2_prefill_rotate) - Gemma3 only
-        if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+        if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "4" ]; then
             run_step 4 "Converting Prefill Rotate" "$CONVERTER \
                 --part 2_prefill_rotate \
                 $LUT2_PARAM \
@@ -405,7 +411,7 @@ if [ "$SPLIT_ROTATE" = true ]; then
     GEMMA3_FLAG=""
 fi
 
-if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "5" ]; then
     if [ ! -z "$LUT_PART2" ]; then
         run_step 5 "Combining Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
             --chunk $NUM_CHUNKS \
@@ -435,7 +441,7 @@ if [ "$FORCE_MLPROGRAM_COMPILE" = true ]; then
 fi
 run_step 6 "Compiling Models Part 1" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 1 ${LUT_PART1:+--lut $LUT_PART1} $FORCE_MLPROG_FLAG --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
 run_step 6 "Compiling Models Part 3" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 3 ${LUT_PART3:+--lut $LUT_PART3} $FORCE_MLPROG_FLAG --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
-if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "6" ]; then
     run_step 6 "Compiling Models Part 2" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 2 ${LUT_PART2:+--lut $LUT_PART2} $FORCE_MLPROG_FLAG $SPLIT_ROTATE_FLAG --chunk $NUM_CHUNKS --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
 fi
 
@@ -523,10 +529,9 @@ echo "python3 $PROJECT_ROOT/tests/chat.py \\"
 echo "    --embed $EMBEDDINGS_NAME \\"
 echo "    --lmhead $LMHEAD_NAME \\"
 if [ "$SPLIT_ROTATE" = true ]; then
-    FFN_BASE="${PREFIX}_FFN${LUT_PART2:+_lut$LUT_PART2}"
-    PF_BASE="${PREFIX}_PF${LUT_PART2:+_lut$LUT_PART2}"
-    echo "    --ffn ${FFN_BASE}_chunk_01of$(printf "%02d" $NUM_CHUNKS)_combined \\"
-    echo "    --pf ${PF_BASE}_chunk_01of$(printf "%02d" $NUM_CHUNKS) \\"
+    FFN_BASE="${PREFIX}_FFN_PF${LUT_PART2:+_lut$LUT_PART2}"
+    echo "    --ffn ${FFN_BASE}_chunk_01of$(printf "%02d" $NUM_CHUNKS) \\"
+    echo "    --pf ${FFN_BASE}_chunk_01of$(printf "%02d" $NUM_CHUNKS)_rot \\"
     echo "    --split-rotate \\"
 else
     FFN_BASE="${PREFIX}_FFN_PF${LUT_PART2:+_lut$LUT_PART2}"

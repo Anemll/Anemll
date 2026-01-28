@@ -216,13 +216,17 @@ def main():
             return 1
         # Make LUT optional for part 2
         lut_suffix = f'_lut{args.lut}' if args.lut else ''
-        # For split-rotate, compile FFN and PF files separately
+        # For split-rotate, compile non-rotate and rotate files separately
+        # Non-rotate file: FFN_PF_chunk_XXofYY (infer + prefill)
+        # Rotate file: FFN_PF_chunk_XXofYY_rot (infer_rotate + prefill_rotate)
+        # NOTE: Multi-function models REQUIRE ML Program format for function_name loading
         if args.split_rotate:
             for i in range(args.chunk):
-                ffn_name = f'{args.prefix}_FFN{lut_suffix}_chunk_{i+1:02d}of{args.chunk:02d}_combined.mlpackage'
-                pf_name = f'{args.prefix}_PF{lut_suffix}_chunk_{i+1:02d}of{args.chunk:02d}.mlpackage'
-                compile_model(os.path.join(args.input, ffn_name), output_dir, force_mlprogram=args.force_mlprogram)
-                compile_model(os.path.join(args.input, pf_name), output_dir, force_mlprogram=args.force_mlprogram)
+                non_rotate_name = f'{args.prefix}_FFN_PF{lut_suffix}_chunk_{i+1:02d}of{args.chunk:02d}.mlpackage'
+                rotate_name = f'{args.prefix}_FFN_PF{lut_suffix}_chunk_{i+1:02d}of{args.chunk:02d}_rot.mlpackage'
+                # Always force ML Program for multi-function models (required for function_name)
+                compile_model(os.path.join(args.input, non_rotate_name), output_dir, force_mlprogram=True)
+                compile_model(os.path.join(args.input, rotate_name), output_dir, force_mlprogram=True)
         else:
             # Standard combined FFN_PF files
             for i in range(args.chunk):

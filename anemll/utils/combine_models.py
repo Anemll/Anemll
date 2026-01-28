@@ -206,12 +206,12 @@ def combine_chunks(num_chunks, lut_bits=None, mode=None, prefix='llama'):
         return False
 
 def combine_chunks_split_rotate(num_chunks, lut_bits=None, prefix='gemma3'):
-    """Combine FFN models into 2-function files, splitting infer and prefill.
+    """Combine models into 2-function files, splitting by rotation mode.
 
     This is for large models where 4 functions in one file is too complex for ANE.
     Creates TWO separate files per chunk:
-    - FFN file with 'infer' + 'infer_rotate' functions
-    - PF file with 'prefill' + 'prefill_rotate' functions
+    - Non-rotate file: 'infer' + 'prefill' functions (FFN_PF_chunk_XXofYY)
+    - Rotate file: 'infer_rotate' + 'prefill_rotate' functions (FFN_PF_chunk_XXofYY_rot)
 
     Args:
         num_chunks: Number of chunks
@@ -230,16 +230,16 @@ def combine_chunks_split_rotate(num_chunks, lut_bits=None, prefix='gemma3'):
             ffn_rotate_template = f"{prefix}_FFN_rotate_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
             pf_template = f"{prefix}_prefill_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
             pf_rotate_template = f"{prefix}_prefill_rotate_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
-            # Output templates - separate FFN and PF files
-            ffn_combined_template = f"{prefix}_FFN_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}_combined.mlpackage"
-            pf_combined_template = f"{prefix}_PF_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            # Output templates - non-rotate and rotate files
+            combined_template = f"{prefix}_FFN_PF_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            combined_rot_template = f"{prefix}_FFN_PF_lut{lut_bits}_chunk_{{:02d}}of{num_chunks:02d}_rot.mlpackage"
         else:
             ffn_template = f"{prefix}_FFN_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
             ffn_rotate_template = f"{prefix}_FFN_rotate_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
             pf_template = f"{prefix}_prefill_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
             pf_rotate_template = f"{prefix}_prefill_rotate_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
-            ffn_combined_template = f"{prefix}_FFN_chunk_{{:02d}}of{num_chunks:02d}_combined.mlpackage"
-            pf_combined_template = f"{prefix}_PF_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            combined_template = f"{prefix}_FFN_PF_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
+            combined_rot_template = f"{prefix}_FFN_PF_chunk_{{:02d}}of{num_chunks:02d}_rot.mlpackage"
 
         for chunk_idx in range(num_chunks):
             try:
@@ -248,16 +248,16 @@ def combine_chunks_split_rotate(num_chunks, lut_bits=None, prefix='gemma3'):
                 ffn_rotate_path = ffn_rotate_template.format(chunk_idx + 1)
                 prefill_path = pf_template.format(chunk_idx + 1)
                 prefill_rotate_path = pf_rotate_template.format(chunk_idx + 1)
-                ffn_output_path = ffn_combined_template.format(chunk_idx + 1)
-                pf_output_path = pf_combined_template.format(chunk_idx + 1)
+                output_path = combined_template.format(chunk_idx + 1)
+                output_rot_path = combined_rot_template.format(chunk_idx + 1)
 
                 print(f"\nProcessing split-rotate chunk {chunk_idx+1}:")
                 print(f"  FFN: {ffn_path}")
                 print(f"  FFN_rotate: {ffn_rotate_path}")
                 print(f"  Prefill: {prefill_path}")
                 print(f"  Prefill_rotate: {prefill_rotate_path}")
-                print(f"  FFN Output: {ffn_output_path}")
-                print(f"  PF Output: {pf_output_path}")
+                print(f"  Output (non-rotate): {output_path}")
+                print(f"  Output (rotate): {output_rot_path}")
 
                 # Check all input files exist
                 missing = []
@@ -276,35 +276,35 @@ def combine_chunks_split_rotate(num_chunks, lut_bits=None, prefix='gemma3'):
                 prefill_model = ct.models.MLModel(prefill_path)
                 prefill_rotate_model = ct.models.MLModel(prefill_rotate_path)
 
-                # Create FFN combined model with 2 functions (infer + infer_rotate)
-                print("Creating FFN 2-function model (infer + infer_rotate)...")
-                ffn_desc = ct.utils.MultiFunctionDescriptor()
-                ffn_desc.add_function(ffn_path, "main", "infer")
-                ffn_desc.add_function(ffn_rotate_path, "main", "infer_rotate")
-                ffn_desc.default_function_name = "infer"
+                # Create non-rotate combined model with 2 functions (infer + prefill)
+                print("Creating non-rotate 2-function model (infer + prefill)...")
+                desc = ct.utils.MultiFunctionDescriptor()
+                desc.add_function(ffn_path, "main", "infer")
+                desc.add_function(prefill_path, "main", "prefill")
+                desc.default_function_name = "infer"
 
-                temp_ffn_path = f"temp_{ffn_output_path}"
-                ct.utils.save_multifunction(ffn_desc, temp_ffn_path)
-                ffn_combined = ct.models.MLModel(temp_ffn_path)
-                AddCombinedMetadata(ffn_combined, [ffn_model, ffn_rotate_model])
-                ffn_combined.save(ffn_output_path)
-                shutil.rmtree(temp_ffn_path, ignore_errors=True)
-                print(f"  ✓ FFN combined model saved: {ffn_output_path}")
+                temp_path = f"temp_{output_path}"
+                ct.utils.save_multifunction(desc, temp_path)
+                combined = ct.models.MLModel(temp_path)
+                AddCombinedMetadata(combined, [ffn_model, prefill_model])
+                combined.save(output_path)
+                shutil.rmtree(temp_path, ignore_errors=True)
+                print(f"  ✓ Non-rotate model saved: {output_path}")
 
-                # Create PF combined model with 2 functions (prefill + prefill_rotate)
-                print("Creating PF 2-function model (prefill + prefill_rotate)...")
-                pf_desc = ct.utils.MultiFunctionDescriptor()
-                pf_desc.add_function(prefill_path, "main", "prefill")
-                pf_desc.add_function(prefill_rotate_path, "main", "prefill_rotate")
-                pf_desc.default_function_name = "prefill"
+                # Create rotate combined model with 2 functions (infer_rotate + prefill_rotate)
+                print("Creating rotate 2-function model (infer_rotate + prefill_rotate)...")
+                desc_rot = ct.utils.MultiFunctionDescriptor()
+                desc_rot.add_function(ffn_rotate_path, "main", "infer_rotate")
+                desc_rot.add_function(prefill_rotate_path, "main", "prefill_rotate")
+                desc_rot.default_function_name = "infer_rotate"
 
-                temp_pf_path = f"temp_{pf_output_path}"
-                ct.utils.save_multifunction(pf_desc, temp_pf_path)
-                pf_combined = ct.models.MLModel(temp_pf_path)
-                AddCombinedMetadata(pf_combined, [prefill_model, prefill_rotate_model])
-                pf_combined.save(pf_output_path)
-                shutil.rmtree(temp_pf_path, ignore_errors=True)
-                print(f"  ✓ PF combined model saved: {pf_output_path}")
+                temp_rot_path = f"temp_{output_rot_path}"
+                ct.utils.save_multifunction(desc_rot, temp_rot_path)
+                combined_rot = ct.models.MLModel(temp_rot_path)
+                AddCombinedMetadata(combined_rot, [ffn_rotate_model, prefill_rotate_model])
+                combined_rot.save(output_rot_path)
+                shutil.rmtree(temp_rot_path, ignore_errors=True)
+                print(f"  ✓ Rotate model saved: {output_rot_path}")
 
                 print(f"Successfully created split-rotate chunk {chunk_idx+1}")
 
@@ -664,7 +664,7 @@ def parse_args():
                            'Creates 4-function model instead of 2-function model.')
     parser.add_argument('--split-rotate', action='store_true',
                       help='Split rotate functions into separate files (for large models). '
-                           'Creates 2 files per chunk: FFN (infer+infer_rotate) and PF (prefill+prefill_rotate).')
+                           'Creates 2 files per chunk: non-rotate (infer+prefill) and rotate (infer_rotate+prefill_rotate).')
     parser.add_argument('--input', type=str, default='.',
                       help='Input directory containing model files (default: current directory)')
     parser.add_argument('--output', type=str, default=None,
@@ -745,8 +745,8 @@ def main():
         # Handle split-rotate mode (2 files per chunk, 2 functions each)
         if args.split_rotate:
             print(f"\nCombining models with split-rotate (2 files per chunk)...")
-            print(f"  FFN file: infer + infer_rotate")
-            print(f"  PF file: prefill + prefill_rotate")
+            print(f"  Non-rotate file (_chunk_XXofYY): infer + prefill")
+            print(f"  Rotate file (_chunk_XXofYY_rot): infer_rotate + prefill_rotate")
             success = combine_chunks_split_rotate(args.chunk, args.lut, args.prefix)
         # Handle Gemma3 mode (4 functions in 1 file)
         elif args.gemma3:

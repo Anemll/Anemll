@@ -366,26 +366,45 @@ class Gemma3Converter(BaseConverter):
         import warnings
 
         if self.converted_model is not None and self.lut_bits is not None:
-            print(
-                f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)..."
-            )
+            # Check if using per-tensor quantization (per_channel <= 0 means per-tensor)
+            use_per_tensor = self.per_channel <= 0
+            if use_per_tensor:
+                print(
+                    f"Applying LUT quantization with {self.lut_bits} bits using PER-TENSOR granularity with {num_workers if num_workers else 1} worker(s)..."
+                )
+            else:
+                print(
+                    f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)..."
+                )
             try:
                 # Suppress sklearn warnings during quantization (common with edge cases)
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-                    # Set up quantization config
-                    config = cto.coreml.OptimizationConfig(
-                        global_config=cto.coreml.OpPalettizerConfig(
-                            mode="kmeans",
-                            nbits=self.lut_bits,
-                            granularity="per_grouped_channel",
-                            group_size=self.per_channel,
-                            num_kmeans_workers=(
-                                num_workers if num_workers is not None else 1
-                            ),  # Use provided workers or default to 1
-                        ),
-                    )
+                    # Set up quantization config - use per_tensor if per_channel <= 0
+                    if use_per_tensor:
+                        config = cto.coreml.OptimizationConfig(
+                            global_config=cto.coreml.OpPalettizerConfig(
+                                mode="kmeans",
+                                nbits=self.lut_bits,
+                                granularity="per_tensor",
+                                num_kmeans_workers=(
+                                    num_workers if num_workers is not None else 1
+                                ),
+                            ),
+                        )
+                    else:
+                        config = cto.coreml.OptimizationConfig(
+                            global_config=cto.coreml.OpPalettizerConfig(
+                                mode="kmeans",
+                                nbits=self.lut_bits,
+                                granularity="per_grouped_channel",
+                                group_size=self.per_channel,
+                                num_kmeans_workers=(
+                                    num_workers if num_workers is not None else 1
+                                ),
+                            ),
+                        )
 
                     # Apply quantization
                     self.converted_model = cto.coreml.palettize_weights(
@@ -1485,6 +1504,48 @@ class Gemma3Converter(BaseConverter):
         return mlmodel
 
 
+def parse_lut_arg(lut_value: str | int | None) -> tuple[int | None, int]:
+    """Parse LUT argument that can be 'bits', 'bits,per_channel', or 'bits,0' for per-tensor.
+
+    Args:
+        lut_value: String or int value from command line (e.g., '6', '6,4', '4,0' for per-tensor)
+
+    Returns:
+        tuple: (lut_bits, per_channel) where:
+               - per_channel > 0 means per_grouped_channel quantization
+               - per_channel <= 0 means per_tensor quantization
+               - per_channel defaults to 8 if not specified
+    """
+    if lut_value is None:
+        return None, 8
+
+    if isinstance(lut_value, int):
+        return lut_value, 8  # Default per_channel value
+
+    lut_str = str(lut_value)
+    if ',' in lut_str:
+        parts = lut_str.split(',')
+        if len(parts) != 2:
+            raise ValueError(f"Invalid LUT format: {lut_value}. Expected 'bits' or 'bits,per_channel'")
+        try:
+            lut_bits = int(parts[0])
+            per_channel_str = parts[1].strip().lower()
+            # Allow "tensor" or "t" or "0" for per-tensor quantization
+            if per_channel_str in ('tensor', 't', '0'):
+                per_channel = 0
+            else:
+                per_channel = int(parts[1])
+            return lut_bits, per_channel
+        except ValueError:
+            raise ValueError(f"Invalid LUT format: {lut_value}. Expected 'bits' or 'bits,per_channel'")
+    else:
+        try:
+            lut_bits = int(lut_str)
+            return lut_bits, 8  # Default per_channel value
+        except ValueError:
+            raise ValueError(f"Invalid LUT bits value: {lut_value}")
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments for the converter."""
 
@@ -1522,9 +1583,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--lut",
-        type=int,
+        type=str,
         default=None,
-        help="Use LUT quantization with N bits",
+        help="Use LUT quantization with N bits. Format: 'bits' or 'bits,per_channel' "
+             "(e.g., '4', '4,8', '4,0' for per-tensor). Default per_channel is 8.",
     )
     parser.add_argument(
         "--chunk",
@@ -1580,6 +1642,7 @@ def test_conversion(
     context_length: int = CONTEXT_LENGTH,
     state_length: Optional[int] = None,
     lut_bits: Optional[int] = None,
+    per_channel: int = 8,
     batch_size: int = 64,
     output_dir: str = ".",
     part: str = "full",
@@ -1599,6 +1662,8 @@ def test_conversion(
         state_length: KV cache size for global attention layers (default: context_length).
                       For split cache, this controls the size of the global cache buffer.
         lut_bits: LUT quantization bits
+        per_channel: Group size for per_grouped_channel quantization.
+                     Use 0 for per-tensor quantization.
         batch_size: Batch size for conversion
         output_dir: Output directory
         part: Part to convert ("full" or "prefill")
@@ -1706,6 +1771,7 @@ def test_conversion(
         context_length=context_length,
         batch_size=batch_size,
         lut_bits=lut_bits,
+        per_channel=per_channel,
         num_chunks=num_chunks,
         argmax_in_model=argmax_in_model,
         attention_size=attention_size,
@@ -1831,6 +1897,14 @@ def main() -> None:
     part_map = {"full": "all", "embeddings": "1", "prefill": "2_prefill"}
     part = part_map.get(args.part, args.part)
 
+    # Parse LUT argument to extract bits and per_channel
+    lut_bits, per_channel = parse_lut_arg(args.lut)
+    if lut_bits is not None:
+        if per_channel <= 0:
+            print(f"LUT quantization: {lut_bits} bits, per-tensor granularity")
+        else:
+            print(f"LUT quantization: {lut_bits} bits, per_channel group size: {per_channel}")
+
     try:
         print("\nCalling test_conversion()...")
         result = test_conversion(
@@ -1838,7 +1912,8 @@ def main() -> None:
             prefix=args.prefix,
             context_length=args.context_length,
             state_length=args.state_length,
-            lut_bits=args.lut,
+            lut_bits=lut_bits,
+            per_channel=per_channel,
             batch_size=args.batch_size,
             output_dir=args.output,
             part=part,

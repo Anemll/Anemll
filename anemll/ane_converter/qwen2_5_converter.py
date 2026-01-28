@@ -109,27 +109,46 @@ class Qwen25Converter(BaseConverter):
                         If None, uses default single worker.
         """
         if self.converted_model is not None and self.lut_bits is not None:
-            print(
-                f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)..."
-            )
+            # Check if using per-tensor quantization (per_channel <= 0 means per-tensor)
+            use_per_tensor = self.per_channel <= 0
+            if use_per_tensor:
+                print(
+                    f"Applying LUT quantization with {self.lut_bits} bits using PER-TENSOR granularity with {num_workers if num_workers else 1} worker(s)..."
+                )
+            else:
+                print(
+                    f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)..."
+                )
             try:
                 # Suppress sklearn ConvergenceWarning during quantization
                 with warnings.catch_warnings():
                     if SklearnConvergenceWarning is not None:
                         warnings.simplefilter('ignore', SklearnConvergenceWarning)
                     warnings.simplefilter('ignore', UserWarning)
-                    # Set up quantization config
-                    config = cto.coreml.OptimizationConfig(
-                        global_config=cto.coreml.OpPalettizerConfig(
-                            mode="kmeans",
-                            nbits=self.lut_bits,
-                            granularity="per_grouped_channel",
-                            group_size=self.per_channel,
-                            num_kmeans_workers=(
-                                num_workers if num_workers is not None else 1
-                            ),  # Use provided workers or default to 1
-                        ),
-                    )
+                    # Set up quantization config - use per_tensor if per_channel <= 0
+                    if use_per_tensor:
+                        config = cto.coreml.OptimizationConfig(
+                            global_config=cto.coreml.OpPalettizerConfig(
+                                mode="kmeans",
+                                nbits=self.lut_bits,
+                                granularity="per_tensor",
+                                num_kmeans_workers=(
+                                    num_workers if num_workers is not None else 1
+                                ),
+                            ),
+                        )
+                    else:
+                        config = cto.coreml.OptimizationConfig(
+                            global_config=cto.coreml.OpPalettizerConfig(
+                                mode="kmeans",
+                                nbits=self.lut_bits,
+                                granularity="per_grouped_channel",
+                                group_size=self.per_channel,
+                                num_kmeans_workers=(
+                                    num_workers if num_workers is not None else 1
+                                ),
+                            ),
+                        )
 
                     # Apply quantization
                     self.converted_model = cto.coreml.palettize_weights(
@@ -1042,13 +1061,16 @@ class Qwen25Converter(BaseConverter):
 
 
 def parse_lut_arg(lut_value):
-    """Parse LUT argument that can be either 'bits' or 'bits,per_channel'.
+    """Parse LUT argument that can be 'bits', 'bits,per_channel', or 'bits,0' for per-tensor.
 
     Args:
-        lut_value: String value from command line (e.g., '6' or '6,4')
+        lut_value: String value from command line (e.g., '6', '6,4', '4,0' for per-tensor)
 
     Returns:
-        tuple: (lut_bits, per_channel) where per_channel defaults to 8 if not specified
+        tuple: (lut_bits, per_channel) where:
+               - per_channel > 0 means per_grouped_channel quantization
+               - per_channel <= 0 means per_tensor quantization
+               - per_channel defaults to 8 if not specified
     """
     if lut_value is None:
         return None, 8
@@ -1059,10 +1081,15 @@ def parse_lut_arg(lut_value):
             raise ValueError(f"Invalid LUT format: {lut_value}. Expected format: 'bits' or 'bits,per_channel'")
         try:
             lut_bits = int(parts[0])
-            per_channel = int(parts[1])
+            per_channel_str = parts[1].strip().lower()
+            # Allow "tensor" or "t" or "0" for per-tensor quantization
+            if per_channel_str in ('tensor', 't', '0'):
+                per_channel = 0
+            else:
+                per_channel = int(parts[1])
             return lut_bits, per_channel
         except ValueError:
-            raise ValueError(f"Invalid LUT format: {lut_value}. Both values must be integers")
+            raise ValueError(f"Invalid LUT format: {lut_value}. Expected 'bits' or 'bits,per_channel'")
     else:
         try:
             lut_bits = int(lut_value)

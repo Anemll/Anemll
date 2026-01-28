@@ -197,15 +197,16 @@ def main():
     # Check FFN (always use LUT if specified, as it's required for ANE) - use only bits for filename
     # FFN files include chunk suffix: e.g., qwen_FFN_PF_lut4_chunk_01of01.mlmodelc
     if split_rotate:
-        # Split-rotate mode: separate FFN and PF files
-        ffn_base = f'{PREFIX}_FFN'
-        pf_base = f'{PREFIX}_PF'
+        # Split-rotate mode: 2 files per chunk (non-rotate and rotate)
+        # Non-rotate file: infer + prefill
+        # Rotate file: infer_rotate + prefill_rotate (with _rot suffix)
+        ffn_base = f'{PREFIX}_FFN_PF'
         if lut_ffn_bits != 'none':
-            ffn_name = f'{ffn_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}_combined'
-            pf_name = f'{pf_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}'
+            ffn_name = f'{ffn_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}'
+            pf_name = f'{ffn_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}_rot'
         else:
-            ffn_name = f'{ffn_base}_chunk_01of{int(NUM_CHUNKS):02d}_combined'
-            pf_name = f'{pf_base}_chunk_01of{int(NUM_CHUNKS):02d}'
+            ffn_name = f'{ffn_base}_chunk_01of{int(NUM_CHUNKS):02d}'
+            pf_name = f'{ffn_base}_chunk_01of{int(NUM_CHUNKS):02d}_rot'
     else:
         # Standard mode: combined FFN_PF file
         ffn_base = f'{PREFIX}_FFN_PF'

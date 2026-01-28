@@ -110,6 +110,14 @@ if [ "$MODEL_TYPE_YAML" = "monolithic" ] && [ -n "$MONOLITHIC_MODEL" ]; then
     echo "Detected monolithic model: $MONOLITHIC_MODEL"
 fi
 
+# Check for split-rotate mode
+IS_SPLIT_ROTATE=false
+SPLIT_ROTATE_YAML=$(grep "split_rotate:" "$INPUT_DIR/meta.yaml" | awk '{print $2}' 2>/dev/null || echo "")
+if [ "$SPLIT_ROTATE_YAML" = "true" ]; then
+    IS_SPLIT_ROTATE=true
+    echo "Detected split-rotate mode (2 files per chunk)"
+fi
+
 # Detect architecture for tokenizer config
 ARCH=$(grep "architecture:" "$INPUT_DIR/meta.yaml" | awk '{print $2}')
 MODEL_TYPE="llama"
@@ -307,6 +315,11 @@ if [ "$PREPARE_IOS" = true ]; then
             chunk_info="_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)"
             ffn_file=$(get_model_filename "$MODEL_PREFIX" "FFN_PF" "$LUT_FFN" "$chunk_info")
             copy_mlmodelc "$ffn_file" "$OUTPUT_DIR/ios"
+            # Copy rotate file if in split-rotate mode
+            if [ "$IS_SPLIT_ROTATE" = true ]; then
+                rot_file="${ffn_file}_rot"
+                copy_mlmodelc "$rot_file" "$OUTPUT_DIR/ios"
+            fi
         done
     fi
 
@@ -343,6 +356,11 @@ else
             chunk_info="_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)"
             ffn_file=$(get_model_filename "$MODEL_PREFIX" "FFN_PF" "$LUT_FFN" "$chunk_info")
             compress_mlmodelc "$ffn_file" "$OUTPUT_DIR/standard"
+            # Compress rotate file if in split-rotate mode
+            if [ "$IS_SPLIT_ROTATE" = true ]; then
+                rot_file="${ffn_file}_rot"
+                compress_mlmodelc "$rot_file" "$OUTPUT_DIR/standard"
+            fi
         done
     fi
 

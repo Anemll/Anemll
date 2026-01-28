@@ -267,16 +267,26 @@ def find_all_chunks(base_path):
     return sorted(glob.glob(pattern))
 
 def load_model(path, function_name=None, compute_unit=None):
-    """Load a CoreML model, handling both .mlmodelc and .mlpackage formats."""
+    """Load a CoreML model, handling both .mlmodelc and .mlpackage formats.
+
+    For single-function compiled models, function_name is ignored.
+    For multi-function ML Program models, function_name selects the function.
+    """
     path = Path(path)
     if compute_unit is None:
         compute_unit = ct.ComputeUnit.CPU_AND_NE
-    
+
     try:
         if path.suffix == '.mlmodelc':
             # For compiled models (.mlmodelc), use CompiledMLModel
             if function_name:
-                return ct.models.CompiledMLModel(str(path), compute_unit, function_name=function_name)
+                try:
+                    return ct.models.CompiledMLModel(str(path), compute_unit, function_name=function_name)
+                except RuntimeError as e:
+                    # If function_name not supported, try without it (single-function model)
+                    if "functionName" in str(e) and "must be" in str(e):
+                        return ct.models.CompiledMLModel(str(path), compute_unit)
+                    raise
             else:
                 return ct.models.CompiledMLModel(str(path), compute_unit)
         else:
@@ -285,7 +295,7 @@ def load_model(path, function_name=None, compute_unit=None):
                 return ct.models.MLModel(str(path), function_name=function_name)
             else:
                 return ct.models.MLModel(str(path))
-                
+
     except RuntimeError as e:
         if "valid manifest does not exist" in str(e):
             print(f"\nError: Could not load compiled model at {path}")

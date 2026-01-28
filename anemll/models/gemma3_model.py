@@ -145,6 +145,9 @@ class Gemma3Config:
         self.use_cache = kwargs.get("use_cache", True)
         self.context_length = kwargs.get("context_length", 256)
 
+        # Batch size for prefill (used in rotation operations)
+        self.batch_size = kwargs.get("batch_size", 64)
+
     def get_global_layer_indices(self) -> list:
         """Get indices of global (full attention) layers from config.layer_types."""
         return [i for i, t in enumerate(self.layer_types) if t == "full_attention"]
@@ -907,28 +910,46 @@ class Gemma3Model(nn.Module):
     # Split cache storage and retrieval methods
     # -------------------------------------------------------------------------
 
-    def _fill_kv_local(self, layer_idx: int, key_states: torch.Tensor,
-                      value_states: torch.Tensor, current_pos: int) -> None:
+    def _apply_update_mask(self, cache_slice: torch.Tensor, new_states: torch.Tensor,
+                           update_mask: torch.Tensor) -> torch.Tensor:
         """
-        Fill KV states in local cache (for prefill, before cache is full).
+        Apply update_mask to write new_states into cache_slice without dynamic slicing.
 
-        Stores at position current_pos. Use for positions 0 to sliding_window-1.
-        No shift operation - direct storage.
+        Args:
+            cache_slice: [1, num_heads, cache_len, head_dim]
+            new_states:  [1, num_heads, 1, head_dim] (single token)
+            update_mask: [1, 1, cache_len, 1] (float mask with 1 at write position)
+        """
+        mask = update_mask.to(dtype=cache_slice.dtype)
+        expanded = new_states.expand(cache_slice.shape[0], new_states.shape[1], cache_slice.shape[2], new_states.shape[3])
+        return cache_slice * (1.0 - mask) + expanded * mask
+
+    def _fill_kv_local(self, layer_idx: int, key_states: torch.Tensor,
+                      value_states: torch.Tensor, update_mask_local: torch.Tensor) -> None:
+        """
+        Fill KV states in local cache (for single-token inference).
+
+        Left-fill using update_mask to avoid dynamic slicing.
 
         Args:
             layer_idx: Original layer index (0-17)
             key_states: Key tensor to store, shape [1, num_kv_heads, 1, head_dim]
             value_states: Value tensor to store, same shape as key_states
-            current_pos: Current position (0 to sliding_window-1)
+            update_mask_local: [1, 1, sliding_window, 1]
         """
         cache_idx = self._local_layer_indices.index(layer_idx)
         num_local = len(self._local_layer_indices)
         key_cache_idx = cache_idx
         value_cache_idx = cache_idx + num_local
+        key_slice = self.kv_cache_local[key_cache_idx:key_cache_idx + 1]
+        value_slice = self.kv_cache_local[value_cache_idx:value_cache_idx + 1]
 
-        # Direct store at current_pos (no shift)
-        self.kv_cache_local[key_cache_idx:key_cache_idx + 1, :, current_pos:current_pos + 1, :] = key_states
-        self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, current_pos:current_pos + 1, :] = value_states
+        self.kv_cache_local[key_cache_idx:key_cache_idx + 1, :, :, :] = self._apply_update_mask(
+            key_slice, key_states, update_mask_local
+        )
+        self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, :, :] = self._apply_update_mask(
+            value_slice, value_states, update_mask_local
+        )
 
     def _update_kv_local(self, layer_idx: int, key_states: torch.Tensor,
                         value_states: torch.Tensor) -> None:
@@ -974,7 +995,8 @@ class Gemma3Model(nn.Module):
         self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, :, :] = shifted_value
 
     def _store_kv_local(self, layer_idx: int, key_states: torch.Tensor,
-                       value_states: torch.Tensor, current_pos: int) -> None:
+                       value_states: torch.Tensor, current_pos: int,
+                       update_mask: torch.Tensor | None = None) -> None:
         """
         Store KV states in local cache (auto-selects fill or update).
 
@@ -997,17 +1019,33 @@ class Gemma3Model(nn.Module):
         """
         force_rotation = getattr(self.config, 'force_rotation_mode', None)
 
+        cache_idx = self._local_layer_indices.index(layer_idx)
+        num_local = len(self._local_layer_indices)
+        key_cache_idx = cache_idx
+        value_cache_idx = cache_idx + num_local
+
         if force_rotation is True:
             # Always rotate (for infer_rotate function)
             self._update_kv_local(layer_idx, key_states, value_states)
         elif force_rotation is False:
             # Always fill (for infer function)
-            self._fill_kv_local(layer_idx, key_states, value_states, current_pos)
+            if update_mask is None:
+                # Fallback to direct write if update_mask is missing
+                self.kv_cache_local[key_cache_idx:key_cache_idx + 1, :, current_pos:current_pos + 1, :] = key_states
+                self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, current_pos:current_pos + 1, :] = value_states
+            else:
+                update_mask_local = torch.narrow(update_mask, 2, 0, self.config.sliding_window)
+                self._fill_kv_local(layer_idx, key_states, value_states, update_mask_local)
         else:
             # Default: conditional based on position
             sliding_window = self.config.sliding_window
             if current_pos < sliding_window:
-                self._fill_kv_local(layer_idx, key_states, value_states, current_pos)
+                if update_mask is None:
+                    self.kv_cache_local[key_cache_idx:key_cache_idx + 1, :, current_pos:current_pos + 1, :] = key_states
+                    self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, current_pos:current_pos + 1, :] = value_states
+                else:
+                    update_mask_local = torch.narrow(update_mask, 2, 0, self.config.sliding_window)
+                    self._fill_kv_local(layer_idx, key_states, value_states, update_mask_local)
             else:
                 self._update_kv_local(layer_idx, key_states, value_states)
 
@@ -1016,9 +1054,7 @@ class Gemma3Model(nn.Module):
         """
         Store KV states in local cache during prefill (multi-token).
 
-        Two modes controlled by USE_RIGHT_FILL_CACHE:
-        - False (default): Fill from left (positions 0 to seq_len-1)
-        - True: Fill from right (positions sliding_window-seq_len to sliding_window-1)
+        Standard left-fill: store at [current_pos : current_pos + seq_len).
 
         For prefill that exceeds sliding_window, only the last sliding_window tokens
         are kept.
@@ -1027,8 +1063,8 @@ class Gemma3Model(nn.Module):
             layer_idx: Original layer index (0-17)
             key_states: Key tensor, shape [1, seq_len, num_kv_heads, head_dim] or similar
             value_states: Value tensor, same shape as key_states
-            current_pos: Starting position in the sequence (typically 0 for prefill)
-            seq_len: Number of tokens being prefilled
+            current_pos: Starting position (unused, kept for API compatibility)
+            seq_len: Number of tokens being prefilled (fixed at compile time)
         """
         cache_idx = self._local_layer_indices.index(layer_idx)
         num_local = len(self._local_layer_indices)
@@ -1039,25 +1075,16 @@ class Gemma3Model(nn.Module):
 
         # For prefill, if seq_len > sliding_window, only keep last sliding_window tokens
         if seq_len > sliding_window:
-            key_states = key_states[:, -sliding_window:, :]
-            value_states = value_states[:, -sliding_window:, :]
+            start = seq_len - sliding_window
+            key_states = torch.narrow(key_states, 1, start, sliding_window)
+            value_states = torch.narrow(value_states, 1, start, sliding_window)
             seq_len = sliding_window
 
-        # Check which mode to use
-        use_right_fill = getattr(self.config, 'use_right_fill_cache', False)
-
-        if use_right_fill:
-            # Right-fill mode: store at positions (sliding_window - seq_len) to (sliding_window - 1)
-            # This aligns with the shift-and-store pattern in single-token generation
-            start_pos = sliding_window - seq_len
-            end_pos = sliding_window
-        else:
-            # Standard mode: fill from left (positions 0 to seq_len-1)
-            start_pos = current_pos
-            end_pos = min(current_pos + seq_len, sliding_window)
-
-        self.kv_cache_local[key_cache_idx:key_cache_idx + 1, :, start_pos:end_pos, :] = key_states[:, :end_pos - start_pos, :]
-        self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, start_pos:end_pos, :] = value_states[:, :end_pos - start_pos, :]
+        # Prefill fill-mode uses fixed left-fill starting at 0 for ANE (static slicing)
+        start_pos = 0
+        end_pos = min(seq_len, sliding_window)
+        self.kv_cache_local[key_cache_idx:key_cache_idx + 1, :, start_pos:end_pos, :] = key_states[:, :end_pos, :]
+        self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, start_pos:end_pos, :] = value_states[:, :end_pos, :]
 
     def _update_kv_local_prefill(self, layer_idx: int, key_states: torch.Tensor,
                                  value_states: torch.Tensor, seq_len: int) -> None:
@@ -1103,25 +1130,36 @@ class Gemma3Model(nn.Module):
         self.kv_cache_local[value_cache_idx:value_cache_idx + 1, :, :, :] = shifted_value
 
     def _store_kv_global(self, layer_idx: int, key_states: torch.Tensor,
-                        value_states: torch.Tensor, current_pos: int) -> None:
+                        value_states: torch.Tensor, current_pos: int,
+                        update_mask: torch.Tensor | None = None) -> None:
         """
-        Store KV states in global cache. No rotation - direct indexing.
+        Store KV states in global cache using left-fill masked update.
 
         Args:
             layer_idx: Original layer index (0-17)
             key_states: Key tensor to store
             value_states: Value tensor to store
-            current_pos: Current position in the sequence
+            current_pos: Current position (unused, kept for API compatibility)
         """
         cache_idx = self._global_layer_indices.index(layer_idx)
         num_global = len(self._global_layer_indices)
         key_cache_idx = cache_idx
         value_cache_idx = cache_idx + num_global
 
-        # Direct storage at position (clamped to state_length)
-        pos = min(current_pos, self.config.state_length - 1)
-        self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, pos:pos + 1, :] = key_states
-        self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, pos:pos + 1, :] = value_states
+        if update_mask is None:
+            pos = min(current_pos, self.config.state_length - 1)
+            self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, pos:pos + 1, :] = key_states
+            self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, pos:pos + 1, :] = value_states
+        else:
+            update_mask_global = torch.narrow(update_mask, 2, 0, self.config.state_length)
+            key_slice = self.kv_cache_global[key_cache_idx:key_cache_idx + 1]
+            value_slice = self.kv_cache_global[value_cache_idx:value_cache_idx + 1]
+            self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, :, :] = self._apply_update_mask(
+                key_slice, key_states, update_mask_global
+            )
+            self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, :, :] = self._apply_update_mask(
+                value_slice, value_states, update_mask_global
+            )
 
     def _update_kv_global(self, layer_idx: int, key_states: torch.Tensor,
                           value_states: torch.Tensor) -> None:
@@ -1160,22 +1198,33 @@ class Gemma3Model(nn.Module):
         """
         Store KV states in global cache during prefill (multi-token).
 
+        Standard left-fill: store at [current_pos : current_pos + seq_len).
+
         Args:
             layer_idx: Original layer index (0-17)
             key_states: Key tensor, shape [1, seq_len, num_kv_heads, head_dim] or similar
             value_states: Value tensor, same shape as key_states
-            current_pos: Starting position in the sequence
-            seq_len: Number of tokens being prefilled
+            current_pos: Starting position (unused, kept for API compatibility)
+            seq_len: Number of tokens being prefilled (fixed at compile time)
         """
         cache_idx = self._global_layer_indices.index(layer_idx)
         num_global = len(self._global_layer_indices)
         key_cache_idx = cache_idx
         value_cache_idx = cache_idx + num_global
 
-        end = min(current_pos + seq_len, self.config.state_length)
-        actual_len = end - current_pos
-        self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, current_pos:end, :] = key_states[:, :actual_len, :]
-        self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, current_pos:end, :] = value_states[:, :actual_len, :]
+        sl = self.config.state_length
+
+        if seq_len > sl:
+            start = seq_len - sl
+            key_states = torch.narrow(key_states, 2, start, sl)
+            value_states = torch.narrow(value_states, 2, start, sl)
+            seq_len = sl
+
+        # Prefill fill-mode uses fixed left-fill starting at 0 for ANE (static slicing)
+        start_pos = 0
+        end_pos = min(seq_len, self.config.state_length)
+        self.kv_cache_global[key_cache_idx:key_cache_idx + 1, :, start_pos:end_pos, :] = key_states[:, :end_pos, :]
+        self.kv_cache_global[value_cache_idx:value_cache_idx + 1, :, start_pos:end_pos, :] = value_states[:, :end_pos, :]
 
     def _update_kv_global_prefill(self, layer_idx: int, key_states: torch.Tensor,
                                   value_states: torch.Tensor, seq_len: int) -> None:
@@ -1400,7 +1449,8 @@ class Gemma3Model(nn.Module):
 
         return hidden_states
 
-    def process_layer_regular(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset):
+    def process_layer_regular(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset,
+                              update_mask=None):
         """Process a single transformer layer in regular (non-prefill) mode"""
         layer = self.layers[layer_idx]
         batch_size = position_ids.shape[0]
@@ -1439,9 +1489,9 @@ class Gemma3Model(nn.Module):
                 if seq_len == 1:
                     # Single token storage with rotation for local cache
                     if self.config.layer_types[layer_idx] == "full_attention":
-                        self._store_kv_global(layer_idx, key_states, value_states, current_pos)
+                        self._store_kv_global(layer_idx, key_states, value_states, current_pos, update_mask)
                     else:
-                        self._store_kv_local(layer_idx, key_states, value_states, current_pos)
+                        self._store_kv_local(layer_idx, key_states, value_states, current_pos, update_mask)
                 else:
                     # Multi-token storage
                     if self.config.layer_types[layer_idx] == "full_attention":
@@ -1590,16 +1640,18 @@ class Gemma3Model(nn.Module):
 
         return hidden_states
 
-    def process_layer(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset, IN_PREFILL=False, IN_PREFILL_ROTATE=False):
+    def process_layer(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset,
+                      IN_PREFILL=False, IN_PREFILL_ROTATE=False, update_mask=None):
         """Process a single transformer layer, delegating to the appropriate mode-specific implementation"""
         if IN_PREFILL_ROTATE:
             return self.process_layer_prefill_rotate(layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset)
         elif IN_PREFILL:
             return self.process_layer_prefill(layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset)
         else:
-            return self.process_layer_regular(layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset)
+            return self.process_layer_regular(layer_idx, hidden_states, position_ids, causal_mask, current_pos, layer_offset, update_mask)
 
-    def process_layers(self, hidden_states, position_ids, causal_mask, current_pos, start_layer=0, end_layer=None, IN_PREFILL=False, IN_PREFILL_ROTATE=False):
+    def process_layers(self, hidden_states, position_ids, causal_mask, current_pos, start_layer=0, end_layer=None,
+                       IN_PREFILL=False, IN_PREFILL_ROTATE=False, update_mask=None):
         """Process a range of transformer layers"""
         if end_layer is None:
             end_layer = len(self.layers)
@@ -1611,7 +1663,7 @@ class Gemma3Model(nn.Module):
         for i in range(start_layer, end_layer):
             hidden_states = self.process_layer(
                 i, hidden_states, position_ids,
-                causal_mask, current_pos, layer_offset, IN_PREFILL, IN_PREFILL_ROTATE
+                causal_mask, current_pos, layer_offset, IN_PREFILL, IN_PREFILL_ROTATE, update_mask
             )
         return hidden_states
 
@@ -1621,6 +1673,7 @@ class Gemma3Model(nn.Module):
         causal_mask: torch.Tensor,
         position_ids: torch.LongTensor,
         current_pos: torch.LongTensor,
+        update_mask: torch.Tensor | None = None,
         IN_PREFILL: bool = False,
     ) -> torch.Tensor:
         """Forward pass through the transformer layers with KV cache support."""
@@ -1631,7 +1684,7 @@ class Gemma3Model(nn.Module):
         # Process layers (rotary embeddings are now retrieved per-layer based on layer type)
         hidden_states = self.process_layers(
             hidden_states, position_ids, causal_mask,
-            current_pos, start_layer=0, end_layer=None, IN_PREFILL=IN_PREFILL,
+            current_pos, start_layer=0, end_layer=None, IN_PREFILL=IN_PREFILL, update_mask=update_mask,
         )
 
         # Always apply final normalization - critical for correct model output
@@ -1823,6 +1876,7 @@ class Gemma3ForCausalLM(nn.Module):
                 causal_mask,
                 position_ids,
                 current_pos,
+                update_mask,
                 IN_PREFILL=IN_PREFILL,
             )
         else:
@@ -1832,6 +1886,7 @@ class Gemma3ForCausalLM(nn.Module):
                 causal_mask,
                 position_ids,
                 current_pos,
+                update_mask,
                 IN_PREFILL=IN_PREFILL,
             )
         

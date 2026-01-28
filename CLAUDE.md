@@ -168,6 +168,38 @@ The model conversion follows an 8-step process:
 
 3. **Weight Reshaping**: Weights from HuggingFace models need proper reshaping for Conv2d format
 
+4. **KV-Cache State Updates Must Use Static Slicing Only**:
+
+   Any slice bounds that depend on runtime values (`current_pos`, dynamic `seq_len`) will compile into
+   `slice_by_index` with unresolved parameters, causing ANE failure: "Failed to retrieve parameter end."
+
+   ```python
+   # ✅ OK - Static slices with fixed bounds
+   cache[:, :, 0:seq_len, :]           # seq_len is fixed at trace time (e.g., batch_size=64)
+   torch.narrow(cache, dim=2, start=1, length=sw-1)  # constant start/length
+
+   # ✅ OK - Rotation using shift-left + append with constant bounds
+   shifted = cache[:, :, 1:, :]        # constant slice
+   new_cache = torch.cat([shifted, new_kv], dim=2)
+
+   # ❌ NOT OK - Dynamic slice bounds
+   cache[:, :, current_pos:current_pos+1, :]      # dynamic start
+   cache[:, :, current_pos:current_pos+seq_len, :]  # dynamic start and end
+   cache[:, :, :current_pos+1, :]                 # dynamic end
+
+   # ❌ NOT OK - Mask/gather logic with int32 ops (blocks ANE)
+   mask = torch.arange(sw) >= current_pos  # greater_equal
+   result = torch.where(mask, new_val, cache)  # logical ops
+   ```
+
+   **Correct Semantics for KV Cache**:
+   - **Normal prefill** (< sliding_window): Left-fill from position 0 with static `[0:batch_size]`
+   - **Rotate prefill** (>= sliding_window): Shift-left + append using static `narrow()` + `cat()`
+   - **Single token infer**: Left-fill with static slice
+   - **Single token infer_rotate**: Shift-left + append with static bounds
+
+   If you need dynamic position writes, use separate compiled functions with fixed bounds for each case.
+
 ### Testing Infrastructure
 
 The project includes extensive testing files (test_*.py) focusing on:
@@ -178,6 +210,27 @@ The project includes extensive testing files (test_*.py) focusing on:
 - Single vs multi-token inference verification
 
 These tests are primarily for development validation rather than CI/CD.
+
+### IMPORTANT: CoreML Testing Guidelines
+
+**ALWAYS use Apple Neural Engine for testing** - NEVER use `CPU_ONLY`:
+```python
+# CORRECT - Always use ANE
+compute_unit = ct.ComputeUnit.CPU_AND_NE  # or ct.ComputeUnit.ALL
+
+# WRONG - Never use this for testing
+compute_unit = ct.ComputeUnit.CPU_ONLY  # Models may work on CPU but fail on ANE!
+```
+
+This is critical because:
+- Models are optimized specifically for ANE
+- CPU_ONLY may work but doesn't validate actual ANE compatibility
+- Production deployment targets ANE, so testing must use ANE
+
+**Known Issue**: Multi-function compiled models (.mlmodelc) with 4 functions may fail to load
+prefill functions on ANE with error: "function_name must be nil unless model type is ML Program".
+This is a CoreML limitation. Workaround: use `--split-rotate` to create separate files for
+rotate and non-rotate functions.
 
 ## Development Guidelines
 

@@ -5,7 +5,13 @@
       "Bash(diff:*)",
       "Bash(ls:*)",
       "Bash(swift build:*)",
-      "Bash(swift run:*)"
+      "Bash(swift run:*)",
+      "Bash(source:*)",
+      "Bash(python ./tests/chat.py:*)",
+      "Bash(cat:*)",
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "Bash(xcrun coremlcompiler compile:*)"
     ],
     "deny": []
   }
