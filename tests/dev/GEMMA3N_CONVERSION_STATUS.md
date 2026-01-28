@@ -33,6 +33,19 @@
 
 ## Key Technical Discoveries
 
+### 0. Prefill + Rotate Behavior (ANE-safe)
+
+**Correct prefill approach**:
+- **Left-fill for normal prefill (< sliding_window)**: Prefill stores KV from the left at `[current_pos : current_pos + seq_len)` using static slicing. If `seq_len > sliding_window`, trim with `torch.narrow` (positive start/length only). No right-fill for normal prefill.
+- **Rotate for sliding-window mode (>= sliding_window)**: Rotation uses shift-left-then-append:
+  - `torch.narrow(start=1, len=sw-1)` + `torch.cat([tail, new], dim=2)`
+  - Static slicing only (ANE-safe), no dynamic indices.
+- **Single-token fill vs rotate**: `infer` uses left-fill; `infer_rotate` uses shift-left-append. Left-fill for single token uses `update_mask` (float mask) instead of dynamic slices.
+- **Global cache behavior**: Global cache is left-fill for prefill and infer. Rotation only applies to local (sliding window) layers.
+- **No negative slicing**: All trimming uses `torch.narrow` with positive indices.
+
+**Intended behavior**: Left-fill for normal prefill and early tokens, rotate/right-fill after `sliding_window` with static slicing only.
+
 ### 1. KV Cache Position Indexing (FIXED)
 
 **Problem**: Using `int(current_pos)` or `current_pos.item()` in PyTorch becomes a constant during JIT tracing, causing all tokens to write to position 0.

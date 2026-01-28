@@ -8,7 +8,7 @@ copy the KV cache state between chunks after each prediction.
 import argparse
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import coremltools as ct
 import numpy as np
@@ -29,8 +29,11 @@ def load_mlpackage(path: Path) -> ct.models.MLModel:
 
 
 def find_infer_chunks(bundle_dir: Path) -> List[Path]:
-    chunks = sorted(bundle_dir.glob("gemma3n_infer_chunk_*of*.mlpackage"))
-    return chunks
+    return sorted(bundle_dir.glob("gemma3n_infer_chunk_*of*.mlpackage"))
+
+
+def find_infer_rotate_chunks(bundle_dir: Path) -> List[Path]:
+    return sorted(bundle_dir.glob("gemma3n_infer_rotate_chunk_*of*.mlpackage"))
 
 
 def concat_logits(outputs: dict) -> np.ndarray:
@@ -84,13 +87,18 @@ def apply_logit_softcap(logits: np.ndarray, softcap: float = 30.0) -> np.ndarray
 class ChunkedInferenceManager:
     """Manages stateful inference across multiple chunks with a single shared state."""
 
-    def __init__(self, chunk_models: List[ct.models.MLModel], state_name: str = "model_kv_cache_0"):
+    def __init__(
+        self,
+        chunk_models: List[ct.models.MLModel],
+        state_name: str = "model_kv_cache_0",
+        shared_state: Optional[ct.models.MLModelState] = None,
+    ):
         self.chunk_models = chunk_models
         self.state_name = state_name
         self.num_chunks = len(chunk_models)
 
         # Single unified state shared across all chunks (like tests/chat.py).
-        self.shared_state = self.chunk_models[0].make_state()
+        self.shared_state = shared_state or self.chunk_models[0].make_state()
 
         kv_cache = self.shared_state.read_state(state_name)
         self.kv_shape = np.array(kv_cache).shape
@@ -104,6 +112,12 @@ class ChunkedInferenceManager:
         """Reset shared state to zeros."""
         zero_kv = np.zeros(self.kv_shape, dtype=np.float16)
         self.shared_state.write_state(self.state_name, zero_kv)
+
+    def get_kv_cache(self) -> np.ndarray:
+        return np.array(self.shared_state.read_state(self.state_name))
+
+    def set_kv_cache(self, kv_cache: np.ndarray) -> None:
+        self.shared_state.write_state(self.state_name, kv_cache)
 
     def predict(self, inputs: dict) -> dict:
         """Run prediction through all chunks with a unified KV cache state."""
@@ -136,11 +150,13 @@ def main() -> None:
     parser.add_argument("--tokenizer", default=None, help="Tokenizer path or HF model id (optional)")
     parser.add_argument("--max-new-tokens", type=int, default=20, help="Max tokens to generate")
     parser.add_argument("--context-length", type=int, default=512, help="Context length")
+    parser.add_argument("--sliding-window", type=int, default=None, help="Sliding window size (default: KV cache length)")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     parser.add_argument("--top-k", type=int, default=0, help="Top-k sampling")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging (no-op)")
     parser.add_argument("--debug-tensors", action="store_true", help="Print tensor stats")
     parser.add_argument("--debug-steps", type=int, default=2, help="Steps to debug")
+    parser.add_argument("--debug-rotation", action="store_true", help="Log when infer_rotate is used")
     args = parser.parse_args()
 
     bundle = Path(args.bundle)
@@ -191,9 +207,22 @@ def main() -> None:
     print("\nInitializing chunked inference manager with state sharing...")
     infer_manager = ChunkedInferenceManager(infer_chunk_models)
 
+    # Optional rotate models
+    rotate_chunk_paths = find_infer_rotate_chunks(model_dir)
+    if not rotate_chunk_paths:
+        rotate_single = model_dir / "gemma3n_infer_rotate.mlpackage"
+        if rotate_single.exists():
+            rotate_chunk_paths = [rotate_single]
+    infer_rotate_manager = None
+    if rotate_chunk_paths:
+        rotate_models = [load_mlpackage(p) for p in rotate_chunk_paths]
+        infer_rotate_manager = ChunkedInferenceManager(rotate_models, shared_state=rotate_models[0].make_state())
+        print(f"Loaded {len(rotate_models)} infer_rotate {'chunk' if len(rotate_models) > 1 else 'model'}")
+
     # Infer actual head dimension/context length from KV cache state
     head_dim = infer_manager.head_dim
     ctx_len = infer_manager.context_length
+    sliding_window = int(args.sliding_window or ctx_len)
 
     # Note: Position-specific masks are created per-step via create_position_mask()
     # This avoids gather() issues in CoreML tracing
@@ -222,6 +251,7 @@ def main() -> None:
 
     # Prefill phase
     last_hidden = None
+    active_manager = infer_manager
     prefill_start = time.time()
     for pos, tok in enumerate(token_ids):
         t0 = time.perf_counter()
@@ -239,7 +269,14 @@ def main() -> None:
         pos_one_hot = create_position_one_hot(pos, ctx_len)
         cos_local, sin_local, cos_global, sin_global = create_rotary_embeddings(pos, head_dim)
 
-        out = infer_manager.predict({
+        # Switch to rotate after sliding_window if available
+        if infer_rotate_manager is not None and pos >= sliding_window:
+            if active_manager is not infer_rotate_manager:
+                infer_rotate_manager.set_kv_cache(active_manager.get_kv_cache())
+                active_manager = infer_rotate_manager
+                if args.debug_rotation:
+                    print(f"\n[rotation] prefill switch at pos={pos} (sliding_window={sliding_window})")
+        out = active_manager.predict({
             "hidden_states": hidden_states,
             "per_layer_inputs": per_layer_inputs,
             "causal_mask": pos_mask,
@@ -250,7 +287,7 @@ def main() -> None:
             "rotary_cos_global": cos_global,
             "rotary_sin_global": sin_global,
         })
-        for i, t in enumerate(infer_manager.last_chunk_times):
+        for i, t in enumerate(active_manager.last_chunk_times):
             timing["infer_chunks"][i] += t
             timing_counts["infer_chunks"][i] += 1
         hidden_states = out["output_hidden_states"]
@@ -308,7 +345,13 @@ def main() -> None:
         pos_one_hot = create_position_one_hot(current_pos, ctx_len)
         cos_local, sin_local, cos_global, sin_global = create_rotary_embeddings(current_pos, head_dim)
 
-        out = infer_manager.predict({
+        if infer_rotate_manager is not None and current_pos >= sliding_window:
+            if active_manager is not infer_rotate_manager:
+                infer_rotate_manager.set_kv_cache(active_manager.get_kv_cache())
+                active_manager = infer_rotate_manager
+                if args.debug_rotation:
+                    print(f"\n[rotation] infer switch at pos={current_pos} (sliding_window={sliding_window})")
+        out = active_manager.predict({
             "hidden_states": hidden_states,
             "per_layer_inputs": per_layer_inputs,
             "causal_mask": pos_mask,
@@ -319,7 +362,7 @@ def main() -> None:
             "rotary_cos_global": cos_global,
             "rotary_sin_global": sin_global,
         })
-        for i, t in enumerate(infer_manager.last_chunk_times):
+        for i, t in enumerate(active_manager.last_chunk_times):
             timing["infer_chunks"][i] += t
             timing_counts["infer_chunks"][i] += 1
         hidden_states = out["output_hidden_states"]

@@ -1604,10 +1604,15 @@ class Gemma3nModel(nn.Module):
         if sw <= 0:
             return
         window_len = min(sw, kv_cache.shape[2])
+        if window_len <= 1:
+            kv_cache[key_idx:key_idx + 1, :, :window_len, :] = key_states.half()
+            kv_cache[value_idx:value_idx + 1, :, :window_len, :] = value_states.half()
+            return
 
         key_slice = kv_cache[key_idx:key_idx + 1, :, :window_len, :]
         value_slice = kv_cache[value_idx:value_idx + 1, :, :window_len, :]
 
+        # Shift-left-then-append using static narrow (ANE-safe)
         key_tail = torch.narrow(key_slice, 2, 1, window_len - 1)
         value_tail = torch.narrow(value_slice, 2, 1, window_len - 1)
 
@@ -1653,7 +1658,12 @@ class Gemma3nModel(nn.Module):
         value_states: torch.Tensor,
         current_pos: torch.Tensor,
     ) -> None:
-        """Store local KV cache for prefill with optional rotation."""
+        """Store local KV cache for prefill with optional rotation.
+
+        NOTE: Prefill fill mode must use static slice bounds for ANE.
+        We therefore left-fill from 0 (static), and only rotate when
+        force_rotation_mode is explicitly enabled.
+        """
         sw = self._get_local_window()
         if sw <= 0:
             return
@@ -1664,14 +1674,8 @@ class Gemma3nModel(nn.Module):
         if force_rotation is True:
             self._update_kv_local_prefill(kv_cache, key_idx, value_idx, key_states, value_states, seq_len)
             return
-        if force_rotation is False:
-            self._fill_kv_local_prefill(kv_cache, key_idx, value_idx, key_states, value_states, current_pos, seq_len, window_len)
-            return
-
-        if current_pos.long() + seq_len <= window_len:
-            self._fill_kv_local_prefill(kv_cache, key_idx, value_idx, key_states, value_states, current_pos, seq_len, window_len)
-        else:
-            self._update_kv_local_prefill(kv_cache, key_idx, value_idx, key_states, value_states, seq_len)
+        # Default (fill) path: always left-fill from 0 for prefill.
+        self._fill_kv_local_prefill(kv_cache, key_idx, value_idx, key_states, value_states, current_pos, seq_len, window_len)
 
     def _fill_kv_local_prefill(
         self,
@@ -1684,13 +1688,21 @@ class Gemma3nModel(nn.Module):
         seq_len: int,
         window_len: int,
     ) -> None:
-        """Fill local KV cache for prefill (no rotation)."""
-        start_pos = int(current_pos.item())
-        end_pos = min(start_pos + seq_len, window_len)
-        if end_pos <= start_pos:
-            return
-        kv_cache[key_idx:key_idx + 1, :, start_pos:end_pos, :] = key_states[:, :, :end_pos - start_pos, :].half()
-        kv_cache[value_idx:value_idx + 1, :, start_pos:end_pos, :] = value_states[:, :, :end_pos - start_pos, :].half()
+        """Fill local KV cache for prefill (no rotation) using LEFT-fill pattern.
+
+        Writes KV at [0 : seq_len) with static slice bounds.
+        If seq_len exceeds the window, trim to the last window_len tokens using
+        torch.narrow (positive indices only), then left-fill from position 0.
+        """
+        if seq_len > window_len:
+            start_idx = seq_len - window_len
+            key_states = torch.narrow(key_states, 2, start_idx, window_len)
+            value_states = torch.narrow(value_states, 2, start_idx, window_len)
+            seq_len = window_len
+        end_pos = seq_len
+
+        kv_cache[key_idx:key_idx + 1, :, :end_pos, :] = key_states[:, :, :seq_len, :].half()
+        kv_cache[value_idx:value_idx + 1, :, :end_pos, :] = value_states[:, :, :seq_len, :].half()
 
     def _update_kv_local_prefill(
         self,
@@ -1701,26 +1713,40 @@ class Gemma3nModel(nn.Module):
         value_states: torch.Tensor,
         seq_len: int,
     ) -> None:
-        """Rotate local KV cache for prefill (shift left by seq_len, append)."""
+        """Rotate local KV cache for prefill (shift left by seq_len, append).
+
+        For ANE compatibility, uses POSITIVE slice indices only.
+        Shift-then-store pattern with static bounds using torch.narrow + torch.cat().
+        """
         sw = self._get_local_window()
         if sw <= 0:
             return
         window_len = min(sw, kv_cache.shape[2])
 
         if seq_len >= window_len:
-            # Keep only the last window_len tokens
-            kv_cache[key_idx:key_idx + 1, :, :window_len, :] = key_states[:, :, -window_len:, :].half()
-            kv_cache[value_idx:value_idx + 1, :, :window_len, :] = value_states[:, :, -window_len:, :].half()
+            # Keep only the last window_len tokens - use POSITIVE indices for ANE
+            # Instead of key_states[:, :, -window_len:, :], use explicit positive range
+            start_idx = seq_len - window_len
+            trimmed_keys = torch.narrow(key_states, 2, start_idx, window_len)
+            trimmed_values = torch.narrow(value_states, 2, start_idx, window_len)
+            kv_cache[key_idx:key_idx + 1, :, :window_len, :] = trimmed_keys.half()
+            kv_cache[value_idx:value_idx + 1, :, :window_len, :] = trimmed_values.half()
             return
 
+        # Shift left by seq_len, store new tokens at end
+        # Using POSITIVE slice indices for ANE compatibility
         key_slice = kv_cache[key_idx:key_idx + 1, :, :window_len, :]
         value_slice = kv_cache[value_idx:value_idx + 1, :, :window_len, :]
 
-        key_tail = torch.narrow(key_slice, 2, seq_len, window_len - seq_len)
-        value_tail = torch.narrow(value_slice, 2, seq_len, window_len - seq_len)
+        # Keep positions seq_len to window_len-1 (tail of old cache)
+        tail_len = window_len - seq_len
+        key_tail = torch.narrow(key_slice, 2, seq_len, tail_len)
+        value_tail = torch.narrow(value_slice, 2, seq_len, tail_len)
 
-        shifted_key = torch.cat([key_tail, key_states], dim=2)
-        shifted_value = torch.cat([value_tail, value_states], dim=2)
+        # Concatenate: [old tail] + [new tokens] -> fills entire window
+        # key_states shape: [1, heads, seq_len, dim] - take first seq_len tokens (all of them)
+        shifted_key = torch.cat([key_tail, key_states[:, :, :seq_len, :]], dim=2)
+        shifted_value = torch.cat([value_tail, value_states[:, :, :seq_len, :]], dim=2)
 
         kv_cache[key_idx:key_idx + 1, :, :window_len, :] = shifted_key.half()
         kv_cache[value_idx:value_idx + 1, :, :window_len, :] = shifted_value.half()
@@ -1906,37 +1932,19 @@ class Gemma3nModel(nn.Module):
                     current_pos,
                 )
             else:
-                # Dynamic position update using element-wise range mask (traces well in CoreML)
-                # For prefill, we write prefill_seq_len tokens starting at current_pos
-                positions = torch.arange(cache_seq_len, device=kv_cache.device, dtype=torch.long)
-                pos_start = current_pos.long()
-                pos_end = pos_start + prefill_seq_len
+                # Prefill fill mode: left-fill from 0 with static slice bounds
+                if prefill_seq_len > cache_seq_len:
+                    start_idx = prefill_seq_len - cache_seq_len
+                    key_trim = torch.narrow(key_states, 2, start_idx, cache_seq_len)
+                    value_trim = torch.narrow(value_states, 2, start_idx, cache_seq_len)
+                    write_len = cache_seq_len
+                else:
+                    key_trim = key_states[:, :, :prefill_seq_len, :]
+                    value_trim = value_states[:, :, :prefill_seq_len, :]
+                    write_len = prefill_seq_len
 
-                # Create range mask: 1.0 for positions in [current_pos, current_pos + prefill_seq_len)
-                range_mask = ((positions >= pos_start) & (positions < pos_end)).float().view(1, 1, cache_seq_len, 1)
-
-                # Get current cache slices
-                kv_key_slice = kv_cache[key_idx:key_idx + 1]  # [1, heads, cache_seq_len, dim]
-                kv_value_slice = kv_cache[value_idx:value_idx + 1]
-
-                # Pad key_states to cache_seq_len by creating a full-size tensor
-                # and placing key_states at the appropriate positions
-                key_states_padded = torch.zeros_like(kv_key_slice)
-                value_states_padded = torch.zeros_like(kv_value_slice)
-
-                # For prefill, use slice assignment (position is known at trace time for prefill)
-                # This is acceptable because prefill position is typically 0
-                pos = current_pos.item()  # OK for prefill - position is constant
-                key_states_padded[:, :, pos:pos + prefill_seq_len, :] = key_states.half()
-                value_states_padded[:, :, pos:pos + prefill_seq_len, :] = value_states.half()
-
-                # Update using mask (positions in range get new values, others keep old)
-                updated_keys = kv_key_slice * (1.0 - range_mask) + key_states_padded * range_mask
-                updated_values = kv_value_slice * (1.0 - range_mask) + value_states_padded * range_mask
-
-                # Write back to kv_cache (CoreML state update)
-                kv_cache[key_idx:key_idx + 1] = updated_keys.half()
-                kv_cache[value_idx:value_idx + 1] = updated_values.half()
+                kv_cache[key_idx:key_idx + 1, :, :write_len, :] = key_trim.half()
+                kv_cache[value_idx:value_idx + 1, :, :write_len, :] = value_trim.half()
 
             key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
             value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
