@@ -87,7 +87,7 @@ public struct YAMLConfig: Sendable {
             self.ffnPath = rawFFNPath
         }
 
-        self.configVersion = yaml["version"] as? String ?? "0.3.4"
+        self.configVersion = yaml["version"] as? String ?? "0.3.5"
     }
     
     /// Load configuration from a file path

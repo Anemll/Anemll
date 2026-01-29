@@ -231,7 +231,7 @@ def main():
     # Build metadata with per_channel info if available
     meta_parts = [f'''model_info:
   name: anemll-{MODEL_NAME}-ctx{CONTEXT}
-  version: 0.3.4
+  version: 0.3.5
   description: |
     Demonstarates running {MODEL_NAME} on Apple Neural Engine
     Context length: {CONTEXT}
