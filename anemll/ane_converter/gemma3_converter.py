@@ -270,7 +270,7 @@ class Gemma3Converter(BaseConverter):
             return False
 
     @staticmethod
-    def GetTransformerStates(model, part=None, prefix="model.model."):
+    def GetTransformerStates(model, part=None, prefix="model.model.", start_layer=None, end_layer=None):
         """Get the transformer states for CoreML conversion.
 
         For split cache mode (Gemma3 local/global attention):
@@ -280,6 +280,13 @@ class Gemma3Converter(BaseConverter):
 
         For unified cache mode (legacy):
         - Returns ONE state tensor: kv_cache_0
+
+        Args:
+            model: The model to get states from
+            part: Part identifier (legacy, unused)
+            prefix: Prefix for state tensor names
+            start_layer: Start layer index for chunk-aware states (optional)
+            end_layer: End layer index for chunk-aware states (optional)
         """
         head_dim = getattr(
             model.config,
@@ -292,45 +299,70 @@ class Gemma3Converter(BaseConverter):
 
         if use_split_cache:
             # Split cache mode for Gemma3 local/global attention
-            # Count layers by type
+            # Count layers by type (total in model)
             num_global_layers = sum(1 for t in model.config.layer_types
                                    if t == "full_attention")
             num_local_layers = model.config.num_hidden_layers - num_global_layers
 
             sliding_window = model.config.sliding_window  # 512
 
+            # Determine which cache types are needed for this chunk
+            need_local = True
+            need_global = True
+
+            if start_layer is not None:
+                # Check if chunk has any global/local attention layers
+                if end_layer is None:
+                    end_layer = model.config.num_hidden_layers
+                chunk_layers = range(start_layer, end_layer)
+                chunk_layer_types = [model.config.layer_types[i] for i in chunk_layers]
+
+                need_global = "full_attention" in chunk_layer_types
+                need_local = "sliding_attention" in chunk_layer_types
+
+                if not need_global or not need_local:
+                    print(f"GetTransformerStates: Chunk layers {start_layer}-{end_layer-1}")
+                    print(f"  Need local cache: {need_local}, Need global cache: {need_global}")
+
             print(f"GetTransformerStates: SPLIT CACHE mode")
             print(f"  {num_local_layers} local layers -> kv_cache_local [{2*num_local_layers}, {model.config.num_key_value_heads}, {sliding_window}, {head_dim}]")
             print(f"  {num_global_layers} global layers -> kv_cache_global [{2*num_global_layers}, {model.config.num_key_value_heads}, {model.config.state_length}, {head_dim}]")
 
-            states = [
-                # Local cache for sliding window layers
-                ct.StateType(
-                    wrapped_type=ct.TensorType(
-                        shape=(
-                            2 * num_local_layers,  # K and V for local layers
-                            model.config.num_key_value_heads,
-                            sliding_window,  # 512 positions
-                            head_dim,
+            states = []
+
+            # Only include local cache if this chunk has local attention layers
+            if need_local:
+                states.append(
+                    ct.StateType(
+                        wrapped_type=ct.TensorType(
+                            shape=(
+                                2 * num_local_layers,  # K and V for local layers
+                                model.config.num_key_value_heads,
+                                sliding_window,  # 512 positions
+                                head_dim,
+                            ),
+                            dtype=np.float16,
                         ),
-                        dtype=np.float16,
-                    ),
-                    name=f"{prefix}kv_cache_local",
-                ),
-                # Global cache for full attention layers
-                ct.StateType(
-                    wrapped_type=ct.TensorType(
-                        shape=(
-                            2 * num_global_layers,  # K and V for global layers
-                            model.config.num_key_value_heads,
-                            model.config.state_length,  # Full context length
-                            head_dim,
+                        name=f"{prefix}kv_cache_local",
+                    )
+                )
+
+            # Only include global cache if this chunk has global attention layers
+            if need_global:
+                states.append(
+                    ct.StateType(
+                        wrapped_type=ct.TensorType(
+                            shape=(
+                                2 * num_global_layers,  # K and V for global layers
+                                model.config.num_key_value_heads,
+                                model.config.state_length,  # Full context length
+                                head_dim,
+                            ),
+                            dtype=np.float16,
                         ),
-                        dtype=np.float16,
-                    ),
-                    name=f"{prefix}kv_cache_global",
-                ),
-            ]
+                        name=f"{prefix}kv_cache_global",
+                    )
+                )
         else:
             # Legacy unified cache mode
             num_layers = model.config.num_hidden_layers
@@ -1106,7 +1138,8 @@ class Gemma3Converter(BaseConverter):
                 self.start_layer = start_layer
                 self.end_layer = end_layer
                 self.states = Gemma3Converter.GetTransformerStates(
-                    model, part="2", prefix="model.model."
+                    model, part="2", prefix="model.model.",
+                    start_layer=start_layer, end_layer=end_layer
                 )
 
             def forward(self, hidden_states, position_ids, causal_mask, current_pos):
@@ -1160,7 +1193,8 @@ class Gemma3Converter(BaseConverter):
                 ),
             ],
             outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
-            states=self.GetTransformerStates(model, part=None, prefix="model.model."),
+            states=self.GetTransformerStates(model, part=None, prefix="model.model.",
+                                             start_layer=start_layer, end_layer=end_layer),
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
@@ -1222,7 +1256,8 @@ class Gemma3Converter(BaseConverter):
                 self.end_layer = end_layer
                 self.is_prefill_rotate = is_prefill_rotate
                 self.states = Gemma3Converter.GetTransformerStates(
-                    model, part="2_prefill", prefix="model.model."
+                    model, part="2_prefill", prefix="model.model.",
+                    start_layer=start_layer, end_layer=end_layer
                 )
 
             def forward(self, hidden_states, position_ids, causal_mask, current_pos):
@@ -1642,6 +1677,14 @@ def parse_args() -> argparse.Namespace:
              "Recommended: 0.48 for 270M, 0.82 for 1B, 0.1875 for 4B QAT. "
              "See anemll/models/GEMMA3_FP16_SCALING.md for details.",
     )
+    parser.add_argument(
+        "--clamp",
+        type=float,
+        default=None,
+        help="Enable runtime residual clamping at the specified value (e.g., 55000). "
+             "This adds clamp ops to the CoreML model to prevent FP16 overflow. "
+             "Alternative to --fp16-scale for models that need runtime overflow protection.",
+    )
 
     return parser.parse_args()
 
@@ -1776,6 +1819,7 @@ def test_conversion(
     force: bool = False,
     decorate: bool = False,
     fp16_scale: Optional[str] = None,
+    clamp: Optional[float] = None,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
     """Convert a Gemma3 model and save the result.
 
@@ -1877,6 +1921,12 @@ def test_conversion(
         print(
             f"Updated config: context_length={config.context_length}, state_length={config.state_length}, attention_size={config.attention_size}, sliding_window={config.sliding_window}, batch_size={config.batch_size}"
         )
+
+        # Enable residual clamping if specified (alternative to FP16 scaling)
+        if clamp is not None:
+            config.enable_residual_clamp = True
+            config.residual_clamp_value = clamp
+            print(f"Enabling residual clamping at {clamp}")
 
         print("Creating model...")
         model = Gemma3ForCausalLM(config, enable_coreml=True)
@@ -2056,6 +2106,7 @@ def main() -> None:
             force=args.force,
             decorate=args.decorate,
             fp16_scale=args.fp16_scale,
+            clamp=args.clamp,
         )
         print(f"Conversion completed successfully! Result: {type(result)}")
     except Exception as e:  # pragma: no cover - CLI tool
