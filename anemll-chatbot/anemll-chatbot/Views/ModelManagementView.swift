@@ -558,6 +558,17 @@ struct ModelManagementView: View {
                 
                 Divider()
                 
+                // Custom model section - at top for easy access
+                CustomModelSection(
+                    customModelURL: $customModelURL,
+                    customModelName: $customModelName,
+                    isAddingCustomModel: $isAddingModel,
+                    isCustomModelSheetActive: $isCustomModelSheetActive,
+                    onAddCustomModel: addCustomModel
+                )
+
+                Divider()
+
                 // Available models section with clear heading
                 VStack(alignment: .leading, spacing: 8) {
                     if !modelsList.contains(where: { $0.isDownloaded }) {
@@ -566,7 +577,7 @@ struct ModelManagementView: View {
                             .foregroundColor(.secondary)
                             .padding(.top, 4)
                     }
-                    
+
                     AvailableModelsSection(
                         models: modelsList,
                         onDownload: downloadModel,
@@ -584,49 +595,22 @@ struct ModelManagementView: View {
                         modelErrors: modelErrors
                     )
                 }
-                
-                Divider()
-                
-                // Custom model section
-                CustomModelSection(
-                    customModelURL: $customModelURL,
-                    customModelName: $customModelName,
-                    isAddingCustomModel: $isAddingModel,
-                    isCustomModelSheetActive: $isCustomModelSheetActive,
-                    onAddCustomModel: addCustomModel
-                )
             }
             .padding()
             .id(refreshID)
         }
         .onTapGesture {
-            if !isCustomModelSheetActive {
-                let state = signposter.beginInterval("TapGesture", id: signpostID)
+            // Don't dismiss keyboard if custom model sheet is active
+            if !isCustomModelSheetActive && !isAddingModel {
                 dismissKeyboard()
-                signposter.endInterval("TapGesture", state)
             }
         }
         .simultaneousGesture(DragGesture().onChanged { _ in
-            if !isCustomModelSheetActive {
-                let state = signposter.beginInterval("DragGesture", id: signpostID)
+            // Don't dismiss keyboard if custom model sheet is active
+            if !isCustomModelSheetActive && !isAddingModel {
                 dismissKeyboard()
-                signposter.endInterval("DragGesture", state)
             }
         })
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
-            if !isCustomModelSheetActive {
-                let state = signposter.beginInterval("KeyboardWillShow", id: signpostID)
-                dismissKeyboard()
-                signposter.endInterval("KeyboardWillShow", state)
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
-            if !isCustomModelSheetActive {
-                let state = signposter.beginInterval("KeyboardDidShow", id: signpostID)
-                dismissKeyboard()
-                signposter.endInterval("KeyboardDidShow", state)
-            }
-        }
     }
     
     // Confirmation buttons for model loading
@@ -931,6 +915,12 @@ struct ModelManagementView: View {
     
     // Optimized model refresh with performance tracking
     private func refreshModels(fullRefresh: Bool = true) {
+        // Don't refresh while user is adding a custom model - prevents sheet dismissal
+        guard !isAddingModel && !isCustomModelSheetActive else {
+            print("DEBUG: Skipping refresh - custom model sheet is active")
+            return
+        }
+
         Task {
             // Get models that are marked as downloaded
             let downloadedModels = modelsList.filter { $0.isDownloaded }
@@ -949,21 +939,28 @@ struct ModelManagementView: View {
                 let expectedSize = model.size
                 let sizePercentage = Float(actualSize) / Float(expectedSize) * 100.0
                 
-                // Check for specific LUT-related errors
-                let missingFiles = verificationDetails.missingFiles
-                let lutErrors = missingFiles.filter { $0.contains("_lut") }
-                if !lutErrors.isEmpty {
-                    let errorMsg = "Missing LUT files: \(lutErrors.joined(separator: ", "))"
-                    modelErrors[model.id] = errorMsg
-                    print("🚨 \(errorMsg)")
+                // Use errorReason from verification if available
+                if let errorReason = verificationDetails.errorReason {
+                    modelErrors[model.id] = errorReason
                     incompleteModels.insert(model.id)
+                    print("🚨 \(errorReason)")
+                } else {
+                    // Fallback: Check for specific LUT-related errors
+                    let missingFiles = verificationDetails.missingFiles
+                    let lutErrors = missingFiles.filter { $0.contains("_lut") }
+                    if !lutErrors.isEmpty {
+                        let errorMsg = "Missing LUT files: \(lutErrors.joined(separator: ", "))"
+                        modelErrors[model.id] = errorMsg
+                        print("🚨 \(errorMsg)")
+                        incompleteModels.insert(model.id)
+                    }
                 }
-                
+
                 if actualSize == 0 || (!isValid && sizePercentage < 5.0) {
                     // Model is completely missing
                     print("🚨 Model \(model.id) is completely missing - valid: \(isValid), size: \(formatFileSize(actualSize))/\(formatFileSize(expectedSize)) (\(String(format: "%.1f", sizePercentage))%)")
                     completelyMissingModels.insert(model.id)
-                    
+
                     // Mark it as not downloaded
                     await MainActor.run {
                         model.isDownloaded = false
@@ -972,8 +969,8 @@ struct ModelManagementView: View {
                     // If files are missing or size is significantly less than expected
                     print("⚠️ Model \(model.id) is incomplete - valid: \(isValid), size: \(formatFileSize(actualSize))/\(formatFileSize(expectedSize)) (\(String(format: "%.1f", sizePercentage))%)")
                     incompleteModels.insert(model.id)
-                    
-                    // Add size error if no LUT error already exists
+
+                    // Add size error if no error reason already exists
                     if modelErrors[model.id] == nil {
                         modelErrors[model.id] = "Incomplete download: \(String(format: "%.1f", sizePercentage))% of expected size"
                     }
@@ -1517,71 +1514,75 @@ struct ModelManagementView: View {
     // Function to force a complete redownload
     private func forceRedownloadModel(_ model: Model) {
         print("Force redownloading model: \(model.id)")
-        
+
         // Mark model as downloading
         isDownloading[model.id] = true
-        
+
         // Reset progress
         downloadProgress[model.id] = 0.0
-        
-        // Initiate full redownload
-        modelService.forceRedownload(model: model) { file, progress in
-            // Update progress on main thread
-            DispatchQueue.main.async {
-                self.downloadProgress[model.id] = progress
-                self.currentDownloadingFile[model.id] = file
-            }
-        }
-        
-        // Handle download completion and verification 
-        Task {
-            // Wait for the download to complete (this is a placeholder for proper download completion detection)
-            // Ideally this would be handled with a proper async/await pattern or callback
-            try? await Task.sleep(nanoseconds: 5_000_000_000) // 5 seconds to allow for a full redownload
-            
-            // Update UI to show download complete
-            await MainActor.run {
-                self.isDownloading[model.id] = false
-                self.downloadProgress[model.id] = 1.0
-                self.currentDownloadingFile[model.id] = "Verifying..."
-                
-                // Show success message
-                self.successMessage = "Model '\(model.name)' redownloaded successfully."
-                self.showSuccess = true
-            }
-            
-            // Perform verification after full redownload
-            print("🔍 Verifying after complete redownload of model: \(model.id)")
-            let verificationDetails = self.modelService.verifyModelWithDetails(modelId: model.id, verbose: false)
-            let isValid = verificationDetails.isValid
-            let actualSize = verificationDetails.actualSize
-            let expectedSize = model.size
-            let sizePercentage = Float(actualSize) / Float(expectedSize) * 100.0
-            
-            // Log verification results
-            if !isValid || sizePercentage < 95.0 {
-                // If files are missing or size is significantly less than expected
-                print("⚠️ Model \(model.id) still has issues after full redownload - valid: \(isValid), size: \(self.formatFileSize(actualSize))/\(self.formatFileSize(expectedSize)) (\(String(format: "%.1f", sizePercentage))%)")
-                
-                // Update incomplete models collection
-                _ = await MainActor.run {
-                    self.modelsWithIncompleteFiles.insert(model.id)
+        currentDownloadingFile[model.id] = "Preparing for download..."
+
+        // Use the proper forceRedownloadModel method with completion handler
+        modelService.forceRedownloadModel(
+            modelId: model.id,
+            fileProgress: { file, progress in
+                // Update progress on main thread
+                DispatchQueue.main.async {
+                    self.downloadProgress[model.id] = progress
+                    self.currentDownloadingFile[model.id] = file
                 }
-            } else {
-                print("✅ Model \(model.id) full redownload successful - size: \(self.formatFileSize(actualSize))/\(self.formatFileSize(expectedSize)) (\(String(format: "%.1f", sizePercentage))%)")
-                
-                // Remove from incomplete models as it should be fixed after complete redownload
-                _ = await MainActor.run {
-                    self.modelsWithIncompleteFiles.remove(model.id)
+            },
+            completion: { success in
+                // Update UI on completion - this is called when download actually finishes
+                DispatchQueue.main.async {
+                    self.isDownloading[model.id] = false
+
+                    if success {
+                        self.downloadProgress[model.id] = 1.0
+                        self.currentDownloadingFile[model.id] = "Verifying..."
+
+                        // Perform verification after redownload
+                        Task {
+                            print("🔍 Verifying after complete redownload of model: \(model.id)")
+                            let verificationDetails = self.modelService.verifyModelWithDetails(modelId: model.id, verbose: false)
+                            let isValid = verificationDetails.isValid
+                            let actualSize = verificationDetails.actualSize
+                            let expectedSize = model.size
+                            let sizePercentage = Float(actualSize) / Float(expectedSize) * 100.0
+
+                            await MainActor.run {
+                                // Log verification results
+                                if !isValid || sizePercentage < 95.0 {
+                                    print("⚠️ Model \(model.id) still has issues after full redownload - valid: \(isValid), size: \(self.formatFileSize(actualSize))/\(self.formatFileSize(expectedSize)) (\(String(format: "%.1f", sizePercentage))%)")
+                                    self.modelsWithIncompleteFiles.insert(model.id)
+                                    self.successMessage = "Model '\(model.name)' downloaded but verification found issues."
+                                } else {
+                                    print("✅ Model \(model.id) full redownload successful - size: \(self.formatFileSize(actualSize))/\(self.formatFileSize(expectedSize)) (\(String(format: "%.1f", sizePercentage))%)")
+                                    self.modelsWithIncompleteFiles.remove(model.id)
+                                    self.successMessage = "Model '\(model.name)' redownloaded successfully."
+                                }
+
+                                self.showSuccess = true
+                                self.currentDownloadingFile[model.id] = "Verification complete"
+                                self.refreshModels(fullRefresh: true)
+                            }
+                        }
+                    } else {
+                        // Download failed - check for error message
+                        let errorMsg = self.modelService.getDownloadError(for: model.id) ?? "Unknown error"
+                        self.currentDownloadingFile[model.id] = "Error: \(errorMsg)"
+                        self.downloadProgress[model.id] = 0.0
+
+                        // Check if it was paused with resume data
+                        if self.modelService.hasResumeData(for: model.id) {
+                            self.currentDownloadingFile[model.id] = "Download paused - can be resumed"
+                        }
+
+                        self.refreshModels(fullRefresh: true)
+                    }
                 }
             }
-            
-            // Update UI with completed status
-            await MainActor.run {
-                self.currentDownloadingFile[model.id] = "Verification complete"
-                self.refreshModels(fullRefresh: true)
-            }
-        }
+        )
     }
     
     // Function to initiate model download
@@ -2145,17 +2146,9 @@ extension ModelService {
     }
     
     // Force a complete redownload by deleting and redownloading
-    func forceRedownload(model: Model, fileProgress: @escaping (String, Double) -> Void) {
-        // First delete the model files
-        let modelPath = getModelPath(for: model.id)
-        if FileManager.default.fileExists(atPath: modelPath.path) {
-            try? FileManager.default.removeItem(at: modelPath)
-        }
-        
-        // Then download it again
-        downloadModel(modelId: model.id, fileProgress: fileProgress, completion: { _ in
-            // Completion handled by caller
-        })
+    func forceRedownload(model: Model, fileProgress: @escaping (String, Double) -> Void, completion: @escaping (Bool) -> Void = { _ in }) {
+        // Use the proper forceRedownloadModel method which handles cleanup and restart
+        forceRedownloadModel(modelId: model.id, fileProgress: fileProgress, completion: completion)
     }
 }
 

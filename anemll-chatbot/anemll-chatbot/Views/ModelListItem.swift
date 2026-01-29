@@ -17,7 +17,9 @@ struct ModelListItem: View {
     
     // Check if the model has incomplete files
     let hasIncompleteFiles: Bool
-    
+    // Error message for incomplete/corrupt files
+    var errorMessage: String? = nil
+
     // Format file size nicely
     private func formatFileSize(_ size: Int) -> String {
         let formatter = ByteCountFormatter()
@@ -49,24 +51,42 @@ struct ModelListItem: View {
                             .foregroundColor(.secondary)
                     }
                     
-                    HStack {
-                        Text("Size: \(formatFileSize(model.size))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            
-                        if isDownloaded && hasIncompleteFiles {
-                            Text("Files incomplete")
-                                .font(.caption)
-                                .foregroundColor(.orange)
-                        }
-                    }
+                    Text("Size: \(formatFileSize(model.size))")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
                 .contentShape(Rectangle())
                 .onTapGesture {
                     onShowInfo()
                 }
-                
+
                 Spacer()
+            }
+
+            // Error banner for incomplete files - more visible
+            if isDownloaded && hasIncompleteFiles {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.white)
+                        .font(.system(size: 14))
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Download Required")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.white)
+
+                        Text(errorMessage ?? "Model has missing or empty weight files")
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.9))
+                            .lineLimit(2)
+                    }
+
+                    Spacer()
+                }
+                .padding(10)
+                .background(Color.orange)
+                .cornerRadius(8)
             }
             
             // Horizontal button row
@@ -157,33 +177,11 @@ struct ModelListItem: View {
             
             // Download progress indicator (only shown when downloading)
             if isDownloading {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Downloading...")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        
-                        Spacer()
-                        
-                        Text("\(Int(downloadProgress * 100))%")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    
-                    // Always use a non-zero progress value to ensure visibility
-                    ProgressView(value: max(0.01, downloadProgress))
-                        .progressViewStyle(LinearProgressViewStyle())
-                        .animation(.easeInOut, value: downloadProgress)
-                    
-                    if !currentFile.isEmpty {
-                        Text("Current file: \(currentFile)")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                }
-                .padding(.vertical, 4)
+                DownloadProgressView(
+                    progress: downloadProgress,
+                    statusText: currentFile,
+                    modelName: model.name
+                )
             }
         }
         .padding()

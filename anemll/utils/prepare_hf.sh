@@ -8,15 +8,19 @@ PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 print_usage() {
-    echo "Usage: $0 --input <converted_model_dir> [--output <output_dir>] [--org <huggingface_org>] [--name <model_name>] [--ios]"
+    echo "Usage: $0 --input <converted_model_dir> [--output <output_dir>] [--org <huggingface_org>] [--name <model_name>] [--ios] [--zip]"
     echo "Options:"
     echo "  --input    Directory containing converted model files (required)"
     echo "  --output   Output directory for HF distribution (optional, defaults to input_dir/hf_dist)"
     echo "  --org      Hugging Face organization/account (optional, defaults to anemll)"
     echo "  --name     Custom model name for HuggingFace upload (optional, defaults to name from meta.yaml)"
-    echo "  --ios      Prepare iOS-ready version with unzipped MLMODELC files (if omitted, prepares standard distribution)"
+    echo "  --ios      Prepare iOS-ready version with unzipped MLMODELC files (default)"
+    echo "  --zip      Prepare standard distribution with compressed .mlmodelc.zip files"
     exit 1
 }
+
+# Default to uncompressed (iOS-style) distribution
+PREPARE_IOS=true
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -39,6 +43,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --ios)
             PREPARE_IOS=true
+            shift
+            ;;
+        --zip)
+            PREPARE_IOS=false
             shift
             ;;
         *)
@@ -96,10 +104,13 @@ MODEL_VERSION=$(grep "version:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f4)
 CONTEXT_LENGTH=$(grep "context_length:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6)
 BATCH_SIZE=$(grep "batch_size:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6)
 MODEL_PREFIX=$(grep "model_prefix:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6)
+MODEL_FORMAT=$(grep "model_type:" "$INPUT_DIR/meta.yaml" | awk '{print $2}')
 NUM_CHUNKS=$(grep "num_chunks:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6)
 LUT_FFN=$(grep "lut_ffn:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6)
 LUT_LMHEAD=$(grep "lut_lmhead:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6)
 LUT_EMBEDDINGS=$(grep "lut_embeddings:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6 2>/dev/null || echo "")
+LUT_BITS=$(grep "lut_bits:" "$INPUT_DIR/meta.yaml" | cut -d' ' -f6 2>/dev/null || echo "")
+MONOLITHIC_MODEL=$(grep "monolithic_model:" "$INPUT_DIR/meta.yaml" | awk '{print $2}')
 
 # Check if this is a monolithic model
 MODEL_TYPE_YAML=$(grep "model_type:" "$INPUT_DIR/meta.yaml" | awk '{print $2}')
@@ -127,12 +138,22 @@ if [[ "$ARCH" == gemma* ]]; then
     TOKENIZER_CLASS="GemmaTokenizer"
 fi
 
-# Validate and set default values for LUT parameters
-validate_lut_values
+# Normalize defaults based on model type
+if [ "$MODEL_FORMAT" = "monolithic" ]; then
+    NUM_CHUNKS=1
+    if [ -n "$LUT_BITS" ]; then
+        LUT_FFN="$LUT_BITS"
+        LUT_LMHEAD="$LUT_BITS"
+        LUT_EMBEDDINGS="$LUT_BITS"
+    fi
+else
+    # Validate and set default values for LUT parameters
+    validate_lut_values
 
-# Set default value for LUT_EMBEDDINGS if not found in meta.yaml
-if [ -z "$LUT_EMBEDDINGS" ]; then
-    LUT_EMBEDDINGS=$LUT_FFN  # Default to same as FFN LUT
+    # Set default value for LUT_EMBEDDINGS if not found in meta.yaml
+    if [ -z "$LUT_EMBEDDINGS" ]; then
+        LUT_EMBEDDINGS=$LUT_FFN  # Default to same as FFN LUT
+    fi
 fi
 
 # Construct full model name with version
@@ -310,6 +331,7 @@ if [ "$PREPARE_IOS" = true ]; then
         lmhead_file=$(get_model_filename "$MODEL_PREFIX" "lm_head" "$LUT_LMHEAD")
         copy_mlmodelc "$lmhead_file" "$OUTPUT_DIR/ios"
 
+
         for ((i=1; i<=NUM_CHUNKS; i++)); do
             chunk_num=$(printf "%02d" $i)
             chunk_info="_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)"
@@ -322,6 +344,7 @@ if [ "$PREPARE_IOS" = true ]; then
             fi
         done
     fi
+
 
     # No need to zip iOS distribution - it should be used directly
     echo "[iOS] Distribution ready in: $OUTPUT_DIR/ios"
@@ -351,6 +374,7 @@ else
         lmhead_file=$(get_model_filename "$MODEL_PREFIX" "lm_head" "$LUT_LMHEAD")
         compress_mlmodelc "$lmhead_file" "$OUTPUT_DIR/standard"
 
+
         for ((i=1; i<=NUM_CHUNKS; i++)); do
             chunk_num=$(printf "%02d" $i)
             chunk_info="_chunk_${chunk_num}of$(printf "%02d" $NUM_CHUNKS)"
@@ -363,6 +387,7 @@ else
             fi
         done
     fi
+
 
     # Create standard distribution zip
     (cd "$OUTPUT_DIR" && zip -r "${FULL_MODEL_NAME}.zip" standard/)
@@ -382,6 +407,13 @@ else
     TARGET_DIR="$OUTPUT_DIR/standard"
 fi
 
+# Determine LUT bits for display (use LUT_BITS for monolithic, LUT_FFN otherwise)
+if [ "$MODEL_FORMAT" = "monolithic" ]; then
+    DISPLAY_LUT_BITS="${LUT_BITS:-none}"
+else
+    DISPLAY_LUT_BITS="${LUT_FFN:-none}"
+fi
+
 # Read template and replace placeholders
 sed -e "s|%NAME_OF_THE_FOLDER_WE_UPLOAD%|$FULL_MODEL_NAME|g" \
     -e "s|%PATH_TO_META_YAML%|./meta.yaml|g" \
@@ -389,6 +421,7 @@ sed -e "s|%NAME_OF_THE_FOLDER_WE_UPLOAD%|$FULL_MODEL_NAME|g" \
     -e "s|%CONTEXT_LENGTH%|$CONTEXT_LENGTH|g" \
     -e "s|%BATCH_SIZE%|$BATCH_SIZE|g" \
     -e "s|%NUM_CHUNKS%|$NUM_CHUNKS|g" \
+    -e "s|%LUT_BITS%|$DISPLAY_LUT_BITS|g" \
     "$README_TEMPLATE" > "$TARGET_DIR/README.md"
 
 # Also create a copy in the main output directory for reference

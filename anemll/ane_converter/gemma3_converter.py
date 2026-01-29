@@ -491,10 +491,12 @@ class Gemma3Converter(BaseConverter):
             mlmodel = self.convert_monolithic(self.model, is_prefill=False, argmax_in_model=self.argmax_in_model, force_rotation=True)
         elif part == "monolithic_prefill":
             print("Converting monolithic model (prefill)...")
-            mlmodel = self.convert_monolithic(self.model, is_prefill=True, argmax_in_model=self.argmax_in_model)
+            # Note: prefill should NEVER have argmax - it only fills the KV cache
+            mlmodel = self.convert_monolithic(self.model, is_prefill=True, argmax_in_model=False)
         elif part == "monolithic_prefill_rotate":
             print("Converting monolithic model (prefill_rotate - rotation mode)...")
-            mlmodel = self.convert_monolithic(self.model, is_prefill=True, argmax_in_model=self.argmax_in_model, force_rotation=True)
+            # Note: prefill should NEVER have argmax - it only fills the KV cache
+            mlmodel = self.convert_monolithic(self.model, is_prefill=True, argmax_in_model=False, force_rotation=True)
         else:
             raise ValueError(f"Unsupported part: {part}")
 
@@ -1631,8 +1633,130 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Add CTX and ATT values to output filename (e.g., gemma3_monolithic_CTX512_ATT64.mlpackage)",
     )
+    parser.add_argument(
+        "--fp16-scale",
+        type=str,
+        default=None,
+        help="FP16 residual stream scaling factor to prevent overflow. "
+             "Use 'auto' to compute based on model, or specify a value (e.g., 0.1875). "
+             "Recommended: 0.48 for 270M, 0.82 for 1B, 0.1875 for 4B QAT. "
+             "See anemll/models/GEMMA3_FP16_SCALING.md for details.",
+    )
 
     return parser.parse_args()
+
+
+# Recommended FP16 scaling factors for Gemma3 models
+# Based on residual stream analysis - see anemll/models/GEMMA3_FP16_SCALING.md
+GEMMA3_SCALING_FACTORS = {
+    # Model identifier patterns -> recommended alpha
+    "gemma-3-270m": 0.48,      # Peak 104,162 (1.6x FP16 max)
+    "gemma-3-1b": 0.82,        # Peak 61,040 (0.93x FP16 max)
+    "gemma-3-4b-it-qat": 0.1875,  # Peak 292,969 (4.5x FP16 max), use 3/16
+    "gemma-3-4b": 0.5,         # Estimate for non-QAT 4B
+    "gemma-3n-E2B": 0.5,       # Estimate, needs verification
+    "gemma-3n-E4B": 0.5,       # Estimate, needs verification
+}
+
+
+def _get_auto_scale_factor(model_path: str) -> Optional[float]:
+    """Get recommended scaling factor based on model path/name."""
+    model_lower = model_path.lower()
+
+    # Check for known model patterns
+    for pattern, alpha in GEMMA3_SCALING_FACTORS.items():
+        if pattern.lower() in model_lower:
+            return alpha
+
+    # Default: no scaling for unknown models
+    return None
+
+
+def _apply_fp16_scaling(
+    model: "Gemma3ForCausalLM",
+    fp16_scale: str,
+    model_path: str,
+) -> Optional[float]:
+    """Apply FP16 residual stream scaling to prevent activation overflow.
+
+    This implements the weight-only transformation from GEMMA3_FP16_SCALING.md:
+    1. Scale embedding weights by α
+    2. Transform post-norm weights: w_new = α * (1 + w_old) - 1
+
+    This shrinks the residual stream without changing model behavior (RMSNorm
+    is scale-invariant, and the final norm cancels the global scale).
+
+    Args:
+        model: The Gemma3 model with loaded weights
+        fp16_scale: Either "auto" or a float value like "0.1875"
+        model_path: Model path for auto-detection
+
+    Returns:
+        The alpha value applied, or None if no scaling was applied
+    """
+    # Determine alpha value
+    if fp16_scale.lower() == "auto":
+        alpha = _get_auto_scale_factor(model_path)
+        if alpha is None:
+            print(f"  ⚠️  Could not auto-detect scaling factor for: {model_path}")
+            print(f"      Known models: {list(GEMMA3_SCALING_FACTORS.keys())}")
+            print(f"      Skipping FP16 scaling. Use --fp16-scale <value> to specify manually.")
+            return None
+        print(f"  Auto-detected FP16 scale factor: α = {alpha}")
+    else:
+        try:
+            alpha = float(fp16_scale)
+        except ValueError:
+            print(f"  ⚠️  Invalid fp16_scale value: {fp16_scale}")
+            return None
+
+    if alpha <= 0 or alpha > 1:
+        print(f"  ⚠️  Alpha must be in (0, 1], got: {alpha}")
+        return None
+
+    print(f"  Applying FP16 residual stream scaling with α = {alpha}")
+
+    # Get model components
+    # Handle both text-only and multimodal model structures
+    if hasattr(model, 'model'):
+        if hasattr(model.model, 'language_model'):
+            # Multimodal model (e.g., Gemma3n)
+            embed = model.model.language_model.embed_tokens if hasattr(model.model.language_model, 'embed_tokens') else None
+            layers = model.model.language_model.layers if hasattr(model.model.language_model, 'layers') else None
+        else:
+            # Text-only model
+            embed = model.model.embed_tokens if hasattr(model.model, 'embed_tokens') else None
+            layers = model.model.layers if hasattr(model.model, 'layers') else None
+    else:
+        embed = None
+        layers = None
+
+    if embed is None or layers is None:
+        print(f"  ⚠️  Could not find model components for scaling")
+        return None
+
+    # 1. Scale embedding weights
+    with torch.no_grad():
+        if hasattr(embed, 'weight'):
+            embed.weight.mul_(alpha)
+            print(f"    ✅ Scaled embed_tokens.weight by {alpha}")
+
+    # 2. Transform post-norm weights
+    # Gemma3 RMSNorm uses: output = norm(x) * (1 + weight)
+    # To scale the gain by α: w_new = α * (1 + w_old) - 1
+    scaled_layers = 0
+    for layer_idx, layer in enumerate(layers):
+        for norm_name in ['post_attention_layernorm', 'post_feedforward_layernorm']:
+            if hasattr(layer, norm_name):
+                norm = getattr(layer, norm_name)
+                if hasattr(norm, 'weight'):
+                    with torch.no_grad():
+                        norm.weight.data = alpha * (1 + norm.weight.data) - 1
+                    scaled_layers += 1
+
+    print(f"    ✅ Transformed {scaled_layers} post-norm weights across {len(layers)} layers")
+
+    return alpha
 
 
 def test_conversion(
@@ -1651,6 +1775,7 @@ def test_conversion(
     attention_size: Optional[int] = None,
     force: bool = False,
     decorate: bool = False,
+    fp16_scale: Optional[str] = None,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
     """Convert a Gemma3 model and save the result.
 
@@ -1758,6 +1883,12 @@ def test_conversion(
         print("Loading pretrained weights...")
         model.load_pretrained_weights(model_path)
         print("Model loaded successfully!")
+
+        # Apply FP16 residual stream scaling if specified
+        if fp16_scale is not None:
+            alpha = _apply_fp16_scaling(model, fp16_scale, model_path)
+            if alpha is not None:
+                print(f"Applied FP16 residual scaling with α = {alpha}")
 
         # Ensure model is in eval mode and gradients are disabled
         model.eval()
@@ -1891,6 +2022,8 @@ def main() -> None:
         print(f"LUT quantization: {args.lut} bits")
     if args.chunk:
         print(f"Splitting into {args.chunk} chunks")
+    if args.fp16_scale:
+        print(f"FP16 scaling: {args.fp16_scale}")
     print(f"Converting part(s): {args.part}")
 
     # Map legacy part names to numeric equivalents
@@ -1922,6 +2055,7 @@ def main() -> None:
             attention_size=args.attention_size,
             force=args.force,
             decorate=args.decorate,
+            fp16_scale=args.fp16_scale,
         )
         print(f"Conversion completed successfully! Result: {type(result)}")
     except Exception as e:  # pragma: no cover - CLI tool

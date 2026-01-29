@@ -157,6 +157,8 @@ python3 tests/chat.py --meta /path/to/output/gemma3_270m/meta.yaml --prompt "Hel
 - Large vocabulary (262K tokens) uses 16-way LM head splitting
 - Requires HuggingFace login for gated models: `hf login`
 
+> **⚠️ FP16 Overflow Warning**: Gemma 3 models can produce activations exceeding FP16 range (65,504). See [FP16 Compatibility](#fp16-compatibility-for-ane) below.
+
 #### Features
 - **Auto-downloads models**: No manual setup required, downloads models from HuggingFace
 - **Fast validation**: Uses unquantized FP16 conversion for quick pipeline testing
@@ -376,6 +378,75 @@ Ready-to-use models available at [Hugging Face](https://huggingface.co/anemll):
 - iOS-friendly builds (unzipped .mlmodelc)
 - Standard builds for macOS development
 - Multiple quantization levels (FP16, LUT4, LUT6)
+
+## FP16 Compatibility for ANE
+
+Apple Neural Engine (ANE) operates in FP16 precision, which can only represent values up to ±65,504. Some models (particularly Gemma 3) produce activations that exceed this range, causing NaN/Inf failures.
+
+### The Problem
+
+Models trained in BF16 (range ±3.4×10³⁸) may have:
+- **Residual accumulation overflow**: The cumulative `hidden = hidden + attention + mlp` grows too large
+- **All sub-tensors within range**: Individual attention, MLP, and norm outputs are fine
+- **Overflow in layer outputs**: Combined residual stream exceeds FP16 max
+
+This affects **all Gemma 3 sizes** (270M through 27B) - see [Unsloth's analysis](https://unsloth.ai/blog/gemma3).
+
+### FP16 Compatibility Check Tool
+
+Check any HuggingFace model for ANE compatibility:
+
+```bash
+# Quick check
+python anemll/utils/fp16_compatibility_check.py --model google/gemma-3-1b-it
+
+# Full analysis with clamp sweep
+python anemll/utils/fp16_compatibility_check.py --model google/gemma-3-4b-it-qat-int4-unquantized --sweep
+```
+
+The tool reports:
+- Weight analysis (are weights within FP16 range?)
+- Precision tests (BF16, FP16, FP16→FP32)
+- Residual accumulation analysis
+- Recommended scaling factor (α)
+
+### Solutions
+
+We support two approaches:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Weight Scaling** (Recommended) | Zero runtime overhead, 100% quality match | Requires preprocessing |
+| **Runtime Clamping** | Simple to implement | Adds ops per layer |
+
+#### Weight Scaling (Recommended)
+
+For Gemma 3 models, apply a weight-only transformation:
+
+```python
+alpha = 0.1875  # 3/16, adjust based on model
+
+# 1. Scale embedding weights
+embed_tokens.weight *= alpha
+
+# 2. Transform post-norm weights (Gemma uses (1+w) gain)
+for layer in layers:
+    post_attention_layernorm.weight = alpha * (1 + w_old) - 1
+    post_feedforward_layernorm.weight = alpha * (1 + w_old) - 1
+```
+
+#### Model-Specific α Values
+
+| Model | Peak Activation | α Recommended | Status |
+|-------|-----------------|---------------|--------|
+| gemma-3-270m | 104,162 (1.6x) | 0.48 | 100% match |
+| gemma-3-1b-it | 61,040 (0.93x) | 0.82 | 100% match |
+| gemma-3-4b-it-qat | 292,969 (4.5x) | 0.17-0.1875 | 100% match |
+
+### Documentation
+
+- [GEMMA3_FP16_SCALING.md](./anemll/models/GEMMA3_FP16_SCALING.md) - Detailed scaling guide
+- [fp16_compatibility_check.py](./anemll/utils/fp16_compatibility_check.py) - Diagnostic tool
 
 ## Acknowledgements
 

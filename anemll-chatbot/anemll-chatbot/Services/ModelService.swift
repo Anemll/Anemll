@@ -12,7 +12,7 @@ import AppKit
 #else
 import UIKit
 #endif
-// import ZIPFoundation
+// import ZIPFoundation - not linked to target, using native unzip instead
 
 // Add ModelError enum at the top level
 enum ModelError: Error {
@@ -136,6 +136,88 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
     private var downloadActivityTimers: [String: Timer] = [:] // For pulsing animation during active downloads
     private var isDownloadActive: [String: Bool] = [:]
     private var downloadProgressObservers: [String: [NSKeyValueObservation]] = [:] // For progress observers
+
+    // Progress smoothing: track max values to prevent UI jumping backward
+    private var maxDownloadedBytes: [String: Int64] = [:]
+    private var maxDownloadProgress: [String: Double] = [:]
+
+    // MARK: - Enhanced Download Tracking (for proper cancel and resume support)
+
+    /// Tracks individual file download tasks by a unique key (modelId:fileName)
+    private var fileDownloadTasks: [String: URLSessionDownloadTask] = [:]
+
+    /// Stores resume data for interrupted downloads (key: modelId:fileName)
+    private var resumeDataStore: [String: Data] = [:]
+
+    /// Tracks expected file sizes from Content-Length headers (for integrity validation)
+    private var expectedFileSizes: [String: Int64] = [:]
+
+    /// Tracks bytes downloaded per file for accurate progress (key: modelId:fileName)
+    private var bytesDownloadedPerFile: [String: Int64] = [:]
+
+    /// Tracks total bytes expected for a model download
+    private var totalBytesExpectedForModel: [String: Int64] = [:]
+
+    /// Tracks total bytes downloaded for a model
+    private var totalBytesDownloadedForModel: [String: Int64] = [:]
+
+    /// Error messages for display in UI
+    private var downloadErrorMessages: [String: String] = [:]
+
+    /// Tracks download start time for ETA calculation (key: modelId)
+    private var downloadStartTimes: [String: Date] = [:]
+
+    /// Tracks last progress update time for stall detection (key: modelId)
+    private var lastProgressUpdateTime: [String: Date] = [:]
+
+    /// Watchdog timers for detecting stalled downloads (key: modelId)
+    private var downloadWatchdogTimers: [String: Timer] = [:]
+
+    /// Retry count per file (key: modelId:fileName)
+    private var fileRetryCount: [String: Int] = [:]
+
+    /// Maximum retry attempts for failed downloads
+    private let maxRetryAttempts = 3
+
+    /// Active dispatch groups for downloads (key: modelId) - kept alive to prevent semaphore crash
+    private var activeDownloadGroups: [String: DispatchGroup] = [:]
+
+    /// Active semaphores for downloads (key: modelId) - kept alive to prevent semaphore crash
+    private var activeDownloadSemaphores: [String: DispatchSemaphore] = [:]
+
+    /// Active queues for downloads (key: modelId) - kept alive to prevent premature deallocation
+    private var activeDownloadQueues: [String: DispatchQueue] = [:]
+
+    /// Caches model display names to avoid repeated lookups (key: modelId)
+    private var modelDisplayNames: [String: String] = [:]
+
+    /// Shared URLSession for file downloads with proper delegate handling
+    private lazy var fileDownloadSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 60      // 1 minute for initial connection
+        config.timeoutIntervalForResource = 3600   // 1 hour for large files
+        config.waitsForConnectivity = true
+        config.allowsCellularAccess = true
+        // Enable HTTP pipelining for better performance
+        config.httpMaximumConnectionsPerHost = 4
+        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }()
+
+    /// Recursive lock for thread-safe access to download tracking dictionaries (allows nested calls from same thread)
+    private let downloadTrackingLock = NSRecursiveLock()
+
+    /// Thread-safe access helper - use this for all access to tracking dictionaries
+    private func withDownloadLock<T>(_ block: () -> T) -> T {
+        downloadTrackingLock.lock()
+        defer { downloadTrackingLock.unlock() }
+        return block()
+    }
+
+    /// Mapping from URLSessionTask to file info for delegate callbacks
+    private var taskToFileInfo: [Int: (modelId: String, fileName: String, destination: URL)] = [:]
+
+    /// Completion handlers for individual file downloads
+    private var fileCompletionHandlers: [String: (Bool) -> Void] = [:]
     
     // Model download status enum
     enum ModelDownloadStatus {
@@ -703,15 +785,12 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
     
     /// Gets the full path to a specific model directory
     public func getModelPath(for modelId: String) -> URL {
-        print("Getting model path for \(modelId)")
-        
         let modelsDirectory = getModelsDirectory()
-        
+
         // Special case for default model - always use the same directory name
         if modelId == "llama-3.2-1b" {
             // Use the standard format for the default model
             let defaultModelPath = modelsDirectory.appendingPathComponent("llama_3_2_1b_iosv2_0")
-            print("Using standard path for default model: \(defaultModelPath.path)")
             
             // Create the directory if it doesn't exist
             if !FileManager.default.fileExists(atPath: defaultModelPath.path) {
@@ -729,18 +808,16 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         // For other models, use the sanitized model ID
         let sanitizedModelId = sanitizeModelId(modelId)
         let modelDir = modelsDirectory.appendingPathComponent(sanitizedModelId)
-        
+
         // Create the directory if it doesn't exist
         if !FileManager.default.fileExists(atPath: modelDir.path) {
             do {
                 try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true, attributes: nil)
-                print("Created model directory at: \(modelDir.path)")
             } catch {
                 print("Error creating model directory: \(error)")
             }
         }
-        
-        print("Using path for model: \(modelDir.path)")
+
         return modelDir
     }
     
@@ -867,10 +944,12 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         model.isDownloaded = false
         
         // Store progress and completion handlers - use actualModelId
-        progressObservers[actualModelId] = { progress in
-            DispatchQueue.main.async {
-                fileProgress("Downloading...", progress)
-            }
+        // Note: Don't call fileProgress with "Downloading..." here - it overwrites
+        // the detailed status set by URLSession delegate. Just store a no-op
+        // since fileProgressObservers handles the actual progress display.
+        progressObservers[actualModelId] = { _ in
+            // Progress is handled by fileProgressObservers via URLSession delegate
+            // Don't overwrite status here - it causes UI flashing
         }
         
         fileProgressObservers[actualModelId] = fileProgress
@@ -947,24 +1026,55 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         
         // Update model download status to downloading
         modelDownloadStatus[actualModelId] = .downloading
-        
+
         // Check if this is a Hugging Face model
-        if model.downloadURL.hasPrefix("https://huggingface.co/") || 
-           model.downloadURL.hasPrefix("huggingface://") {
-            print("Starting Hugging Face model download")
-            downloadHuggingFaceModel(modelId: actualModelId, modelURL: model.downloadURL)
+        // Supported formats:
+        // 1. https://huggingface.co/owner/repo
+        // 2. huggingface://owner/repo
+        // 3. owner/repo (shorthand - must contain exactly one "/" and no other URL parts)
+        let isHuggingFaceURL = model.downloadURL.hasPrefix("https://huggingface.co/") ||
+                               model.downloadURL.hasPrefix("huggingface://")
+
+        // Check for shorthand format: "owner/repo" (contains one slash, no protocol, no dots except in repo name)
+        let isHuggingFaceShorthand: Bool = {
+            let url = model.downloadURL
+            // Must contain exactly one "/"
+            let slashCount = url.filter { $0 == "/" }.count
+            guard slashCount == 1 else { return false }
+            // Must not be an actual URL (no protocol)
+            guard !url.contains("://") else { return false }
+            // Split and verify both parts exist
+            let parts = url.split(separator: "/")
+            guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return false }
+            // First part (owner) should not contain dots (to avoid domain.com/path)
+            guard !parts[0].contains(".") else { return false }
+            return true
+        }()
+
+        if isHuggingFaceURL || isHuggingFaceShorthand {
+            print("Starting Hugging Face model download (detected format: \(isHuggingFaceURL ? "full URL" : "shorthand"))")
+            // Convert shorthand to full URL if needed
+            let fullModelURL: String
+            if isHuggingFaceShorthand {
+                fullModelURL = "https://huggingface.co/\(model.downloadURL)"
+                print("Converted shorthand '\(model.downloadURL)' to full URL: \(fullModelURL)")
+            } else {
+                fullModelURL = model.downloadURL
+            }
+            downloadHuggingFaceModel(modelId: actualModelId, modelURL: fullModelURL)
             return
         }
-        
+
         // For regular URL downloads
         guard let url = URL(string: model.downloadURL) else {
             print("Invalid download URL: \(model.downloadURL)")
+            setDownloadError(for: actualModelId, message: "Invalid download URL format")
             DispatchQueue.main.async {
                 completion(false)
             }
             return
         }
-        
+
         print("Starting download from URL: \(url)")
         
         // Create download task
@@ -976,25 +1086,25 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
     private func downloadHuggingFaceModel(modelId: String, modelURL: String) {
         print("\nStarting Hugging Face model download: \(modelId) from URL: \(modelURL)")
         print("Note: This download will preserve existing files rather than doing a clean download")
-        
+
         // Extract repository information from the URL
         guard let repoInfo = extractHuggingFaceRepoInfo(from: modelURL) else {
             print("Failed to extract repository information from URL: \(modelURL)")
             reportDownloadFailure(for: modelId)
             return
         }
-        
+
         print("Repository information:")
         print("- Owner: \(repoInfo.owner)")
         print("- Repository: \(repoInfo.repo)")
-        
+
         // Create HuggingFaceRepo object for download
         let huggingFaceRepo = HuggingFaceRepo(
-            owner: repoInfo.owner, 
-            repo: repoInfo.repo, 
+            owner: repoInfo.owner,
+            repo: repoInfo.repo,
             branch: "main"
         )
-        
+
         // Create directory for the model but don't remove if it exists
         let modelDir = getModelPath(for: modelId)
         do {
@@ -1009,109 +1119,145 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             self.reportDownloadFailure(for: modelId)
             return
         }
-        
+
+        // Update UI to show we're starting and record start time for ETA
+        DispatchQueue.main.async {
+            self.currentDownloadingFiles[modelId] = "Downloading model configuration..."
+            self.progressObservers[modelId]?(0.02)
+        }
+        downloadStartTimes[modelId] = Date()
+        lastProgressUpdateTime[modelId] = Date()
+
+        // Reset progress smoothing values for a fresh download
+        maxDownloadedBytes[modelId] = 0
+        maxDownloadProgress[modelId] = 0.0
+
+        // Start download watchdog timer to detect stalls
+        startDownloadWatchdog(for: modelId)
+        logDownload("▶️ STARTED: \(modelId)")
+
         // First, download meta.yaml to get the correct capitalization and model structure
+        // Using NON-BLOCKING approach to keep UI responsive
         print("Downloading meta.yaml first to get correct capitalization...")
-        // IMPORTANT: Use original case-sensitive components for URL construction
         let metaYamlURL = URL(string: "https://huggingface.co/\(repoInfo.owner)/\(repoInfo.repo)/resolve/main/meta.yaml")!
         let metaYamlPath = modelDir.appendingPathComponent("meta.yaml")
-        
-        // Create a semaphore to wait for meta.yaml download to complete
-        let semaphore = DispatchSemaphore(value: 0)
-        var metaYamlSuccess = false
-        
-        // Add logging to track download state
+
         print("📥 Starting meta.yaml download from: \(metaYamlURL)")
         print("📂 Saving to: \(metaYamlPath.path)")
-        
-        // Download meta.yaml first with retry mechanism
-        let downloadTask = URLSession.shared.dataTask(with: metaYamlURL) { data, response, error in
-            // Validate the response
+
+        // Use non-blocking async download instead of semaphore
+        downloadMetaYamlAsync(
+            url: metaYamlURL,
+            destination: metaYamlPath,
+            modelId: modelId
+        ) { [weak self] success in
+            guard let self = self else { return }
+
+            if !success {
+                print("❌ meta.yaml download failed")
+                self.setDownloadError(for: modelId, message: "Failed to download model configuration (meta.yaml)")
+                self.reportDownloadFailure(for: modelId)
+                return
+            }
+
+            // Parse meta.yaml and continue with model files download
+            self.continueHuggingFaceDownload(
+                modelId: modelId,
+                metaYamlPath: metaYamlPath,
+                modelDir: modelDir,
+                huggingFaceRepo: huggingFaceRepo
+            )
+        }
+    }
+
+    /// Downloads meta.yaml asynchronously without blocking
+    private func downloadMetaYamlAsync(url: URL, destination: URL, modelId: String, completion: @escaping (Bool) -> Void) {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 60
+        let session = URLSession(configuration: config)
+
+        let task = session.dataTask(with: url) { [weak self] data, response, error in
             if let error = error {
                 print("❌ Error downloading meta.yaml: \(error.localizedDescription)")
-                semaphore.signal()
+                self?.setDownloadError(for: modelId, message: "Network error: \(error.localizedDescription)")
+                DispatchQueue.main.async { completion(false) }
                 return
             }
-            
+
             guard let httpResponse = response as? HTTPURLResponse else {
                 print("❌ Invalid response type for meta.yaml")
-                semaphore.signal()
+                self?.setDownloadError(for: modelId, message: "Invalid server response")
+                DispatchQueue.main.async { completion(false) }
                 return
             }
-            
+
             if httpResponse.statusCode != 200 {
                 print("❌ HTTP error for meta.yaml: \(httpResponse.statusCode)")
-                semaphore.signal()
+                self?.setDownloadError(for: modelId, message: "Server error: HTTP \(httpResponse.statusCode)")
+                DispatchQueue.main.async { completion(false) }
                 return
             }
-            
+
             guard let data = data, !data.isEmpty else {
                 print("❌ Empty data received for meta.yaml")
-                semaphore.signal()
+                self?.setDownloadError(for: modelId, message: "Empty configuration file received")
+                DispatchQueue.main.async { completion(false) }
                 return
             }
-            
+
             print("✅ meta.yaml download successful: \(data.count) bytes")
-            
+
             // Write the file
             do {
-                try data.write(to: metaYamlPath)
-                metaYamlSuccess = true
-                print("✅ meta.yaml saved successfully to \(metaYamlPath.path)")
-                
+                try data.write(to: destination)
+                print("✅ meta.yaml saved successfully to \(destination.path)")
+
                 // Print the content for debugging
                 if let content = String(data: data, encoding: .utf8) {
                     print("📃 meta.yaml content:\n\(content)")
                 }
+
+                DispatchQueue.main.async { completion(true) }
             } catch {
                 print("❌ Error saving meta.yaml: \(error.localizedDescription)")
+                self?.setDownloadError(for: modelId, message: "Failed to save configuration: \(error.localizedDescription)")
+                DispatchQueue.main.async { completion(false) }
             }
-            
-            semaphore.signal()
         }
-        
-        downloadTask.resume()
-        
-        // Wait for meta.yaml download to complete with timeout
-        let timeoutResult = semaphore.wait(timeout: .now() + 60)
-        if timeoutResult == .timedOut {
-            print("⏱️ Timed out waiting for meta.yaml download")
-            self.reportDownloadFailure(for: modelId)
-            return
-        }
-        
-        if !metaYamlSuccess {
-            print("❌ meta.yaml download failed")
-            self.reportDownloadFailure(for: modelId)
-            return
-        }
-        
+
+        task.resume()
+    }
+
+    /// Continues the HuggingFace download after meta.yaml is downloaded
+    private func continueHuggingFaceDownload(modelId: String, metaYamlPath: URL, modelDir: URL, huggingFaceRepo: HuggingFaceRepo) {
         // Read and parse meta.yaml content
         do {
             let metaYamlContent = try String(contentsOf: metaYamlPath, encoding: .utf8)
-            
+
             // Confirm we have non-empty content
             guard !metaYamlContent.isEmpty else {
                 print("❌ Empty meta.yaml content")
+                self.setDownloadError(for: modelId, message: "Empty model configuration")
                 self.reportDownloadFailure(for: modelId)
                 return
             }
-            
+
             print("📝 Parsing meta.yaml content...")
-            
+
             // Parse meta.yaml to get model configuration
             let config = try ModelConfiguration(from: metaYamlContent, modelPath: modelDir.path)
             print("📋 Model configuration parsed successfully")
-            
+
             // Initialize collections for blobs and trees information
             let blobs: [[String: Any]] = []
             let trees: [[String: Any]] = []
-            
+
             DispatchQueue.main.async {
                 self.progressObservers[modelId]?(0.1) // 10% for downloading meta.yaml and parsing
                 self.currentDownloadingFiles[modelId] = "Analyzed model structure..."
             }
-            
+
             // Get the required files based on the configuration
             let requiredFiles = self.getRequiredFiles(from: config)
             
@@ -1199,11 +1345,19 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         print("  - Branch: \(huggingFaceRepo.branch)")
         print("  - Destination: \(metaYamlDestination.path)")
 
+        // Store in instance property to prevent premature deallocation (semaphore crash)
         let downloadGroup = DispatchGroup()
+        withDownloadLock { activeDownloadGroups["\(modelId):meta"] = downloadGroup }
         downloadGroup.enter()
-        
+
         let downloadTask = URLSession.shared.downloadTask(with: metaYamlURL) { [weak self] tempURL, response, error in
-            defer { downloadGroup.leave() }
+            defer {
+                downloadGroup.leave()
+                // DELAYED cleanup - wait for internal semaphore operations to complete
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    self?.withDownloadLock { _ = self?.activeDownloadGroups.removeValue(forKey: "\(modelId):meta") }
+                }
+            }
             guard let self = self else { return }
             
             if let error = error {
@@ -1283,205 +1437,467 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         var sortedFiles = requiredFiles.sorted()
         
         // Check for .mlmodelc directories and add weight.bin path if needed
+        // BUT avoid duplicates - getRequiredFiles already adds individual files including weights/weight.bin
         var expandedFiles: [String] = []
+        var addedPaths = Set<String>()  // Track what we've added to avoid duplicates
+
         for file in sortedFiles {
-            if file.hasSuffix(".mlmodelc") {
-                // For .mlmodelc directories, we need to download the weights/weight.bin file directly
+            if file.hasSuffix(".mlmodelc") && !file.contains("/") {
+                // This is a bare directory name (e.g., "xxx.mlmodelc") not a path within it
+                // Convert to weight.bin path, but only if not already in list
                 let weightBinPath = "\(file)/weights/weight.bin"
-                print("🔄 Converting directory download to weight file: \(weightBinPath)")
-                expandedFiles.append(weightBinPath)
-            } else {
+                if !addedPaths.contains(weightBinPath) && !sortedFiles.contains(weightBinPath) {
+                    print("🔄 Converting directory to weight file: \(weightBinPath)")
+                    expandedFiles.append(weightBinPath)
+                    addedPaths.insert(weightBinPath)
+                } else {
+                    print("⏭️ Skipping duplicate directory expansion: \(weightBinPath)")
+                }
+            } else if !addedPaths.contains(file) {
                 expandedFiles.append(file)
+                addedPaths.insert(file)
+            } else {
+                print("⏭️ Skipping duplicate file: \(file)")
             }
         }
-        
-        // Replace the sorted files with our expanded list
+
+        // Replace the sorted files with our deduplicated list
         sortedFiles = expandedFiles
+        print("📊 After deduplication: \(sortedFiles.count) files (was \(requiredFiles.count))")
+
+        // IMPORTANT: Filter out files that are already fully downloaded
+        // This enables resume functionality - only download missing/incomplete files
+        var filesToDownload: [String] = []
+        var alreadyDownloadedBytes: Int64 = 0
+        var skippedCount = 0
+
+        for file in sortedFiles {
+            let fileURL = modelDir.appendingPathComponent(file)
+            if fileManager.fileExists(atPath: fileURL.path) {
+                // File exists - check if it has content (not empty)
+                do {
+                    let attributes = try fileManager.attributesOfItem(atPath: fileURL.path)
+                    if let fileSize = attributes[.size] as? Int64, fileSize > 0 {
+                        // File exists and has content - skip download
+                        alreadyDownloadedBytes += fileSize
+                        skippedCount += 1
+                        logDownload("⏭️ Skipping already downloaded: \(file) (\(fileSize) bytes)")
+                        continue
+                    }
+                } catch {
+                    // Can't read attributes, download anyway
+                    logDownload("⚠️ Can't check file, will re-download: \(file)")
+                }
+            }
+            filesToDownload.append(file)
+        }
+
+        if skippedCount > 0 {
+            logDownload("📊 Resuming download: \(skippedCount) files already downloaded, \(filesToDownload.count) remaining")
+            // Update progress tracking to account for already downloaded bytes
+            withDownloadLock {
+                bytesDownloadedPerFile["\(modelId):_already_downloaded"] = alreadyDownloadedBytes
+            }
+        }
+
+        // Use filtered list (only files that need downloading)
+        sortedFiles = filesToDownload
         let totalFiles = sortedFiles.count
-        
+
+        // If all files are already downloaded, report success immediately
+        if totalFiles == 0 {
+            logDownload("✅ All files already downloaded for \(modelId)")
+            DispatchQueue.main.async {
+                self.progressObservers[modelId]?(1.0)
+                self.currentDownloadingFiles[modelId] = "All files already downloaded!"
+                self.completionHandlers[modelId]?(true)
+            }
+            return
+        }
+
+        let maxConcurrentDownloads = 2  // Limit concurrent downloads to avoid network issues
+
+        // Use a dispatch group to wait for all downloads to complete
+        // Store ALL synchronization primitives in instance properties to prevent premature deallocation
+
+        // IMPORTANT: Clean up any existing GCD objects from a previous cancelled download
+        // This prevents crashes when cancel -> restart quickly
+        withDownloadLock {
+            if activeDownloadGroups["\(modelId):files"] != nil {
+                print("⚠️ Cleaning up existing download group for \(modelId)")
+                _ = activeDownloadGroups.removeValue(forKey: "\(modelId):files")
+            }
+            if activeDownloadSemaphores["\(modelId):concurrent"] != nil {
+                print("⚠️ Cleaning up existing semaphore for \(modelId)")
+                _ = activeDownloadSemaphores.removeValue(forKey: "\(modelId):concurrent")
+            }
+            if activeDownloadQueues["\(modelId):counter"] != nil {
+                print("⚠️ Cleaning up existing counter queue for \(modelId)")
+                _ = activeDownloadQueues.removeValue(forKey: "\(modelId):counter")
+            }
+            if activeDownloadQueues["\(modelId):download"] != nil {
+                print("⚠️ Cleaning up existing download queue for \(modelId)")
+                _ = activeDownloadQueues.removeValue(forKey: "\(modelId):download")
+            }
+        }
+
+        let downloadGroup = DispatchGroup()
+        let counterQueue = DispatchQueue(label: "com.anemll.modelfiledownload.\(modelId).\(Date().timeIntervalSince1970)")
+        let downloadQueue = DispatchQueue(label: "com.anemll.modelfiledownload.\(modelId).concurrent.\(Date().timeIntervalSince1970)", attributes: .concurrent)
+        withDownloadLock {
+            activeDownloadGroups["\(modelId):files"] = downloadGroup
+            activeDownloadQueues["\(modelId):counter"] = counterQueue
+            activeDownloadQueues["\(modelId):download"] = downloadQueue
+        }
+
+        print("📂 Model directory: \(modelDir.path)")
+
+        // Use a semaphore to limit concurrent downloads
+        // Store in instance property to prevent premature deallocation (semaphore crash)
+        let semaphore = DispatchSemaphore(value: maxConcurrentDownloads)
+        withDownloadLock { activeDownloadSemaphores["\(modelId):concurrent"] = semaphore }
+
+        // Update UI to show we're calculating total size first
+        DispatchQueue.main.async {
+            self.progressObservers[modelId]?(0.05)  // Start at 5% (meta.yaml done, calculating sizes)
+            self.currentDownloadingFiles[modelId] = "Calculating total download size..."
+        }
+
+        // DEBUG: Print all files that will be downloaded
+        print("📋 ALL FILES TO DOWNLOAD (\(totalFiles) total):")
+        for (index, file) in sortedFiles.enumerated() {
+            print("   [\(index + 1)/\(totalFiles)] \(file)")
+        }
+
+        // First, fetch file sizes from HuggingFace API to calculate total expected bytes
+        calculateTotalExpectedBytes(for: modelId, files: sortedFiles, owner: huggingFaceRepo.owner, repo: huggingFaceRepo.repo) { [weak self] totalBytes in
+            guard let self = self else { return }
+
+            // Update UI to show total size calculated
+            DispatchQueue.main.async {
+                let totalMB = Double(totalBytes) / 1_000_000.0
+                self.progressObservers[modelId]?(0.1)  // 10% progress after calculating sizes
+                self.currentDownloadingFiles[modelId] = String(format: "Starting download (%.1f MB total)...", totalMB)
+            }
+
+            // Now start the actual downloads
+            self.startFileDownloads(
+                modelId: modelId,
+                sortedFiles: sortedFiles,
+                totalFiles: totalFiles,
+                modelDir: modelDir,
+                huggingFaceRepo: huggingFaceRepo,
+                downloadGroup: downloadGroup,
+                downloadQueue: downloadQueue,
+                counterQueue: counterQueue,
+                semaphore: semaphore
+            )
+        }
+    }
+
+    /// Internal method to start file downloads after total size is calculated
+    private func startFileDownloads(
+        modelId: String,
+        sortedFiles: [String],
+        totalFiles: Int,
+        modelDir: URL,
+        huggingFaceRepo: HuggingFaceRepo,
+        downloadGroup: DispatchGroup,
+        downloadQueue: DispatchQueue,
+        counterQueue: DispatchQueue,
+        semaphore: DispatchSemaphore
+    ) {
         // Initialize counters for download progress tracking
         var completedFiles = 0
         var failedFiles = 0
         var inProgressDownloads = 0
-        let maxConcurrentDownloads = 2  // Limit concurrent downloads to avoid network issues
-        
-        // Use a dispatch group to wait for all downloads to complete
-        let downloadGroup = DispatchGroup()
-        // Use a serial queue for updating counters safely
-        let counterQueue = DispatchQueue(label: "com.anemll.modelfiledownload")
-        // Use a concurrent queue for downloads
-        let downloadQueue = DispatchQueue(label: "com.anemll.modelfiledownload.concurrent", attributes: .concurrent)
-        
-        print("📂 Model directory: \(modelDir.path)")
-        
+
         // Track overall success
         var overallSuccess = true
-        
-        // Use a semaphore to limit concurrent downloads
-        let semaphore = DispatchSemaphore(value: maxConcurrentDownloads)
-        
-        // Update UI to show download is starting
-        DispatchQueue.main.async {
-            self.progressObservers[modelId]?(0.1)  // Start at 10% progress (meta.yaml already done)
-            self.currentDownloadingFiles[modelId] = "Starting download of \(totalFiles) files..."
-        }
-        
+
+        // Track enter/leave balance for debugging
+        var enterCount = 0
+        var leaveCount = 0
+        var pendingFiles: Set<Int> = []  // Track which file indices are still pending
+        let balanceQueue = DispatchQueue(label: "com.anemll.balance.\(modelId)")
+
         // Process each required file
-        for requiredFile in sortedFiles {
+        for (fileIndex, requiredFile) in sortedFiles.enumerated() {
             // Enter the dispatch group for this download
             downloadGroup.enter()
-            
+            balanceQueue.sync {
+                enterCount += 1
+                pendingFiles.insert(fileIndex + 1)
+                print("⬆️ ENTER [\(enterCount)] for file [\(fileIndex + 1)/\(totalFiles)]: \(requiredFile)")
+            }
+
+            // Capture file info for closure
+            let capturedFile = requiredFile
+            let capturedIndex = fileIndex
+
+            // Log when async block is queued
+            print("📤 QUEUED async block for file [\(capturedIndex + 1)/\(totalFiles)]: \(capturedFile)")
+
             // Wait for a semaphore slot to become available
             downloadQueue.async {
+                print("🚀 ASYNC BLOCK STARTED for file [\(capturedIndex + 1)/\(totalFiles)]: \(capturedFile)")
+                print("🔄 Waiting for semaphore slot for file [\(capturedIndex + 1)/\(totalFiles)]: \(capturedFile)")
                 semaphore.wait()
+                print("✅ Got semaphore slot for file [\(capturedIndex + 1)/\(totalFiles)]: \(capturedFile)")
                 
                 // Create the full URL for the file download
-                let fileURLString = "https://huggingface.co/\(huggingFaceRepo.owner)/\(huggingFaceRepo.repo)/resolve/main/\(requiredFile)"
-                let destinationURL = modelDir.appendingPathComponent(requiredFile)
-                
+                let fileURLString = "https://huggingface.co/\(huggingFaceRepo.owner)/\(huggingFaceRepo.repo)/resolve/main/\(capturedFile)"
+                let destinationURL = modelDir.appendingPathComponent(capturedFile)
+
                 // Update counter for in-progress downloads
                 counterQueue.sync {
                     inProgressDownloads += 1
-                    
-                    // Update UI to show current file being downloaded
-                    let fileName = (requiredFile as NSString).lastPathComponent
-                    let progressPercent = Double(completedFiles) / Double(totalFiles)
-                    let progressFormatted = String(format: "%.1f%%", progressPercent * 100)
-                    let status = "Downloading: \(fileName) (\(completedFiles)/\(totalFiles) - \(progressFormatted))"
-                    
-                    DispatchQueue.main.async {
-                        self.currentDownloadingFiles[modelId] = status
-                    }
+
+                    // Note: Real-time byte-based progress is shown via handleFileDownloadProgress
+                    // This just tracks which file we're starting to download
+                    let fileName = (capturedFile as NSString).lastPathComponent
+                    print("📥 Starting download of \(fileName) (\(completedFiles+1)/\(totalFiles)) [index \(capturedIndex + 1)]")
                 }
-                
-                // Download the file with retry mechanism
-                self.downloadSingleFile(urlString: fileURLString, destination: destinationURL) { success in
+
+                // Track if this file's completion has been called (to prevent double-call from timeout)
+                var fileCompleted = false
+                let fileCompletionLock = NSLock()
+
+                // Completion handler wrapper that ensures single execution
+                let handleFileCompletion: (Bool) -> Void = { success in
+                    fileCompletionLock.lock()
+                    if fileCompleted {
+                        fileCompletionLock.unlock()
+                        print("⚠️ Ignoring duplicate completion for file [\(capturedIndex + 1)/\(totalFiles)]: \(capturedFile)")
+                        return
+                    }
+                    fileCompleted = true
+                    fileCompletionLock.unlock()
+
                     // Update counters based on result
                     counterQueue.sync {
                         completedFiles += 1
                         inProgressDownloads -= 1
-                        
+
                         if !success {
                             failedFiles += 1
                             overallSuccess = false
-                            print("❌ Failed to download: \(requiredFile)")
+                            print("❌ Failed to download: \(capturedFile)")
                         }
-                        
-                        // Calculate and update progress
-                        let progress = 0.1 + (0.9 * Double(completedFiles) / Double(totalFiles))
-                        
-                        // Update UI on main thread
-                        DispatchQueue.main.async {
-                            self.progressObservers[modelId]?(progress)
-                            
-                            let fileName = (requiredFile as NSString).lastPathComponent
-                            let status = success ? 
-                                "Downloaded: \(fileName) (\(completedFiles)/\(totalFiles))" : 
-                                "Error downloading: \(fileName) (\(completedFiles)/\(totalFiles))"
-                            
-                            self.currentDownloadingFiles[modelId] = status
-                            self.fileProgressObservers[modelId]?(status, progress)
+
+                        // Only update status message on errors - byte-based progress shows real-time updates
+                        if !success {
+                            let fileName = (capturedFile as NSString).lastPathComponent
+                            let status = "Error downloading: \(fileName) (\(completedFiles)/\(totalFiles))"
+                            DispatchQueue.main.async {
+                                self.currentDownloadingFiles[modelId] = status
+                            }
+                        }
+
+                        // Log completion for debugging
+                        print("📦 File completed (\(completedFiles)/\(totalFiles)): \(capturedFile) [index \(capturedIndex + 1)]")
+                    }
+
+                    // Release the semaphore slot for next download
+                    print("🔓 Signaling semaphore for file [\(capturedIndex + 1)/\(totalFiles)]: \(capturedFile)")
+                    semaphore.signal()
+
+                    // Mark this download as complete in the group
+                    balanceQueue.sync {
+                        leaveCount += 1
+                        pendingFiles.remove(capturedIndex + 1)
+                        print("⬇️ LEAVE [\(leaveCount)] for file [\(capturedIndex + 1)/\(totalFiles)]: \(capturedFile) (balance: enter=\(enterCount), leave=\(leaveCount))")
+                        if leaveCount < enterCount {
+                            print("   📌 Still pending: \(pendingFiles.sorted())")
                         }
                     }
-                    
-                    // Release the semaphore slot for next download
-                    semaphore.signal()
-                    
-                    // Mark this download as complete in the group
                     downloadGroup.leave()
+                }
+
+                // Set up progress-aware stall detection
+                // Instead of a fixed timeout from start, check if progress is being made
+                // This allows large files to take as long as needed if they're actively downloading
+                let stallCheckInterval: Double = 30.0  // Check every 30 seconds
+                let maxStallTime: Double = 90.0  // Fail if no progress for 90 seconds
+
+                // Use a timer that repeatedly checks for stalls
+                var lastProgressCheck = Date()
+                var lastBytesForFile: Int64 = 0
+
+                let stallCheckTimer = Timer.scheduledTimer(withTimeInterval: stallCheckInterval, repeats: true) { [weak self] timer in
+                    guard let self = self else {
+                        timer.invalidate()
+                        return
+                    }
+
+                    fileCompletionLock.lock()
+                    let alreadyCompleted = fileCompleted
+                    fileCompletionLock.unlock()
+
+                    if alreadyCompleted {
+                        timer.invalidate()
+                        return
+                    }
+
+                    // Check if progress was made since last check
+                    let fileKey = "\(modelId):\(capturedFile)"
+                    let currentBytes = self.bytesDownloadedPerFile[fileKey] ?? 0
+
+                    if currentBytes > lastBytesForFile {
+                        // Progress is being made, reset stall timer
+                        lastProgressCheck = Date()
+                        lastBytesForFile = currentBytes
+                        let downloadedMB = Double(currentBytes) / 1_000_000.0
+                        self.logDownload("📊 Progress: \(capturedFile) - \(String(format: "%.1f", downloadedMB)) MB")
+                    } else {
+                        // No progress, check if stalled too long
+                        let stallTime = Date().timeIntervalSince(lastProgressCheck)
+                        if stallTime > maxStallTime {
+                            self.logDownload("⏰ STALLED: \(capturedFile) - no progress for \(Int(stallTime))s")
+                            timer.invalidate()
+                            handleFileCompletion(false)
+                        } else {
+                            self.logDownload("⚠️ Slow: \(capturedFile) - no progress for \(Int(stallTime))s")
+                        }
+                    }
+                }
+
+                // Make sure timer runs on main run loop
+                RunLoop.main.add(stallCheckTimer, forMode: .common)
+
+                // Download the file with streaming support and progress tracking
+                self.downloadSingleFile(urlString: fileURLString, destination: destinationURL, modelId: modelId) { success in
+                    handleFileCompletion(success)
                 }
             }
         }
         
-        // Wait for all downloads to complete
-        downloadQueue.async {
-            // Wait for all downloads to complete with timeout
-            let waitResult = downloadGroup.wait(timeout: .now() + .seconds(3600))  // 1 hour timeout
-            
-            if waitResult == .timedOut {
-                print("⏱️ Download timed out after 1 hour")
-                overallSuccess = false
+        // Add a timeout diagnostic - if downloads stall, print which files are stuck
+        // Use longer timeout since weight files can take several minutes
+        DispatchQueue.main.asyncAfter(deadline: .now() + 300.0) {  // 5 minutes
+            balanceQueue.sync {
+                if leaveCount < enterCount {
+                    print("[DOWNLOAD] ⏰ DIAGNOSTIC: Downloads may be stuck after 5 minutes")
+                    print("   Enter count: \(enterCount), Leave count: \(leaveCount)")
+                    print("   🚨 STILL PENDING (indices): \(pendingFiles.sorted())")
+                    // Print file names for stuck indices
+                    for idx in pendingFiles.sorted() {
+                        if idx > 0 && idx <= sortedFiles.count {
+                            print("      [\(idx)/\(totalFiles)] \(sortedFiles[idx - 1])")
+                        }
+                    }
+                }
             }
-            
+        }
+
+        // Use notify() instead of wait() to avoid blocking the download queue
+        // wait() can cause deadlock if called on the same queue where downloads run
+        print("🔔 Setting up downloadGroup.notify() - will fire when all \(totalFiles) files complete")
+        downloadGroup.notify(queue: .main) { [weak self] in
+            print("🎉 downloadGroup.notify() FIRED! All downloads complete.")
+            guard let self = self else {
+                print("❌ self is nil in notify callback!")
+                return
+            }
+
+            // DELAYED cleanup - wait for internal semaphore operations to complete
+            // This prevents "Semaphore object deallocated while in use" crash
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                self.withDownloadLock {
+                    _ = self.activeDownloadGroups.removeValue(forKey: "\(modelId):files")
+                    _ = self.activeDownloadSemaphores.removeValue(forKey: "\(modelId):concurrent")
+                    _ = self.activeDownloadQueues.removeValue(forKey: "\(modelId):counter")
+                    _ = self.activeDownloadQueues.removeValue(forKey: "\(modelId):download")
+                }
+            }
+
             // Print download summary
             print("📊 Download summary:")
             print("  - Total files: \(totalFiles)")
             print("  - Completed: \(completedFiles)")
             print("  - Failed: \(failedFiles)")
             print("  - Overall success: \(overallSuccess)")
-            
-            // Update UI with final status
-            DispatchQueue.main.async {
-                if overallSuccess {
-                    self.currentDownloadingFiles[modelId] = "Download complete. Verifying files..."
-                    
-                    // Verify the model files
-                    let isValid = self.verifyModelFiles(modelId: modelId)
-                    print("🔍 Model verification result: \(isValid)")
-                    
-                    if isValid {
-                        // Update model status to downloaded
-                        self.modelDownloadStatus[modelId] = .downloaded
-                        
-                        // Update model in available models list
-                        if let model = self.availableModels.first(where: { $0.id == modelId }) {
-                            model.isDownloaded = true
-                            
-                            // Add to downloaded models list if not already there
-                            if !self.downloadedModels.contains(where: { $0.id == model.id }) {
-                                self.downloadedModels.append(model)
-                            }
+
+            // Update UI with final status (already on main queue from notify)
+            if overallSuccess {
+                print("✅ Download successful, starting verification...")
+                self.currentDownloadingFiles[modelId] = "Download complete. Verifying files..."
+
+                // Verify the model files
+                let isValid = self.verifyModelFiles(modelId: modelId)
+                print("🔍 Model verification result: \(isValid)")
+
+                if isValid {
+                    print("✅ Verification passed, updating model status...")
+                    // Update model status to downloaded
+                    self.modelDownloadStatus[modelId] = .downloaded
+
+                    // Update model in available models list
+                    if let model = self.availableModels.first(where: { $0.id == modelId }) {
+                        model.isDownloaded = true
+                        print("✅ Model marked as downloaded: \(model.name)")
+
+                        // Add to downloaded models list if not already there
+                        if !self.downloadedModels.contains(where: { $0.id == model.id }) {
+                            self.downloadedModels.append(model)
                         }
-                        
-                        // Call completion handler with success
-                        self.completionHandlers[modelId]?(true)
-                    } else {
-                        // Model verification failed - likely missing weight files or other critical components
-                        print("⚠️ Download seemed successful but verification failed - likely missing essential files")
-                        
-                        // Check if weight files are missing (the most common issue)
-                        let modelDir = self.getModelPath(for: modelId)
-                        let missingWeightFiles = self.checkForMissingWeightFiles(in: modelDir)
-                        
-                        if !missingWeightFiles.isEmpty {
-                            print("❌ Missing critical weight files:")
-                            for file in missingWeightFiles {
-                                print("   - \(file)")
-                            }
-                            print("⚠️ This may indicate file availability issues with the repository")
-                        }
-                        
-                        self.modelDownloadStatus[modelId] = .partiallyDownloaded
-                        self.currentDownloadingFiles[modelId] = "Download incomplete. Missing essential files."
-                        
-                        // Mark model as not downloaded since verification failed
-                        if let model = self.availableModels.first(where: { $0.id == modelId }) {
-                            model.isDownloaded = false
-                        }
-                        
-                        // Save changes to ensure status persists
-                        self.updateCustomModelsInUserDefaults()
-                        
-                        // Schedule cleanup of the download tracking after a delay
-                        // This prevents the endless "Found download progress" messages
-                        self.cleanupDownloadTracking(for: modelId, delay: 5.0)
-                        
-                        self.completionHandlers[modelId]?(false)
                     }
+
+                    // Call completion handler with success
+                    self.logDownload("✅ SUCCESS: Download completed for \(modelId)")
+                    self.stopDownloadWatchdog(for: modelId)
+                    self.completionHandlers[modelId]?(true)
                 } else {
-                    // Download failed
-                    self.modelDownloadStatus[modelId] = .failed
-                    self.currentDownloadingFiles[modelId] = "Download failed with \(failedFiles) file errors."
-                    
+                    // Model verification failed - likely missing weight files or other critical components
+                    self.logDownload("⚠️ INCOMPLETE: Download finished but verification failed for \(modelId)")
+
+                    // Check if weight files are missing (the most common issue)
+                    let modelDir = self.getModelPath(for: modelId)
+                    let missingWeightFiles = self.checkForMissingWeightFiles(in: modelDir)
+
+                    if !missingWeightFiles.isEmpty {
+                        print("❌ Missing critical weight files:")
+                        for file in missingWeightFiles {
+                            print("   - \(file)")
+                        }
+                        print("⚠️ This may indicate file availability issues with the repository")
+                    }
+
+                    self.modelDownloadStatus[modelId] = .partiallyDownloaded
+                    self.currentDownloadingFiles[modelId] = "Download incomplete. Missing essential files."
+
+                    // Mark model as not downloaded since verification failed
+                    if let model = self.availableModels.first(where: { $0.id == modelId }) {
+                        model.isDownloaded = false
+                    }
+
+                    // Save changes to ensure status persists
+                    self.updateCustomModelsInUserDefaults()
+
                     // Schedule cleanup of the download tracking after a delay
                     self.cleanupDownloadTracking(for: modelId, delay: 5.0)
-                    
+
+                    self.logDownload("❌ FAILED: Verification failed for \(modelId) - missing essential files")
+                    self.stopDownloadWatchdog(for: modelId)
                     self.completionHandlers[modelId]?(false)
                 }
-                
-                // Clean up resources
-                self.cleanupDownload(for: modelId)
+            } else {
+                // Download failed
+                self.logDownload("❌ FAILED: Download failed with \(failedFiles) file errors for \(modelId)")
+                self.modelDownloadStatus[modelId] = .failed
+                self.currentDownloadingFiles[modelId] = "Download failed with \(failedFiles) file errors."
+
+                // Schedule cleanup of the download tracking after a delay
+                self.cleanupDownloadTracking(for: modelId, delay: 5.0)
+
+                self.stopDownloadWatchdog(for: modelId)
+                self.completionHandlers[modelId]?(false)
             }
+
+            // Clean up resources
+            print("🧹 Cleaning up download resources...")
+            self.cleanupDownload(for: modelId)
+            print("✅ Download finalization complete for modelId: \(modelId)")
         }
     }
     
@@ -1534,10 +1950,23 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
     }
     
     // MARK: - URLSessionDownloadDelegate
-    
+
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        // Find the model ID associated with this download task
-        guard let modelId = downloadTasks.first(where: { 
+        let taskId = downloadTask.taskIdentifier
+
+        // Thread-safe access to taskToFileInfo
+        let fileInfo: (modelId: String, fileName: String, destination: URL)? = withDownloadLock {
+            return taskToFileInfo[taskId]
+        }
+
+        // First check if this is an individual file download (new system)
+        if let fileInfo = fileInfo {
+            handleFileDownloadCompletion(taskId: taskId, fileInfo: fileInfo, location: location)
+            return
+        }
+
+        // Legacy handling for top-level model downloads
+        guard let modelId = downloadTasks.first(where: {
             if let task = $0.value as? URLSessionDownloadTask {
                 return task == downloadTask
             } else if let combinedTask = $0.value as? CombinedDownloadTask {
@@ -1545,29 +1974,29 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             }
             return false
         })?.key else {
-            print("Could not find model ID for completed download task")
+            print("Could not find model ID for completed download task (taskId: \(taskId))")
             return
         }
-        
+
         // Get the destination path for the model
         let destinationURL = modelStorageDirectory.appendingPathComponent(modelId)
-        
+
         do {
             // Create model directory if it doesn't exist
             if !fileManager.fileExists(atPath: destinationURL.path) {
                 try fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true)
             }
-            
+
             // For single-file downloads (like .zip), move to the model directory
             let finalZipURL = destinationURL.appendingPathComponent("model.zip")
             try fileManager.moveItem(at: location, to: finalZipURL)
-            
+
             print("Downloaded file saved to: \(finalZipURL.path)")
-            
+
             // Update model status
             if let model = availableModels.first(where: { $0.id == modelId }) {
                 model.isDownloaded = true
-                
+
                 // Update downloaded models list
                 DispatchQueue.main.async {
                     if !self.downloadedModels.contains(where: { $0.id == model.id }) {
@@ -1575,7 +2004,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                     }
                 }
             }
-            
+
             DispatchQueue.main.async {
                 self.modelDownloadStatus[modelId] = .downloaded
                 self.completionHandlers[modelId]?(true)
@@ -1588,11 +2017,134 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             }
         }
     }
-    
+
+    /// Handles completion of individual file downloads (new streaming system)
+    private func handleFileDownloadCompletion(taskId: Int, fileInfo: (modelId: String, fileName: String, destination: URL), location: URL) {
+        let fileKey = "\(fileInfo.modelId):\(fileInfo.fileName)"
+
+        print("✅ File download completed: \(fileInfo.fileName) (taskId: \(taskId))")
+
+        do {
+            // Create destination directory if needed
+            let directory = fileInfo.destination.deletingLastPathComponent()
+            if !fileManager.fileExists(atPath: directory.path) {
+                try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            }
+
+            // Remove existing file if present (for re-downloads)
+            if fileManager.fileExists(atPath: fileInfo.destination.path) {
+                try fileManager.removeItem(at: fileInfo.destination)
+            }
+
+            // Move downloaded file to destination
+            try fileManager.moveItem(at: location, to: fileInfo.destination)
+
+            // Verify file size if we have expected size
+            if let expectedSize = expectedFileSizes[fileKey] {
+                let attributes = try fileManager.attributesOfItem(atPath: fileInfo.destination.path)
+                if let actualSize = attributes[.size] as? Int64 {
+                    if actualSize < expectedSize {
+                        print("⚠️ File size mismatch: \(actualSize) < \(expectedSize) for \(fileInfo.fileName)")
+                    } else {
+                        print("✅ File size verified: \(actualSize) bytes for \(fileInfo.fileName)")
+                    }
+                }
+            }
+
+            print("✅ File saved to: \(fileInfo.destination.path)")
+
+            // Handle zip file extraction for monolithic models
+            if fileInfo.fileName.hasSuffix(".mlmodelc.zip") || fileInfo.fileName.hasSuffix(".mlpackage.zip") {
+                print("📦 Extracting zip file: \(fileInfo.fileName)")
+                let modelDir = fileInfo.destination.deletingLastPathComponent()
+
+                if self.extractZipFile(at: fileInfo.destination, to: modelDir) {
+                    print("✅ Successfully extracted \(fileInfo.fileName) to \(modelDir.path)")
+
+                    // Remove the zip file after successful extraction
+                    do {
+                        try self.fileManager.removeItem(at: fileInfo.destination)
+                        print("🗑️ Removed zip file after extraction: \(fileInfo.fileName)")
+                    } catch {
+                        print("⚠️ Could not remove zip file after extraction: \(error)")
+                    }
+                } else {
+                    print("❌ Failed to extract zip file \(fileInfo.fileName)")
+                    // Don't fail the download - the zip file is still there for manual extraction
+                }
+            }
+
+            // Defer cleanup to after delegate callback completes
+            // IMPORTANT: Call completion handler on a BACKGROUND queue - the handler
+            // may contain dispatch group leave() calls, and calling on main thread
+            // can cause "Semaphore object deallocated while in use" crash.
+            let taskIdToCleanup = taskId
+            let keyToCleanup = fileKey
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
+
+                // Thread-safe cleanup of tracking (but NOT fileDownloadTasks)
+                let completionHandler: ((Bool) -> Void)? = self.withDownloadLock {
+                    self.taskToFileInfo.removeValue(forKey: taskIdToCleanup)
+                    // Do NOT remove fileDownloadTasks - causes semaphore crash
+                    let handler = self.fileCompletionHandlers[keyToCleanup]
+                    self.fileCompletionHandlers.removeValue(forKey: keyToCleanup)
+                    return handler
+                }
+
+                // Call completion handler on background queue
+                completionHandler?(true)
+            }
+
+        } catch {
+            print("❌ Error saving downloaded file \(fileInfo.fileName): \(error)")
+            setDownloadError(for: fileInfo.modelId, message: "Failed to save \(fileInfo.fileName)")
+
+            // Defer cleanup - call handler on BACKGROUND queue to avoid semaphore crash
+            let taskIdToCleanup = taskId
+            let keyToCleanup = fileKey
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
+
+                // Thread-safe cleanup of tracking (but NOT fileDownloadTasks)
+                let completionHandler: ((Bool) -> Void)? = self.withDownloadLock {
+                    self.taskToFileInfo.removeValue(forKey: taskIdToCleanup)
+                    // Do NOT remove fileDownloadTasks - causes semaphore crash
+                    let handler = self.fileCompletionHandlers[keyToCleanup]
+                    self.fileCompletionHandlers.removeValue(forKey: keyToCleanup)
+                    return handler
+                }
+
+                // Call completion handler with failure on background queue
+                completionHandler?(false)
+            }
+        }
+    }
+
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        let taskId = downloadTask.taskIdentifier
+
+        // Thread-safe access to taskToFileInfo
+        let fileInfo: (modelId: String, fileName: String, destination: URL)? = withDownloadLock {
+            return taskToFileInfo[taskId]
+        }
+
+        // Handle individual file download progress (new system)
+        if let fileInfo = fileInfo {
+            handleFileDownloadProgress(
+                taskId: taskId,
+                fileInfo: fileInfo,
+                bytesWritten: bytesWritten,
+                totalBytesWritten: totalBytesWritten,
+                totalBytesExpected: totalBytesExpectedToWrite
+            )
+            return
+        }
+
+        // Legacy handling for top-level model downloads
         let progress = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
-        
-        guard let modelId = downloadTasks.first(where: { 
+
+        guard let modelId = downloadTasks.first(where: {
             if let task = $0.value as? URLSessionDownloadTask {
                 return task == downloadTask
             } else if let combinedTask = $0.value as? CombinedDownloadTask {
@@ -1603,21 +2155,135 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
               let progressHandler = progressObservers[modelId] else {
             return
         }
-        
+
         DispatchQueue.main.async {
             progressHandler(progress)
         }
     }
-    
+
+    /// Handles progress updates for individual file downloads with byte-based tracking
+    private func handleFileDownloadProgress(taskId: Int, fileInfo: (modelId: String, fileName: String, destination: URL), bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpected: Int64) {
+        let fileKey = "\(fileInfo.modelId):\(fileInfo.fileName)"
+        let modelId = fileInfo.modelId
+
+        // Store expected size for integrity validation later
+        if totalBytesExpected > 0 {
+            expectedFileSizes[fileKey] = totalBytesExpected
+        }
+
+        // Update bytes downloaded for this file
+        bytesDownloadedPerFile[fileKey] = totalBytesWritten
+
+        // Calculate and update total bytes for the model
+        var totalDownloaded: Int64 = 0
+        for (key, bytes) in bytesDownloadedPerFile {
+            if key.hasPrefix("\(modelId):") {
+                totalDownloaded += bytes
+            }
+        }
+        totalBytesDownloadedForModel[modelId] = totalDownloaded
+
+        // Update last progress time for stall detection
+        lastProgressUpdateTime[modelId] = Date()
+
+        // Progress smoothing: only use values that are >= the max we've seen
+        // This prevents UI from jumping backward due to concurrent download updates
+        let previousMaxBytes = maxDownloadedBytes[modelId] ?? 0
+        let smoothedDownloaded = max(totalDownloaded, previousMaxBytes)
+        maxDownloadedBytes[modelId] = smoothedDownloaded
+
+        // Calculate overall progress for this model using smoothed values
+        let totalExpected = totalBytesExpectedForModel[modelId] ?? totalBytesExpected
+        let overallProgress = totalExpected > 0 ? Double(smoothedDownloaded) / Double(totalExpected) : 0.0
+
+        // Also smooth the progress percentage
+        let previousMaxProgress = maxDownloadProgress[modelId] ?? 0.0
+        let smoothedProgress = max(overallProgress, previousMaxProgress)
+        maxDownloadProgress[modelId] = smoothedProgress
+
+        let overallProgressPercent = Int(smoothedProgress * 100)
+
+        // Format total bytes for display (use smoothed value)
+        let totalDownloadedMB = Double(smoothedDownloaded) / 1_000_000.0
+        let totalExpectedMB = Double(totalExpected) / 1_000_000.0
+
+        // Get or cache model display name
+        let modelName: String
+        if let cachedName = modelDisplayNames[modelId] {
+            modelName = cachedName
+        } else if let model = getModel(for: modelId) {
+            modelName = model.name
+            modelDisplayNames[modelId] = modelName
+        } else {
+            // Fallback: clean up modelId for display
+            modelName = modelId.replacingOccurrences(of: "_", with: " ")
+                .components(separatedBy: "-").last ?? modelId
+            modelDisplayNames[modelId] = modelName
+        }
+
+        // Calculate ETA based on download speed
+        var etaString = ""
+        if let startTime = downloadStartTimes[modelId], overallProgress > 0.01 {
+            let elapsedTime = Date().timeIntervalSince(startTime)
+            let estimatedTotalTime = elapsedTime / overallProgress
+            let remainingTime = estimatedTotalTime - elapsedTime
+
+            if remainingTime > 0 && remainingTime < 86400 { // Less than 24 hours
+                if remainingTime < 60 {
+                    etaString = " - <1 min"
+                } else if remainingTime < 3600 {
+                    let minutes = Int(remainingTime / 60)
+                    etaString = " - ~\(minutes) min"
+                } else {
+                    let hours = Int(remainingTime / 3600)
+                    let minutes = Int((remainingTime.truncatingRemainder(dividingBy: 3600)) / 60)
+                    etaString = " - ~\(hours)h \(minutes)m"
+                }
+            }
+        }
+
+        DispatchQueue.main.async {
+            // Update progress observers with smoothed progress
+            self.progressObservers[modelId]?(smoothedProgress)
+
+            // Update status with overall progress for whole model (no individual file names)
+            // Format: "ModelName: 45% (156.2/355.9 MB) - ~5 min"
+            let statusMessage = String(format: "%@: %d%% (%.1f/%.1f MB)%@",
+                                       modelName, overallProgressPercent,
+                                       totalDownloadedMB, totalExpectedMB, etaString)
+            self.currentDownloadingFiles[modelId] = statusMessage
+
+            // Update file progress observers with smoothed progress
+            self.fileProgressObservers[modelId]?(statusMessage, smoothedProgress)
+
+            // Clear any error messages since download is progressing
+            self.downloadErrorMessages.removeValue(forKey: modelId)
+        }
+    }
+
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let taskId = task.taskIdentifier
+
+        // Thread-safe access to taskToFileInfo
+        let fileInfo: (modelId: String, fileName: String, destination: URL)? = withDownloadLock {
+            return taskToFileInfo[taskId]
+        }
+
+        // Handle individual file download errors (new system)
+        if let fileInfo = fileInfo {
+            handleFileDownloadError(taskId: taskId, fileInfo: fileInfo, error: error)
+            return
+        }
+
+        // Legacy handling for top-level model downloads
         if let error = error, !(error.localizedDescription.contains("cancelled")) {
             print("Download task failed with error: \(error)")
-            
+
             // Find the model ID associated with this task
-            if let modelId = downloadTasks.first(where: { 
+            if let modelId = downloadTasks.first(where: {
                 if let downloadTask = $0.value as? URLSessionDownloadTask {
                     return downloadTask == task
-                } else if let combinedTask = $0.value as? CombinedDownloadTask, 
+                } else if let combinedTask = $0.value as? CombinedDownloadTask,
                           let downloadTask = task as? URLSessionDownloadTask {
                     return combinedTask.tasks.contains(downloadTask)
                 }
@@ -1631,9 +2297,266 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             }
         }
     }
-    
+
+    /// Handles errors for individual file downloads with resume data support
+    private func handleFileDownloadError(taskId: Int, fileInfo: (modelId: String, fileName: String, destination: URL), error: Error?) {
+        let fileKey = "\(fileInfo.modelId):\(fileInfo.fileName)"
+        let modelId = fileInfo.modelId
+        let taskIdToCleanup = taskId
+        let keyToCleanup = fileKey
+
+        // Handle no error case (successful completion without didFinishDownloadingTo being called)
+        // Note: didFinishDownloadingTo should always be called first for successful downloads,
+        // so the completion handler should already have been called and removed from fileCompletionHandlers.
+        guard let error = error else {
+            print("✅ File download task completed without error: \(fileInfo.fileName) (didCompleteWithError path)")
+
+            // Check if completion handler still exists (shouldn't if didFinishDownloadingTo was called)
+            let handlerStillExists = self.withDownloadLock {
+                return self.fileCompletionHandlers[keyToCleanup] != nil
+            }
+
+            if handlerStillExists {
+                print("⚠️ WARNING: Completion handler still exists for \(fileInfo.fileName) - didFinishDownloadingTo may not have been called!")
+                // Call the handler to prevent hanging
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    guard let self = self else { return }
+                    let handler: ((Bool) -> Void)? = self.withDownloadLock {
+                        self.taskToFileInfo.removeValue(forKey: taskIdToCleanup)
+                        let h = self.fileCompletionHandlers[keyToCleanup]
+                        self.fileCompletionHandlers.removeValue(forKey: keyToCleanup)
+                        return h
+                    }
+                    handler?(true)
+                }
+            } else {
+                // Normal case - just cleanup
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.withDownloadLock {
+                        _ = self.taskToFileInfo.removeValue(forKey: taskIdToCleanup)
+                    }
+                }
+            }
+            return
+        }
+
+        // Check if this was a cancellation
+        let nsError = error as NSError
+        if nsError.code == NSURLErrorCancelled {
+            print("[DOWNLOAD] ⏸️ CANCELLED: \(fileInfo.fileName)")
+
+            // Try to extract resume data for later
+            var resumeDataToStore: Data? = nil
+            if let resumeData = nsError.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+                print("💾 Saved resume data for: \(fileInfo.fileName) (\(resumeData.count) bytes)")
+                resumeDataToStore = resumeData
+            }
+
+            // Defer cleanup - use background queue for handler to avoid semaphore crash
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
+
+                // Store resume data if available
+                if let resumeData = resumeDataToStore {
+                    self.withDownloadLock {
+                        self.resumeDataStore[keyToCleanup] = resumeData
+                    }
+                }
+
+                // Cleanup tracking (but NOT fileDownloadTasks)
+                let handler: ((Bool) -> Void)? = self.withDownloadLock {
+                    self.taskToFileInfo.removeValue(forKey: taskIdToCleanup)
+                    // Do NOT remove fileDownloadTasks - causes semaphore crash
+                    let h = self.fileCompletionHandlers[keyToCleanup]
+                    self.fileCompletionHandlers.removeValue(forKey: keyToCleanup)
+                    return h
+                }
+                handler?(false)
+            }
+            return
+        }
+
+        // Handle actual errors - check if we should auto-retry
+        let currentRetryCount = fileRetryCount[keyToCleanup] ?? 0
+        let canRetry = currentRetryCount < maxRetryAttempts
+
+        logDownload("❌ File failed: \(fileInfo.fileName) - \(error.localizedDescription) (attempt \(currentRetryCount + 1)/\(maxRetryAttempts + 1))")
+
+        // Extract resume data if available (for network errors)
+        var resumeDataToStore: Data? = nil
+        if let resumeData = nsError.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+            logDownload("💾 Saved resume data: \(fileInfo.fileName) (\(resumeData.count) bytes)")
+            resumeDataToStore = resumeData
+        }
+
+        // Store resume data immediately (thread-safe)
+        if let resumeData = resumeDataToStore {
+            self.withDownloadLock {
+                self.resumeDataStore[keyToCleanup] = resumeData
+            }
+        }
+
+        // Auto-retry for retryable errors
+        let isRetryable = [NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost,
+                          NSURLErrorCannotConnectToHost, NSURLErrorNotConnectedToInternet].contains(nsError.code)
+
+        if canRetry && (isRetryable || resumeDataToStore != nil) {
+            // Increment retry count
+            fileRetryCount[keyToCleanup] = currentRetryCount + 1
+
+            logDownload("🔄 AUTO-RETRY: Retrying \(fileInfo.fileName) in 5 seconds (attempt \(currentRetryCount + 2)/\(maxRetryAttempts + 1))")
+
+            // Update UI to show retry
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.currentDownloadingFiles[modelId] = "Retrying \(fileInfo.fileName)... (attempt \(currentRetryCount + 2))"
+            }
+
+            // Retry after delay
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5.0) { [weak self] in
+                guard let self = self else { return }
+
+                // Get the handler before retrying
+                let handler: ((Bool) -> Void)? = self.withDownloadLock {
+                    return self.fileCompletionHandlers[keyToCleanup]
+                }
+
+                // Retry the download
+                self.downloadSingleFileWithRetry(
+                    modelId: modelId,
+                    fileName: fileInfo.fileName,
+                    destination: fileInfo.destination,
+                    completion: handler
+                )
+            }
+            return
+        }
+
+        // Create user-friendly error message (no more retries)
+        var userMessage: String
+        switch nsError.code {
+        case NSURLErrorTimedOut:
+            userMessage = "Connection timed out for \(fileInfo.fileName) after \(maxRetryAttempts + 1) attempts."
+        case NSURLErrorNetworkConnectionLost:
+            userMessage = "Network connection lost while downloading \(fileInfo.fileName)."
+        case NSURLErrorNotConnectedToInternet:
+            userMessage = "No internet connection. Please check your network settings."
+        case NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost:
+            userMessage = "Cannot reach download server after \(maxRetryAttempts + 1) attempts."
+        default:
+            userMessage = "Download failed: \(error.localizedDescription)"
+        }
+
+        logDownload("❌ GAVE UP: \(fileInfo.fileName) after \(currentRetryCount + 1) attempts")
+
+        // Update UI on main thread (no completion handler here)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.downloadErrorMessages[modelId] = userMessage
+            self.currentDownloadingFiles[modelId] = "Error: \(userMessage)"
+            self.modelDownloadStatus[modelId] = .failed
+        }
+
+        // Cleanup and call handler on background queue to avoid semaphore crash
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+
+            // Cleanup retry count
+            self.fileRetryCount.removeValue(forKey: keyToCleanup)
+
+            // Cleanup tracking (but NOT fileDownloadTasks)
+            let handler: ((Bool) -> Void)? = self.withDownloadLock {
+                self.taskToFileInfo.removeValue(forKey: taskIdToCleanup)
+                // Do NOT remove fileDownloadTasks - causes semaphore crash
+                let h = self.fileCompletionHandlers[keyToCleanup]
+                self.fileCompletionHandlers.removeValue(forKey: keyToCleanup)
+                return h
+            }
+            handler?(false)
+        }
+    }
+
+    // MARK: - Zip Extraction
+
+    /// Extracts a zip file to the specified destination directory
+    /// Uses posix_spawn to call /usr/bin/unzip which works on macOS, Mac Catalyst, and iOS
+    private func extractZipFile(at zipURL: URL, to destinationURL: URL) -> Bool {
+        #if os(macOS) || targetEnvironment(macCatalyst)
+        // Use posix_spawn to call unzip - works on macOS and Mac Catalyst
+        return extractZipUsingPosixSpawn(at: zipURL, to: destinationURL)
+        #else
+        // For iOS devices, zip extraction requires bundled binaries or third-party library
+        print("⚠️ Zip extraction not supported on iOS devices")
+        print("📂 Please manually extract the zip file: \(zipURL.path)")
+        return false
+        #endif
+    }
+
+    #if os(macOS) || targetEnvironment(macCatalyst)
+    /// Uses posix_spawn to call /usr/bin/unzip - works on Mac Catalyst unlike Process
+    private func extractZipUsingPosixSpawn(at zipURL: URL, to destinationURL: URL) -> Bool {
+        print("📦 Extracting zip using posix_spawn...")
+        print("   Source: \(zipURL.path)")
+        print("   Destination: \(destinationURL.path)")
+
+        // Prepare arguments for unzip: /usr/bin/unzip -o -q zipfile -d destdir
+        let unzipPath = "/usr/bin/unzip"
+        let args = [unzipPath, "-o", "-q", zipURL.path, "-d", destinationURL.path]
+
+        // Convert to C strings
+        var cArgs = args.map { strdup($0) }
+        cArgs.append(nil)
+
+        defer {
+            // Free the duplicated strings
+            for i in 0..<(cArgs.count - 1) {
+                free(cArgs[i])
+            }
+        }
+
+        var pid: pid_t = 0
+        var fileActions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&fileActions)
+
+        // Redirect stdout and stderr to /dev/null for quiet operation
+        posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
+        posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
+
+        let status = posix_spawn(&pid, unzipPath, &fileActions, nil, &cArgs, nil)
+        posix_spawn_file_actions_destroy(&fileActions)
+
+        if status != 0 {
+            print("❌ posix_spawn failed with status \(status)")
+            return false
+        }
+
+        // Wait for the unzip process to complete
+        var exitStatus: Int32 = 0
+        waitpid(pid, &exitStatus, 0)
+
+        // Check if process exited normally and with success code
+        // WIFEXITED(status) = ((status) & 0x7f) == 0
+        // WEXITSTATUS(status) = ((status) >> 8) & 0xff
+        let normalExit = (exitStatus & 0x7f) == 0
+        if normalExit {
+            let exitCode = (exitStatus >> 8) & 0xff
+            if exitCode == 0 {
+                print("✅ unzip completed successfully")
+                return true
+            } else {
+                print("❌ unzip failed with exit code \(exitCode)")
+                return false
+            }
+        } else {
+            print("❌ unzip process terminated abnormally")
+            return false
+        }
+    }
+    #endif
+
     // MARK: - Helper Methods
-    
+
     /// Loads custom models from storage
     private func loadCustomModels() {
         // Only load from models.json, removing UserDefaults backward compatibility
@@ -1775,27 +2698,50 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             "tokenizer.json",
             "tokenizer_config.json"
         ]
-        
+
         // Directory names (.mlmodelc directories)
         var requiredDirectories = [String]()
-        
-        // Print configuration values for debugging
-        print("\n🔍 MODEL CONFIGURATION DETAILS:")
-        print("Model Prefix: \(config.modelPrefix)")
-        print("Number of Chunks: \(config.numChunks)")
-        print("LUT LM Head: \(config.lutLMHead != nil ? String(config.lutLMHead!) : "nil")")
-        print("LUT FFN: \(config.lutFFN != nil ? String(config.lutFFN!) : "nil")")
-        print("LUT Embeddings: \(config.lutEmbeddings != nil ? String(config.lutEmbeddings!) : "nil")")
-        print("Context Length: \(config.contextLength)")
+
+        // Detailed logging only when VERBOSE_MODEL_VERIFICATION environment is set
+        // This reduces log noise during normal operation
+        #if DEBUG
+        // Minimal logging for debugging - only show model type
+        // print("🔍 Model: \(config.modelPrefix), chunks=\(config.numChunks), monolithic=\(config.isMonolithic)")
+        #endif
+
+        // Handle monolithic models differently
+        if config.isMonolithic, let monolithicModelName = config.monolithicModel {
+            print("🎯 MONOLITHIC MODEL DETECTED: \(monolithicModelName)")
+
+            // Monolithic models can be distributed either as:
+            // 1. A zip file (xxx.mlmodelc.zip) - will be extracted after download
+            // 2. A directory (xxx.mlmodelc) - download weights/weight.bin directly
+            // We add BOTH options - download/verification will use whichever is available
+
+            // Option 1: Add the monolithic model directory (will download weights/weight.bin)
+            requiredDirectories.append(monolithicModelName)
+            print("📁 Added monolithic model directory: \(monolithicModelName)")
+
+            // Option 2: Also add the zip file as an alternative (for models distributed as zip)
+            let zipFileName = "\(monolithicModelName).zip"
+            requiredFiles.append(zipFileName)
+            print("📦 Added monolithic model zip (alternative): \(zipFileName)")
+
+            // Combine directories and files
+            let allRequired = requiredDirectories + requiredFiles
+
+            print("Total required for monolithic model: \(allRequired.count) files")
+            return allRequired
+        }
+
+        // Standard chunked model handling below
         
         // 1. Embeddings model directory structure
         let embedDirName: String
         if let lutEmbeddings = config.lutEmbeddings, lutEmbeddings > 0 {
             embedDirName = "\(config.modelPrefix)_embeddings_lut\(lutEmbeddings).mlmodelc"
-            print("Using specified LUT embeddings value: \(lutEmbeddings)")
         } else {
             embedDirName = "\(config.modelPrefix)_embeddings.mlmodelc"
-            print("Using embeddings without LUT suffix (for lut_embeddings=none/nil/0)")
         }
         
         // Add embedding directory
@@ -1812,11 +2758,9 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         let lmHeadDirName: String
         if let lutLMHead = config.lutLMHead, lutLMHead > 0 {
             lmHeadDirName = "\(config.modelPrefix)_lm_head_lut\(lutLMHead).mlmodelc"
-            print("Using specified LUT LM head value: \(lutLMHead)")
         } else {
             // If LUT LM head is nil or 0, use the version without LUT suffix
             lmHeadDirName = "\(config.modelPrefix)_lm_head.mlmodelc"
-            print("Using LM head without LUT suffix since LUT LM head is nil or 0")
         }
         
         // Add lmhead directory
@@ -1830,18 +2774,14 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         requiredFiles.append("\(lmHeadDirName)/coremldata.bin") // Add root coremldata.bin file
         
         // 3. FFN chunks directory structures - using config.numChunks
-        print("🔄 Creating \(config.numChunks) FFN chunk entries based on configuration")
-        
         // If lutFFN is specified and > 0, use that value
         if let lutFFN = config.lutFFN, lutFFN > 0 {
-            print("Using specified LUT FFN value: \(lutFFN)")
             for i in 1...config.numChunks {
-                let chunkDirName = String(format: "\(config.modelPrefix)_FFN_PF_lut\(lutFFN)_chunk_%02dof%02d.mlmodelc", 
+                let chunkDirName = String(format: "\(config.modelPrefix)_FFN_PF_lut\(lutFFN)_chunk_%02dof%02d.mlmodelc",
                                          i, config.numChunks)
-                
+
                 // Add chunk directory
                 requiredDirectories.append(chunkDirName)
-                print("📦 Adding chunk \(i)/\(config.numChunks): \(chunkDirName)")
                 
                 // Add files within chunk directory (excluding model.mlmodel)
                 requiredFiles.append("\(chunkDirName)/model.mil")
@@ -1852,15 +2792,12 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             }
         } else {
             // If LUT FFN is nil or 0, use without LUT suffix
-            print("Using FFN chunks without LUT suffix since LUT FFN is nil or 0")
-            
             for i in 1...config.numChunks {
-                let chunkDirName = String(format: "\(config.modelPrefix)_FFN_PF_chunk_%02dof%02d.mlmodelc", 
+                let chunkDirName = String(format: "\(config.modelPrefix)_FFN_PF_chunk_%02dof%02d.mlmodelc",
                                          i, config.numChunks)
-                
+
                 // Add chunk directory
                 requiredDirectories.append(chunkDirName)
-                print("📦 Adding chunk \(i)/\(config.numChunks) without LUT: \(chunkDirName)")
                 
                 // Add files within chunk directory (excluding model.mlmodel)
                 requiredFiles.append("\(chunkDirName)/model.mil")
@@ -1873,8 +2810,6 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         
         // Combine directories and files, with directories first
         let allRequired = requiredDirectories + requiredFiles
-        
-        print("Total required: \(allRequired.count) (Directories: \(requiredDirectories.count), Files: \(requiredFiles.count))")
         return allRequired
     }
     
@@ -2068,39 +3003,33 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
     
     // Method to get a model by ID
     public func getModel(for modelId: String) -> Model? {
-        print("🔍 Looking for model with ID: \(modelId)")
-        
         // First try exact match
         if let model = availableModels.first(where: { $0.id == modelId }) {
-            print("✅ Found exact match for model ID: \(modelId)")
             return model
         }
-        
+
         // Special case for default model
-        if modelId == "llama-3.2-1b" || 
-           modelId == "llama_3_2_1b_iosv2_0" || 
-           modelId.contains("anemll-llama-3.2") || 
+        if modelId == "llama-3.2-1b" ||
+           modelId == "llama_3_2_1b_iosv2_0" ||
+           modelId.contains("anemll-llama-3.2") ||
            modelId.contains("anemll/anemll-llama-3.2") {
-        
+
             if let defaultModel = availableModels.first(where: { $0.id == "llama-3.2-1b" }) {
-                print("✅ Mapped ID \(modelId) to default model: llama-3.2-1b")
                 return defaultModel
             }
         }
-        
+
         // If not found, try case-insensitive match
         if let model = availableModels.first(where: { $0.id.lowercased() == modelId.lowercased() }) {
-            print("✅ Found case-insensitive match for model ID: \(modelId) -> \(model.id)")
             return model
         }
-        
+
         // Try with sanitized version of the ID
         let sanitizedId = sanitizeModelId(modelId)
         if let model = availableModels.first(where: { sanitizeModelId($0.id) == sanitizedId }) {
-            print("✅ Found match with sanitized ID: \(modelId) -> \(sanitizedId) -> \(model.id)")
             return model
         }
-        
+
         print("⚠️ Model not found: \(modelId)")
         return nil
     }
@@ -2239,11 +3168,121 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                 
                 print("\n🔍 Checking for \(requiredFiles.count) required files...")
                 
+                // Minimum size for weight.bin files (1KB) - anything smaller is likely corrupt/placeholder
+                let minimumWeightFileSize: Int64 = 1024
+                var emptyWeightFiles: [String] = []
+
+                // Track if we found valid monolithic weights (via either zip extraction or directory)
+                var foundValidMonolithicWeights = false
+                var monolithicModelName: String? = nil
+                if modelConfig.isMonolithic {
+                    monolithicModelName = modelConfig.monolithicModel
+                }
+
                 // Now check all required files
                 for file in requiredFiles {
-                    let filePath = modelDir.appendingPathComponent(file)
+                    // Special handling for monolithic model zip files
+                    // After extraction, the zip is deleted and we should check for the extracted directory
+                    var fileToCheck = file
+                    var isMonolithicZip = false
+                    var isMonolithicDir = false
+
+                    // Check if this is the monolithic model directory entry
+                    if let monoName = monolithicModelName, file == monoName {
+                        isMonolithicDir = true
+                        let dirPath = modelDir.appendingPathComponent(file)
+
+                        // Check if the directory exists with weight file inside
+                        if fileManager.fileExists(atPath: dirPath.path) {
+                            let weightFilePath = dirPath.appendingPathComponent("weights/weight.bin")
+                            if fileManager.fileExists(atPath: weightFilePath.path) {
+                                let weightSize = getFileSize(at: weightFilePath.path)
+                                if weightSize >= minimumWeightFileSize {
+                                    // Good! Monolithic model directory is valid
+                                    print("  ✅ \(file) (directory, weight: \(formatFileSize(weightSize)))")
+                                    actualTotalSize += weightSize
+                                    foundValidMonolithicWeights = true
+
+                                    // Also add other files in the directory to total size
+                                    if let enumerator = fileManager.enumerator(atPath: dirPath.path) {
+                                        while let subFile = enumerator.nextObject() as? String {
+                                            if subFile != "weights/weight.bin" {
+                                                let subFilePath = dirPath.appendingPathComponent(subFile).path
+                                                var isDir: ObjCBool = false
+                                                if fileManager.fileExists(atPath: subFilePath, isDirectory: &isDir) && !isDir.boolValue {
+                                                    actualTotalSize += getFileSize(at: subFilePath)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    continue  // Skip to next file - this one is valid
+                                }
+                            }
+                        }
+                        // If directory doesn't exist or is invalid, we might have the zip instead
+                        // Don't fail yet - check if we already found valid weights via zip
+                        if foundValidMonolithicWeights {
+                            continue  // Already have valid weights, skip this
+                        }
+                        // Fall through to normal file checking (will mark as missing)
+                    }
+
+                    if file.hasSuffix(".mlmodelc.zip") || file.hasSuffix(".mlpackage.zip") {
+                        isMonolithicZip = true
+                        // Remove .zip extension to get the directory name
+                        let extractedDirName = String(file.dropLast(4)) // Remove ".zip"
+                        let extractedDirPath = modelDir.appendingPathComponent(extractedDirName)
+
+                        // Check if the extracted directory exists
+                        if fileManager.fileExists(atPath: extractedDirPath.path) {
+                            // Extracted directory exists - check for weight file inside
+                            let weightFilePath = extractedDirPath.appendingPathComponent("weights/weight.bin")
+                            if fileManager.fileExists(atPath: weightFilePath.path) {
+                                let weightSize = getFileSize(at: weightFilePath.path)
+                                if weightSize >= minimumWeightFileSize {
+                                    // Good! Monolithic model is properly extracted
+                                    print("  ✅ \(extractedDirName) (extracted, weight: \(formatFileSize(weightSize)))")
+                                    actualTotalSize += weightSize
+                                    foundValidMonolithicWeights = true
+
+                                    // Also add other files in the directory to total size
+                                    if let enumerator = fileManager.enumerator(atPath: extractedDirPath.path) {
+                                        while let subFile = enumerator.nextObject() as? String {
+                                            if subFile != "weights/weight.bin" {
+                                                let subFilePath = extractedDirPath.appendingPathComponent(subFile).path
+                                                var isDir: ObjCBool = false
+                                                if fileManager.fileExists(atPath: subFilePath, isDirectory: &isDir) && !isDir.boolValue {
+                                                    actualTotalSize += getFileSize(at: subFilePath)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    continue  // Skip to next file - this one is valid
+                                } else {
+                                    print("  ❌ \(extractedDirName) (extracted but weight file empty/corrupt)")
+                                    emptyWeightFiles.append("\(extractedDirName)/weights/weight.bin")
+                                    missingWeightFiles.append("\(extractedDirName)/weights/weight.bin")
+                                    allRequiredFilesExist = false
+                                    continue
+                                }
+                            } else {
+                                print("  ❌ \(extractedDirName) (extracted but missing weight file)")
+                                missingWeightFiles.append("\(extractedDirName)/weights/weight.bin")
+                                allRequiredFilesExist = false
+                                continue
+                            }
+                        }
+                        // If extracted dir doesn't exist, check if we have valid weights from directory
+                        if foundValidMonolithicWeights {
+                            print("  ⏭️ \(file) (skipped - using directory weights)")
+                            continue  // Already have valid weights via directory, skip zip
+                        }
+                        // If extracted dir doesn't exist, fall through to check for the zip file
+                    }
+
+                    let filePath = modelDir.appendingPathComponent(fileToCheck)
                     let exists = fileManager.fileExists(atPath: filePath.path)
-                    
+
                     // Get file size for existing files
                     var fileSize: Int64 = 0
                     if exists {
@@ -2251,32 +3290,70 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                         actualTotalSize += fileSize
                         fileSizes[file] = fileSize
                     }
-                    
+
+                    // Check if this is a weight file with 0 or very small size (corrupt/placeholder)
+                    let isWeightFile = file.contains("/weights/weight.bin")
+                    // Monolithic zip files should also be checked for minimum size (at least 100KB for a real zip)
+                    let minimumZipFileSize: Int64 = 100_000  // 100KB minimum for zip files
+                    let isEmptyOrCorrupt = exists && (
+                        (isWeightFile && fileSize < minimumWeightFileSize) ||
+                        (isMonolithicZip && fileSize < minimumZipFileSize)
+                    )
+
                     // Critical files that must exist for the model to work
-                    let isCriticalFile = file == "meta.yaml" || 
-                                         file == "config.json" || 
+                    let isCriticalFile = file == "meta.yaml" ||
+                                         file == "config.json" ||
                                          file == "tokenizer.json" ||
                                          file == "tokenizer_config.json" ||  // Add tokenizer_config.json as critical
-                                         file.contains("/weights/weight.bin")
-                    
+                                         isWeightFile ||
+                                         isMonolithicZip  // Monolithic zip files are critical
+
                     if !exists {
                         missingFiles.append(file)
-                        if file.contains("/weights/weight.bin") {
+                        // Monolithic zip files are essentially weight files - they contain the model weights
+                        if isWeightFile || isMonolithicZip {
                             missingWeightFiles.append(file)
+                            if isMonolithicZip {
+                                print("❌ MONOLITHIC MODEL: Zip file not found and not extracted: \(file)")
+                                print("   💡 Please download the model to get the monolithic model weights")
+                            }
                         }
-                        
+
                         if isCriticalFile {
                             allRequiredFilesExist = false
                             if verbose {
                                 print("❌ Critical file missing: \(file)")
                             }
                         }
+                    } else if isEmptyOrCorrupt {
+                        // File exists but is empty or corrupt - treat as missing
+                        emptyWeightFiles.append(file)
+                        missingWeightFiles.append(file)
+                        allRequiredFilesExist = false
+                        if verbose {
+                            if isMonolithicZip {
+                                print("❌ MONOLITHIC MODEL: Zip file is empty/corrupt (\(formatFileSize(fileSize))): \(file)")
+                                print("   💡 Please re-download the model to get the monolithic model weights")
+                            } else {
+                                print("❌ Weight file is empty/corrupt (\(formatFileSize(fileSize))): \(file)")
+                            }
+                        }
                     }
-                    
+
                     // Print status with proper emoji and size information
-                    let statusEmoji = exists ? "✅" : (isCriticalFile ? "❌" : "⚠️")
+                    let statusEmoji: String
+                    if isEmptyOrCorrupt {
+                        statusEmoji = "❌"  // Empty/corrupt file
+                    } else if exists {
+                        statusEmoji = "✅"  // File exists with valid size
+                    } else if isCriticalFile {
+                        statusEmoji = "❌"  // Missing critical file
+                    } else {
+                        statusEmoji = "⚠️"  // Missing non-critical file
+                    }
                     let sizeInfo = exists ? " (\(formatFileSize(fileSize)))" : ""
-                    print("  \(statusEmoji) \(file)\(sizeInfo)")
+                    let corruptNote = isEmptyOrCorrupt ? " [EMPTY/CORRUPT]" : ""
+                    print("  \(statusEmoji) \(file)\(sizeInfo)\(corruptNote)")
                 }
                 
                 // Size verification
@@ -2308,24 +3385,58 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                     }
                 }
                 
+                // Update hasPlaceholders if there are empty/missing weight files
+                if !emptyWeightFiles.isEmpty || !missingWeightFiles.isEmpty {
+                    if let model = self.getModel(for: modelId) {
+                        print("⚠️ Model \(modelId) has \(emptyWeightFiles.count) empty and \(missingWeightFiles.count - emptyWeightFiles.count) missing weight files - setting hasPlaceholders to true")
+                        DispatchQueue.main.async {
+                            model.hasPlaceholders = true
+                        }
+                    }
+                }
+
+                // CRITICAL CHECK for monolithic models: the .mlmodelc directory MUST exist with valid weights
+                // If we didn't find valid weights via either zip extraction or direct directory, fail verification
+                if modelConfig.isMonolithic && !foundValidMonolithicWeights {
+                    print("\n❌ MONOLITHIC MODEL VERIFICATION FAILED:")
+                    print("   The monolithic model directory '\(monolithicModelName ?? "unknown")' is missing or has invalid weights.")
+                    print("   💡 Please download the model to get the monolithic model files.")
+                    if let model = self.getModel(for: modelId) {
+                        DispatchQueue.main.async {
+                            model.hasPlaceholders = true
+                        }
+                    }
+                    return false
+                }
+
                 // Summary of verification results
-                if missingFiles.isEmpty && hasValidSize {
+                if missingFiles.isEmpty && emptyWeightFiles.isEmpty && hasValidSize {
                     print("\n✅ Model verification SUCCESSFUL: All files present and valid size.")
                     return true
-                } else if missingWeightFiles.isEmpty && hasValidSize {
+                } else if missingWeightFiles.isEmpty && emptyWeightFiles.isEmpty && hasValidSize {
                     print("\n⚠️ Model verification PARTIALLY SUCCESSFUL: Missing some non-critical files, but all weight files present and size looks good.")
                     print("   Missing files:")
                     for file in missingFiles {
                         print("   - \(file)")
                     }
                     return true
-                } else if missingWeightFiles.isEmpty && !hasValidSize {
+                } else if missingWeightFiles.isEmpty && emptyWeightFiles.isEmpty && !hasValidSize {
                     print("\n⚠️ Model verification PARTIALLY SUCCESSFUL: All required files present but total size (\(formatFileSize(actualTotalSize))) is less than expected (\(formatFileSize(Int64(expectedSize)))).")
                     return true
                 } else {
-                    print("\n❌ Model verification FAILED: Missing weight files or size mismatch:")
-                    for file in missingWeightFiles {
-                        print("   - \(file)")
+                    print("\n❌ Model verification FAILED:")
+                    if !emptyWeightFiles.isEmpty {
+                        print("   Empty/corrupt weight files (0 KB):")
+                        for file in emptyWeightFiles {
+                            print("   - \(file)")
+                        }
+                    }
+                    let actualMissingFiles = missingWeightFiles.filter { !emptyWeightFiles.contains($0) }
+                    if !actualMissingFiles.isEmpty {
+                        print("   Missing weight files:")
+                        for file in actualMissingFiles {
+                            print("   - \(file)")
+                        }
                     }
                     if !hasValidSize {
                         print("   - Size mismatch: Expected \(formatFileSize(Int64(expectedSize))), got \(formatFileSize(actualTotalSize)) (\(String(format: "%.1f", sizePercentage))%)")
@@ -2347,16 +3458,19 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                 print("Found \(mlmodelcDirs.count) .mlmodelc directories and essential files")
                 
                 // Check for weight.bin files in each .mlmodelc directory
+                // Minimum size for weight.bin files (1KB) - anything smaller is likely corrupt/placeholder
+                let minimumWeightFileSize: Int64 = 1024
                 var hasAllWeightFiles = true
                 var weightFilesMissing: [String] = []
-                
+                var emptyWeightFilesInFallback: [String] = []
+
                 for mlmodelcDir in mlmodelcDirs {
                     let weightsDir = mlmodelcDir.appendingPathComponent("weights")
                     let weightBinPath = weightsDir.appendingPathComponent("weight.bin")
-                    
+
                     let weightBinExists = fileManager.fileExists(atPath: weightBinPath.path)
                     let dirName = mlmodelcDir.lastPathComponent
-                    
+
                     // Get size if file exists
                     var fileSize: Int64 = 0
                     if weightBinExists {
@@ -2364,17 +3478,36 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                         actualTotalSize += fileSize
                         fileSizes["\(dirName)/weights/weight.bin"] = fileSize
                     }
-                    
+
+                    // Check if file is empty/corrupt
+                    let isEmptyOrCorrupt = weightBinExists && fileSize < minimumWeightFileSize
+
                     // Print with size information
                     if verbose {
                         let sizeInfo = weightBinExists ? " (\(formatFileSize(fileSize)))" : ""
-                        print("  \(weightBinExists ? "✅" : "❌") \(dirName)/weights/weight.bin\(sizeInfo)")
+                        let corruptNote = isEmptyOrCorrupt ? " [EMPTY/CORRUPT]" : ""
+                        let statusEmoji = isEmptyOrCorrupt ? "❌" : (weightBinExists ? "✅" : "❌")
+                        print("  \(statusEmoji) \(dirName)/weights/weight.bin\(sizeInfo)\(corruptNote)")
                     }
-                    
+
                     if !weightBinExists {
                         hasAllWeightFiles = false
                         weightFilesMissing.append("\(dirName)/weights/weight.bin")
                         allRequiredFilesExist = false
+                    } else if isEmptyOrCorrupt {
+                        hasAllWeightFiles = false
+                        emptyWeightFilesInFallback.append("\(dirName)/weights/weight.bin")
+                        weightFilesMissing.append("\(dirName)/weights/weight.bin")
+                        allRequiredFilesExist = false
+                    }
+                }
+
+                // Update hasPlaceholders if there are empty/missing weight files
+                if !emptyWeightFilesInFallback.isEmpty || !weightFilesMissing.isEmpty {
+                    if let model = self.getModel(for: modelId) {
+                        DispatchQueue.main.async {
+                            model.hasPlaceholders = true
+                        }
                     }
                 }
                 
@@ -2406,9 +3539,19 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                     return true
                 } else {
                     if verbose {
-                        print("\n❌ Model verification FAILED: Missing weight files:")
-                        for file in weightFilesMissing {
-                            print("   - \(file)")
+                        print("\n❌ Model verification FAILED:")
+                        if !emptyWeightFilesInFallback.isEmpty {
+                            print("   Empty/corrupt weight files (0 KB):")
+                            for file in emptyWeightFilesInFallback {
+                                print("   - \(file)")
+                            }
+                        }
+                        let actualMissingFiles = weightFilesMissing.filter { !emptyWeightFilesInFallback.contains($0) }
+                        if !actualMissingFiles.isEmpty {
+                            print("   Missing weight files:")
+                            for file in actualMissingFiles {
+                                print("   - \(file)")
+                            }
                         }
                         if !hasValidSize {
                             print("   - Size mismatch: Expected \(formatFileSize(Int64(expectedSize))), got \(formatFileSize(actualTotalSize)) (\(String(format: "%.1f", sizePercentage))%)")
@@ -2523,50 +3666,128 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         }
     }
     
-    /// Cancels an ongoing model download
+    /// Cancels an ongoing model download, saving resume data for all in-progress file downloads
     public func cancelDownload(modelId: String) {
         print("🛑 Cancelling download for model: \(modelId)")
-        
+
         // Stop any activity indicators
         stopDownloadActivityIndicator(for: modelId)
-        
-        // Get the download task
+
+        var cancelledTasks = 0
+
+        // Thread-safe access to get tasks to cancel
+        let fileTasksToCancel: [(String, URLSessionDownloadTask)] = withDownloadLock {
+            return Array(fileDownloadTasks.filter { $0.key.hasPrefix("\(modelId):") })
+        }
+
+        for (fileKey, task) in fileTasksToCancel {
+            // Cancel with resume data by calling cancelByProducingResumeData
+            task.cancel(byProducingResumeData: { [weak self] resumeData in
+                guard let self = self, let resumeData = resumeData else { return }
+                print("💾 Saved resume data for: \(fileKey) (\(resumeData.count) bytes)")
+                self.withDownloadLock {
+                    self.resumeDataStore[fileKey] = resumeData
+                }
+            })
+            cancelledTasks += 1
+        }
+
+        // Thread-safe cleanup of task tracking
+        withDownloadLock {
+            for (fileKey, _) in fileTasksToCancel {
+                fileDownloadTasks.removeValue(forKey: fileKey)
+            }
+            // Clean up task info
+            let taskIdsToRemove = taskToFileInfo.filter { $0.value.modelId == modelId }.map { $0.key }
+            for taskId in taskIdsToRemove {
+                taskToFileInfo.removeValue(forKey: taskId)
+            }
+        }
+
+        if cancelledTasks > 0 {
+            print("📥 Cancelled \(cancelledTasks) file download tasks for model: \(modelId)")
+        }
+
+        // Cancel top-level download tasks (legacy system)
         if let task = downloadTasks[modelId] {
             if let downloadTask = task as? URLSessionDownloadTask {
-                downloadTask.cancel()
+                downloadTask.cancel(byProducingResumeData: { [weak self] resumeData in
+                    guard let self = self, let resumeData = resumeData else { return }
+                    print("💾 Saved resume data for main task: \(modelId) (\(resumeData.count) bytes)")
+                    self.withDownloadLock {
+                        self.resumeDataStore["\(modelId):main"] = resumeData
+                    }
+                })
                 print("Download task cancelled for model: \(modelId)")
             } else if let combinedTask = task as? CombinedDownloadTask {
                 combinedTask.cancel()
                 print("Combined download task cancelled for model: \(modelId)")
             }
-            
-            // Update model status
-            modelDownloadStatus[modelId] = .notDownloaded
-            currentDownloadingFiles[modelId] = "Download cancelled"
-            
-            // Clean up resources
-            cleanupDownload(for: modelId)
-            
-            // Add cleanup of tracking data with a delay
-            cleanupDownloadTracking(for: modelId, delay: 2.0)
-            
-            // Notify any completion handlers with failure
-            completionHandlers[modelId]?(false)
-            completionHandlers.removeValue(forKey: modelId)
-        } else {
-            print("No download task found for model: \(modelId)")
-            
-            // Update status in case the UI is still showing progress
-            isDownloadActive[modelId] = false
-            currentDownloadingFiles[modelId] = "Download cancelled"
-            
-            // Clean up tracking data
-            cleanupDownloadTracking(for: modelId)
-            
-            // Even if no task was found, make sure we allow sleep
-            // This is a safety measure in case the download state was lost
-            allowSleepAfterDownload()
+
+            downloadTasks.removeValue(forKey: modelId)
         }
+
+        // Stop the watchdog timer
+        stopDownloadWatchdog(for: modelId)
+
+        // Update model status - mark as partially downloaded if we have resume data
+        let hasResumeData: Bool = withDownloadLock {
+            return resumeDataStore.keys.contains { $0.hasPrefix("\(modelId):") }
+        }
+        modelDownloadStatus[modelId] = hasResumeData ? .partiallyDownloaded : .notDownloaded
+        currentDownloadingFiles[modelId] = hasResumeData ? "Download paused - can be resumed" : "Download cancelled"
+        print("[DOWNLOAD] \(hasResumeData ? "⏸️ PAUSED" : "🛑 STOPPED"): \(modelId)")
+
+        // Clear byte tracking for this model
+        for key in bytesDownloadedPerFile.keys where key.hasPrefix("\(modelId):") {
+            bytesDownloadedPerFile.removeValue(forKey: key)
+        }
+        totalBytesDownloadedForModel.removeValue(forKey: modelId)
+        totalBytesExpectedForModel.removeValue(forKey: modelId)
+
+        // Thread-safe cleanup of file completion handlers
+        let handlersToCall: [(Bool) -> Void] = withDownloadLock {
+            var handlers: [(Bool) -> Void] = []
+            for key in fileCompletionHandlers.keys where key.hasPrefix("\(modelId):") {
+                if let handler = fileCompletionHandlers[key] {
+                    handlers.append(handler)
+                }
+                fileCompletionHandlers.removeValue(forKey: key)
+            }
+            return handlers
+        }
+        // Call handlers outside the sync block to avoid deadlock
+        for handler in handlersToCall {
+            handler(false)
+        }
+
+        // Clean up resources
+        cleanupDownload(for: modelId)
+
+        // Add cleanup of tracking data with a delay
+        cleanupDownloadTracking(for: modelId, delay: 2.0)
+
+        // Notify any completion handlers with failure
+        completionHandlers[modelId]?(false)
+        completionHandlers.removeValue(forKey: modelId)
+
+        // Allow device to sleep
+        allowSleepAfterDownload()
+
+        print("✅ Cancel complete for model: \(modelId) (hasResumeData: \(hasResumeData))")
+    }
+
+    /// Checks if a model has resume data available for continuing an interrupted download
+    public func hasResumeData(for modelId: String) -> Bool {
+        return resumeDataStore.keys.contains { $0.hasPrefix("\(modelId):") }
+    }
+
+    /// Clears all resume data for a model (use before force redownload)
+    public func clearResumeData(for modelId: String) {
+        for key in resumeDataStore.keys where key.hasPrefix("\(modelId):") {
+            resumeDataStore.removeValue(forKey: key)
+        }
+        print("🗑️ Cleared resume data for model: \(modelId)")
     }
     
     /// Starts an activity indicator for a model download
@@ -2590,18 +3811,13 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                 let pulseAmount = 0.005 // Small amount to pulse
                 let pulseProgress = currentProgress + (sin(Date().timeIntervalSince1970 * 5) * pulseAmount)
                 
-                // Update UI with pulsing effect
+                // Update UI with pulsing effect (progress bar only, don't modify status text)
                 DispatchQueue.main.async {
                     // Update the progress observers with the pulsing effect
                     self.progressObservers[modelId]?(pulseProgress)
-                    
-                    // Update the status message to show activity
-                    let currentFile = self.currentDownloadingFiles[modelId] ?? "Downloading..."
-                    let activityIndicator = self.getActivityIndicator()
-                    self.currentDownloadingFiles[modelId] = "\(currentFile) \(activityIndicator)"
-                    
-                    // Also update the file progress observer
-                    self.fileProgressObservers[modelId]?(currentFile, pulseProgress)
+
+                    // Note: Don't modify currentDownloadingFiles here - it causes UI flashing
+                    // The DownloadProgressView already has a built-in ProgressView spinner
                 }
             }
         }
@@ -2615,6 +3831,75 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         isDownloadActive[modelId] = false
         downloadActivityTimers[modelId]?.invalidate()
         downloadActivityTimers[modelId] = nil
+    }
+
+    // MARK: - Download Logging Helper
+
+    /// Returns a timestamp string for download logs (HH:mm:ss format)
+    private func downloadTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: Date())
+    }
+
+    /// Logs a download message with timestamp
+    private func logDownload(_ message: String) {
+        print("[DOWNLOAD] [\(downloadTimestamp())] \(message)")
+    }
+
+    // MARK: - Download Watchdog (Stall Detection)
+
+    /// Starts a watchdog timer to detect stalled downloads
+    private func startDownloadWatchdog(for modelId: String) {
+        // Stop any existing watchdog
+        stopDownloadWatchdog(for: modelId)
+
+        // Check every 30 seconds for stalled downloads
+        let timer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+
+            // Check if download is still active
+            guard self.modelDownloadStatus[modelId] == .downloading else {
+                print("[DOWNLOAD] Watchdog: Download no longer active for \(modelId)")
+                self.stopDownloadWatchdog(for: modelId)
+                return
+            }
+
+            // Check time since last progress update
+            guard let lastUpdate = self.lastProgressUpdateTime[modelId] else {
+                print("[DOWNLOAD] Watchdog: No progress recorded for \(modelId)")
+                return
+            }
+
+            let timeSinceUpdate = Date().timeIntervalSince(lastUpdate)
+            let currentProgress = self.maxDownloadProgress[modelId] ?? 0
+
+            if timeSinceUpdate > 60 {
+                // No progress in 60 seconds - likely stalled
+                print("[DOWNLOAD] ⚠️ STALL DETECTED: No progress for \(Int(timeSinceUpdate))s on \(modelId)")
+                print("[DOWNLOAD] Current progress: \(Int(currentProgress * 100))%")
+                print("[DOWNLOAD] Last update: \(lastUpdate)")
+
+                // Update status to show stall warning
+                DispatchQueue.main.async {
+                    let currentStatus = self.currentDownloadingFiles[modelId] ?? ""
+                    if !currentStatus.contains("stalled") && !currentStatus.contains("Error") {
+                        self.currentDownloadingFiles[modelId] = "Download may be stalled... (\(Int(currentProgress * 100))%)"
+                    }
+                }
+            } else if timeSinceUpdate > 30 {
+                // Warn about slow progress
+                print("[DOWNLOAD] Slow: No progress for \(Int(timeSinceUpdate))s on \(modelId) (\(Int(currentProgress * 100))%)")
+            }
+        }
+
+        downloadWatchdogTimers[modelId] = timer
+    }
+
+    /// Stops the download watchdog timer
+    private func stopDownloadWatchdog(for modelId: String) {
+        downloadWatchdogTimers[modelId]?.invalidate()
+        downloadWatchdogTimers[modelId] = nil
     }
     
     /// Returns a rotating activity indicator string
@@ -2711,10 +3996,10 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         }
         
         // Store progress and completion handlers
-        progressObservers[actualModelId] = { progress in
-            DispatchQueue.main.async {
-                fileProgress("Downloading missing files...", progress)
-            }
+        // Note: Don't call fileProgress with generic message here - it overwrites
+        // the detailed status set by URLSession delegate.
+        progressObservers[actualModelId] = { _ in
+            // Progress is handled by fileProgressObservers via URLSession delegate
         }
         
         fileProgressObservers[actualModelId] = fileProgress
@@ -2968,15 +4253,117 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             }
         }.resume()
     }
-    
+
+    /// Fetches file sizes from HuggingFace tree API for a list of files
+    /// Returns a dictionary mapping file paths to their sizes in bytes
+    private func fetchFileSizes(owner: String, repo: String, files: [String], completion: @escaping ([String: Int64]) -> Void) {
+        // HuggingFace tree API requires fetching directory by directory
+        // For simplicity, we'll fetch the entire tree recursively
+        let urlString = "https://huggingface.co/api/models/\(owner)/\(repo)/tree/main?recursive=true"
+        print("📏 Fetching file sizes from: \(urlString)")
+
+        guard let url = URL(string: urlString) else {
+            print("❌ Invalid URL for fetching file sizes")
+            completion([:])
+            return
+        }
+
+        URLSession.shared.dataTask(with: url) { data, response, error in
+            if let error = error {
+                print("❌ Error fetching file sizes: \(error.localizedDescription)")
+                completion([:])
+                return
+            }
+
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                print("❌ Failed to fetch file sizes: HTTP error")
+                completion([:])
+                return
+            }
+
+            guard let data = data else {
+                print("❌ No data received for file sizes")
+                completion([:])
+                return
+            }
+
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                    var fileSizes: [String: Int64] = [:]
+
+                    for item in json {
+                        if let path = item["path"] as? String,
+                           let size = item["size"] as? Int64 {
+                            fileSizes[path] = size
+                        } else if let path = item["path"] as? String,
+                                  let sizeInt = item["size"] as? Int {
+                            fileSizes[path] = Int64(sizeInt)
+                        }
+                    }
+
+                    print("✅ Successfully fetched sizes for \(fileSizes.count) files")
+                    completion(fileSizes)
+                } else {
+                    print("❌ Invalid JSON format for file sizes")
+                    completion([:])
+                }
+            } catch {
+                print("❌ Error parsing file sizes: \(error.localizedDescription)")
+                completion([:])
+            }
+        }.resume()
+    }
+
+    /// Calculates total expected bytes for a model download based on file list
+    private func calculateTotalExpectedBytes(for modelId: String, files: [String], owner: String, repo: String, completion: @escaping (Int64) -> Void) {
+        fetchFileSizes(owner: owner, repo: repo, files: files) { [weak self] fileSizes in
+            guard let self = self else {
+                completion(0)
+                return
+            }
+
+            var totalBytes: Int64 = 0
+            var foundSizes = 0
+            var missingSizes: [String] = []
+
+            for file in files {
+                if let size = fileSizes[file] {
+                    totalBytes += size
+                    foundSizes += 1
+                } else {
+                    missingSizes.append(file)
+                }
+            }
+
+            if !missingSizes.isEmpty && missingSizes.count <= 5 {
+                print("⚠️ Missing sizes for \(missingSizes.count) files: \(missingSizes)")
+            } else if missingSizes.count > 5 {
+                print("⚠️ Missing sizes for \(missingSizes.count) files")
+            }
+
+            print("📊 Total expected bytes for \(modelId): \(totalBytes) bytes (\(Double(totalBytes) / 1_000_000.0) MB) from \(foundSizes) files")
+
+            // Store the total expected bytes
+            self.withDownloadLock {
+                self.totalBytesExpectedForModel[modelId] = totalBytes
+            }
+
+            DispatchQueue.main.async {
+                completion(totalBytes)
+            }
+        }
+    }
+
     private func continuePartialDownload(modelId: String, modelURL: String, filesToDownload: [String], repoInfo: HuggingFaceRepoInfo) {
         let modelDir = getModelPath(for: modelId)
         var downloadedCount = 0
         let totalFiles = filesToDownload.count
         
         // Create a dispatch group to track all downloads
+        // Store in instance property to prevent premature deallocation (semaphore crash)
         let downloadGroup = DispatchGroup()
-        
+        withDownloadLock { activeDownloadGroups["\(modelId):regular"] = downloadGroup }
+
         // Track overall success
         var overallSuccess = true
         
@@ -3140,17 +4527,25 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         }
         
         // Wait for regular files to complete
-        downloadGroup.notify(queue: .main) {
+        downloadGroup.notify(queue: .main) { [weak self] in
+            guard let self = self else { return }
             print("✅ Regular files download complete. Now downloading weight files...")
-            
+
+            // DELAYED cleanup - wait for internal semaphore operations to complete
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                self.withDownloadLock { _ = self.activeDownloadGroups.removeValue(forKey: "\(modelId):regular") }
+            }
+
             // Now download the weight files
             DispatchQueue.main.async {
                 self.currentDownloadingFiles[modelId] = "Starting \(weightFiles.count) weight files..."
                 self.downloadProgress[modelId] = 0.55 // Regular files are done (50% + 5% initial)
                 self.progressObservers[modelId]?(0.55)
             }
-            
+
+            // Store in instance property to prevent premature deallocation (semaphore crash)
             let weightDownloadGroup = DispatchGroup()
+            self.withDownloadLock { self.activeDownloadGroups["\(modelId):weights"] = weightDownloadGroup }
             
             // Download each weight file
             for (index, weightFile) in weightFiles.enumerated() {
@@ -3181,8 +4576,14 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             }
             
             // Wait for weight files to complete
-            weightDownloadGroup.notify(queue: .main) {
+            weightDownloadGroup.notify(queue: .main) { [weak self] in
+                guard let self = self else { return }
                 print("All downloads completed, including weight files. Success: \(overallSuccess)")
+
+                // DELAYED cleanup - wait for internal semaphore operations to complete
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    self.withDownloadLock { _ = self.activeDownloadGroups.removeValue(forKey: "\(modelId):weights") }
+                }
                 
                 // Mark final progress
                 self.updateDownloadProgress(
@@ -3963,11 +5364,19 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         completion: @escaping (Bool) -> Void
     ) {
         print("🔄 Starting FORCED redownload for model: \(modelId)")
-        
+
+        // Clear any saved resume data since we're starting fresh
+        clearResumeData(for: modelId)
+
+        // Clear any cached expected file sizes
+        for key in expectedFileSizes.keys where key.hasPrefix("\(modelId):") {
+            expectedFileSizes.removeValue(forKey: key)
+        }
+
         // Get the model directory path
         let modelDir = getModelPath(for: modelId)
         print("📂 Model directory: \(modelDir.path)")
-        
+
         // First attempt to remove the directory if it exists
         if fileManager.fileExists(atPath: modelDir.path) {
             do {
@@ -3981,7 +5390,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         } else {
             print("ℹ️ Model directory doesn't exist, nothing to remove")
         }
-        
+
         // Introduce a small delay to ensure filesystem operations complete
         // This is especially important on iOS where file operations can be slightly delayed
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -3990,34 +5399,124 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         }
     }
 
-    // Add this method to improve download of individual files
-    private func downloadSingleFile(urlString: String, destination: URL, completion: @escaping (Bool) -> Void) {
+    // MARK: - Streaming File Download with Resume Support
+
+    /// Wrapper for downloadSingleFile that handles retry with resume data
+    private func downloadSingleFileWithRetry(modelId: String, fileName: String, destination: URL, completion: ((Bool) -> Void)?) {
+        // Build the URL for the file
+        guard let model = getModel(for: modelId) else {
+            logDownload("❌ Cannot retry: Model not found for \(modelId)")
+            completion?(false)
+            return
+        }
+
+        // Parse HuggingFace URL from downloadURL
+        var repoPath = model.downloadURL
+        if repoPath.hasPrefix("https://huggingface.co/") {
+            repoPath = String(repoPath.dropFirst("https://huggingface.co/".count))
+        } else if repoPath.hasPrefix("huggingface://") {
+            repoPath = String(repoPath.dropFirst("huggingface://".count))
+        }
+
+        // Parse owner/repo from path
+        let urlComponents = repoPath.components(separatedBy: "/")
+        guard urlComponents.count >= 2 else {
+            logDownload("❌ Cannot retry: Invalid HuggingFace URL: \(model.downloadURL)")
+            completion?(false)
+            return
+        }
+
+        let owner = urlComponents[0]
+        let repo = urlComponents[1]
+        let fileURLString = "https://huggingface.co/\(owner)/\(repo)/resolve/main/\(fileName)"
+
+        logDownload("🔄 Retrying download: \(fileName)")
+
+        downloadSingleFile(urlString: fileURLString, destination: destination, modelId: modelId) { success in
+            completion?(success)
+        }
+    }
+
+    /// Downloads a single file using URLSessionDownloadTask for streaming (not loading into memory)
+    /// Supports resume from interrupted downloads and provides proper progress tracking
+    private func downloadSingleFile(urlString: String, destination: URL, modelId: String? = nil, completion: @escaping (Bool) -> Void) {
+        let fileName = (destination.path as NSString).lastPathComponent
+
+        // CRITICAL FIX: Use full relative path as key, not just fileName
+        // Multiple files can have the same name (e.g., weight.bin in different directories)
+        // Using just fileName causes completion handler collisions!
+        let relativePath: String
+        if let modelId = modelId {
+            let modelDir = getModelPath(for: modelId)
+            if destination.path.hasPrefix(modelDir.path) {
+                // Extract relative path from model directory
+                let startIndex = destination.path.index(destination.path.startIndex, offsetBy: modelDir.path.count + 1)
+                relativePath = String(destination.path[startIndex...])
+            } else {
+                relativePath = fileName
+            }
+        } else {
+            relativePath = fileName
+        }
+        let fileKey = modelId.map { "\($0):\(relativePath)" } ?? relativePath
+
         print("📥 Downloading file from: \(urlString)")
         print("📂 Saving to: \(destination.path)")
-        
-        // First check if the file already exists with a decent size
+        print("🔑 File key: \(fileKey)")
+
+        // Check if file already exists and validate its size
         if fileManager.fileExists(atPath: destination.path) {
             do {
-                // Get file size
                 let attributes = try fileManager.attributesOfItem(atPath: destination.path)
                 if let fileSize = attributes[.size] as? UInt64, fileSize > 0 {
-                    print("✅ File already exists with size \(fileSize) bytes, preserving existing file: \(destination.path)")
-                    completion(true)
-                    return
+                    // SPECIAL CHECK: weight.bin files must be at least 1MB to be valid
+                    // Placeholder/corrupt weight files are often tiny (< 1KB)
+                    let isWeightFile = fileName == "weight.bin" || destination.path.contains("weights/weight.bin")
+                    let minimumWeightFileSize: UInt64 = 1_000_000 // 1 MB minimum for weight files
+
+                    if isWeightFile && fileSize < minimumWeightFileSize {
+                        print("⚠️ CORRUPT WEIGHT FILE: \(fileName) is only \(fileSize) bytes (< 1MB minimum), will redownload")
+                        // Delete the corrupt file first
+                        try? fileManager.removeItem(at: destination)
+                        // Fall through to download
+                    } else if let expectedSize = expectedFileSizes[fileKey], expectedSize > 0 {
+                        // Check if we have expected size info to validate completeness
+                        if Int64(fileSize) >= expectedSize {
+                            print("✅ SKIP (already complete): \(fileName) (\(fileSize)/\(expectedSize) bytes)")
+                            completion(true)
+                            return
+                        } else {
+                            print("⚠️ PARTIAL: \(fileName) (\(fileSize)/\(expectedSize) bytes), will resume")
+                            // Don't return - we'll try to resume below
+                        }
+                    } else if isWeightFile {
+                        // Weight file with no expected size - only skip if >= 1MB
+                        print("✅ SKIP (weight file >= 1MB): \(fileName) (\(fileSize) bytes)")
+                        completion(true)
+                        return
+                    } else {
+                        // No expected size info - assume file is complete if it has content
+                        print("✅ SKIP (assuming complete, no expected size): \(fileName) (\(fileSize) bytes)")
+                        completion(true)
+                        return
+                    }
                 } else {
-                    print("⚠️ File exists but has zero size, will redownload: \(destination.path)")
+                    print("⚠️ EMPTY FILE (zero size), will redownload: \(fileName)")
                 }
             } catch {
                 print("⚠️ Error checking existing file: \(error.localizedDescription)")
             }
+        } else {
+            print("📝 File does not exist, will download: \(fileName)")
         }
-        
+
         guard let url = URL(string: urlString) else {
             print("❌ Invalid URL: \(urlString)")
+            setDownloadError(for: modelId, message: "Invalid URL: \(urlString)")
             completion(false)
             return
         }
-        
+
         // Create parent directory if needed
         let directory = destination.deletingLastPathComponent()
         do {
@@ -4027,117 +5526,70 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             }
         } catch {
             print("❌ Error creating directory: \(error.localizedDescription)")
+            setDownloadError(for: modelId, message: "Failed to create directory")
             completion(false)
             return
         }
-        
-        // Set up the download task with increased timeout
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 180  // 3 minutes for request timeout
-        config.timeoutIntervalForResource = 600  // 10 minutes for resource timeout
-        config.waitsForConnectivity = true  // Wait for connectivity if the network is poor
-        
-        let session = URLSession(configuration: config)
-        
-        let task = session.dataTask(with: url) { [self] data, response, error in
-            // Handle errors
-            if let error = error {
-                print("❌ Download error: \(error.localizedDescription)")
-                
-                // Provide more specific error info
-                if let nsError = error as NSError? {
-                    print("❌ Error domain: \(nsError.domain), code: \(nsError.code)")
-                    
-                    // Handle timeout specifically
-                    if nsError.domain == NSURLErrorDomain && 
-                      (nsError.code == NSURLErrorTimedOut || nsError.code == NSURLErrorNetworkConnectionLost) {
-                        print("⏱️ Network timeout or connection lost - consider retrying later")
-                    }
-                }
-                
-                completion(false)
-                return
+
+        // Check for resume data from a previous interrupted download
+        var downloadTask: URLSessionDownloadTask
+        let resumeData: Data? = withDownloadLock {
+            let data = resumeDataStore[fileKey]
+            if data != nil {
+                resumeDataStore.removeValue(forKey: fileKey)
             }
-            
-            // Validate response
-            guard let httpResponse = response as? HTTPURLResponse else {
-                print("❌ Invalid response type")
-                completion(false)
-                return
-            }
-            
-            if httpResponse.statusCode != 200 {
-                // Log specific details for 404 errors which are common for missing model files
-                if httpResponse.statusCode == 404 {
-                    print("❌ HTTP error: 404 - File not found at URL: \(urlString)")
-                    
-                    // For weight.bin files, try to recover with alternative paths
-                    if urlString.contains(".mlmodelc") {
-                        print("⚠️ This appears to be an .mlmodelc directory or file - trying alternative approaches")
-                        
-                        // If we're trying to download the .mlmodelc directory itself
-                        if urlString.hasSuffix(".mlmodelc") {
-                            // Try to download the weights/weight.bin file instead
-                            let weightBinURL = urlString + "/weights/weight.bin"
-                            print("🔄 Trying to download weight file instead: \(weightBinURL)")
-                            
-                            // Create the weights directory
-                            let weightsDir = destination.appendingPathComponent("weights")
-                            do {
-                                if !fileManager.fileExists(atPath: weightsDir.path) {
-                                    try fileManager.createDirectory(at: weightsDir, withIntermediateDirectories: true)
-                                    print("📁 Created weights directory: \(weightsDir.path)")
-                                }
-                            } catch {
-                                print("❌ Error creating weights directory: \(error)")
-                            }
-                            
-                            // Try downloading the weight.bin file
-                            self.downloadSingleFile(
-                                urlString: weightBinURL, 
-                                destination: destination.appendingPathComponent("weights/weight.bin"),
-                                completion: completion
-                            )
-                            return
-                        }
-                    }
-                } 
-                
-                print("❌ HTTP error: \(httpResponse.statusCode)")
-                
-                // Log headers to help diagnose
-                if let headers = httpResponse.allHeaderFields as? [String: String] {
-                    print("📝 Response headers:")
-                    headers.forEach { key, value in
-                        print("  - \(key): \(value)")
-                    }
-                }
-                
-                completion(false)
-                return
-            }
-            
-            // Validate data
-            guard let data = data, !data.isEmpty else {
-                print("❌ Empty data received")
-                completion(false)
-                return
-            }
-            
-            print("✅ Download successful: \(data.count) bytes")
-            
-            // Save file
-            do {
-                try data.write(to: destination)
-                print("✅ File saved successfully to \(destination.path)")
-                completion(true)
-            } catch {
-                print("❌ Error saving file: \(error.localizedDescription)")
-                completion(false)
-            }
+            return data
         }
-        
-        task.resume()
+
+        if let resumeData = resumeData {
+            print("📥 Resuming download from saved data for: \(fileName)")
+            downloadTask = fileDownloadSession.downloadTask(withResumeData: resumeData)
+        } else {
+            downloadTask = fileDownloadSession.downloadTask(with: url)
+        }
+
+        // Thread-safe storage of task tracking info
+        // CRITICAL: Store relativePath (not just fileName) to correctly identify files in delegate callbacks
+        let effectiveModelId = modelId ?? "unknown"
+        withDownloadLock {
+            fileCompletionHandlers[fileKey] = completion
+            taskToFileInfo[downloadTask.taskIdentifier] = (modelId: effectiveModelId, fileName: relativePath, destination: destination)
+            fileDownloadTasks[fileKey] = downloadTask
+        }
+
+        // Start the download
+        downloadTask.resume()
+        print("🚀 Download task started for: \(relativePath) (taskId: \(downloadTask.taskIdentifier))")
+    }
+
+    /// Legacy wrapper for backward compatibility with existing code
+    private func downloadSingleFile(urlString: String, destination: URL, completion: @escaping (Bool) -> Void) {
+        // Extract modelId from destination path if possible
+        let pathComponents = destination.pathComponents
+        var modelId: String? = nil
+        if let modelsIndex = pathComponents.firstIndex(of: "Models"), modelsIndex + 1 < pathComponents.count {
+            modelId = pathComponents[modelsIndex + 1]
+        }
+        downloadSingleFile(urlString: urlString, destination: destination, modelId: modelId, completion: completion)
+    }
+
+    /// Sets an error message for display in the UI
+    private func setDownloadError(for modelId: String?, message: String) {
+        guard let modelId = modelId else { return }
+        DispatchQueue.main.async {
+            self.downloadErrorMessages[modelId] = message
+            self.currentDownloadingFiles[modelId] = "Error: \(message)"
+        }
+    }
+
+    /// Gets the current error message for a model download
+    public func getDownloadError(for modelId: String) -> String? {
+        return downloadErrorMessages[modelId]
+    }
+
+    /// Clears the error message for a model
+    public func clearDownloadError(for modelId: String) {
+        downloadErrorMessages.removeValue(forKey: modelId)
     }
     
     // Helper method to try alternative URL structures for weight files
@@ -4508,23 +5960,28 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         return totalSize
     }
 
-    func verifyModelWithDetails(modelId: String, verbose: Bool = true) -> (isValid: Bool, actualSize: Int, missingFiles: [String], fileSizes: [String: Int]) {
+    func verifyModelWithDetails(modelId: String, verbose: Bool = true) -> (isValid: Bool, actualSize: Int, missingFiles: [String], fileSizes: [String: Int], emptyWeightFiles: [String], errorReason: String?) {
         let modelPath = self.getModelPath(for: modelId)
         var fileSizes: [String: Int] = [:]
         var missingFiles: [String] = []
+        var emptyWeightFiles: [String] = []
         var hasCriticalFilesMissing = false
-        
+        var errorReason: String? = nil
+
+        // Minimum size for weight.bin files (1KB)
+        let minimumWeightFileSize = 1024
+
         // Get the model to check for hasPlaceholders
         if let model = self.getModel(for: modelId) {
             // Check for critical files
             let tokenizerConfigPath = modelPath.appendingPathComponent("tokenizer_config.json")
             let tokenizerConfigExists = FileManager.default.fileExists(atPath: tokenizerConfigPath.path)
-            
+
             if !tokenizerConfigExists {
                 missingFiles.append("tokenizer_config.json")
                 hasCriticalFilesMissing = true
                 print("⚠️ Critical file missing: tokenizer_config.json")
-                
+
                 // Update model's hasPlaceholders status on main thread
                 DispatchQueue.main.async {
                     model.hasPlaceholders = true
@@ -4538,7 +5995,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                         print("⚠️ tokenizer_config.json exists but is empty")
                         missingFiles.append("tokenizer_config.json (empty)")
                         hasCriticalFilesMissing = true
-                        
+
                         // Update model's hasPlaceholders status on main thread
                         DispatchQueue.main.async {
                             model.hasPlaceholders = true
@@ -4546,23 +6003,62 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                     }
                 }
             }
+
+            // Check for empty weight.bin files in .mlmodelc directories
+            do {
+                let contents = try FileManager.default.contentsOfDirectory(at: modelPath, includingPropertiesForKeys: nil)
+                let mlmodelcDirs = contents.filter { $0.pathExtension == "mlmodelc" }
+
+                for mlmodelcDir in mlmodelcDirs {
+                    let weightBinPath = mlmodelcDir.appendingPathComponent("weights/weight.bin")
+                    if FileManager.default.fileExists(atPath: weightBinPath.path) {
+                        if let attributes = try? FileManager.default.attributesOfItem(atPath: weightBinPath.path),
+                           let fileSize = attributes[.size] as? Int {
+                            let fileName = "\(mlmodelcDir.lastPathComponent)/weights/weight.bin"
+                            fileSizes[fileName] = fileSize
+                            if fileSize < minimumWeightFileSize {
+                                emptyWeightFiles.append(fileName)
+                                hasCriticalFilesMissing = true
+                                print("⚠️ Weight file is empty/corrupt (0 KB): \(fileName)")
+                            }
+                        }
+                    }
+                }
+            } catch {
+                print("Error checking .mlmodelc directories: \(error)")
+            }
         }
-        
+
         // Use existing verification to check if files exist
-        let isValid = !hasCriticalFilesMissing && self.verifyModelFiles(modelId: modelId)
-        
+        let isValid = !hasCriticalFilesMissing && self.verifyModelFiles(modelId: modelId, verbose: verbose)
+
         // Calculate actual size on disk
         let actualSize = self.calculateActualModelSize(modelId: modelId)
-        
+
+        // Determine error reason
+        if !isValid {
+            if !emptyWeightFiles.isEmpty {
+                errorReason = "Empty weight files detected (\(emptyWeightFiles.count) files) - re-download required"
+            } else if !missingFiles.isEmpty {
+                errorReason = "Missing files: \(missingFiles.joined(separator: ", "))"
+            } else {
+                errorReason = "Model verification failed"
+            }
+        }
+
         if verbose {
             print("📋 Model verification details for \(modelId):")
             print("  - Valid: \(isValid)")
             print("  - Actual size: \(formatFileSize(actualSize))")
             print("  - Missing files: \(missingFiles.joined(separator: ", "))")
+            print("  - Empty weight files: \(emptyWeightFiles.joined(separator: ", "))")
             print("  - Has critical files missing: \(hasCriticalFilesMissing)")
+            if let reason = errorReason {
+                print("  - Error reason: \(reason)")
+            }
         }
-        
-        return (isValid: isValid, actualSize: actualSize, missingFiles: missingFiles, fileSizes: fileSizes)
+
+        return (isValid: isValid, actualSize: actualSize, missingFiles: missingFiles, fileSizes: fileSizes, emptyWeightFiles: emptyWeightFiles, errorReason: errorReason)
     }
 }
 

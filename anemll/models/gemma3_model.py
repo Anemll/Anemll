@@ -98,6 +98,11 @@ class Gemma3Config:
         self.context_length = kwargs.get("context_length", 256)
         self.state_length = kwargs.get("state_length", self.context_length)
 
+        # FP16 residual clamping (OFF by default - use weight scaling instead)
+        # See GEMMA3_FP16_SCALING.md for details
+        self.enable_residual_clamp = kwargs.get("enable_residual_clamp", False)
+        self.residual_clamp_value = kwargs.get("residual_clamp_value", 65504.0)
+
         # Interleaved attention (Gemma3 architectural feature)
         # layer_types should be read from HuggingFace config.json which defines
         # the exact pattern for each model size (270M, 1B, 4B, 12B, 27B)
@@ -704,6 +709,7 @@ class Gemma3Attention(nn.Module):
 class Gemma3DecoderLayer(nn.Module):
     def __init__(self, config: Gemma3Config) -> None:
         super().__init__()
+        self.config = config  # Store config for clamping settings
         self.self_attn = Gemma3Attention(config)
         self.mlp = Gemma3MLP(config)
         # Gemma3 uses 4 norms per block:
@@ -734,8 +740,9 @@ class Gemma3DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-        # Clamp to FP16 range to prevent overflow (max ~65504)
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+        # Optional FP16 clamping (OFF by default - use weight scaling instead)
+        if self.config.enable_residual_clamp:
+            hidden_states = torch.clamp(hidden_states, min=-self.config.residual_clamp_value, max=self.config.residual_clamp_value)
 
         # MLP block
         residual = hidden_states
@@ -743,8 +750,9 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-        # Clamp to FP16 range to prevent overflow
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+        # Optional FP16 clamping (OFF by default - use weight scaling instead)
+        if self.config.enable_residual_clamp:
+            hidden_states = torch.clamp(hidden_states, min=-self.config.residual_clamp_value, max=self.config.residual_clamp_value)
         return hidden_states
 
 
@@ -1369,8 +1377,9 @@ class Gemma3Model(nn.Module):
         # Apply post_attention_layernorm before residual add
         attn_output = layer.post_attention_layernorm(attn_output)
         hidden_states = hidden_states + attn_output
-        # Clamp to FP16 range to prevent overflow (Gemma3 was trained in bfloat16)
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+        # Optional FP16 clamping (OFF by default - use weight scaling instead)
+        if self.config.enable_residual_clamp:
+            hidden_states = torch.clamp(hidden_states, min=-self.config.residual_clamp_value, max=self.config.residual_clamp_value)
 
         # Apply MLP with proper normalization (Gemma3: pre + post feedforward norms)
         residual = hidden_states
@@ -1378,8 +1387,9 @@ class Gemma3Model(nn.Module):
         hidden_states = layer.mlp(hidden_states)
         hidden_states = layer.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-        # Clamp to FP16 range to prevent overflow
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+        # Optional FP16 clamping (OFF by default - use weight scaling instead)
+        if self.config.enable_residual_clamp:
+            hidden_states = torch.clamp(hidden_states, min=-self.config.residual_clamp_value, max=self.config.residual_clamp_value)
 
         return hidden_states
 
@@ -1435,8 +1445,9 @@ class Gemma3Model(nn.Module):
         # Apply post_attention_layernorm before residual add
         attn_output = layer.post_attention_layernorm(attn_output)
         hidden_states = hidden_states + attn_output
-        # Clamp to FP16 range to prevent overflow (Gemma3 was trained in bfloat16)
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+        # Optional FP16 clamping (OFF by default - use weight scaling instead)
+        if self.config.enable_residual_clamp:
+            hidden_states = torch.clamp(hidden_states, min=-self.config.residual_clamp_value, max=self.config.residual_clamp_value)
 
         # Apply MLP with proper normalization (Gemma3: pre + post feedforward norms)
         residual = hidden_states
@@ -1444,8 +1455,9 @@ class Gemma3Model(nn.Module):
         hidden_states = layer.mlp(hidden_states)
         hidden_states = layer.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-        # Clamp to FP16 range to prevent overflow
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+        # Optional FP16 clamping (OFF by default - use weight scaling instead)
+        if self.config.enable_residual_clamp:
+            hidden_states = torch.clamp(hidden_states, min=-self.config.residual_clamp_value, max=self.config.residual_clamp_value)
 
         return hidden_states
 
@@ -1626,8 +1638,9 @@ class Gemma3Model(nn.Module):
         # Apply post_attention_layernorm before residual add
         attn_output = layer.post_attention_layernorm(attn_output)
         hidden_states = hidden_states + attn_output
-        # Clamp to FP16 range to prevent overflow (Gemma3 was trained in bfloat16)
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+        # Optional FP16 clamping (OFF by default - use weight scaling instead)
+        if self.config.enable_residual_clamp:
+            hidden_states = torch.clamp(hidden_states, min=-self.config.residual_clamp_value, max=self.config.residual_clamp_value)
 
         # Apply MLP with proper normalization (Gemma3: pre + post feedforward norms)
         residual = hidden_states
@@ -1635,8 +1648,9 @@ class Gemma3Model(nn.Module):
         hidden_states = layer.mlp(hidden_states)
         hidden_states = layer.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-        # Clamp to FP16 range to prevent overflow
-        hidden_states = torch.clamp(hidden_states, min=-65504.0, max=65504.0)
+        # Optional FP16 clamping (OFF by default - use weight scaling instead)
+        if self.config.enable_residual_clamp:
+            hidden_states = torch.clamp(hidden_states, min=-self.config.residual_clamp_value, max=self.config.residual_clamp_value)
 
         return hidden_states
 

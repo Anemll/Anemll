@@ -26,6 +26,7 @@ FORCE_MLPROGRAM_COMPILE=false
 ALLOW_MISSING_WEIGHTS=false
 ARGMAX_IN_MODEL=false
 SPLIT_ROTATE=false
+FP16_SCALE=""  # FP16 residual scaling for Gemma3 models
 
 # Default converter; may be overridden after parsing config.json
 CONVERTER="python3 -m anemll.ane_converter.llama_converter"
@@ -59,6 +60,8 @@ print_usage() {
     echo "  --allow-missing-weights  Continue conversion even if some weights are missing"
     echo "  --argmax        Compute argmax inside LM head (outputs idx+val pairs instead of logits)"
     echo "  --split-rotate  Combine rotate/non-rotate into two files per chunk (FFN + PF)"
+    echo "  --fp16-scale    FP16 residual scaling for Gemma3 (e.g., 'auto', '0.1875')"
+    echo "                  Recommended: 0.48 for 270M, 0.82 for 1B, 0.1875 for 4B QAT"
     echo ""
     echo "Examples:"
     echo "  # Use default per_channel (8) for all parts"
@@ -138,6 +141,10 @@ while [[ $# -gt 0 ]]; do
         --split-rotate)
             SPLIT_ROTATE=true
             shift
+            ;;
+        --fp16-scale)
+            FP16_SCALE="$2"
+            shift 2
             ;;
         *)
             echo "Unknown parameter: $1"
@@ -285,6 +292,13 @@ run_step() {
     fi
 }
 
+# Prepare FP16 scaling parameter for Gemma3 models (must be before any converter steps)
+FP16_SCALE_PARAM=""
+if [ ! -z "$FP16_SCALE" ]; then
+    FP16_SCALE_PARAM="--fp16-scale $FP16_SCALE"
+    echo "Using FP16 residual scaling: $FP16_SCALE"
+fi
+
 # Step 1: Convert Embeddings (Part 1)
 LUT1_PARAM=""
 if [ ! -z "$LUT_PART1" ]; then
@@ -295,6 +309,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "1" ]; then
     run_step 1 "Converting Embeddings" "$CONVERTER \
         --part 1 \
         $LUT1_PARAM \
+        $FP16_SCALE_PARAM \
         --context-length $CONTEXT_LENGTH \
         --batch-size $BATCH_SIZE \
         --context-length $CONTEXT_LENGTH \
@@ -323,6 +338,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
         --part 3 \
         $LUT3_PARAM \
         $ARGMAX_PARAM \
+        $FP16_SCALE_PARAM \
         --context-length $CONTEXT_LENGTH \
         --context-length $CONTEXT_LENGTH \
         --prefix \"$PREFIX\" \
@@ -342,6 +358,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "3" ]; then
     run_step 3 "Converting FFN" "$CONVERTER \
         --part 2 \
         $LUT2_PARAM \
+        $FP16_SCALE_PARAM \
         --chunk $NUM_CHUNKS \
         --context-length $CONTEXT_LENGTH \
         --batch-size $BATCH_SIZE \
@@ -356,6 +373,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "4" ]; then
     run_step 4 "Converting Prefill" "$CONVERTER \
         --part 2_prefill \
         $LUT2_PARAM \
+        $FP16_SCALE_PARAM \
         --chunk $NUM_CHUNKS \
         --context-length $CONTEXT_LENGTH \
         --batch-size $BATCH_SIZE \
@@ -374,6 +392,7 @@ if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
             run_step 4 "Converting FFN Rotate" "$CONVERTER \
                 --part 2_rotate \
                 $LUT2_PARAM \
+                $FP16_SCALE_PARAM \
                 --chunk $NUM_CHUNKS \
                 --context-length $CONTEXT_LENGTH \
                 --batch-size $BATCH_SIZE \
@@ -387,6 +406,7 @@ if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
             run_step 4 "Converting Prefill Rotate" "$CONVERTER \
                 --part 2_prefill_rotate \
                 $LUT2_PARAM \
+                $FP16_SCALE_PARAM \
                 --chunk $NUM_CHUNKS \
                 --context-length $CONTEXT_LENGTH \
                 --batch-size $BATCH_SIZE \

@@ -10,6 +10,7 @@ import re
 import glob
 from pathlib import Path
 import json
+import sys
 import coremltools as ct
 from transformers import LlamaTokenizer, AutoTokenizer
 import torch
@@ -1335,36 +1336,59 @@ def load_monolithic_model(args, metadata):
     if not args.eval:
         print(f"Loading from: {model_path}")
 
-    # Load all functions
-    infer_model = load_model(model_path, function_name='infer', compute_unit=compute_unit)
-    prefill_model = load_model(model_path, function_name='prefill', compute_unit=compute_unit)
-    _maybe_report_mem("after load monolithic infer+prefill", getattr(args, "mem_report", False))
+    def _progress_bar(done, total, label, width=18):
+        if total <= 0:
+            total = 1
+        filled = int(width * done / total)
+        bar = "[" + ("#" * filled) + ("." * (width - filled)) + "]"
+        sys.stdout.write(f"\r{bar} {done}/{total} {label}")
+        sys.stdout.flush()
+        if done == total:
+            sys.stdout.write("\n")
 
-    # Try to load infer_rotate (optional, for models with split cache rotation)
+    # Decide whether to attempt rotate functions
+    attempt_rotate = True
+    if getattr(args, "context_length", None) is not None and args.context_length <= 512:
+        attempt_rotate = False
+
+    functions_to_load = [("infer", True), ("prefill", True)]
+    if attempt_rotate:
+        functions_to_load += [("infer_rotate", False), ("prefill_rotate", False)]
+
+    infer_model = None
+    prefill_model = None
     infer_rotate_model = None
-    try:
-        infer_rotate_model = load_model(model_path, function_name='infer_rotate', compute_unit=compute_unit)
-    except Exception:
-        if not args.eval:
-            print("  Note: infer_rotate not available - using infer for all positions")
-    _maybe_report_mem("after load monolithic infer_rotate (if any)", getattr(args, "mem_report", False))
-
-    # Try to load prefill_rotate (optional, for long context prefill with rotation)
     prefill_rotate_model = None
-    try:
-        prefill_rotate_model = load_model(model_path, function_name='prefill_rotate', compute_unit=compute_unit)
-    except Exception:
-        pass  # prefill_rotate is optional
-    _maybe_report_mem("after load monolithic prefill_rotate (if any)", getattr(args, "mem_report", False))
+    loaded = []
+    missing = []
 
-    # Report loaded functions
+    total = len(functions_to_load)
+    for idx, (name, required) in enumerate(functions_to_load, start=1):
+        if not args.eval:
+            _progress_bar(idx, total, name)
+        try:
+            model = load_model(model_path, function_name=name, compute_unit=compute_unit)
+            loaded.append(name)
+            if name == "infer":
+                infer_model = model
+            elif name == "prefill":
+                prefill_model = model
+            elif name == "infer_rotate":
+                infer_rotate_model = model
+            elif name == "prefill_rotate":
+                prefill_rotate_model = model
+        except Exception:
+            if required:
+                raise
+            missing.append(name)
+
+    _maybe_report_mem("after load monolithic functions", getattr(args, "mem_report", False))
+
     if not args.eval:
-        functions = ["infer", "prefill"]
-        if infer_rotate_model:
-            functions.insert(1, "infer_rotate")
-        if prefill_rotate_model:
-            functions.append("prefill_rotate")
-        print(f"Monolithic model loaded successfully ({' + '.join(functions)} functions)")
+        summary = "Monolithic model loaded (" + ", ".join(loaded) + ")"
+        if missing:
+            summary += f" [missing: {', '.join(missing)}]"
+        print(summary)
 
     # Extract metadata from model
     metadata = load_metadata(infer_model, args)

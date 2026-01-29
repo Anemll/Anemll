@@ -16,6 +16,15 @@ public struct ModelConfiguration {
     let version: String
     var modelPath: String?  // Add model path property
     let splitLMHead: Int  // Add split_lm_head parameter for Qwen support
+    let modelType: String  // "monolithic" or "chunked" (default)
+    let monolithicModel: String?  // Name of monolithic .mlmodelc file (e.g., "gemma3_monolithic_full_lut6.mlmodelc")
+    let argmaxInModel: Bool  // If true, model outputs argmax_idx/val pairs instead of logits
+    let slidingWindow: Int?  // nil means no rotation needed, 512 for Gemma3
+
+    /// Returns true if this is a monolithic model (single combined model file)
+    var isMonolithic: Bool {
+        return modelType.lowercased() == "monolithic" && monolithicModel != nil
+    }
     
     // Make shouldUseV110 settable while keeping the default behavior
     var shouldUseV110: Bool {
@@ -48,6 +57,10 @@ public struct ModelConfiguration {
         var batchSize = 512
         var version = "0.0.0"
         var splitLMHead = 8  // Default to 8 for LLaMA models
+        var modelType = "chunked"  // Default to chunked (separate embed/FFN/lmhead)
+        var monolithicModel: String? = nil  // Only set for monolithic models
+        var argmaxInModel = false  // Default to false (model outputs logits)
+        var slidingWindow: Int? = nil  // Default to nil (no rotation needed)
         
         // Helper function to extract parameter value from a section
         func extractParameterFromSection(section: String, key: String) -> String? {
@@ -169,8 +182,38 @@ public struct ModelConfiguration {
                         print("✅ Set splitLMHead to \(splitInt)")
                     }
                 }
+
+                // Parse monolithic_model from nested parameters (for monolithic models)
+                if let monolithicValue = extractParameterFromSection(section: nestedParamsContent, key: "monolithic_model") {
+                    print("🔍 Parsing monolithic_model from model_info.parameters: '\(monolithicValue)'")
+                    monolithicModel = monolithicValue
+                    print("✅ Set monolithicModel to \(monolithicValue)")
+                }
+
+                // Parse argmax_in_model from nested parameters (for models with built-in argmax)
+                if let argmaxValue = extractParameterFromSection(section: nestedParamsContent, key: "argmax_in_model") {
+                    print("🔍 Parsing argmax_in_model from model_info.parameters: '\(argmaxValue)'")
+                    argmaxInModel = argmaxValue.lowercased() == "true"
+                    print("✅ Set argmaxInModel to \(argmaxInModel)")
+                }
+
+                // Parse sliding_window from nested parameters (for Gemma3 rotation support)
+                if let slidingValue = extractParameterFromSection(section: nestedParamsContent, key: "sliding_window") {
+                    print("🔍 Parsing sliding_window from model_info.parameters: '\(slidingValue)'")
+                    if let slidingInt = Int(slidingValue) {
+                        slidingWindow = slidingInt
+                        print("✅ Set slidingWindow to \(slidingInt)")
+                    }
+                }
             } else {
                 print("⚠️ No nested parameters section found in model_info section")
+            }
+
+            // Look for model_type in model_info section (outside of parameters)
+            if let typeValue = extractParameterFromSection(section: modelInfoContent, key: "model_type") {
+                print("🔍 Parsing model_type from model_info: '\(typeValue)'")
+                modelType = typeValue
+                print("✅ Set modelType to \(typeValue)")
             }
         } else {
             print("⚠️ No model_info section found in YAML")
@@ -197,8 +240,12 @@ public struct ModelConfiguration {
         self.version = version
         self.modelPath = modelPath
         self.splitLMHead = splitLMHead
-        
-        print("📊 ModelConfiguration initialized: modelPrefix='\(modelPrefix)', numChunks=\(numChunks), lutLMHead=\(String(describing: lutLMHead)), lutFFN=\(String(describing: lutFFN)), lutEmbeddings=\(String(describing: lutEmbeddings)), contextLength=\(contextLength), batchSize=\(batchSize), splitLMHead=\(splitLMHead), version=\(version)")
+        self.modelType = modelType
+        self.monolithicModel = monolithicModel
+        self.argmaxInModel = argmaxInModel
+        self.slidingWindow = slidingWindow
+
+        print("📊 ModelConfiguration initialized: modelPrefix='\(modelPrefix)', numChunks=\(numChunks), lutLMHead=\(String(describing: lutLMHead)), lutFFN=\(String(describing: lutFFN)), lutEmbeddings=\(String(describing: lutEmbeddings)), contextLength=\(contextLength), batchSize=\(batchSize), splitLMHead=\(splitLMHead), version=\(version), modelType=\(modelType), monolithicModel=\(String(describing: monolithicModel)), argmaxInModel=\(argmaxInModel), slidingWindow=\(String(describing: slidingWindow))")
         
         let v110Reason = self._manualV110Flag != nil ? "MANUALLY SET" : "version check"
         print("📊 v110 flag is: \(self.shouldUseV110 ? "TRUE" : "FALSE") (\(v110Reason)) based on version \(version)")

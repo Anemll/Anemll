@@ -127,21 +127,14 @@ struct HomeView: View {
             ModelManagementCoordinator.didDismiss()
             
             // Check if we still need a model after dismissal
-            let needModel = modelService.getSelectedModel() == nil || 
-                          (modelService.getSelectedModel() != nil && 
+            let needModel = modelService.getSelectedModel() == nil ||
+                          (modelService.getSelectedModel() != nil &&
                            !modelService.verifyModelFiles(modelId: modelService.getSelectedModel()!.id))
-            
+
             if needModel {
-                print("DEBUG: Model still required after dismiss attempt from HomeView")
-                // Add delay before attempting to show again to avoid presentation conflicts
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    Task { @MainActor in
-                        if ModelManagementCoordinator.canPresent() {
-                            print("DEBUG: Re-showing ModelManagementView after failed dismiss from HomeView")
-                            showingModelManagement = true
-                        }
-                    }
-                }
+                print("DEBUG: Model incomplete after dismiss from HomeView - allowing dismiss but model may not work")
+                // Allow dismiss but warn user via console - don't force re-show
+                // The user can manually open model management if needed
             } else {
                 print("DEBUG: Model verification successful, HomeView ModelManagementView dismissed")
             }

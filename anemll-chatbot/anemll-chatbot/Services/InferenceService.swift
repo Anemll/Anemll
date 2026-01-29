@@ -812,9 +812,9 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
     
     /// Loads a model from a given URL with its YAML configuration
     func loadModel(modelId: String, from url: URL) async throws {
-        // First, unload any existing model to free up memory
+        // First, unload any existing model to free up memory - but don't cancel the new loading
         print("🧹 Unloading previous model before loading new one")
-                unloadModel()
+                unloadModelResources()  // Use resource-only cleanup, don't cancel the new loading task
         
         // Continue with the existing implementation...
         // Create a class with an isolated property for thread safety
@@ -1368,23 +1368,29 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                     print("📊 DEBUG: Setting up InferenceManager")
                                     print("📊 DEBUG: Context length: \(localConfig.contextLength)")
                                     print("📊 DEBUG: Batch size: \(localConfig.batchSize)")
-                                    
+
                                     // Get splitLMHead from modelConfig or use default value of 8
                                     let splitLMHead = modelConfig?.splitLMHead ?? 8
+                                    let argmaxInModel = modelConfig?.argmaxInModel ?? false
+                                    let slidingWindow = modelConfig?.slidingWindow
                                     print("📊 DEBUG: Split LM Head: \(splitLMHead)")
                                     print("📊 DEBUG: v110 flag: \(shouldUseV110)")
+                                    print("📊 DEBUG: argmaxInModel: \(argmaxInModel)")
+                                    print("📊 DEBUG: slidingWindow: \(String(describing: slidingWindow))")
                                     print("📊 DEBUG: Debug level: \(self.debugLevel)")
-                                    
+
                                     self.inferenceManager = try InferenceManager(
                                         models: models,
                                         contextLength: localConfig.contextLength,
                                         batchSize: localConfig.batchSize,
                                         splitLMHead: splitLMHead,  // Pass split_lm_head for Qwen support
                                         debugLevel: self.debugLevel,  // Pass debug level to show hidden states
-                                        v110: shouldUseV110  // Pass the v110 flag based on model version
+                                        v110: shouldUseV110,  // Pass the v110 flag based on model version
+                                        argmaxInModel: argmaxInModel,  // Pass argmax flag for Gemma3 support
+                                        slidingWindow: slidingWindow  // Pass sliding window for Gemma3 rotation
                                     )
-                                    
-                                    print("✅ InferenceManager successfully initialized with v110=\(shouldUseV110)")
+
+                                    print("✅ InferenceManager successfully initialized with v110=\(shouldUseV110), argmaxInModel=\(argmaxInModel), slidingWindow=\(String(describing: slidingWindow))")
                                     
                                     
                                 } catch {
@@ -1688,8 +1694,21 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
             }
             InferenceManager.unload()
         }
+    /// Unloads model resources only, without cancelling the loading task
+    /// Use this when switching to a new model to avoid cancelling the new load
+    private func unloadModelResources() {
+        print("🛑 unloadModelResources - Freeing memory")
+        unloadInferenceManager()
+        self.inferenceManager = nil
+        self.tokenizer = nil
+
+        // Reset component tracking
+        self.totalComponents = 0
+        self.loadedComponents = 0
+    }
+
     func unloadModel() {
-    
+
             // Cancel any ongoing model loading
         cancelModelLoading()
 
@@ -1698,19 +1717,19 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
             self.currentModelId = nil
             self.inferenceManager = nil
             self.tokenizer = nil
-            
+
             // Reset component tracking
             self.totalComponents = 0
             self.loadedComponents = 0
-        
-            
+
+
             // Update published property
             DispatchQueue.main.async {
                 self.isModelLoaded = false
                 self.loadingProgress = 0.0
                 self.loadingStatus = ""
             }
-            
+
             // Ensure hasLoadingError is set appropriately
             // Reset cancellation flag for future loads
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in

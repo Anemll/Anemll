@@ -14,7 +14,7 @@ import Accelerate
     private var state: MLState!
     private let contextLength: Int
     private let batchSize: Int
-    private let fullCausalMask: MLMultiArray  // We already have this
+    private var fullCausalMask: MLMultiArray?  // Optional - not needed for monolithic argmax models
     private var debugLevel: Int
     private var v110: Bool = false // old conversio has batch x hidden_states for the last chunk
     // Change timing property to CFAbsoluteTime
@@ -115,11 +115,12 @@ import Accelerate
         // Check if rotation functions are available
         let hasRotation = ffnChunks.first?.hasRotationSupport ?? false
         print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation)")
+
+        // Create full causal mask - needed for attention
         self.fullCausalMask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: contextLength)], dataType: .float16)
+        initFullCausalMask()
 
         self.initState()
-
-        initFullCausalMask()
 
         try initializeBackings()
 
@@ -226,21 +227,39 @@ import Accelerate
     
     
     public func initFullCausalMask()  {
-        // Create full causal mask once with -inf and 0.0 (we already have this)
-        
-        // Initialize all values to -inf first
-        for i in 0..<fullCausalMask.count {
-            fullCausalMask[i] = NSNumber(value: Float(-Float.infinity))
+        // Create full causal mask once with -inf and 0.0
+        // Optimized using direct pointer access for large context lengths
+        guard let mask = fullCausalMask else {
+            print("Skipping initFullCausalMask - mask is nil")
+            return
         }
-        
-        // Set values to 0.0 where j <= i (causal masking)
+
+        let totalCount = mask.count
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        // Use direct pointer access for Float16 - MUCH faster than NSNumber subscripting
+        // Shape is [1, 1, contextLength, contextLength], stored row-major
+        let ptr = mask.dataPointer.assumingMemoryBound(to: Float16.self)
+
+        // Fill entire array with -inf first (fast memset-like operation)
+        let negInf = Float16(-Float.infinity)
+        for i in 0..<totalCount {
+            ptr[i] = negInf
+        }
+
+        // Set causal pattern: for row i, columns 0..i should be 0.0 (visible)
+        // Index in flat array for [0, 0, i, j] = i * contextLength + j
+        let zero = Float16(0.0)
         for i in 0..<contextLength {
-            for j in 0..<contextLength {
-                if j <= i {
-                    fullCausalMask[[0, 0, i, j] as [NSNumber]] = NSNumber(value: Float(0.0))
-                }
+            let rowOffset = i * contextLength
+            // Set columns 0 through i to 0.0
+            for j in 0...(i) {
+                ptr[rowOffset + j] = zero
             }
         }
+
+        let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+        print("initFullCausalMask completed in \(String(format: "%.3f", elapsed))s for context \(contextLength)")
     }
     
     public func initState()  {
@@ -607,44 +626,53 @@ import Accelerate
     }
     
     // Helper to get causal mask slice for current position
+    // Optimized with direct pointer access for performance
     private func getCausalMask(for length: Int, at position: Int, paddingLength: Int? = nil) throws -> MLMultiArray {
         // Ensure position is within bounds
         let safePosition = min(position, contextLength - 1)
-        
+
         // Create mask with correct dimensions
         let mask = try MLMultiArray(
             shape: [1, 1, NSNumber(value: length), NSNumber(value: contextLength)],
             dataType: .float16
         )
-        
+
+        // Use direct pointer access for performance
+        let ptr = mask.dataPointer.assumingMemoryBound(to: Float16.self)
+        let negInf = Float16(-Float.infinity)
+        let zero = Float16(0.0)
+
         // Fill mask with -inf by default
-        for i in 0..<mask.count {
-            mask[i] = NSNumber(value: Float(-Float.infinity))
+        let totalCount = mask.count
+        for i in 0..<totalCount {
+            ptr[i] = negInf
         }
-        
+
         // Set causal attention pattern
+        // Shape is [1, 1, length, contextLength], index = i * contextLength + j
         for i in 0..<length {
-            for j in 0..<contextLength {
-                if j <= (safePosition + i) {
-                    mask[[0, 0, i, j] as [NSNumber]] = NSNumber(value: Float(0.0))
-                }
+            let rowOffset = i * contextLength
+            let visibleEnd = min(safePosition + i, contextLength - 1)
+            for j in 0...visibleEnd {
+                ptr[rowOffset + j] = zero
             }
         }
-        
+
         // Apply padding if specified
         if let paddingLength = paddingLength {
             for i in paddingLength..<length {
+                let rowOffset = i * contextLength
                 for j in 0..<contextLength {
-                    mask[[0, 0, i, j] as [NSNumber]] = NSNumber(value: Float(-Float.infinity))
+                    ptr[rowOffset + j] = negInf
                 }
             }
         }
-        
+
         if debugLevel >= 2 {
             print("\nCausal mask for length \(length) at position \(position):")
             print("Shape:", mask.shape.map { $0.intValue })
         }
-        
+
         return mask
     }
     
