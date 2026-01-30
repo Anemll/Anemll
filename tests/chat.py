@@ -215,21 +215,22 @@ def build_stop_token_ids(tokenizer):
     def _get_token_id_if_present(token_str):
         if not token_str:
             return None
-        if hasattr(tokenizer, "get_vocab"):
-            vocab = tokenizer.get_vocab()
-            if token_str in vocab:
-                return vocab[token_str]
-        token_id = tokenizer.convert_tokens_to_ids(token_str)
-        if isinstance(token_id, list):
-            if len(token_id) == 1:
-                token_id = token_id[0]
-            else:
+        # Avoid calling get_vocab() as it can segfault on some tokenizers (e.g., Gemma)
+        # Use convert_tokens_to_ids() directly instead
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(token_str)
+            if isinstance(token_id, list):
+                if len(token_id) == 1:
+                    token_id = token_id[0]
+                else:
+                    return None
+            if token_id is None:
                 return None
-        if token_id is None:
+            if tokenizer.unk_token_id is not None and token_id == tokenizer.unk_token_id:
+                return None
+            return token_id
+        except Exception:
             return None
-        if tokenizer.unk_token_id is not None and token_id == tokenizer.unk_token_id:
-            return None
-        return token_id
 
     stop_ids = set()
     eos_token_ids = tokenizer.eos_token_id
@@ -273,6 +274,47 @@ def load_model(path, function_name=None, compute_unit=None):
     For single-function compiled models, function_name is ignored.
     For multi-function ML Program models, function_name selects the function.
     """
+    def _available_functions(model):
+        if not hasattr(model, "get_spec"):
+            return []
+        spec = model.get_spec()
+        functions = []
+        mlprog = getattr(spec, "mlProgram", None)
+        if mlprog is not None and hasattr(mlprog, "functions"):
+            try:
+                functions.extend(list(mlprog.functions.keys()))
+            except Exception:
+                pass
+        desc = getattr(spec, "description", None)
+        if desc is not None and hasattr(desc, "functions"):
+            try:
+                functions.extend([f.name for f in desc.functions])
+            except Exception:
+                pass
+        seen = set()
+        ordered = []
+        for fn in functions:
+            if fn not in seen:
+                seen.add(fn)
+                ordered.append(fn)
+        return ordered
+
+    def _check_function_exists(path_obj, fn_name, cu):
+        try:
+            if path_obj.suffix == '.mlmodelc':
+                probe = ct.models.CompiledMLModel(str(path_obj), cu)
+            else:
+                probe = ct.models.MLModel(str(path_obj), compute_units=cu)
+        except Exception:
+            return  # If we can't probe, let the real load error surface.
+        available = _available_functions(probe)
+        if available and fn_name not in available:
+            raise RuntimeError(
+                f"Model is missing '{fn_name}' function. "
+                f"Available: {', '.join(available)}\n"
+                f"Model path: {path_obj}"
+            )
+
     path = Path(path)
     if compute_unit is None:
         compute_unit = ct.ComputeUnit.CPU_AND_NE
@@ -281,18 +323,14 @@ def load_model(path, function_name=None, compute_unit=None):
         if path.suffix == '.mlmodelc':
             # For compiled models (.mlmodelc), use CompiledMLModel
             if function_name:
-                try:
-                    return ct.models.CompiledMLModel(str(path), compute_unit, function_name=function_name)
-                except RuntimeError as e:
-                    # If function_name not supported, try without it (single-function model)
-                    if "functionName" in str(e) and "must be" in str(e):
-                        return ct.models.CompiledMLModel(str(path), compute_unit)
-                    raise
+                _check_function_exists(path, function_name, compute_unit)
+                return ct.models.CompiledMLModel(str(path), compute_unit, function_name=function_name)
             else:
                 return ct.models.CompiledMLModel(str(path), compute_unit)
         else:
             # For packages (.mlpackage)
             if function_name:
+                _check_function_exists(path, function_name, compute_unit)
                 return ct.models.MLModel(str(path), function_name=function_name)
             else:
                 return ct.models.MLModel(str(path))
@@ -644,15 +682,25 @@ def load_models(args,metadata):
                             'infer': load_model(chunk_path, function_name='infer', compute_unit=compute_unit),
                             'prefill': load_model(chunk_path, function_name='prefill', compute_unit=compute_unit)
                         }
-                        # Try to load rotation functions (Gemma3 with context > 512)
-                        try:
-                            chunk_dict['infer_rotate'] = load_model(chunk_path, function_name='infer_rotate', compute_unit=compute_unit)
-                            chunk_dict['prefill_rotate'] = load_model(chunk_path, function_name='prefill_rotate', compute_unit=compute_unit)
-                            if not args.eval:
-                                print("  Rotation functions loaded (4-function model)")
-                        except Exception:
-                            # Rotation functions not available - standard 2-function model
-                            pass
+                        # Try to load rotation functions only if context > sliding_window
+                        # If context_length <= sliding_window, rotation is never needed
+                        sliding_window = getattr(args, 'sliding_window', None)
+                        context_length = getattr(args, 'context_length', None)
+                        needs_rotation = (sliding_window is not None and
+                                         context_length is not None and
+                                         context_length > sliding_window)
+
+                        if needs_rotation:
+                            try:
+                                chunk_dict['infer_rotate'] = load_model(chunk_path, function_name='infer_rotate', compute_unit=compute_unit)
+                                chunk_dict['prefill_rotate'] = load_model(chunk_path, function_name='prefill_rotate', compute_unit=compute_unit)
+                                if not args.eval:
+                                    print("  Rotation functions loaded (4-function model)")
+                            except Exception:
+                                # Rotation functions not available - standard 2-function model
+                                pass
+                        elif not args.eval and sliding_window is not None:
+                            print(f"  Skipping rotation functions (context {context_length} <= sliding_window {sliding_window})")
                         ffn_models.append(chunk_dict)
                         if not args.eval:
                             print("Chunk loaded successfully")
@@ -1495,13 +1543,14 @@ def parse_args():
                 args.attention_size = int(params.get('attention_size', args.context_length))
 
                 # sliding_window for Gemma3 rotation support (default 512 for Gemma3)
-                # Only set if the model has a sliding window configured or if prefix is gemma3
-                if 'sliding_window' in params:
-                    args.sliding_window = int(params['sliding_window'])
-                elif prefix.lower().startswith('gemma3'):
-                    args.sliding_window = 512  # Default Gemma3 sliding window
-                else:
-                    args.sliding_window = None  # No rotation for other models
+                # Only set if not overridden by command line
+                if getattr(args, 'sliding_window', None) is None:
+                    if 'sliding_window' in params:
+                        args.sliding_window = int(params['sliding_window'])
+                    elif prefix.lower().startswith('gemma3'):
+                        args.sliding_window = 512  # Default Gemma3 sliding window
+                    else:
+                        args.sliding_window = None  # No rotation for other models
 
                 # Set split_lm_head, but allow CLI override
                 if args.split_lm_head is None:
@@ -1570,7 +1619,11 @@ def load_monolithic_model(args, metadata):
 
     # Decide whether to attempt rotate functions
     attempt_rotate = True
-    if getattr(args, "context_length", None) is not None and args.context_length <= 512:
+    context_length = getattr(args, "context_length", None)
+    sliding_window = getattr(args, "sliding_window", None)
+    if context_length is not None and sliding_window is not None:
+        attempt_rotate = context_length > sliding_window
+    elif context_length is not None and context_length <= 512:
         attempt_rotate = False
 
     functions_to_load = [("infer", True), ("prefill", True)]
@@ -2087,7 +2140,7 @@ def main():
             metadata['argmax_in_model'] = getattr(args, 'argmax_in_model', False)
             metadata['debug_argmax'] = getattr(args, 'debug_argmax', False)
             metadata['debug'] = getattr(args, 'debug', False)
-            metadata['sliding_window'] = 512  # Local attention window for Gemma3
+            metadata['sliding_window'] = getattr(args, 'sliding_window', 512)
 
             if not args.eval:
                 print(f"\nMonolithic metadata: {metadata}")
@@ -2189,7 +2242,11 @@ def main():
             sliding_window = getattr(args, 'sliding_window', None)
             metadata['sliding_window'] = sliding_window
             if sliding_window is not None and not args.eval:
-                print(f"Sliding window: {sliding_window} (rotation enabled for pos >= {sliding_window})")
+                context_len = metadata['context_length']
+                if context_len > sliding_window:
+                    print(f"Sliding window: {sliding_window} (rotation enabled for pos >= {sliding_window})")
+                else:
+                    print(f"Sliding window: {sliding_window} (rotation disabled - context {context_len} <= sliding_window)")
 
             causal_mask = initialize_causal_mask(attention_size, args.eval)
 

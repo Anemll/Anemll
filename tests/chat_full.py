@@ -197,21 +197,22 @@ def build_stop_token_ids(tokenizer):
     def _get_token_id_if_present(token_str):
         if not token_str:
             return None
-        if hasattr(tokenizer, "get_vocab"):
-            vocab = tokenizer.get_vocab()
-            if token_str in vocab:
-                return vocab[token_str]
-        token_id = tokenizer.convert_tokens_to_ids(token_str)
-        if isinstance(token_id, list):
-            if len(token_id) == 1:
-                token_id = token_id[0]
-            else:
+        # Avoid calling get_vocab() as it can segfault on some tokenizers (e.g., Gemma)
+        # Use convert_tokens_to_ids() directly instead
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(token_str)
+            if isinstance(token_id, list):
+                if len(token_id) == 1:
+                    token_id = token_id[0]
+                else:
+                    return None
+            if token_id is None:
                 return None
-        if token_id is None:
+            if tokenizer.unk_token_id is not None and token_id == tokenizer.unk_token_id:
+                return None
+            return token_id
+        except Exception:
             return None
-        if tokenizer.unk_token_id is not None and token_id == tokenizer.unk_token_id:
-            return None
-        return token_id
 
     stop_ids = set()
     eos_token_ids = tokenizer.eos_token_id
@@ -621,14 +622,24 @@ def load_models(args,metadata):
                         'infer': load_model(chunk_path, function_name='infer', compute_unit=compute_unit),
                         'prefill': load_model(chunk_path, function_name='prefill', compute_unit=compute_unit)
                     }
-                    # Try to load rotation functions (Gemma3 with context > 512)
-                    try:
-                        chunk_dict['infer_rotate'] = load_model(chunk_path, function_name='infer_rotate', compute_unit=compute_unit)
-                        chunk_dict['prefill_rotate'] = load_model(chunk_path, function_name='prefill_rotate', compute_unit=compute_unit)
-                        print("  Rotation functions loaded (4-function model)")
-                    except Exception:
-                        # Rotation functions not available - standard 2-function model
-                        pass
+                    # Try to load rotation functions only if context > sliding_window
+                    # If context_length <= sliding_window, rotation is never needed
+                    sliding_window = getattr(args, 'sliding_window', None)
+                    context_length = getattr(args, 'context_length', None)
+                    needs_rotation = (sliding_window is not None and
+                                     context_length is not None and
+                                     context_length > sliding_window)
+
+                    if needs_rotation:
+                        try:
+                            chunk_dict['infer_rotate'] = load_model(chunk_path, function_name='infer_rotate', compute_unit=compute_unit)
+                            chunk_dict['prefill_rotate'] = load_model(chunk_path, function_name='prefill_rotate', compute_unit=compute_unit)
+                            print("  Rotation functions loaded (4-function model)")
+                        except Exception:
+                            # Rotation functions not available - standard 2-function model
+                            pass
+                    elif sliding_window is not None:
+                        print(f"  Skipping rotation functions (context {context_length} <= sliding_window {sliding_window})")
                     ffn_models.append(chunk_dict)
                     print("Chunk loaded successfully")
                 except Exception as e:
@@ -1935,7 +1946,11 @@ def main():
             sliding_window = getattr(args, 'sliding_window', None)
             metadata['sliding_window'] = sliding_window
             if sliding_window is not None:
-                print(f"Sliding window: {sliding_window} (rotation enabled for pos >= {sliding_window})")
+                context_len = metadata['context_length']
+                if context_len > sliding_window:
+                    print(f"Sliding window: {sliding_window} (rotation enabled for pos >= {sliding_window})")
+                else:
+                    print(f"Sliding window: {sliding_window} (rotation disabled - context {context_len} <= sliding_window)")
 
             # Warmup runs to prevent Python GIL issues with CoreML !
             if not args.nw:

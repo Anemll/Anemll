@@ -1597,7 +1597,11 @@ def parse_lut_arg(lut_value: str | int | None) -> tuple[int | None, int]:
     if isinstance(lut_value, int):
         return lut_value, 8  # Default per_channel value
 
-    lut_str = str(lut_value)
+    lut_str = str(lut_value).strip().lower()
+
+    # Handle "none" as no LUT quantization
+    if lut_str in ('none', 'no', 'false', ''):
+        return None, 8
     if ',' in lut_str:
         parts = lut_str.split(',')
         if len(parts) != 2:
