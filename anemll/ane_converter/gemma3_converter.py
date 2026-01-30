@@ -50,6 +50,7 @@ class Gemma3Converter(BaseConverter):
         num_chunks: int = 1,
         argmax_in_model: bool = False,
         attention_size: int | None = None,
+        fp16_scaled: bool = False,
     ) -> None:
         super().__init__(model)
         self.context_length = context_length
@@ -62,6 +63,7 @@ class Gemma3Converter(BaseConverter):
         self.converted_model = None
         self.num_chunks = num_chunks
         self.argmax_in_model = argmax_in_model
+        self.fp16_scaled = fp16_scaled  # If True, exclude scaled tensors from LUT quantization
         # attention_size controls the attention computation span
         # For Gemma3, must be at least sliding_window for local attention to work
         if attention_size is not None:
@@ -306,63 +308,53 @@ class Gemma3Converter(BaseConverter):
 
             sliding_window = model.config.sliding_window  # 512
 
-            # Determine which cache types are needed for this chunk
-            need_local = True
-            need_global = True
-
+            # Log which layer types are in this chunk (for debugging)
             if start_layer is not None:
-                # Check if chunk has any global/local attention layers
                 if end_layer is None:
                     end_layer = model.config.num_hidden_layers
                 chunk_layers = range(start_layer, end_layer)
                 chunk_layer_types = [model.config.layer_types[i] for i in chunk_layers]
-
-                need_global = "full_attention" in chunk_layer_types
-                need_local = "sliding_attention" in chunk_layer_types
-
-                if not need_global or not need_local:
-                    print(f"GetTransformerStates: Chunk layers {start_layer}-{end_layer-1}")
-                    print(f"  Need local cache: {need_local}, Need global cache: {need_global}")
+                has_global = "full_attention" in chunk_layer_types
+                has_local = "sliding_attention" in chunk_layer_types
+                print(f"GetTransformerStates: Chunk layers {start_layer}-{end_layer-1}")
+                print(f"  Has local layers: {has_local}, Has global layers: {has_global}")
+                print(f"  (Both caches declared for all chunks - state is shared)")
 
             print(f"GetTransformerStates: SPLIT CACHE mode")
             print(f"  {num_local_layers} local layers -> kv_cache_local [{2*num_local_layers}, {model.config.num_key_value_heads}, {sliding_window}, {head_dim}]")
             print(f"  {num_global_layers} global layers -> kv_cache_global [{2*num_global_layers}, {model.config.num_key_value_heads}, {model.config.state_length}, {head_dim}]")
 
-            states = []
-
-            # Only include local cache if this chunk has local attention layers
-            if need_local:
-                states.append(
-                    ct.StateType(
-                        wrapped_type=ct.TensorType(
-                            shape=(
-                                2 * num_local_layers,  # K and V for local layers
-                                model.config.num_key_value_heads,
-                                sliding_window,  # 512 positions
-                                head_dim,
-                            ),
-                            dtype=np.float16,
+            # Always declare BOTH state types for all chunks, even if chunk doesn't
+            # have that layer type. This is required because:
+            # 1. State is shared across all chunks - they must have same interface
+            # 2. Chunks without global layers pass through global cache unchanged
+            # 3. CoreML requires consistent state declarations
+            states = [
+                ct.StateType(
+                    wrapped_type=ct.TensorType(
+                        shape=(
+                            2 * num_local_layers,  # K and V for local layers
+                            model.config.num_key_value_heads,
+                            sliding_window,  # sliding_window positions
+                            head_dim,
                         ),
-                        name=f"{prefix}kv_cache_local",
-                    )
-                )
-
-            # Only include global cache if this chunk has global attention layers
-            if need_global:
-                states.append(
-                    ct.StateType(
-                        wrapped_type=ct.TensorType(
-                            shape=(
-                                2 * num_global_layers,  # K and V for global layers
-                                model.config.num_key_value_heads,
-                                model.config.state_length,  # Full context length
-                                head_dim,
-                            ),
-                            dtype=np.float16,
+                        dtype=np.float16,
+                    ),
+                    name=f"{prefix}kv_cache_local",
+                ),
+                ct.StateType(
+                    wrapped_type=ct.TensorType(
+                        shape=(
+                            2 * num_global_layers,  # K and V for global layers
+                            model.config.num_key_value_heads,
+                            model.config.state_length,  # Full context length
+                            head_dim,
                         ),
-                        name=f"{prefix}kv_cache_global",
-                    )
-                )
+                        dtype=np.float16,
+                    ),
+                    name=f"{prefix}kv_cache_global",
+                ),
+            ]
         else:
             # Legacy unified cache mode
             num_layers = model.config.num_hidden_layers
@@ -413,6 +405,15 @@ class Gemma3Converter(BaseConverter):
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=RuntimeWarning)
 
+                    # Exclude small weights from LUT quantization (norms, etc.)
+                    # Norm weights are small: layernorm=5KB, q/k_norm=512B in FP16
+                    # Setting weight_threshold=8192 (8KB) excludes all norms but keeps
+                    # large projection weights (which are typically 1MB+)
+                    # This is more reliable than op_name_configs regex patterns which
+                    # often fail because CoreML renames ops to generic names (op_0, etc.)
+                    weight_threshold = 8192  # 8KB - excludes norms (~5KB), keeps projections
+                    print(f"  Using weight_threshold={weight_threshold} bytes (excludes norm weights)")
+
                     # Set up quantization config - use per_tensor if per_channel <= 0
                     if use_per_tensor:
                         config = cto.coreml.OptimizationConfig(
@@ -423,6 +424,7 @@ class Gemma3Converter(BaseConverter):
                                 num_kmeans_workers=(
                                     num_workers if num_workers is not None else 1
                                 ),
+                                weight_threshold=weight_threshold,
                             ),
                         )
                     else:
@@ -435,6 +437,7 @@ class Gemma3Converter(BaseConverter):
                                 num_kmeans_workers=(
                                     num_workers if num_workers is not None else 1
                                 ),
+                                weight_threshold=weight_threshold,
                             ),
                         )
 
@@ -1124,9 +1127,13 @@ class Gemma3Converter(BaseConverter):
 
         total_layers = model.config.num_hidden_layers
         if total_chunks > 1:
-            layers_per_chunk = total_layers // total_chunks
-            start_layer = chunk_idx * layers_per_chunk
-            end_layer = min((chunk_idx + 1) * layers_per_chunk, total_layers)
+            # Balanced distribution: first `rem` chunks get one extra layer
+            # Same algorithm as llama_converter.py and qwen_converter.py
+            base = total_layers // total_chunks
+            rem = total_layers % total_chunks
+            start_layer = chunk_idx * base + min(chunk_idx, rem)
+            end_layer = start_layer + base + (1 if chunk_idx < rem else 0)
+            print(f"  Chunk {chunk_idx + 1}/{total_chunks}: layers {start_layer}-{end_layer - 1}")
         else:
             start_layer = 0
             end_layer = None
@@ -1157,6 +1164,16 @@ class Gemma3Converter(BaseConverter):
                 # Only apply final norm if this is the last chunk
                 if self.end_layer is None or self.end_layer == len(self.model.model.layers):
                     out = self.model.model.norm(out)
+
+                # CRITICAL: Touch both caches to mark them as "used" for CoreML
+                # Chunks without global layers still need to declare kv_cache_global
+                # but CoreML errors on unused state inputs. This adds 0 to output
+                # but forces CoreML to track both states as used.
+                if hasattr(self.model.model, 'kv_cache_local') and hasattr(self.model.model, 'kv_cache_global'):
+                    dummy_local = self.model.model.kv_cache_local[0, 0, 0, 0] * 0.0
+                    dummy_global = self.model.model.kv_cache_global[0, 0, 0, 0] * 0.0
+                    out = out + (dummy_local + dummy_global).view(1, 1, 1)
+
                 return out
 
         wrapper = FFNWrapper(model, start_layer, end_layer)
@@ -1237,9 +1254,13 @@ class Gemma3Converter(BaseConverter):
 
         total_layers = model.config.num_hidden_layers
         if total_chunks > 1:
-            layers_per_chunk = total_layers // total_chunks
-            start_layer = chunk_idx * layers_per_chunk
-            end_layer = min((chunk_idx + 1) * layers_per_chunk, total_layers)
+            # Balanced distribution: first `rem` chunks get one extra layer
+            # Same algorithm as llama_converter.py and qwen_converter.py
+            base = total_layers // total_chunks
+            rem = total_layers % total_chunks
+            start_layer = chunk_idx * base + min(chunk_idx, rem)
+            end_layer = start_layer + base + (1 if chunk_idx < rem else 0)
+            print(f"  Prefill chunk {chunk_idx + 1}/{total_chunks}: layers {start_layer}-{end_layer - 1}")
         else:
             start_layer = 0
             end_layer = None
@@ -1273,6 +1294,15 @@ class Gemma3Converter(BaseConverter):
                     IN_PREFILL=True,
                     IN_PREFILL_ROTATE=self.is_prefill_rotate,
                 )
+
+                # CRITICAL: Touch both caches to mark them as "used" for CoreML
+                # Chunks without global layers still need to declare kv_cache_global
+                # but CoreML errors on unused state inputs. This adds 0 to output
+                # but forces CoreML to track both states as used.
+                if hasattr(self.model.model, 'kv_cache_local') and hasattr(self.model.model, 'kv_cache_global'):
+                    dummy_local = self.model.model.kv_cache_local[0, 0, 0, 0] * 0.0
+                    dummy_global = self.model.model.kv_cache_global[0, 0, 0, 0] * 0.0
+                    out = out + (dummy_local + dummy_global).view(1, 1, 1)
 
                 # Skip normalization for prefill - data not used, only KV cache is updated!
                 # This follows the LLAMA pattern and avoids unnecessary computation
@@ -1532,11 +1562,19 @@ class Gemma3Converter(BaseConverter):
         print("Embeddings conversion completed")
 
         # Apply LUT quantization if specified
-        if self.lut_bits:
+        # IMPORTANT: Skip LUT for embeddings when FP16 scaling is applied
+        # The op_name_configs regex patterns don't work for embeddings-only models
+        # because CoreML assigns generic names (op_0, op_1) instead of preserving
+        # the PyTorch module names. LUT quantization on embeddings causes the
+        # gather operation to return constant values regardless of input token.
+        if self.lut_bits and not self.fp16_scaled:
             self.converted_model = mlmodel
             # Use single-threaded for embeddings (large vocab) to avoid multiprocessing issues
             self.postprocess(num_workers=None)
             mlmodel = self.converted_model
+        elif self.lut_bits and self.fp16_scaled:
+            print("  ⚠️  Skipping LUT quantization for embeddings (FP16-scaled model)")
+            print("      Embeddings will remain in FP16 to preserve lookup accuracy")
 
         return mlmodel
 
@@ -1887,6 +1925,9 @@ def test_conversion(
         f"test_conversion called with model_path={model_path}, prefix={prefix}, part={part}"
     )
 
+    # Track if FP16 scaling was applied (to exclude scaled tensors from LUT quantization)
+    fp16_scaled = False
+
     if model is None:
         if model_path is None:
             raise ValueError("model_path must be provided if model is None")
@@ -1903,6 +1944,11 @@ def test_conversion(
         )
 
         # Update config to match conversion parameters
+        # For Gemma3, context_length must be >= sliding_window for local attention to work
+        if context_length < config.sliding_window:
+            print(f"  ⚠️  context_length ({context_length}) < sliding_window ({config.sliding_window})")
+            print(f"      Auto-adjusting context_length to {config.sliding_window}")
+            context_length = config.sliding_window
         config.context_length = context_length
         # state_length controls global KV cache size (for split cache: global attention layers)
         # If not specified, defaults to context_length
@@ -1939,6 +1985,7 @@ def test_conversion(
             alpha = _apply_fp16_scaling(model, fp16_scale, model_path)
             if alpha is not None:
                 print(f"Applied FP16 residual scaling with α = {alpha}")
+                fp16_scaled = True  # Mark that scaling was applied
 
         # Ensure model is in eval mode and gradients are disabled
         model.eval()
@@ -1956,6 +2003,7 @@ def test_conversion(
         num_chunks=num_chunks,
         argmax_in_model=argmax_in_model,
         attention_size=attention_size,
+        fp16_scaled=fp16_scaled,  # Exclude scaled tensors from LUT quantization
     )
 
     print("Starting conversion...")
