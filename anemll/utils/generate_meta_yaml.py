@@ -40,7 +40,7 @@ def check_file_exists(output_dir, base_name, lut_value):
         print(f"Warning: {lut_name}.mlmodelc not found, using {base_name}.mlmodelc instead")
         return base_name, 'none', None
 
-def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch, output_dir, argmax_in_model=False, rotate=False):
+def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch, output_dir, argmax_in_model=False, rotate=False, sliding_window=None):
     """Generate meta.yaml for monolithic model format.
 
     Args:
@@ -53,6 +53,7 @@ def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch,
         output_dir: Output directory
         argmax_in_model: If True, model computes argmax internally
         rotate: If True, include rotation functions (4-function model for context >= 512)
+        sliding_window: Sliding window size for Gemma3 models (or None)
     """
     # Parse LUT value
     lut_value, lut_per_channel, _ = parse_lut_value(lut_bits)
@@ -98,6 +99,7 @@ def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch,
         meta_parts.append(f'    lut_per_channel: {lut_per_channel}')
 
     argmax_line = f'\n    argmax_in_model: true' if argmax_in_model else ''
+    sliding_window_line = f'\n    sliding_window: {sliding_window}' if sliding_window is not None else ''
 
     # Build functions list based on rotate flag
     if rotate:
@@ -113,7 +115,7 @@ def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch,
 
     meta_parts.append(f'''    model_prefix: {prefix}
     monolithic_model: {model_name_file}
-    split_lm_head: {split_lm_head}{argmax_line}
+    split_lm_head: {split_lm_head}{argmax_line}{sliding_window_line}
 {functions_yaml}
 ''')
 
@@ -149,6 +151,15 @@ def main():
     if split_rotate:
         sys.argv.remove('--split-rotate')
 
+    # Check for --sliding-window flag (e.g., --sliding-window 1024)
+    sliding_window = None
+    for i, arg in enumerate(sys.argv):
+        if arg == '--sliding-window' and i + 1 < len(sys.argv):
+            sliding_window = int(sys.argv[i + 1])
+            sys.argv.pop(i + 1)
+            sys.argv.pop(i)
+            break
+
     if is_monolithic:
         if len(sys.argv) != 11:
             print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_bits> <lut_bits> <lut_bits> <num_chunks> <prefix> <arch> <output_dir> --monolithic [--argmax] [--rotate]")
@@ -163,7 +174,8 @@ def main():
             arch=sys.argv[9],
             output_dir=sys.argv[10],
             argmax_in_model=argmax_in_model,
-            rotate=rotate
+            rotate=rotate,
+            sliding_window=sliding_window
         )
         return
 
@@ -265,12 +277,15 @@ def main():
     split_rotate_line = '\n    split_rotate: true' if split_rotate else ''
     pf_line = f'\n    pf: {pf_path}' if split_rotate else ''
 
+    # Add sliding_window for Gemma3 models
+    sliding_window_line = f'\n    sliding_window: {sliding_window}' if sliding_window is not None else ''
+
     meta_parts.append(f'''    num_chunks: {NUM_CHUNKS}
     model_prefix: {PREFIX}
     embeddings: {embeddings_path}
     lm_head: {lmhead_path}
     ffn: {ffn_path}{pf_line}
-    split_lm_head: {split_lm_head}{argmax_line}{split_rotate_line}
+    split_lm_head: {split_lm_head}{argmax_line}{split_rotate_line}{sliding_window_line}
 ''')
 
     meta = '\n'.join(meta_parts)

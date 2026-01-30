@@ -7,6 +7,35 @@ PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 # Add project root to PYTHONPATH
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
+# Auto-activate a local virtual environment if none is active.
+# - If you already activated a venv, we leave it alone.
+# - You can override with ANEMLL_VENV (venv dir) or ANEMLL_VENV_ACTIVATE (activate script).
+# - Disable with ANEMLL_AUTO_VENV=0.
+if [ -z "${VIRTUAL_ENV:-}" ] && [ "${ANEMLL_AUTO_VENV:-1}" != "0" ]; then
+    ACTIVATE_CANDIDATES=()
+    if [ -n "${ANEMLL_VENV_ACTIVATE:-}" ]; then
+        ACTIVATE_CANDIDATES+=("${ANEMLL_VENV_ACTIVATE}")
+    fi
+    if [ -n "${ANEMLL_VENV:-}" ]; then
+        ACTIVATE_CANDIDATES+=("${ANEMLL_VENV}/bin/activate")
+    fi
+    ACTIVATE_CANDIDATES+=(
+        "${PROJECT_ROOT}/env-anemll/bin/activate"
+        "${PROJECT_ROOT}/anemll-env/bin/activate"
+        "${PROJECT_ROOT}/.venv/bin/activate"
+        "${PROJECT_ROOT}/venv/bin/activate"
+    )
+
+    for ACTIVATE in "${ACTIVATE_CANDIDATES[@]}"; do
+        if [ -f "${ACTIVATE}" ]; then
+            # shellcheck disable=SC1090
+            source "${ACTIVATE}"
+            echo "Activated Python environment: ${ACTIVATE}"
+            break
+        fi
+    done
+fi
+
 # Default values
 CONTEXT_LENGTH=512
 BATCH_SIZE=64
@@ -52,6 +81,7 @@ print_usage() {
     echo "                  Format: 'bits' or 'bits,per_channel' (e.g., '6' or '6,4')"
     echo "                  Use 'bits,0' or 'bits,tensor' for per-tensor quantization"
     echo "                  Default per_channel is 8 if not specified"
+    echo "  --no-lut        Disable all LUT quantization (FP16 only)"
     echo "  --restart       Restart from specific step (1-8, default: 1)"
     echo "  --only          Run only specified step and exit (1-8)"
     echo "  --prefix        Prefix for model names (default: llama)"
@@ -257,6 +287,12 @@ if [ -f "$CONFIG_FILE" ]; then
     else
         CONVERTER="python3 -m anemll.ane_converter.llama_converter"
     fi
+
+    # Extract sliding_window from config.json (used for Gemma3 rotation checks)
+    # Gemma3 models have it nested in .text_config.sliding_window
+    # Default: 512 for 1B models, 1024 for 4B models
+    SLIDING_WINDOW=$(jq -r '.text_config.sliding_window // .sliding_window // 512' "$CONFIG_FILE")
+    echo "Detected sliding_window: $SLIDING_WINDOW"
 fi
 
 # Step 0: Check dependencies
@@ -267,6 +303,63 @@ if [ "$SKIP_CHECK" = false ]; then
         exit 1
     fi
 fi
+
+# Create initial meta.yaml with conversion config (for progress monitoring)
+INITIAL_META="$OUTPUT_DIR/meta_progress.yaml"
+cat > "$INITIAL_META" << EOF
+# Conversion in progress - this file is for monitoring only
+# Final meta.yaml will be created at step 7
+conversion:
+  status: in_progress
+  start_time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  model_path: $MODEL_PATH
+  output_dir: $OUTPUT_DIR
+  context_length: $CONTEXT_LENGTH
+  batch_size: $BATCH_SIZE
+  num_chunks: $NUM_CHUNKS
+  prefix: $PREFIX
+  architecture: ${ARCH:-unknown}
+  lut_part1: ${LUT_PART1:-none}
+  lut_part2: ${LUT_PART2:-none}
+  lut_part3: ${LUT_PART3:-none}
+  fp16_scale: ${FP16_SCALE:-none}
+  argmax: $ARGMAX_IN_MODEL
+  split_rotate: $SPLIT_ROTATE
+steps:
+  - name: embeddings
+    part: 1
+    status: pending
+  - name: lm_head
+    part: 3
+    status: pending
+  - name: ffn
+    part: 2
+    status: pending
+  - name: prefill
+    part: 2_prefill
+    status: pending
+  - name: ffn_rotate
+    part: 2_rotate
+    status: pending
+    gemma3_only: true
+  - name: prefill_rotate
+    part: 2_prefill_rotate
+    status: pending
+    gemma3_only: true
+  - name: combine
+    part: 5
+    status: pending
+  - name: compile
+    part: 6
+    status: pending
+  - name: tokenizer
+    part: 7
+    status: pending
+  - name: test
+    part: 8
+    status: pending
+EOF
+echo "Created progress tracking file: $INITIAL_META"
 
 # Function to run step if restart_step is less than or equal to step number
 run_step() {
@@ -401,7 +494,7 @@ fi
 # Step 4a: Convert FFN Rotate (Part 2_rotate) - Gemma3 only
 # For Gemma3 models with context > sliding_window (512), we need rotation versions
 if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
-    if [ $CONTEXT_LENGTH -gt 512 ]; then
+    if [ $CONTEXT_LENGTH -gt $SLIDING_WINDOW ]; then
         if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "4" ]; then
             run_step 4 "Converting FFN Rotate" "$CONVERTER \
                 --part 2_rotate \
@@ -436,7 +529,7 @@ fi
 GEMMA3_FLAG=""
 SPLIT_ROTATE_FLAG=""
 if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
-    if [ $CONTEXT_LENGTH -gt 512 ]; then
+    if [ $CONTEXT_LENGTH -gt $SLIDING_WINDOW ]; then
         GEMMA3_FLAG="--gemma3"
     fi
 fi
@@ -532,10 +625,15 @@ EOF_CONFIG
         if [ \"$SPLIT_ROTATE\" = true ]; then
             SPLIT_ROTATE_META_FLAG=\"--split-rotate\"
         fi
+        # Add sliding_window flag for Gemma3 models
+        SLIDING_WINDOW_FLAG=\"\"
+        if [[ \"$ARCH\" == \"gemma3\"* ]] && [ -n \"$SLIDING_WINDOW\" ]; then
+            SLIDING_WINDOW_FLAG=\"--sliding-window $SLIDING_WINDOW\"
+        fi
         python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
-            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \$ARGMAX_META_FLAG \$SPLIT_ROTATE_META_FLAG
+            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \$ARGMAX_META_FLAG \$SPLIT_ROTATE_META_FLAG \$SLIDING_WINDOW_FLAG
     "
 fi
 

@@ -233,6 +233,12 @@ if [ -f "$CONFIG_FILE" ]; then
             PREFIX="llama"
         fi
     fi
+
+    # Extract sliding_window from config.json (used for Gemma3 rotation checks)
+    # Gemma3 models have it nested in .text_config.sliding_window
+    # Default: 512 for 1B models, 1024 for 4B models
+    SLIDING_WINDOW=$(jq -r '.text_config.sliding_window // .sliding_window // 512' "$CONFIG_FILE")
+    echo "Detected sliding_window: $SLIDING_WINDOW"
 fi
 
 echo ""
@@ -332,9 +338,9 @@ run_step 2 "Converting Monolithic Prefill Model" "$CONVERTER \
     --model \"$MODEL_PATH\" \
     --output \"$OUTPUT_DIR\""
 
-# For context > 512, also convert rotation functions (4-function model for Gemma3)
-if [ "$CONTEXT_LENGTH" -gt 512 ]; then
-    echo "Context > 512: Converting rotation functions for 4-function model support..."
+# For context > sliding_window, also convert rotation functions (4-function model for Gemma3)
+if [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
+    echo "Context > sliding_window ($SLIDING_WINDOW): Converting rotation functions for 4-function model support..."
 
     # Step 2b: Convert Monolithic Inference Rotate Model
     run_step "2b" "Converting Monolithic Inference Rotate Model" "$CONVERTER \
@@ -360,9 +366,9 @@ if [ "$CONTEXT_LENGTH" -gt 512 ]; then
 fi
 
 # Step 3: Combine into Multi-Function Model
-# Includes rotation functions if context > 512
+# Includes rotation functions if context > sliding_window
 ROTATE_FLAG=""
-if [ "$CONTEXT_LENGTH" -gt 512 ]; then
+if [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
     ROTATE_FLAG="--rotate"
 fi
 run_step 3 "Combining Monolithic Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
@@ -429,16 +435,21 @@ EOF_CONFIG
         fi && \
 
         # Create meta.yaml for monolithic model
-        # Add --rotate flag if context > 512 (4-function model)
+        # Add --rotate flag if context > sliding_window (4-function model)
         ROTATE_META_FLAG=\"\"
-        if [ \"$CONTEXT_LENGTH\" -gt 512 ]; then
+        if [ \"$CONTEXT_LENGTH\" -gt \"$SLIDING_WINDOW\" ]; then
             ROTATE_META_FLAG=\"--rotate\"
+        fi
+        # Add sliding_window flag for Gemma3 models
+        SLIDING_WINDOW_FLAG=\"\"
+        if [[ \"$ARCH\" == \"gemma3\"* ]] && [ -n \"$SLIDING_WINDOW\" ]; then
+            SLIDING_WINDOW_FLAG=\"--sliding-window $SLIDING_WINDOW\"
         fi
         python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \
             1 \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \
-            --monolithic $ARGMAX_PARAM $ROTATE_META_FLAG
+            --monolithic $ARGMAX_PARAM $ROTATE_META_FLAG $SLIDING_WINDOW_FLAG
     "
 fi
 

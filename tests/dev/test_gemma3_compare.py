@@ -61,10 +61,16 @@ def _candidate_paths(base_dir: Path, name: str) -> List[Path]:
 
 def _find_chunk_paths(base_dir: Path, base_name: str) -> List[Path]:
     from glob import glob
+    import re
 
     stem = base_name
     if stem.endswith(".mlmodelc") or stem.endswith(".mlpackage"):
         stem = stem.rsplit(".", 1)[0]
+
+    # If stem contains a specific chunk like _chunk_01of08, replace with wildcard
+    # to find all chunks
+    stem = re.sub(r"_chunk_\d+of\d+", "_chunk_*of*", stem)
+
     pattern = str(base_dir / stem)
     if "_chunk_" not in pattern:
         pattern += "_chunk_*of*"
@@ -72,22 +78,34 @@ def _find_chunk_paths(base_dir: Path, base_name: str) -> List[Path]:
     pkg_paths = [Path(p) for p in glob(pattern + ".mlpackage")]
     mlc_paths = [Path(p) for p in glob(pattern + ".mlmodelc")]
 
-    # Prefer .mlpackage when both exist for the same chunk stem.
+    # Prefer .mlmodelc (compiled) when both exist for the same chunk stem.
     pkg_by_stem = {p.with_suffix("").name: p for p in pkg_paths}
     mlc_by_stem = {p.with_suffix("").name: p for p in mlc_paths}
 
     combined = []
     for stem_name in sorted(set(pkg_by_stem.keys()) | set(mlc_by_stem.keys())):
-        if stem_name in pkg_by_stem:
-            combined.append(pkg_by_stem[stem_name])
-        else:
+        if stem_name in mlc_by_stem:
             combined.append(mlc_by_stem[stem_name])
+        else:
+            combined.append(pkg_by_stem[stem_name])
 
     return [p for p in combined if p.exists()]
 
 
-def _load_coreml_model(path: Path, function_name: str | None = None) -> ct.models.MLModel:
-    return ct.models.MLModel(str(path), function_name=function_name)
+def _load_coreml_model(path: Path, function_name: str | None = None):
+    """Load CoreML model - handles both .mlpackage and .mlmodelc formats."""
+    path_str = str(path)
+    if path_str.endswith(".mlmodelc"):
+        # Compiled model - use CompiledMLModel
+        compute_unit = ct.ComputeUnit.CPU_AND_NE
+        if function_name:
+            return ct.models.CompiledMLModel(path_str, compute_unit, function_name=function_name)
+        return ct.models.CompiledMLModel(path_str, compute_unit)
+    else:
+        # Package model - use MLModel
+        if function_name:
+            return ct.models.MLModel(path_str, function_name=function_name)
+        return ct.models.MLModel(path_str)
 
 
 def _model_input_names(model: ct.models.MLModel, function_name: str | None = None) -> List[str]:
@@ -184,22 +202,23 @@ class CoreMLRunner:
                 infer = _load_coreml_model(chunk)
             self.ffn_models.append({"infer": infer})
         self._causal_mask = _build_causal_mask(self.context_length)
-        self._state = self.ffn_models[0]["infer"].make_state()
+        # Create per-chunk states (each chunk has its own KV cache)
+        self._states = [chunk["infer"].make_state() for chunk in self.ffn_models]
 
     def reset(self) -> None:
-        self._state = self.ffn_models[0]["infer"].make_state()
+        self._states = [chunk["infer"].make_state() for chunk in self.ffn_models]
 
     def _predict_infer(
-        self, model: ct.models.MLModel, inputs: Dict[str, np.ndarray], update_mask: np.ndarray
+        self, model: ct.models.MLModel, state, inputs: Dict[str, np.ndarray], update_mask: np.ndarray
     ) -> Dict[str, np.ndarray]:
         try:
-            return model.predict(inputs, self._state)
+            return model.predict(inputs, state)
         except RuntimeError as e:
             msg = str(e)
             if "update_mask" in msg and "required" in msg:
                 inputs_with_mask = dict(inputs)
                 inputs_with_mask["update_mask"] = update_mask
-                return model.predict(inputs_with_mask, self._state)
+                return model.predict(inputs_with_mask, state)
             raise
 
     def step(self, token_id: int, pos: int) -> np.ndarray:
@@ -221,14 +240,14 @@ class CoreMLRunner:
         update_mask = np.zeros((1, 1, self.context_length, 1), dtype=np.float16)
         update_mask[0, 0, pos, 0] = 1.0
 
-        for chunk in self.ffn_models:
+        for chunk_idx, chunk in enumerate(self.ffn_models):
             inputs = {
                 "hidden_states": hidden.astype(np.float16),
                 "position_ids": position_ids,
                 "causal_mask": single_mask.astype(np.float16),
                 "current_pos": current_pos,
             }
-            out = self._predict_infer(chunk["infer"], inputs, update_mask)
+            out = self._predict_infer(chunk["infer"], self._states[chunk_idx], inputs, update_mask)
             hidden = out[_get_output_key(out)]
 
         lm_out = self.lm_head.predict({"hidden_states": hidden.astype(np.float16)})

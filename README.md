@@ -2,14 +2,19 @@
 
 ANEMLL (pronounced like "animal") is an open-source project focused on accelerating the porting of Large Language Models (LLMs) to tensor processors, starting with the Apple Neural Engine (ANE).
 
-## 🚀 Version 0.3.4 Alpha Release - Enhanced Evaluation & Quality Improved Stability
+## 🚀 Version 0.3.5 Alpha Release - ANE Profiler & Workflow Improvements
+
+### 🔄 **What's New in 0.3.5**
+- **🔬 ANE Profiler** - CoreML/ANE profiling without Xcode: analyze which ops run on ANE vs GPU vs CPU, benchmark timing, identify fallbacks, and generate compatibility reports. [Documentation](./anemll/utils/ANE_PROFILER.md)
+- **📦 Auto-activate virtual environment** - `convert_model.sh` and `check_dependencies.sh` now auto-activate a project venv (`env-anemll`, `anemll-env`, `.venv`, or `venv`) when none is active. Override with `ANEMLL_VENV` or disable with `ANEMLL_AUTO_VENV=0`.
+- **🦙 Gemma 3 converter** - Improvements to Gemma 3 conversion pipeline.
 
 ### 🔄 **What's New in 0.3.4**
 - **📊 lm-evaluation-harness Support** - Model evaluation with standard benchmarks (BoolQ, ARC Challenge, etc.) - [Documentation](./evaluate/ane/README.md)
 - **🎯 New RMSN-orm Implementation** - Precise calculation with ANE hardware ops
 - **🐛 Fixed RoPE Tensor Size Bug** - Resolved random overflows (existing pre-0.3.4 models should be re-converted)
 
-####Example ANE vs HF on MPS backend 
+#### Example ANE vs HF on MPS backend 
 
 | Task        | HF-FP16 | ANEMLL-FP16 | DIFF % |
 |-------------|---------|--------------|--------|
@@ -55,27 +60,29 @@ python tests/test_gemma3_1B_model.py  # Test Gemma 3 1B (chunked, LUT6, 4096 ctx
 
 See update [Roadmap.md](./Roadmap.MD) for more details
 
-## Main Components in 0.3.4 Alpha Release
+## Main Components in 0.3.5 Alpha Release
 
-ANEMLL provides five main components for Apple Neural Engine inference development:
+ANEMLL provides six main components for Apple Neural Engine inference development:
 
 1. [LLM Conversion Tools](./docs/convert.md) - Scripts and code to convert models directly from Hugging Face weights
    - [Single-shot Conversion Script](./docs/convert_model.md)
 
-2. [Swift Reference Implementation](./docs/swift_cli.md) - Optimized inference code for Swift applications
+2. [ANE Profiler](./anemll/utils/ANE_PROFILER.md) - CoreML/ANE profiling without Xcode (analyze compute plan, benchmark all units, compatibility reports). Requires CoreMLTools 9.0+ and macOS 15+.
+
+3. [Swift Reference Implementation](./docs/swift_cli.md) - Optimized inference code for Swift applications
    - Sample CLI application in `anemll-swift-cli`
    - Core inference engine implementation
 
-3. [Python Sample Code](./docs/chat.md) - Reference implementation and testing tools
+4. [Python Sample Code](./docs/chat.md) - Reference implementation and testing tools
    - Basic chat interface (`chat.py`)
    - Advanced conversation management (`chat_full.py`)
 
-4. [iOS/macOS Sample Applications](./docs/sample_apps.md) - Ready-to-use example applications (Alpha, now on TestFlight)
+5. [iOS/macOS Sample Applications](./docs/sample_apps.md) - Ready-to-use example applications (Alpha, now on TestFlight)
    - SwiftUI Chat interface
    - Model Downloads and integration example
    - Conversation management
 
-5. [ANEMLL-BENCH](https://github.com/anemll/anemll-bench) - Apple Neural Engine Benchmarking
+6. [ANEMLL-BENCH](https://github.com/anemll/anemll-bench) - Apple Neural Engine Benchmarking
    - Performance testing and comparison
    - Model optimization metrics
    - Hardware-specific benchmarks
@@ -171,7 +178,7 @@ python3 tests/chat.py --meta /path/to/output/gemma3_270m/meta.yaml --prompt "Hel
 Visit our [Hugging Face repository](https://huggingface.co/anemll) for the latest converted models.
 
 ### ⚠️ **Important Alpha Release Notes**
-> This is **Alpha Release 0.3.3** - **QWEN 3 & QWEN 2.5 support is experimental**
+> This is **Alpha Release 0.3.5** - **ANE Profiler and auto-venv in conversion scripts**
 > - **Breaking Change**: `install_dependencies.sh` moved to project root
 > - **Enhanced Python Support**: Now supports Python 3.9-3.13 (recommended: 3.9-3.11)
 > - **New Architecture**: Initial Qwen 3 and Qwen 2.5 support with custom converter optimizations

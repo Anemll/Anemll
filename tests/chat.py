@@ -402,7 +402,151 @@ def load_metadata(model,args):
             print(f"\nOverriding num chunks from args: {args.num_chunks}")
     
     return metadata
-    
+
+def detect_cache_type(ffn_model, eval_mode=False):
+    """Detect KV cache type from model's state specification.
+
+    Works with both .mlpackage (MLModel) and .mlmodelc (CompiledMLModel).
+    For compiled models, tries make_state() and inspects the state object.
+
+    Returns:
+        dict with:
+            - 'has_global_cache': True if model has kv_cache_global state
+            - 'has_local_cache': True if model has kv_cache_local state
+            - 'has_unified_cache': True if model has kv_cache_0 state (legacy)
+            - 'cache_type': 'split' for local+global, 'unified' for kv_cache_0
+            - 'global_cache_chunk_idx': index of chunk with global cache (for multi-chunk)
+    """
+    result = {
+        'has_global_cache': False,
+        'has_local_cache': False,
+        'has_unified_cache': False,
+        'cache_type': 'unknown',
+        'global_cache_chunk_idx': None
+    }
+
+    def check_model_state(model):
+        """Check a single model for state types."""
+        state_names = []
+
+        # Method 1: Try get_spec() for .mlpackage
+        try:
+            spec = model.get_spec()
+            if hasattr(spec, 'description') and hasattr(spec.description, 'stateInput'):
+                state_names = [s.name for s in spec.description.stateInput]
+        except (AttributeError, Exception):
+            pass
+
+        # Method 2: For compiled models, try make_state() and inspect
+        if not state_names:
+            try:
+                state = model.make_state()
+                # Try different ways to get state names from MLState
+                if hasattr(state, 'keys'):
+                    state_names = list(state.keys())
+                elif hasattr(state, '_state') and hasattr(state._state, 'keys'):
+                    state_names = list(state._state.keys())
+                elif hasattr(state, '__dict__'):
+                    # Check internal dict for state names
+                    for key, val in state.__dict__.items():
+                        if 'kv_cache' in str(key) or 'kv_cache' in str(val):
+                            state_names.append(str(key))
+                # Try repr/str for state names
+                if not state_names:
+                    state_repr = repr(state)
+                    if 'kv_cache_global' in state_repr:
+                        state_names.append('kv_cache_global')
+                    if 'kv_cache_local' in state_repr:
+                        state_names.append('kv_cache_local')
+                    if 'kv_cache_0' in state_repr:
+                        state_names.append('kv_cache_0')
+            except Exception:
+                pass
+
+        return state_names
+
+    try:
+        # Handle list of models (multi-chunk)
+        if isinstance(ffn_model, list):
+            models_to_check = ffn_model
+        else:
+            models_to_check = [ffn_model]
+
+        all_state_names = set()
+        for idx, fm in enumerate(models_to_check):
+            if isinstance(fm, dict):
+                model = fm.get('prefill') or fm.get('infer')
+            else:
+                model = fm
+
+            if model is None:
+                continue
+
+            state_names = check_model_state(model)
+            all_state_names.update(state_names)
+
+            # Track which chunk has global cache
+            has_global = any('kv_cache_global' in name for name in state_names)
+            if has_global and result['global_cache_chunk_idx'] is None:
+                result['global_cache_chunk_idx'] = idx
+
+        result['has_global_cache'] = any('kv_cache_global' in name for name in all_state_names)
+        result['has_local_cache'] = any('kv_cache_local' in name for name in all_state_names)
+        result['has_unified_cache'] = any('kv_cache_0' in name for name in all_state_names)
+
+        if result['has_local_cache'] and result['has_global_cache']:
+            result['cache_type'] = 'split'
+        elif result['has_unified_cache']:
+            result['cache_type'] = 'unified'
+        elif result['has_local_cache']:
+            result['cache_type'] = 'local_only'
+
+        # Fallback: if we couldn't detect via spec, try make_state() on each chunk
+        # and look for global cache in the state repr
+        if result['global_cache_chunk_idx'] is None and result['cache_type'] == 'unknown':
+            if not eval_mode:
+                print("  Trying fallback detection via make_state()...")
+            for idx, fm in enumerate(models_to_check):
+                try:
+                    if isinstance(fm, dict):
+                        model = fm.get('prefill') or fm.get('infer')
+                    else:
+                        model = fm
+                    if model is None:
+                        continue
+                    state = model.make_state()
+                    state_repr = repr(state)
+                    has_global = 'kv_cache_global' in state_repr
+                    has_local = 'kv_cache_local' in state_repr
+                    if not eval_mode:
+                        print(f"    Chunk {idx}: global={has_global}, local={has_local}")
+                    if has_global:
+                        result['global_cache_chunk_idx'] = idx
+                        result['has_global_cache'] = True
+                        if has_local:
+                            result['has_local_cache'] = True
+                            result['cache_type'] = 'split'
+                        break
+                    elif has_local and not result['has_local_cache']:
+                        result['has_local_cache'] = True
+                        result['cache_type'] = 'local_only'
+                except Exception as e:
+                    if not eval_mode:
+                        print(f"    Chunk {idx}: error - {e}")
+
+        if not eval_mode:
+            print(f"\nCache type detection: {result['cache_type']}")
+            if all_state_names:
+                print(f"  State inputs: {sorted(all_state_names)}")
+            if result['global_cache_chunk_idx'] is not None:
+                print(f"  Global cache found in chunk: {result['global_cache_chunk_idx']}")
+
+    except Exception as e:
+        if not eval_mode:
+            print(f"Warning: Could not detect cache type: {e}")
+
+    return result
+
 def load_models(args,metadata):
     """Load all required models and extract metadata."""
     if not args.eval:
@@ -526,7 +670,15 @@ def load_models(args,metadata):
             if not args.eval:
                 print("FFN model loaded successfully")
             _maybe_report_mem("after FFN load", getattr(args, "mem_report", False))
-        
+
+        # Detect cache type from first FFN model
+        # Detect cache type from ALL FFN models (some chunks may not have global cache)
+        cache_info = detect_cache_type(ffn_models, eval_mode=args.eval)
+        metadata['has_global_cache'] = cache_info['has_global_cache']
+        metadata['has_local_cache'] = cache_info['has_local_cache']
+        metadata['cache_type'] = cache_info['cache_type']
+        metadata['global_cache_chunk_idx'] = cache_info['global_cache_chunk_idx']
+
         return embed_model, ffn_models, lmhead_model, metadata
         
     except Exception as e:
@@ -683,7 +835,8 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
         prefill_func_name = 'prefill_rotate' if batch_pos >= sliding_window and has_rotation else 'prefill'
 
         # Run through FFN chunks with state
-        for ffn_model in ffn_models:
+        # Handle per-chunk states (list) or unified state (single object)
+        for chunk_idx, ffn_model in enumerate(ffn_models):
             if isinstance(ffn_model, dict):
                 inputs = {
                     'hidden_states': hidden_states.numpy().astype(np.float16),  # [1, 64, hidden_size]
@@ -691,7 +844,9 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
                     'causal_mask': batch_causal_mask.numpy().astype(np.float16), # [1, 1, 64, context_length]
                     'current_pos': np.array([batch_pos], dtype=np.int32)  # [1]
                 }
-                output = ffn_model[prefill_func_name].predict(inputs, state)
+                # Use per-chunk state if state is a list, otherwise use unified state
+                chunk_state = state[chunk_idx] if isinstance(state, list) else state
+                output = ffn_model[prefill_func_name].predict(inputs, chunk_state)
                 hidden_states = torch.from_numpy(output['output_hidden_states'])
 
         batch_pos = batch_end
@@ -747,7 +902,8 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
         print(f"[DEBUG]   hidden_states shape={hidden_states.shape}")
 
     # Run through FFN chunks with state
-    for ffn_model in ffn_models:
+    # Handle per-chunk states (list) or unified state (single object)
+    for chunk_idx, ffn_model in enumerate(ffn_models):
         if isinstance(ffn_model, dict):
             # Build inputs dict - only include inputs that the model expects
             inputs = {
@@ -768,7 +924,9 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
                 print(f"[DEBUG]   FFN {infer_func_name} inputs: position_ids={inputs['position_ids']}, current_pos={inputs['current_pos']}")
                 print(f"[DEBUG]   FFN {infer_func_name} causal_mask shape={inputs['causal_mask'].shape}")
             try:
-                output = ffn_model[infer_func_name].predict(inputs, state)
+                # Use per-chunk state if state is a list, otherwise use unified state
+                chunk_state = state[chunk_idx] if isinstance(state, list) else state
+                output = ffn_model[infer_func_name].predict(inputs, chunk_state)
             except Exception as e:
                 print(f"\n[ERROR] FFN {infer_func_name} failed at pos={pos}, position_ids={position_ids.item()}")
                 print(f"[ERROR]   context_length={context_length}, attention_size={attention_size}")
@@ -845,19 +1003,83 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
 
     return next_token
 
-def create_unified_state(ffn_models, context_length, eval_mode=False):
-    """Create unified KV cache state for transformer."""
-    if isinstance(ffn_models[0], dict):
-        # Use first FFN model's prefill function to create state
-        state = ffn_models[0]['prefill'].make_state()
+def create_unified_state(ffn_models, context_length, eval_mode=False, metadata=None):
+    """Create unified KV cache state for transformer.
+
+    For split cache models (Gemma3), uses the chunk with global cache to ensure
+    both kv_cache_local and kv_cache_global are properly initialized.
+
+    For models with inconsistent state declarations (old converter), creates
+    per-chunk states to avoid passing unsupported state types.
+
+    Args:
+        ffn_models: List of FFN model chunks
+        context_length: Context length (unused but kept for API compatibility)
+        eval_mode: Suppress output if True
+        metadata: Optional metadata dict with 'global_cache_chunk_idx'
+
+    Returns:
+        Either a single state (if all chunks have same state interface) or
+        a list of states (one per chunk, for inconsistent models)
+    """
+    # First, check if all chunks have consistent state interfaces
+    # by checking if each chunk's state has global cache
+    chunk_has_global = []
+    for idx, fm in enumerate(ffn_models):
+        if isinstance(fm, dict):
+            model = fm.get('prefill') or fm.get('infer')
+        else:
+            model = fm
+
+        has_global = False
+        try:
+            state = model.make_state()
+            state_repr = repr(state)
+            has_global = 'kv_cache_global' in state_repr
+        except Exception:
+            pass
+        chunk_has_global.append(has_global)
+
+    # Check if all chunks have same interface
+    all_have_global = all(chunk_has_global)
+    none_have_global = not any(chunk_has_global)
+    consistent = all_have_global or none_have_global
+
+    if not eval_mode:
+        print(f"\nChunk global cache support: {chunk_has_global}")
+        print(f"  Consistent interface: {consistent}")
+
+    if consistent:
+        # All chunks have same state interface - use unified state
+        state_chunk_idx = 0
+        if metadata and metadata.get('global_cache_chunk_idx') is not None:
+            state_chunk_idx = metadata['global_cache_chunk_idx']
+
+        if isinstance(ffn_models[0], dict):
+            state = ffn_models[state_chunk_idx]['prefill'].make_state()
+        else:
+            state = ffn_models[state_chunk_idx].make_state()
+
         if not eval_mode:
-            print(f"\nCreated unified transformer state for {len(ffn_models)} chunks")
+            print(f"Created unified transformer state from chunk {state_chunk_idx}")
         return state
     else:
-        state = ffn_models[0].make_state()
+        # Inconsistent state interfaces - create per-chunk states
+        # This is a workaround for models converted before the fix
         if not eval_mode:
-            print("\nCreated unified transformer state")
-        return state
+            print("WARNING: Chunks have inconsistent state interfaces!")
+            print("  Creating per-chunk states (KV cache won't be fully shared)")
+            print("  Please reconvert model with latest converter for proper support")
+
+        states = []
+        for idx, fm in enumerate(ffn_models):
+            if isinstance(fm, dict):
+                model = fm.get('prefill') or fm.get('infer')
+            else:
+                model = fm
+            states.append(model.make_state())
+
+        return states
 
 def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False):
     """Interactive chat loop."""
@@ -1954,8 +2176,8 @@ def main():
                 if metadata.get('argmax_in_model'):
                     print("Argmax mode enabled for LM head")
 
-            # Create unified state once
-            state = create_unified_state(ffn_models, metadata['context_length'], args.eval)
+            # Create unified state once (use chunk with global cache if available)
+            state = create_unified_state(ffn_models, metadata['context_length'], args.eval, metadata=metadata)
             _maybe_report_mem("after chunked make_state", getattr(args, "mem_report", False))
 
             # Initialize causal mask once

@@ -3,6 +3,37 @@
 # check_dependencies.sh
 # This script checks for necessary dependencies before running convert_model.sh
 
+# Auto-activate a local virtual environment if none is active.
+# - If you already activated a venv, we leave it alone.
+# - You can override with ANEMLL_VENV (venv dir) or ANEMLL_VENV_ACTIVATE (activate script).
+# - Disable with ANEMLL_AUTO_VENV=0.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+if [ -z "${VIRTUAL_ENV:-}" ] && [ "${ANEMLL_AUTO_VENV:-1}" != "0" ]; then
+    ACTIVATE_CANDIDATES=()
+    if [ -n "${ANEMLL_VENV_ACTIVATE:-}" ]; then
+        ACTIVATE_CANDIDATES+=("${ANEMLL_VENV_ACTIVATE}")
+    fi
+    if [ -n "${ANEMLL_VENV:-}" ]; then
+        ACTIVATE_CANDIDATES+=("${ANEMLL_VENV}/bin/activate")
+    fi
+    ACTIVATE_CANDIDATES+=(
+        "${PROJECT_ROOT}/env-anemll/bin/activate"
+        "${PROJECT_ROOT}/anemll-env/bin/activate"
+        "${PROJECT_ROOT}/.venv/bin/activate"
+        "${PROJECT_ROOT}/venv/bin/activate"
+    )
+
+    for ACTIVATE in "${ACTIVATE_CANDIDATES[@]}"; do
+        if [ -f "${ACTIVATE}" ]; then
+            # shellcheck disable=SC1090
+            source "${ACTIVATE}"
+            echo "Activated Python environment: ${ACTIVATE}"
+            break
+        fi
+    done
+fi
+
 # Function to display usage
 usage() {
     echo "Usage: $0 [--skip-check] [--model <model_directory>] [--context <context_length>] [--batch <batch_size>] [other options for convert_model.sh]"
