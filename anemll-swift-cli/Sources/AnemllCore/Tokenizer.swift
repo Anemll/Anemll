@@ -374,32 +374,76 @@ public final class Tokenizer: @unchecked Sendable {
                 return tokens
             } catch {
                 print("Error applying chat template: \(error)")
-                // Fallback: use template-specific prompt formatting
+                // Fallback: use template-specific prompt formatting for ALL messages (multi-turn)
                 print("Using fallback prompt formatting for template: \(templateName)")
-                if let userMessage = messagesArray.first(where: { $0["role"] as? String == "user" }),
-                   let content = userMessage["content"] as? String {
-                    let formattedPrompt: String
-                    switch templateName.lowercased() {
-                    case "gemma", "gemma3":
-                        // Gemma format: <start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
-                        formattedPrompt = "<bos><start_of_turn>user\n\(content)<end_of_turn>\n<start_of_turn>model\n"
-                    case "llama", "llama3":
-                        // LLaMA 3 format
-                        formattedPrompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n\(content)<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-                    case "deepseek":
-                        // DeepSeek format
-                        formattedPrompt = "<｜begin▁of▁sentence｜>User: \(content)\n\nAssistant:"
-                    case "qwen", "qwen2", "qwen3":
-                        // Qwen/ChatML format
-                        formattedPrompt = "<|im_start|>user\n\(content)<|im_end|>\n<|im_start|>assistant\n"
-                    default:
-                        // Default ChatML format
-                        formattedPrompt = "<|im_start|>user\n\(content)<|im_end|>\n<|im_start|>assistant\n"
+
+                let formattedPrompt: String
+                switch templateName.lowercased() {
+                case "gemma", "gemma3":
+                    // Gemma format: <bos><start_of_turn>role\n{content}<end_of_turn>\n...
+                    var prompt = "<bos>"
+                    for message in messagesArray {
+                        let role = message["role"] as? String ?? "user"
+                        let content = message["content"] as? String ?? ""
+                        let gemmaRole = role == "assistant" ? "model" : role
+                        prompt += "<start_of_turn>\(gemmaRole)\n\(content)<end_of_turn>\n"
                     }
-                    print("Fallback formatted prompt: \(formattedPrompt.prefix(100))...")
-                    return tokenizer.encode(text: formattedPrompt)
+                    prompt += "<start_of_turn>model\n"
+                    formattedPrompt = prompt
+
+                case "llama", "llama3":
+                    // LLaMA 3 format
+                    var prompt = "<|begin_of_text|>"
+                    for message in messagesArray {
+                        let role = message["role"] as? String ?? "user"
+                        let content = message["content"] as? String ?? ""
+                        prompt += "<|start_header_id|>\(role)<|end_header_id|>\n\n\(content)<|eot_id|>"
+                    }
+                    prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+                    formattedPrompt = prompt
+
+                case "deepseek":
+                    // DeepSeek format
+                    var prompt = "<｜begin▁of▁sentence｜>"
+                    for message in messagesArray {
+                        let role = message["role"] as? String ?? "user"
+                        let content = message["content"] as? String ?? ""
+                        if role == "user" {
+                            prompt += "User: \(content)\n\n"
+                        } else if role == "assistant" {
+                            prompt += "Assistant: \(content)\n\n"
+                        } else if role == "system" {
+                            prompt += "\(content)\n\n"
+                        }
+                    }
+                    prompt += "Assistant:"
+                    formattedPrompt = prompt
+
+                case "qwen", "qwen2", "qwen3":
+                    // Qwen/ChatML format
+                    var prompt = ""
+                    for message in messagesArray {
+                        let role = message["role"] as? String ?? "user"
+                        let content = message["content"] as? String ?? ""
+                        prompt += "<|im_start|>\(role)\n\(content)<|im_end|>\n"
+                    }
+                    prompt += "<|im_start|>assistant\n"
+                    formattedPrompt = prompt
+
+                default:
+                    // Default ChatML format
+                    var prompt = ""
+                    for message in messagesArray {
+                        let role = message["role"] as? String ?? "user"
+                        let content = message["content"] as? String ?? ""
+                        prompt += "<|im_start|>\(role)\n\(content)<|im_end|>\n"
+                    }
+                    prompt += "<|im_start|>assistant\n"
+                    formattedPrompt = prompt
                 }
-                return []
+
+                print("Fallback formatted prompt (\(messagesArray.count) messages): \(formattedPrompt.prefix(200))...")
+                return tokenizer.encode(text: formattedPrompt)
             }
         }
 

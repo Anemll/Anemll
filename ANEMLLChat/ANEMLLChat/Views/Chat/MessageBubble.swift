@@ -6,9 +6,16 @@
 //
 
 import SwiftUI
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 
 struct MessageBubble: View {
     let message: ChatMessage
+
+    @State private var isHovering = false
 
     private var isUser: Bool {
         message.role == .user
@@ -21,9 +28,16 @@ struct MessageBubble: View {
             }
 
             VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
-                // Message content
-                messageContent
-                    .frame(maxWidth: isUser ? nil : .infinity, alignment: .leading)
+                // Message content with hover overlay
+                ZStack(alignment: .topTrailing) {
+                    messageContent
+                        .frame(maxWidth: isUser ? nil : .infinity, alignment: .leading)
+
+                    // Copy button (appears on hover for macOS, always visible touch target for iOS)
+                    if !message.content.isEmpty {
+                        copyButton
+                    }
+                }
 
                 // Stats (for assistant messages)
                 if !isUser && message.isComplete {
@@ -31,11 +45,58 @@ struct MessageBubble: View {
                 }
             }
             .frame(maxWidth: isUser ? nil : .infinity, alignment: .leading)
+            #if os(macOS)
+            .onHover { hovering in
+                isHovering = hovering
+            }
+            #endif
 
             if isUser {
                 // Only add right spacer for user messages (not assistant)
             }
         }
+    }
+
+    // MARK: - Copy Button
+
+    @ViewBuilder
+    private var copyButton: some View {
+        #if os(macOS)
+        // macOS: show on hover
+        if isHovering {
+            Button {
+                copyToClipboard()
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.caption)
+                    .padding(6)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .offset(x: -4, y: 4)
+            .transition(.opacity.combined(with: .scale))
+        }
+        #else
+        // iOS: context menu for copy (long press)
+        Color.clear
+            .frame(width: 1, height: 1)
+            .contextMenu {
+                Button {
+                    copyToClipboard()
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+            }
+        #endif
+    }
+
+    private func copyToClipboard() {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(message.content, forType: .string)
+        #else
+        UIPasteboard.general.string = message.content
+        #endif
     }
 
     // MARK: - Message Content

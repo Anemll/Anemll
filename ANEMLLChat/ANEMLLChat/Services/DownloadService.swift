@@ -380,6 +380,9 @@ actor DownloadService: NSObject {
         downloadCompletions.removeValue(forKey: modelId)
     }
 
+    // Timer for progress polling (needed for macOS where KVO may not fire frequently)
+    private var progressTimers: [String: Task<Void, Never>] = [:]
+
     private func observeProgress(task: URLSessionDownloadTask, modelId: String) {
         // Use KVO to observe progress - store observation to keep it alive
         let observation = task.progress.observe(\.fractionCompleted) { [weak self] progress, _ in
@@ -390,6 +393,22 @@ actor DownloadService: NSObject {
 
         // Store observation to keep it alive for the duration of the download
         progressObservations[modelId] = observation
+
+        // Also start a timer-based polling for macOS (KVO may not fire frequently)
+        #if os(macOS)
+        progressTimers[modelId]?.cancel()
+        progressTimers[modelId] = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 second
+                guard !Task.isCancelled else { break }
+                let completed = task.progress.completedUnitCount
+                let total = task.progress.totalUnitCount
+                if completed > 0 || total > 0 {
+                    await self?.handleProgressUpdate(for: modelId, completedBytes: completed, totalBytes: total)
+                }
+            }
+        }
+        #endif
     }
 
     private func handleProgressUpdate(for modelId: String, completedBytes: Int64, totalBytes: Int64) {
@@ -533,5 +552,9 @@ actor DownloadService: NSObject {
         progressObservations.removeValue(forKey: modelId)
         downloadCompletions.removeValue(forKey: modelId)
         currentFileSize.removeValue(forKey: modelId)
+
+        // Cancel progress timer (macOS)
+        progressTimers[modelId]?.cancel()
+        progressTimers.removeValue(forKey: modelId)
     }
 }

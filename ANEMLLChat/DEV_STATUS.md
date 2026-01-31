@@ -47,6 +47,39 @@ open /Users/anemll/Library/Developer/Xcode/DerivedData/ANEMLLChat-cfloixiatmalxi
 pkill -f "ANEMLLChat"
 ```
 
+## Build & Export (Claude Notes)
+
+### macOS (local Mac app)
+```bash
+# Build Debug .app
+cd /Users/anemll/SourceRelease/GITHUB/ML_playground/anemll-0.3.5/ANEMLLChat
+xcodebuild -project ANEMLLChat.xcodeproj -scheme ANEMLLChat -configuration Debug build
+
+# Launch built app
+open /Users/anemll/Library/Developer/Xcode/DerivedData/ANEMLLChat-*/Build/Products/Debug/ANEMLLChat.app
+```
+
+### iPhone (device build/export)
+```bash
+# Build for device (generic iOS device)
+cd /Users/anemll/SourceRelease/GITHUB/ML_playground/anemll-0.3.5/ANEMLLChat
+xcodebuild -project ANEMLLChat.xcodeproj -scheme ANEMLLChat -configuration Debug \
+  -destination 'generic/platform=iOS' build
+
+# Archive (for export / TestFlight / IPA)
+xcodebuild -project ANEMLLChat.xcodeproj -scheme ANEMLLChat -configuration Release \
+  -destination 'generic/platform=iOS' archive \
+  -archivePath /tmp/ANEMLLChat.xcarchive
+
+# Export IPA (needs export options plist with signing)
+xcodebuild -exportArchive \
+  -archivePath /tmp/ANEMLLChat.xcarchive \
+  -exportPath /tmp/ANEMLLChatExport \
+  -exportOptionsPlist /tmp/ANEMLLChatExportOptions.plist
+```
+
+**Claude gotcha**: iOS export requires a valid signing team + provisioning profile. If `xcodebuild -exportArchive` fails, open the `.xcarchive` in Xcode Organizer and export there once to generate a working `ExportOptions.plist`, then reuse it for CLI exports.
+
 ## Key Files
 
 ### App Structure
@@ -240,6 +273,45 @@ Created `Views/Chat/MarkdownView.swift` with full markdown support:
    - Assistant messages now expand full width (removed right spacer)
    - Added extra bottom padding (20pt) to prevent overlap with input bar
    - User messages still right-aligned with left spacer
+
+## Recent Fixes (2026-01-31 10:30 AM)
+
+1. **Fixed Delete button visibility on iOS**
+   - Made delete button more prominent with bordered style and `.body` font (was `.caption`)
+   - Changed from plain style to bordered button with red tint
+   - Made "Show in Finder" swipe action and context menu item macOS-only (won't work on iOS)
+
+2. **Fixed multi-turn conversation bug in Tokenizer.swift**
+   - The fallback chat template formatting was only using the FIRST user message, causing context loss
+   - Now properly formats ALL messages in the conversation history for multi-turn support
+   - Fixed for all templates: Gemma/Gemma3, LLaMA 3, DeepSeek, Qwen/ChatML
+   - This fixes the bug where model would respond to previous questions instead of current one
+
+3. **Added copy button on hover for messages (macOS)**
+   - Copy icon appears in top-right corner when hovering over messages
+   - Uses `.ultraThinMaterial` background for subtle appearance
+   - iOS uses context menu (long press) for copy
+   - Copies message content to clipboard
+
+4. **Verified macOS model info display**
+   - Model status shows in top-right toolbar (green dot when loaded, orange when not)
+   - Model list shows full details: name, description, size, context length, architecture tag
+   - Delete button (red trash icon) visible next to Load button for downloaded models
+
+5. **Imported app icon from anemll-chatbot**
+   - Copied Assets.xcassets with full AppIcon.appiconset (all sizes for iOS, iPad, macOS, Watch)
+   - Bundle identifier updated to `anemll.anemll-chat.demo` (matches anemll-chatbot for App Store)
+   - Marketing version updated to 0.3.7
+
+6. **Fixed macOS download progress not updating**
+   - KVO on URLSessionDownloadTask.progress was not firing frequently on macOS
+   - Added timer-based polling (0.5s interval) as fallback for macOS
+   - iOS continues to use KVO only (works fine there)
+
+## Known Issues / TODO
+
+1. ~~**CTX display** - Need to verify if "ctx" in message stats shows overall context buffer or just per-message tokens~~ ✓ VERIFIED - CTX shows **overall context** (grew from 22→410 tokens in multi-turn conversation)
+2. **App icon in dock** - May need dock cache refresh to show new icon
 
 ## TODO
 

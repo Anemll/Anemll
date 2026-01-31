@@ -105,12 +105,14 @@ struct ModelCard: View {
                     Label("Delete", systemImage: "trash")
                 }
 
+                #if os(macOS)
                 Button {
                     showInFinder()
                 } label: {
                     Label("Finder", systemImage: "folder")
                 }
                 .tint(.blue)
+                #endif
             }
         }
         .alert("Delete Model", isPresented: $showingDeleteAlert) {
@@ -188,15 +190,15 @@ struct ModelCard: View {
                     .controlSize(.small)
             } else {
                 HStack(spacing: 8) {
-                    // Delete button
+                    // Delete button - more visible on iOS
                     Button {
                         showingDeleteAlert = true
                     } label: {
                         Image(systemName: "trash")
-                            .font(.caption)
+                            .font(.body)
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.red.opacity(0.7))
+                    .buttonStyle(.bordered)
+                    .tint(.red)
 
                     // Load button
                     Button {
@@ -245,6 +247,7 @@ struct ModelCard: View {
 
             Divider()
 
+            #if os(macOS)
             Button {
                 showInFinder()
             } label: {
@@ -252,6 +255,7 @@ struct ModelCard: View {
             }
 
             Divider()
+            #endif
 
             Button(role: .destructive) {
                 showingDeleteAlert = true
