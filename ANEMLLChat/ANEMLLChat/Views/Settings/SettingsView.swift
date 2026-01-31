@@ -16,9 +16,13 @@ struct SettingsView: View {
     @State private var systemPrompt: String = "You are a helpful assistant."
 
     @State private var showingLogs = false
+    @State private var autoLoadLastModel = true
 
     var body: some View {
         Form {
+            // Model settings
+            modelSection
+
             // Generation settings
             generationSection
 
@@ -49,6 +53,26 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $showingLogs) {
             LogsView()
+        }
+    }
+
+    // MARK: - Model Section
+
+    private var modelSection: some View {
+        Section {
+            Toggle("Auto-load last model", isOn: $autoLoadLastModel)
+
+            Button(role: .destructive) {
+                Task {
+                    await StorageService.shared.clearLastModel()
+                }
+            } label: {
+                Label("Clear remembered model", systemImage: "xmark.circle")
+            }
+        } header: {
+            Text("Model")
+        } footer: {
+            Text("When enabled, the app will automatically load the last used model on startup")
         }
     }
 
@@ -183,6 +207,10 @@ struct SettingsView: View {
         temperature = chatVM.temperature
         maxTokens = chatVM.maxTokens
         systemPrompt = chatVM.systemPrompt
+
+        Task {
+            autoLoadLastModel = await StorageService.shared.autoLoadLastModel
+        }
     }
 
     private func saveSettings() {
@@ -192,6 +220,7 @@ struct SettingsView: View {
 
         Task {
             await chatVM.saveSettings()
+            await StorageService.shared.saveAutoLoadLastModel(autoLoadLastModel)
         }
     }
 }

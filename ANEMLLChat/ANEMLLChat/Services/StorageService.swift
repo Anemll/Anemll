@@ -250,6 +250,19 @@ actor StorageService {
         UserDefaults.standard.object(forKey: "selectedModelId") as? String
     }
 
+    var autoLoadLastModel: Bool {
+        // Default to true if not set
+        UserDefaults.standard.object(forKey: "autoLoadLastModel") as? Bool ?? true
+    }
+
+    func saveAutoLoadLastModel(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "autoLoadLastModel")
+    }
+
+    func clearLastModel() {
+        UserDefaults.standard.removeObject(forKey: "selectedModelId")
+    }
+
     func saveTemperature(_ value: Float) {
         UserDefaults.standard.set(value, forKey: "temperature")
     }

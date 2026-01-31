@@ -1981,12 +1981,12 @@ import Accelerate
         var generatedTokens: [Int] = []
         let startTime = CFAbsoluteTimeGetCurrent()
         var stopReason = "max_tokens"
-        // Use known EOT token ID
-        let eotToken = 128009  // Hardcode the token ID we observed
 
         if (busy) {
             print("Should not happen!!!!!")
-            generatedTokens.append(eotToken)
+            if let firstEos = eosTokens.first {
+                generatedTokens.append(firstEos)
+            }
             return  (generatedTokens, 0, "Inference is Busy")
         }
 
@@ -2002,9 +2002,11 @@ import Accelerate
         do {
 
             if debugLevel >= 1 {
-                print("\n=== EOT Token Setup ===")
-                print("EOT token ID: \(eotToken)")
-                print("EOT decoded: '\(tokenizer.decode(tokens: [eotToken], skipSpecialTokens: false))'")
+                print("\n=== EOS Token Setup ===")
+                print("EOS token IDs: \(eosTokens)")
+                for eos in eosTokens {
+                    print("  \(eos): '\(tokenizer.decode(tokens: [eos], skipSpecialTokens: false))'")
+                }
             }
             
             // Create mutable copy of initialTokens
@@ -2092,22 +2094,13 @@ import Accelerate
                     print("Next token: \(nextToken)")
                     print("Decoded: '\(tokenizer.decode(tokens: [nextToken], skipSpecialTokens: false))'")
                     print("Is EOS? \(eosTokens.contains(nextToken))")
-                    print("Is EOT? \(nextToken == eotToken)")  // Direct comparison
                 }
-                
+
                 // Check for stop tokens before adding to generated tokens
                 if eosTokens.contains(nextToken) {
                     stopReason = "eos_token"
                     if debugLevel >= 1 {
                         print("\nStopping: EOS token detected (\(nextToken))")
-                    }
-                    break
-                }
-                
-                if nextToken == eotToken {  // Direct comparison
-                    stopReason = "eot_token"
-                    if debugLevel >= 1 {
-                        print("\nStopping: EOT token detected (\(nextToken))")
                     }
                     break
                 }

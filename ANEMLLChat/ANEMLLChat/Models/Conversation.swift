@@ -53,6 +53,7 @@ struct Conversation: Identifiable, Codable, Sendable {
         tokenCount: Int? = nil,
         windowShifts: Int? = nil,
         prefillTime: TimeInterval? = nil,
+        prefillTokens: Int? = nil,
         isComplete: Bool? = nil,
         wasCancelled: Bool? = nil,
         stopReason: String? = nil
@@ -73,6 +74,9 @@ struct Conversation: Identifiable, Codable, Sendable {
         }
         if let time = prefillTime {
             messages[index].prefillTime = time
+        }
+        if let tokens = prefillTokens {
+            messages[index].prefillTokens = tokens
         }
         if let complete = isComplete {
             messages[index].isComplete = complete

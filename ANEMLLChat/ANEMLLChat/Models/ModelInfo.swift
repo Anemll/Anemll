@@ -122,7 +122,7 @@ extension ModelInfo {
 
     var statusIcon: String {
         switch status {
-        case .available: return "arrow.down.circle"
+        case .available: return "cloud"
         case .downloading: return "arrow.down.circle.fill"
         case .downloaded: return "checkmark.circle.fill"
         case .error: return "exclamationmark.triangle.fill"

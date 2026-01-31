@@ -46,9 +46,9 @@ final class ModelManagerViewModel {
         availableModels.filter { $0.isDownloaded }
     }
 
-    /// Models available for download
+    /// Models available for download (excludes errored models)
     var availableForDownload: [ModelInfo] {
-        availableModels.filter { !$0.isDownloaded && !$0.isDownloading }
+        availableModels.filter { !$0.isDownloaded && !$0.isDownloading && $0.downloadError == nil }
     }
 
     /// Total size of downloaded models
@@ -116,6 +116,11 @@ final class ModelManagerViewModel {
         // Update the published property - this triggers UI update
         availableModels = models
         logInfo("Loaded \(models.count) models (\(downloadedModels.count) downloaded)", category: .model)
+
+        // Auto-load last model after models are loaded (if setting enabled)
+        if await StorageService.shared.autoLoadLastModel {
+            await autoLoadLastModel()
+        }
     }
 
     /// Refresh download status for all models
@@ -251,10 +256,18 @@ final class ModelManagerViewModel {
 
     /// Auto-load the last selected model
     func autoLoadLastModel() async {
-        guard let selectedId = await StorageService.shared.selectedModelId else { return }
+        guard let selectedId = await StorageService.shared.selectedModelId else {
+            logInfo("[AUTO-LOAD] No saved model ID found", category: .model)
+            return
+        }
+
+        logInfo("[AUTO-LOAD] Looking for model: \(selectedId)", category: .model)
 
         if let model = availableModels.first(where: { $0.id == selectedId && $0.isDownloaded }) {
+            logInfo("[AUTO-LOAD] Found model, loading: \(model.name)", category: .model)
             await loadModelForInference(model)
+        } else {
+            logWarning("[AUTO-LOAD] Model not found or not downloaded: \(selectedId)", category: .model)
         }
     }
 

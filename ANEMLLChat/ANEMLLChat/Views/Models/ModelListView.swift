@@ -27,6 +27,9 @@ struct ModelListView: View {
                 }
             }
             .padding()
+            #if os(iOS)
+            .padding(.horizontal, 4)
+            #endif
 
             List {
                 // Active model (if any is loaded)
@@ -61,6 +64,7 @@ struct ModelListView: View {
             }
             #if os(iOS)
             .listStyle(.insetGrouped)
+            .contentMargins(.horizontal, 8, for: .scrollContent)
             #else
             .listStyle(.inset)
             #endif
@@ -82,7 +86,20 @@ struct ModelListView: View {
             AddModelView()
                 .environment(modelManager)
         }
+        #if os(macOS)
         .frame(minWidth: 400, minHeight: 300)
+        #endif
+        // Auto-dismiss when a model is loaded
+        .onChange(of: modelManager.loadedModelId) { oldValue, newValue in
+            if newValue != nil && oldValue != newValue {
+                dismiss()
+            }
+        }
+        // Error toast
+        .errorToast(Binding(
+            get: { modelManager.errorMessage },
+            set: { modelManager.errorMessage = $0 }
+        ))
     }
 
     // MARK: - Computed Properties
@@ -96,6 +113,8 @@ struct ModelListView: View {
     }
 
     // MARK: - Active Model Section
+
+    @State private var showingActiveModelDetail = false
 
     private func activeModelSection(_ model: ModelInfo) -> some View {
         Section {
@@ -111,8 +130,21 @@ struct ModelListView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(model.name)
-                        .font(.headline)
+                    // Name with info button
+                    Button {
+                        showingActiveModelDetail = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(model.name)
+                                .font(.headline)
+                                .foregroundStyle(.primary)
+
+                            Image(systemName: "info.circle")
+                                .font(.caption)
+                                .foregroundStyle(.blue)
+                        }
+                    }
+                    .buttonStyle(.plain)
 
                     Text("Loaded & Active")
                         .font(.caption)
@@ -134,6 +166,9 @@ struct ModelListView: View {
                 .tint(.orange)
             }
             .padding(.vertical, 4)
+            .sheet(isPresented: $showingActiveModelDetail) {
+                ModelDetailView(model: model)
+            }
         } header: {
             Label("Active Model", systemImage: "bolt.circle.fill")
                 .foregroundStyle(.green)
@@ -274,16 +309,7 @@ struct ModelListView: View {
             }
             .foregroundStyle(.secondary)
 
-            // Show error message if any
-            if let error = modelManager.errorMessage {
-                HStack {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
-                    Text(error)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
+            // Error messages now shown as toast at top of view
         } header: {
             Text("Storage")
         }
@@ -300,45 +326,55 @@ struct AddModelView: View {
     @State private var name = ""
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    TextField("HuggingFace Repo ID", text: $repoId)
-                        .textContentType(.URL)
-                        .autocorrectionDisabled()
-                        #if os(iOS)
-                        .textInputAutocapitalization(.never)
-                        #endif
+        VStack(spacing: 16) {
+            // Header
+            Text("Add Model")
+                .font(.headline)
+                .padding(.top)
 
-                    TextField("Display Name", text: $name)
-                } header: {
-                    Text("Custom Model")
-                } footer: {
-                    Text("Enter a HuggingFace repo ID like 'anemll/my-model'")
-                }
+            // Form content
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Custom Model")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+
+                TextField("HuggingFace Repo ID", text: $repoId)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+
+                TextField("Display Name", text: $name)
+                    .textFieldStyle(.roundedBorder)
+
+                Text("Enter a HuggingFace repo ID like 'anemll/my-model'")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .navigationTitle("Add Model")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
+            .padding(.horizontal)
+
+            Spacer()
+
+            // Buttons
+            HStack {
+                Button("Cancel") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Spacer()
+
+                Button("Add") {
+                    Task {
+                        await modelManager.addCustomModel(repoId: repoId, name: name)
                         dismiss()
                     }
                 }
-
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Add") {
-                        Task {
-                            await modelManager.addCustomModel(repoId: repoId, name: name)
-                            dismiss()
-                        }
-                    }
-                    .disabled(repoId.isEmpty || name.isEmpty)
-                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .disabled(repoId.isEmpty || name.isEmpty)
             }
+            .padding()
         }
+        .frame(width: 350, height: 220)
     }
 }
 

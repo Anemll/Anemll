@@ -34,9 +34,7 @@ struct ContentView: View {
             }
         }
         #endif
-        .task {
-            await modelManager.autoLoadLastModel()
-        }
+        // Auto-load is now handled in ModelManagerViewModel.loadModels()
     }
 
     // MARK: - Sidebar
@@ -120,53 +118,64 @@ struct ContentView: View {
     }
 
     private var detailToolbar: some View {
-        HStack {
-            // New Chat button
+        HStack(spacing: 8) {
+            // New Chat button - icon only on iPhone for compactness
             Button {
                 chatVM.newConversation()
             } label: {
+                #if os(iOS)
+                Image(systemName: "plus.bubble")
+                    .imageScale(.large)
+                #else
                 Label("New Chat", systemImage: "plus.bubble")
+                #endif
             }
             .buttonStyle(.bordered)
+            .controlSize(.small)
 
             Spacer()
 
             // Model loading indicator
             if modelManager.isLoadingModel {
-                HStack(spacing: 6) {
+                HStack(spacing: 4) {
                     ProgressView()
-                        .controlSize(.small)
-                    Text("Loading model...")
-                        .font(.caption)
+                        .controlSize(.mini)
+                    Text("Loading...")
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }
 
-            // Models button
+            // Models button - compact pill style
             Button {
                 showingModelSheet = true
             } label: {
-                HStack(spacing: 6) {
+                HStack(spacing: 4) {
                     Circle()
                         .fill(modelManager.loadedModelId != nil ? Color.green : Color.orange)
-                        .frame(width: 8, height: 8)
+                        .frame(width: 6, height: 6)
                     if let modelId = modelManager.loadedModelId,
                        let model = modelManager.availableModels.first(where: { $0.id == modelId }) {
                         Text(model.name)
+                            .font(.caption)
                             .lineLimit(1)
+                            .fixedSize(horizontal: false, vertical: true)
                     } else {
-                        Text("No Model")
+                        Text("Select Model")
+                            .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     Image(systemName: "chevron.down")
                         .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             }
             .buttonStyle(.bordered)
+            .controlSize(.small)
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-        .background(Color(NSColor.windowBackgroundColor))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.background)
     }
 
     private var emptyState: some View {
@@ -239,3 +248,4 @@ struct ConversationRow: View {
         .environment(ChatViewModel())
         .environment(ModelManagerViewModel())
 }
+

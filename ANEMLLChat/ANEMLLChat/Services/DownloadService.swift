@@ -91,6 +91,8 @@ actor DownloadService: NSObject {
     private var downloadedBytesTotal: [String: Int64] = [:]
     private var currentFileName: [String: String] = [:]
     private var progressObservations: [String: NSKeyValueObservation] = [:]
+    private var downloadCompletions: [String: CheckedContinuation<Void, Error>] = [:]
+    private var currentFileSize: [String: Int64] = [:]
 
     override private init() {
         super.init()
@@ -248,11 +250,18 @@ actor DownloadService: NSObject {
                   let type = item["type"] as? String else { continue }
 
             if type == "directory" {
-                // Check if this is a directory we need (mlmodelc or contains essential files)
+                // Check if this is a directory we need
                 let dirName = (itemPath as NSString).lastPathComponent
+
+                // Always recurse into:
+                // - .mlmodelc directories (compiled CoreML models)
+                // - Directories inside .mlmodelc
+                // - "weights" directories
+                // - Root-level directories (to find nested models)
                 let shouldRecurse = dirName.hasSuffix(".mlmodelc") ||
                                    itemPath.contains(".mlmodelc") ||
-                                   dirName == "weights"
+                                   dirName == "weights" ||
+                                   path.isEmpty  // Recurse into all root-level dirs
 
                 if shouldRecurse {
                     logDebug("Recursing into directory: \(itemPath)", category: .download)
@@ -321,41 +330,54 @@ actor DownloadService: NSObject {
 
         logDebug("Downloading: \(file.name) (\(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file)))", category: .download)
 
-        return try await withCheckedThrowingContinuation { continuation in
-            let task = urlSession.downloadTask(with: file.url) { [weak self] tempURL, response, error in
-                Task {
-                    if let error = error {
-                        continuation.resume(throwing: DownloadError.networkError(error))
-                        return
-                    }
+        // Create the download task with completion handler
+        let task = urlSession.downloadTask(with: file.url) { [weak self] tempURL, response, error in
+            Task {
+                if let error = error {
+                    await self?.handleDownloadCompletion(modelId: modelId, file: file, destURL: destURL, result: .failure(error))
+                    return
+                }
 
-                    guard let tempURL = tempURL else {
-                        continuation.resume(throwing: DownloadError.downloadFailed(file.name))
-                        return
-                    }
+                guard let tempURL = tempURL else {
+                    await self?.handleDownloadCompletion(modelId: modelId, file: file, destURL: destURL, result: .failure(DownloadError.downloadFailed(file.name)))
+                    return
+                }
 
-                    do {
-                        // Remove existing file if any
-                        try? FileManager.default.removeItem(at: destURL)
-                        // Move downloaded file to destination
-                        try FileManager.default.moveItem(at: tempURL, to: destURL)
-
-                        await self?.addDownloadedBytes(file.size, for: modelId)
-                        continuation.resume()
-                    } catch {
-                        continuation.resume(throwing: DownloadError.networkError(error))
-                    }
+                do {
+                    // Remove existing file if any
+                    try? FileManager.default.removeItem(at: destURL)
+                    // Move downloaded file to destination
+                    try FileManager.default.moveItem(at: tempURL, to: destURL)
+                    await self?.handleDownloadCompletion(modelId: modelId, file: file, destURL: destURL, result: .success(()))
+                } catch {
+                    await self?.handleDownloadCompletion(modelId: modelId, file: file, destURL: destURL, result: .failure(error))
                 }
             }
+        }
 
-            // Track progress
-            Task {
-                await self.downloadTasks[modelId] = task
-                await self.observeProgress(task: task, modelId: modelId)
-            }
+        // Set up progress tracking BEFORE starting the download (critical fix!)
+        downloadTasks[modelId] = task
+        observeProgress(task: task, modelId: modelId)
 
+        return try await withCheckedThrowingContinuation { continuation in
+            downloadCompletions[modelId] = continuation
             task.resume()
         }
+    }
+
+    private func handleDownloadCompletion(modelId: String, file: HFFile, destURL: URL, result: Result<Void, Error>) {
+        switch result {
+        case .success:
+            addDownloadedBytes(file.size, for: modelId)
+            downloadCompletions[modelId]?.resume()
+        case .failure(let error):
+            if let dlError = error as? DownloadError {
+                downloadCompletions[modelId]?.resume(throwing: dlError)
+            } else {
+                downloadCompletions[modelId]?.resume(throwing: DownloadError.networkError(error))
+            }
+        }
+        downloadCompletions.removeValue(forKey: modelId)
     }
 
     private func observeProgress(task: URLSessionDownloadTask, modelId: String) {
@@ -461,14 +483,20 @@ actor DownloadService: NSObject {
     // MARK: - Verification
 
     private func verifyDownload(modelId: String, at directory: URL) async -> Bool {
-        let requiredFiles = ["meta.yaml", "tokenizer.json"]
+        // Check for meta.yaml (required)
+        let metaPath = directory.appendingPathComponent("meta.yaml")
+        if !FileManager.default.fileExists(atPath: metaPath.path) {
+            logWarning("Missing required file: meta.yaml", category: .download)
+            return false
+        }
 
-        for file in requiredFiles {
-            let filePath = directory.appendingPathComponent(file)
-            if !FileManager.default.fileExists(atPath: filePath.path) {
-                logWarning("Missing required file: \(file)", category: .download)
-                return false
-            }
+        // Check for tokenizer (either .json or .model is acceptable)
+        let tokenizerJson = directory.appendingPathComponent("tokenizer.json")
+        let tokenizerModel = directory.appendingPathComponent("tokenizer.model")
+        if !FileManager.default.fileExists(atPath: tokenizerJson.path) &&
+           !FileManager.default.fileExists(atPath: tokenizerModel.path) {
+            logWarning("Missing tokenizer file (neither tokenizer.json nor tokenizer.model found)", category: .download)
+            return false
         }
 
         // Check for .mlmodelc directories
@@ -503,5 +531,7 @@ actor DownloadService: NSObject {
         downloadedBytesTotal.removeValue(forKey: modelId)
         currentFileName.removeValue(forKey: modelId)
         progressObservations.removeValue(forKey: modelId)
+        downloadCompletions.removeValue(forKey: modelId)
+        currentFileSize.removeValue(forKey: modelId)
     }
 }

@@ -14,6 +14,7 @@ struct ChatView: View {
     @State private var scrollProxy: ScrollViewProxy?
     @State private var isUserScrolling = false
     @State private var showingModelSheet = false
+    @State private var showScrollToBottom = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -43,48 +44,91 @@ struct ChatView: View {
                 .environment(modelManager)
                 .environment(chatVM)
         }
-        .alert("Error", isPresented: .constant(chatVM.errorMessage != nil)) {
-            Button("OK") {
-                chatVM.errorMessage = nil
-            }
-        } message: {
-            if let error = chatVM.errorMessage {
-                Text(error)
-            }
-        }
+        // Error toast (non-intrusive)
+        .errorToast(Binding(
+            get: { chatVM.errorMessage },
+            set: { chatVM.errorMessage = $0 }
+        ))
     }
 
     // MARK: - Messages View
 
     private var messagesView: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    ForEach(visibleMessages) { message in
-                        MessageBubble(message: message)
-                            .id(message.id)
-                    }
+        GeometryReader { outerGeometry in
+            ZStack(alignment: .bottom) {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 12) {
+                            ForEach(visibleMessages) { message in
+                                MessageBubble(message: message)
+                                    .id(message.id)
+                            }
 
-                    // Typing indicator
-                    if chatVM.isGenerating && !chatVM.streamingContent.isEmpty {
-                        typingIndicator
+                            // Typing indicator
+                            if chatVM.isGenerating && !chatVM.streamingContent.isEmpty {
+                                typingIndicator
+                            }
+
+                            // Bottom anchor for scroll detection
+                            GeometryReader { bottomGeometry in
+                                Color.clear
+                                    .preference(
+                                        key: BottomVisiblePreferenceKey.self,
+                                        value: bottomGeometry.frame(in: .global).minY < outerGeometry.frame(in: .global).maxY + 50
+                                    )
+                            }
+                            .frame(height: 1)
+                            .id("bottom")
+                        }
+                        .padding(.horizontal)
+                        .padding(.top)
+                        .padding(.bottom, 20) // Extra bottom padding to avoid overlap with input bar
+                    }
+                    .onPreferenceChange(BottomVisiblePreferenceKey.self) { isBottomVisible in
+                        // Show button when bottom anchor is NOT visible (scrolled up)
+                        showScrollToBottom = !isBottomVisible && !visibleMessages.isEmpty
+                    }
+                    .onAppear {
+                        scrollProxy = proxy
+                    }
+                    .onChange(of: chatVM.currentConversation?.messages.count) { _, _ in
+                        scrollToBottom()
+                    }
+                    .onChange(of: chatVM.streamingContent) { _, _ in
+                        if !isUserScrolling {
+                            scrollToBottom()
+                        }
                     }
                 }
-                .padding()
-            }
-            .onAppear {
-                scrollProxy = proxy
-            }
-            .onChange(of: chatVM.currentConversation?.messages.count) { _, _ in
-                scrollToBottom()
-            }
-            .onChange(of: chatVM.streamingContent) { _, _ in
-                if !isUserScrolling {
-                    scrollToBottom()
+
+                // Scroll to bottom button
+                if showScrollToBottom {
+                    Button {
+                        scrollToBottom()
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .frame(width: 36, height: 36)
+                            .background(Color(platformSecondaryBackground))
+                            .clipShape(Circle())
+                            .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
+                    }
+                    .padding(.bottom, 12)
+                    .transition(.scale.combined(with: .opacity))
                 }
             }
         }
         .background(Color(platformBackground))
+        .animation(.easeInOut(duration: 0.2), value: showScrollToBottom)
+    }
+
+    // Preference key for tracking if bottom is visible
+    private struct BottomVisiblePreferenceKey: PreferenceKey {
+        static var defaultValue: Bool = true
+        static func reduce(value: inout Bool, nextValue: () -> Bool) {
+            value = nextValue()
+        }
     }
 
     private var visibleMessages: [ChatMessage] {

@@ -10,8 +10,6 @@ import SwiftUI
 struct MessageBubble: View {
     let message: ChatMessage
 
-    @State private var showStats = false
-
     private var isUser: Bool {
         message.role == .user
     }
@@ -25,15 +23,17 @@ struct MessageBubble: View {
             VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
                 // Message content
                 messageContent
+                    .frame(maxWidth: isUser ? nil : .infinity, alignment: .leading)
 
                 // Stats (for assistant messages)
                 if !isUser && message.isComplete {
                     statsView
                 }
             }
+            .frame(maxWidth: isUser ? nil : .infinity, alignment: .leading)
 
-            if !isUser {
-                Spacer(minLength: 60)
+            if isUser {
+                // Only add right spacer for user messages (not assistant)
             }
         }
     }
@@ -46,24 +46,19 @@ struct MessageBubble: View {
                 // Loading state
                 ProgressView()
                     .controlSize(.small)
-            } else {
-                // Text content with markdown support
-                Text(formattedContent)
+            } else if isUser {
+                // User messages - simple text
+                Text(message.content)
                     .textSelection(.enabled)
+            } else {
+                // Assistant messages - full markdown rendering
+                MarkdownView(content: message.content, isUserMessage: false)
             }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .background(bubbleBackground)
         .foregroundStyle(isUser ? .white : .primary)
-    }
-
-    private var formattedContent: AttributedString {
-        // Try to parse as markdown
-        if let attributed = try? AttributedString(markdown: message.content) {
-            return attributed
-        }
-        return AttributedString(message.content)
     }
 
     private var bubbleBackground: some View {
@@ -85,27 +80,41 @@ private let platformSecondaryBackground = NSColor.controlBackgroundColor
 extension MessageBubble {
     @ViewBuilder
     fileprivate var statsView: some View {
-        if let stats = message.performanceStats {
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    showStats.toggle()
-                }
-            } label: {
-                HStack(spacing: 4) {
+        // Always show key stats: tok/s, prefill speed, context tokens
+        HStack(spacing: 8) {
+            // Generation speed
+            if let tps = message.tokensPerSecond {
+                HStack(spacing: 2) {
                     Image(systemName: "gauge.medium")
                         .font(.caption2)
-
-                    if showStats {
-                        Text(stats)
-                            .font(.caption2)
-                    } else if let tps = message.tokensPerSecond {
-                        Text(String(format: "%.1f tok/s", tps))
-                            .font(.caption2)
-                    }
+                    Text(String(format: "%.1f tok/s", tps))
+                        .font(.caption2)
                 }
                 .foregroundStyle(.secondary)
             }
-            .buttonStyle(.plain)
+
+            // Prefill speed (TTFT)
+            if let prefillTime = message.prefillTime, let prefillTokens = message.prefillTokens, prefillTime > 0 {
+                let prefillSpeed = Double(prefillTokens) / prefillTime
+                HStack(spacing: 2) {
+                    Image(systemName: "arrow.right.circle")
+                        .font(.caption2)
+                    Text(String(format: "%.0f t/s", prefillSpeed))
+                        .font(.caption2)
+                }
+                .foregroundStyle(.cyan)
+            }
+
+            // Context token count
+            if let ctx = message.prefillTokens {
+                HStack(spacing: 2) {
+                    Image(systemName: "text.alignleft")
+                        .font(.caption2)
+                    Text("\(ctx) ctx")
+                        .font(.caption2)
+                }
+                .foregroundStyle(.green)
+            }
         }
 
         // Window shifts indicator
@@ -143,6 +152,8 @@ extension MessageBubble {
             content: "I'm doing great, thank you for asking! How can I help you today?",
             tokensPerSecond: 24.5,
             tokenCount: 15,
+            prefillTime: 0.05,
+            prefillTokens: 10,
             isComplete: true
         ))
 
@@ -152,6 +163,8 @@ extension MessageBubble {
             tokensPerSecond: 18.2,
             tokenCount: 50,
             windowShifts: 2,
+            prefillTime: 0.15,
+            prefillTokens: 128,
             isComplete: true
         ))
 

@@ -171,6 +171,7 @@ final class ChatViewModel {
                 tokenCount: result.tokenCount,
                 windowShifts: result.windowShifts,
                 prefillTime: result.prefillTime,
+                prefillTokens: result.prefillTokens,
                 isComplete: true,
                 wasCancelled: result.wasCancelled,
                 stopReason: result.stopReason

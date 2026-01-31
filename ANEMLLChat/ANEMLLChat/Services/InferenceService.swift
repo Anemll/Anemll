@@ -37,6 +37,7 @@ struct GenerationResult: Sendable {
     let tokenCount: Int
     let windowShifts: Int
     let prefillTime: TimeInterval
+    let prefillTokens: Int        // Number of context tokens (input prompt tokens)
     let isComplete: Bool
     let wasCancelled: Bool
     let stopReason: String
@@ -325,6 +326,7 @@ final class InferenceService: ObservableObject {
                 tokenCount: stats.tokenCount,
                 windowShifts: stats.windowShifts,
                 prefillTime: prefillTime,
+                prefillTokens: inputTokens.count,
                 isComplete: true,
                 wasCancelled: shouldCancel,
                 stopReason: stopReason
@@ -338,6 +340,7 @@ final class InferenceService: ObservableObject {
                     tokenCount: stats.tokenCount,
                     windowShifts: stats.windowShifts,
                     prefillTime: 0,
+                    prefillTokens: inputTokens.count,
                     isComplete: false,
                     wasCancelled: true,
                     stopReason: "cancelled"
