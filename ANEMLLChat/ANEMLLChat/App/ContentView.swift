@@ -135,15 +135,9 @@ struct ContentView: View {
 
             Spacer()
 
-            // Model loading indicator
+            // Model loading indicator - animated
             if modelManager.isLoadingModel {
-                HStack(spacing: 4) {
-                    ProgressView()
-                        .controlSize(.mini)
-                    Text("Loading...")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+                ToolbarLoadingIndicator()
             }
 
             // Models button - compact pill style
@@ -240,6 +234,47 @@ struct ConversationRow: View {
             }
         }
         .padding(.vertical, 4)
+    }
+}
+
+// MARK: - Toolbar Loading Indicator
+
+/// Compact animated loading indicator for toolbar
+private struct ToolbarLoadingIndicator: View {
+    @State private var rotation: Double = 0
+    @State private var pulse = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ZStack {
+                // Pulsing glow
+                Circle()
+                    .fill(Color.green.opacity(0.3))
+                    .frame(width: 16, height: 16)
+                    .scaleEffect(pulse ? 1.3 : 0.9)
+                    .animation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true), value: pulse)
+
+                // Rotating icon
+                Image(systemName: "cpu")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.green)
+                    .rotationEffect(.degrees(rotation))
+            }
+
+            Text("Loading...")
+                .font(.caption2)
+                .fontWeight(.medium)
+                .foregroundStyle(.green)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Color.green.opacity(0.1), in: Capsule())
+        .onAppear {
+            pulse = true
+            withAnimation(.linear(duration: 2).repeatForever(autoreverses: false)) {
+                rotation = 360
+            }
+        }
     }
 }
 

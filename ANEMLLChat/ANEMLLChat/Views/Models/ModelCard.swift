@@ -186,8 +186,8 @@ struct ModelCard: View {
 
         case .downloaded:
             if modelManager.loadingModelId == model.id {
-                ProgressView()
-                    .controlSize(.small)
+                // Animated loading indicator - more visible
+                ModelLoadingIndicator()
             } else {
                 HStack(spacing: 8) {
                     // Delete button - more visible on iOS
@@ -518,6 +518,48 @@ private struct DetailRow: View {
             Spacer()
             Text(value)
                 .fontWeight(.medium)
+        }
+    }
+}
+
+// MARK: - Model Loading Indicator
+
+/// Animated loading indicator for model loading state
+private struct ModelLoadingIndicator: View {
+    @State private var isAnimating = false
+    @State private var rotation: Double = 0
+
+    var body: some View {
+        HStack(spacing: 6) {
+            // Animated brain/chip icon
+            ZStack {
+                // Pulsing background
+                Circle()
+                    .fill(Color.green.opacity(0.2))
+                    .frame(width: 28, height: 28)
+                    .scaleEffect(isAnimating ? 1.2 : 0.8)
+                    .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: isAnimating)
+
+                // Rotating gear
+                Image(systemName: "cpu")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.green)
+                    .rotationEffect(.degrees(rotation))
+            }
+
+            Text("Loading...")
+                .font(.caption)
+                .fontWeight(.medium)
+                .foregroundStyle(.green)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.green.opacity(0.1), in: Capsule())
+        .onAppear {
+            isAnimating = true
+            withAnimation(.linear(duration: 2).repeatForever(autoreverses: false)) {
+                rotation = 360
+            }
         }
     }
 }

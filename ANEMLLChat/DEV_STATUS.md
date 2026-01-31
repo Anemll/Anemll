@@ -308,6 +308,12 @@ Created `Views/Chat/MarkdownView.swift` with full markdown support:
    - Added timer-based polling (0.5s interval) as fallback for macOS
    - iOS continues to use KVO only (works fine there)
 
+7. **Improved model loading indicator visibility**
+   - Replaced plain ProgressView with animated ModelLoadingIndicator
+   - Features green pulsing background circle with rotating CPU icon
+   - Shows "Loading..." text in green capsule-shaped background
+   - Much more visible than the previous tiny spinner
+
 ## Known Issues / TODO
 
 1. ~~**CTX display** - Need to verify if "ctx" in message stats shows overall context buffer or just per-message tokens~~ ✓ VERIFIED - CTX shows **overall context** (grew from 22→410 tokens in multi-turn conversation)
