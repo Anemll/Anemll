@@ -9,8 +9,10 @@ import SwiftUI
 
 struct InputBar: View {
     @Environment(ChatViewModel.self) private var chatVM
+    @Environment(ModelManagerViewModel.self) private var modelManager
 
     @FocusState private var isFocused: Bool
+    @State private var showModelLoadingAlert = false
 
     var body: some View {
         @Bindable var vm = chatVM
@@ -25,6 +27,11 @@ struct InputBar: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(Color(platformSecondaryBackground))
+        .alert("Model Still Loading", isPresented: $showModelLoadingAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Please wait for the model to finish loading before sending a message.")
+        }
     }
 
     // MARK: - Text Field
@@ -83,7 +90,8 @@ struct InputBar: View {
 
     private var canSend: Bool {
         !chatVM.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        !chatVM.isGenerating
+        !chatVM.isGenerating &&
+        !modelManager.isLoadingModel
     }
 
     private var buttonColor: Color {
@@ -96,6 +104,12 @@ struct InputBar: View {
     // MARK: - Actions
 
     private func sendMessage() {
+        // Check if model is still loading
+        if modelManager.isLoadingModel {
+            showModelLoadingAlert = true
+            return
+        }
+
         guard canSend else { return }
 
         Task {
