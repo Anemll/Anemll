@@ -143,6 +143,12 @@ def parse_lut_arg(lut_value):
     if lut_value is None:
         return None
 
+    lut_str = str(lut_value).strip().lower()
+
+    # Handle "none" as no LUT quantization
+    if lut_str in ('none', 'no', 'false', ''):
+        return None
+
     if ',' in lut_value:
         # Extract just the bits value, ignore per_channel for file naming
         parts = lut_value.split(',')
