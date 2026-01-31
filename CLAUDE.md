@@ -6,6 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ANEMLL (pronounced "animal") is an open-source project for accelerating Large Language Models (LLMs) on Apple Neural Engine (ANE). The project converts Hugging Face models to CoreML format for on-device inference on Apple devices.
 
+## Command Allowlist (Claude Code)
+
+Approved commands for Claude Code in this repo:
+```bash
+osascript -e 'tell application "System Events" to key code 121'  # page down
+sleep 0.5
+export ANEMLL_HOST="http://127.0.0.1:8765"
+curl ...
+```
+
 ## Development Commands
 
 ### Environment Setup

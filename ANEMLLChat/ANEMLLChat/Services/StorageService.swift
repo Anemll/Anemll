@@ -1,0 +1,268 @@
+//
+//  StorageService.swift
+//  ANEMLLChat
+//
+//  Persistence for conversations and settings
+//
+
+import Foundation
+
+/// Errors that can occur during storage operations
+enum StorageError: LocalizedError {
+    case encodingFailed
+    case decodingFailed
+    case fileWriteFailed(Error)
+    case fileReadFailed(Error)
+    case directoryCreationFailed(Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .encodingFailed: return "Failed to encode data"
+        case .decodingFailed: return "Failed to decode data"
+        case .fileWriteFailed(let error): return "Failed to write file: \(error.localizedDescription)"
+        case .fileReadFailed(let error): return "Failed to read file: \(error.localizedDescription)"
+        case .directoryCreationFailed(let error): return "Failed to create directory: \(error.localizedDescription)"
+        }
+    }
+}
+
+/// Service for persisting app data
+actor StorageService {
+    static let shared = StorageService()
+
+    private let fileManager = FileManager.default
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+
+    private init() {
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        decoder.dateDecodingStrategy = .iso8601
+    }
+
+    // MARK: - Directories
+
+    /// Documents directory URL
+    private var documentsDirectory: URL {
+        fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+
+    /// Conversations directory
+    private var conversationsDirectory: URL {
+        documentsDirectory.appendingPathComponent("Conversations", isDirectory: true)
+    }
+
+    /// Models directory (for downloaded models)
+    var modelsDirectory: URL {
+        documentsDirectory.appendingPathComponent("Models", isDirectory: true)
+    }
+
+    /// Ensure directory exists
+    private func ensureDirectoryExists(_ url: URL) throws {
+        if !fileManager.fileExists(atPath: url.path) {
+            do {
+                try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+                logDebug("Created directory: \(url.path)", category: .storage)
+            } catch {
+                throw StorageError.directoryCreationFailed(error)
+            }
+        }
+    }
+
+    // MARK: - Conversations
+
+    /// Save a conversation
+    func saveConversation(_ conversation: Conversation) async throws {
+        try ensureDirectoryExists(conversationsDirectory)
+
+        let fileURL = conversationsDirectory.appendingPathComponent("\(conversation.id.uuidString).json")
+
+        do {
+            let data = try encoder.encode(conversation)
+            try data.write(to: fileURL, options: .atomic)
+            logDebug("Saved conversation: \(conversation.id)", category: .storage)
+        } catch let error as EncodingError {
+            logError("Encoding failed: \(error)", category: .storage)
+            throw StorageError.encodingFailed
+        } catch {
+            logError("Write failed: \(error)", category: .storage)
+            throw StorageError.fileWriteFailed(error)
+        }
+    }
+
+    /// Load all conversations
+    func loadConversations() async throws -> [Conversation] {
+        try ensureDirectoryExists(conversationsDirectory)
+
+        var conversations: [Conversation] = []
+
+        do {
+            let files = try fileManager.contentsOfDirectory(
+                at: conversationsDirectory,
+                includingPropertiesForKeys: nil
+            )
+
+            for file in files where file.pathExtension == "json" {
+                do {
+                    let data = try Data(contentsOf: file)
+                    let conversation = try decoder.decode(Conversation.self, from: data)
+                    conversations.append(conversation)
+                } catch {
+                    logWarning("Failed to load conversation \(file.lastPathComponent): \(error)", category: .storage)
+                }
+            }
+        } catch {
+            throw StorageError.fileReadFailed(error)
+        }
+
+        // Sort by most recent first
+        conversations.sort { $0.updatedAt > $1.updatedAt }
+        logInfo("Loaded \(conversations.count) conversations", category: .storage)
+
+        return conversations
+    }
+
+    /// Delete a conversation
+    func deleteConversation(_ id: UUID) async throws {
+        let fileURL = conversationsDirectory.appendingPathComponent("\(id.uuidString).json")
+
+        if fileManager.fileExists(atPath: fileURL.path) {
+            do {
+                try fileManager.removeItem(at: fileURL)
+                logDebug("Deleted conversation: \(id)", category: .storage)
+            } catch {
+                throw StorageError.fileWriteFailed(error)
+            }
+        }
+    }
+
+    // MARK: - Model Registry
+
+    /// File for custom model registry
+    private var modelsRegistryFile: URL {
+        documentsDirectory.appendingPathComponent("models.json")
+    }
+
+    /// Save custom models to registry
+    func saveModelsRegistry(_ models: [ModelInfo]) async throws {
+        // Only save custom models (not defaults)
+        let customModels = models.filter { model in
+            !ModelInfo.defaultModels.contains(where: { $0.id == model.id })
+        }
+
+        do {
+            let data = try encoder.encode(customModels)
+            try data.write(to: modelsRegistryFile, options: .atomic)
+            logDebug("Saved \(customModels.count) custom models to registry", category: .storage)
+        } catch {
+            throw StorageError.fileWriteFailed(error)
+        }
+    }
+
+    /// Load custom models from registry
+    func loadModelsRegistry() async throws -> [ModelInfo] {
+        guard fileManager.fileExists(atPath: modelsRegistryFile.path) else {
+            return []
+        }
+
+        do {
+            let data = try Data(contentsOf: modelsRegistryFile)
+            let models = try decoder.decode([ModelInfo].self, from: data)
+            logInfo("Loaded \(models.count) custom models from registry", category: .storage)
+            return models
+        } catch {
+            logWarning("Failed to load models registry: \(error)", category: .storage)
+            return []
+        }
+    }
+
+    // MARK: - Model Files
+
+    /// Get local path for a model
+    func modelPath(for modelId: String) -> URL {
+        modelsDirectory.appendingPathComponent(modelId.replacingOccurrences(of: "/", with: "_"))
+    }
+
+    /// Check if a model is downloaded
+    func isModelDownloaded(_ modelId: String) async -> Bool {
+        let modelDir = modelPath(for: modelId)
+        let metaYaml = modelDir.appendingPathComponent("meta.yaml")
+        return fileManager.fileExists(atPath: metaYaml.path)
+    }
+
+    /// Delete a downloaded model
+    func deleteModel(_ modelId: String) async throws {
+        let modelDir = modelPath(for: modelId)
+
+        if fileManager.fileExists(atPath: modelDir.path) {
+            do {
+                try fileManager.removeItem(at: modelDir)
+                logInfo("Deleted model: \(modelId)", category: .storage)
+            } catch {
+                throw StorageError.fileWriteFailed(error)
+            }
+        }
+    }
+
+    /// Get size of downloaded models
+    func downloadedModelsSize() async -> Int64 {
+        guard fileManager.fileExists(atPath: modelsDirectory.path) else { return 0 }
+
+        var totalSize: Int64 = 0
+
+        // Use contentsOfDirectory instead of enumerator to avoid async context issues
+        func calculateSize(at url: URL) -> Int64 {
+            var size: Int64 = 0
+            if let contents = try? fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey]) {
+                for item in contents {
+                    if let values = try? item.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey]) {
+                        if values.isDirectory == true {
+                            size += calculateSize(at: item)
+                        } else if let fileSize = values.fileSize {
+                            size += Int64(fileSize)
+                        }
+                    }
+                }
+            }
+            return size
+        }
+
+        totalSize = calculateSize(at: modelsDirectory)
+        return totalSize
+    }
+
+    // MARK: - Settings
+
+    /// Default settings
+    var defaultTemperature: Float {
+        UserDefaults.standard.object(forKey: "temperature") as? Float ?? 0.7
+    }
+
+    var defaultMaxTokens: Int {
+        UserDefaults.standard.object(forKey: "maxTokens") as? Int ?? 512
+    }
+
+    var defaultSystemPrompt: String {
+        UserDefaults.standard.object(forKey: "systemPrompt") as? String ?? "You are a helpful assistant."
+    }
+
+    var selectedModelId: String? {
+        UserDefaults.standard.object(forKey: "selectedModelId") as? String
+    }
+
+    func saveTemperature(_ value: Float) {
+        UserDefaults.standard.set(value, forKey: "temperature")
+    }
+
+    func saveMaxTokens(_ value: Int) {
+        UserDefaults.standard.set(value, forKey: "maxTokens")
+    }
+
+    func saveSystemPrompt(_ value: String) {
+        UserDefaults.standard.set(value, forKey: "systemPrompt")
+    }
+
+    func saveSelectedModelId(_ value: String?) {
+        UserDefaults.standard.set(value, forKey: "selectedModelId")
+    }
+}

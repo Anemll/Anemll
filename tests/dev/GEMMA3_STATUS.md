@@ -226,3 +226,59 @@ Metric guidance:
 - Validate sliding window rotation for context > 1024.
 - Benchmark ANE inference speed vs HuggingFace.
 - Test LUT quantization on non-QAT models (e.g., base Gemma3 or LLaMA) where LUT may perform better.
+- **Implement chunked-Q SDPA with larger batch sizes** (see benchmark results below)
+
+---
+
+## SDPA Chunking Benchmark (2025-01-31)
+
+### Background
+
+CoreML calls have significant overhead (~2-4ms per call). The current 64-token batch approach makes many small calls. By increasing batch size and using chunked Q-SDPA, we can reduce call overhead while maintaining memory efficiency.
+
+**Benchmark script**: `tests/dev/benchmark_sdpa_chunking.py`
+
+### Benchmark Results - Processing 512 tokens (attention layer only)
+
+**Config**: Gemma3 4B (hidden=3072, heads=24, head_dim=128, KV=1024 sliding window)
+
+| Configuration | Per-call | Calls | Total | µs/token | Speedup |
+|--------------|----------|-------|-------|----------|---------|
+| 8× 64-token (current) | 4.51ms | 8 | 36.05ms | 70.4 | 1.00x |
+| 4× 128-token, chunk=64 | 4.37ms | 4 | 17.48ms | 34.1 | 2.06x |
+| 2× 256-token, chunk=128 | 5.40ms | 2 | 10.81ms | 21.1 | 3.34x |
+| **1× 512-token, chunk=256** | 9.09ms | 1 | 9.09ms | 17.7 | **3.97x** |
+
+### Key Findings
+
+1. **CoreML call overhead is significant** (~2-4ms per call)
+2. **Larger batches with Q-chunking are much faster** - 1×512 with chunk=256 is 4x faster than 8×64
+3. **Optimal chunk size** is around batch/2 (256 for 512-token batch)
+4. **Chunked K/V for decode does NOT help** - adds 13-63% overhead due to online softmax
+
+### Recommendation
+
+Increase prefill batch size from 64 to 256-512 tokens and add Q-chunking:
+
+```
+Current: batch=64, no chunking  → 70.4µs/token
+Better:  batch=256, chunk=128   → 21.1µs/token (3.3x faster)
+Best:    batch=512, chunk=256   → 17.7µs/token (4.0x faster)
+```
+
+### Implementation Notes
+
+Q-chunking splits the query into chunks, computes attention for each chunk against the full K/V cache, and concatenates results:
+
+```python
+def _sdpa_chunked(self, Q, K, V, chunk_size=256):
+    outputs = []
+    for i in range(0, seq_len, chunk_size):
+        q_chunk = Q[:, :, i:i+chunk_size, :]
+        scores = torch.matmul(q_chunk, K.T) * scale
+        probs = F.softmax(scores, dim=-1)
+        outputs.append(torch.matmul(probs, V))
+    return torch.cat(outputs, dim=2)
+```
+
+This reduces the attention score matrix from O(batch × KV) to O(chunk × KV), enabling larger batch sizes while staying within ANE memory limits.
