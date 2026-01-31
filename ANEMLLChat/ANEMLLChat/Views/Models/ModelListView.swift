@@ -6,6 +6,11 @@
 //
 
 import SwiftUI
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
 
 struct ModelListView: View {
     @Environment(ModelManagerViewModel.self) private var modelManager
@@ -323,58 +328,265 @@ struct AddModelView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var repoId = ""
-    @State private var name = ""
+    @State private var displayName = ""
+    @State private var isAdding = false
+    @State private var addError: String?
+    @State private var showSuccess = false
+
+    // Auto-generate display name from repo ID
+    private var suggestedName: String {
+        guard !repoId.isEmpty else { return "" }
+
+        // Extract model name from repo ID (e.g., "anemll/google-gemma-3-4b" -> "Gemma 3 4B")
+        let parts = repoId.split(separator: "/")
+        let modelPart = parts.count > 1 ? String(parts[1]) : repoId
+
+        // Clean up the name
+        var name = modelPart
+            .replacingOccurrences(of: "anemll-", with: "")
+            .replacingOccurrences(of: "google-", with: "")
+            .replacingOccurrences(of: "-it-", with: "-")
+            .replacingOccurrences(of: "-qat-", with: "-QAT-")
+            .replacingOccurrences(of: "-int4", with: "")
+            .replacingOccurrences(of: "-unquantized", with: "")
+            .replacingOccurrences(of: "_0.3.5", with: "")
+            .replacingOccurrences(of: "-ctx", with: " CTX")
+            .replacingOccurrences(of: "-", with: " ")
+
+        // Capitalize first letter of each word, handle special cases
+        name = name.split(separator: " ").map { word in
+            let w = String(word)
+            if w.uppercased() == w { return w } // Keep all-caps (like QAT, CTX)
+            if w.lowercased() == "gemma" { return "Gemma" }
+            if w.lowercased() == "qwen" { return "Qwen" }
+            if w.lowercased() == "llama" { return "LLaMA" }
+            if w.lowercased() == "deepseek" { return "DeepSeek" }
+            // Numbers and sizes
+            if w.contains(where: { $0.isNumber }) { return w.uppercased() }
+            return w.capitalized
+        }.joined(separator: " ")
+
+        return name
+    }
+
+    // Use suggested name if display name is empty
+    private var effectiveName: String {
+        displayName.isEmpty ? suggestedName : displayName
+    }
+
+    private var isValidRepoId: Bool {
+        // Must contain a slash and have content on both sides
+        let parts = repoId.split(separator: "/")
+        return parts.count >= 2 && parts[0].count > 0 && parts[1].count > 0
+    }
 
     var body: some View {
-        VStack(spacing: 16) {
-            // Header
-            Text("Add Model")
-                .font(.headline)
-                .padding(.top)
+        VStack(spacing: 0) {
+            // Header with icon
+            VStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(Color.blue.opacity(0.1))
+                        .frame(width: 60, height: 60)
 
-            // Form content
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Custom Model")
+                    Image(systemName: "plus.circle.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.blue)
+                }
+
+                Text("Add Custom Model")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+
+                Text("Add a model from HuggingFace to your library")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
 
-                TextField("HuggingFace Repo ID", text: $repoId)
-                    .textFieldStyle(.roundedBorder)
-                    .autocorrectionDisabled()
-
-                TextField("Display Name", text: $name)
-                    .textFieldStyle(.roundedBorder)
-
-                Text("Enter a HuggingFace repo ID like 'anemll/my-model'")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                // Quick access to ANEMLL models
+                Button {
+                    openAnemllHuggingFace()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "link")
+                            .font(.caption)
+                        Text("Browse ANEMLL Models")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                    }
+                    .foregroundStyle(.blue)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.blue.opacity(0.1), in: Capsule())
+                }
+                .buttonStyle(.plain)
             }
-            .padding(.horizontal)
+            .padding(.top, 24)
+            .padding(.bottom, 20)
+
+            // Form
+            VStack(alignment: .leading, spacing: 20) {
+                // Repo ID Field
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("HuggingFace Repository")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+
+                    TextField("anemll/model-name", text: $repoId)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        #endif
+                        .onChange(of: repoId) { _, _ in
+                            addError = nil
+                        }
+
+                    // Validation hint
+                    if !repoId.isEmpty && !isValidRepoId {
+                        Label("Format: owner/model-name", systemImage: "exclamationmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    } else {
+                        Text("Example: anemll/anemll-google-gemma-3-4b-it-qat-int4-unquantized-ctx4096_0.3.5")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+
+                // Display Name Field
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Display Name")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+
+                    TextField(suggestedName.isEmpty ? "Model Name" : suggestedName, text: $displayName)
+                        .textFieldStyle(.roundedBorder)
+
+                    if !suggestedName.isEmpty && displayName.isEmpty {
+                        HStack(spacing: 4) {
+                            Image(systemName: "sparkles")
+                                .font(.caption)
+                            Text("Auto-suggested: \(suggestedName)")
+                                .font(.caption)
+                        }
+                        .foregroundStyle(.blue)
+                    } else {
+                        Text("Friendly name shown in the model list")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                // Error message
+                if let error = addError {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text(error)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                }
+
+                // Success message
+                if showSuccess {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                        Text("Model added! Download starting...")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.green.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            .padding(.horizontal, 24)
 
             Spacer()
 
             // Buttons
-            HStack {
-                Button("Cancel") {
+            HStack(spacing: 12) {
+                Button {
                     dismiss()
+                } label: {
+                    Text("Cancel")
+                        .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.bordered)
                 .keyboardShortcut(.cancelAction)
 
-                Spacer()
+                Button {
+                    addModel()
+                } label: {
+                    HStack(spacing: 6) {
+                        if isAdding {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(isAdding ? "Adding..." : "Add Model")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!isValidRepoId || effectiveName.isEmpty || isAdding)
+            }
+            .padding(.horizontal, 24)
+            .padding(.bottom, 24)
+            .padding(.top, 16)
+        }
+        #if os(macOS)
+        .frame(width: 420, height: 480)
+        #else
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        #endif
+    }
 
-                Button("Add") {
-                    Task {
-                        await modelManager.addCustomModel(repoId: repoId, name: name)
+    private func openAnemllHuggingFace() {
+        if let url = URL(string: "https://huggingface.co/anemll") {
+            #if os(iOS)
+            UIApplication.shared.open(url)
+            #else
+            NSWorkspace.shared.open(url)
+            #endif
+        }
+    }
+
+    private func addModel() {
+        guard isValidRepoId else {
+            addError = "Please enter a valid HuggingFace repo ID"
+            return
+        }
+
+        isAdding = true
+        addError = nil
+
+        Task {
+            await modelManager.addCustomModel(repoId: repoId.trimmingCharacters(in: .whitespaces), name: effectiveName)
+
+            await MainActor.run {
+                isAdding = false
+
+                // Check if there was an error (model already exists, etc.)
+                if let error = modelManager.errorMessage, !error.isEmpty {
+                    addError = error
+                    modelManager.errorMessage = nil
+                } else {
+                    // Success - show feedback briefly then dismiss
+                    showSuccess = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                         dismiss()
                     }
                 }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
-                .disabled(repoId.isEmpty || name.isEmpty)
             }
-            .padding()
         }
-        .frame(width: 350, height: 220)
     }
 }
 

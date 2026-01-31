@@ -21,6 +21,7 @@ wheels/
 *.egg
 env-anemll/
 anemll-swift-cli/.build/
+ANEMLLChat/.build/
 lib/
 bin/
 share/
