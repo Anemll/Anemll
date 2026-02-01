@@ -27,8 +27,14 @@ If you confident it's incorrectly reporting an issue, you can skip the check by 
 - Error message: "pip is required but it's not installed. Aborting. (Issue #2)"
 
 **Solution:**
-- Install pip by following the instructions at [pip.pypa.io](https://pip.pypa.io/en/stable/installation/).
-- Verify the installation by running `pip --version`.
+
+- **If you're using pip:** Install pip by following the instructions at [pip.pypa.io](https://pip.pypa.io/en/stable/installation/). Verify with `pip --version`.
+
+- **If you're using UV:** The following command can install pip in your UV environment:
+  ```bash
+  uv pip install pip
+  ```
+  Then install project dependencies (e.g. `uv pip install coremltools`). Verify with `pip --version` or `uv pip --version`.
 
 ### 3. CoreML Tools Not Installed
 **Problem:**
