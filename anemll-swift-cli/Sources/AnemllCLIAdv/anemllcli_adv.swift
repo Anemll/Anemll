@@ -352,7 +352,8 @@ struct AnemllCLIAdv: AsyncParsableCommand {
             debugLevel: debugLevel,
             v110: config.configVersion == "0.1.1",  // Set v110 flag based on version
             argmaxInModel: config.argmaxInModel,
-            slidingWindow: config.slidingWindow  // Gemma3 rotation support
+            slidingWindow: config.slidingWindow,  // Gemma3 rotation support
+            updateMaskPrefill: config.updateMaskPrefill  // Multi-turn KV cache support
         )
         
         // *** SET SAMPLING CONFIGURATION ***
@@ -401,7 +402,7 @@ struct AnemllCLIAdv: AsyncParsableCommand {
                 // Use chat template formatting
                 var messages: [Tokenizer.ChatMessage] = []
                 if let system = system {
-                    messages.append(Tokenizer.ChatMessage.assistant("I am an AI assistant. \(system)"))
+                    messages.append(Tokenizer.ChatMessage.system(system))
                 }
                 messages.append(Tokenizer.ChatMessage.user(prompt))
                 
@@ -487,9 +488,9 @@ struct AnemllCLIAdv: AsyncParsableCommand {
             print("Thinking mode is \(thinkingMode ? "ON" : "OFF")")
             
             var conversation: [Tokenizer.ChatMessage] = []
-            
+
             if let system = system {
-                conversation.append(.assistant("I am an AI assistant. \(system)"))
+                conversation.append(.system(system))
             }
             
             // Initialize token printer outside the loop

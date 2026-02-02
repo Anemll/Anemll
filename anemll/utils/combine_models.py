@@ -446,6 +446,8 @@ def parse_lut_arg(lut_value):
     """
     if lut_value is None:
         return None
+    if isinstance(lut_value, str) and lut_value.lower() == "none":
+        return None
 
     if ',' in lut_value:
         # Extract just the bits value, ignore per_channel for file naming

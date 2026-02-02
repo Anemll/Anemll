@@ -273,6 +273,18 @@ public final class Tokenizer: @unchecked Sendable {
                 }
             }
 
+            // Explicitly look up critical stop tokens (like Python's build_stop_token_ids)
+            // This ensures we catch <end_of_turn> even if it's not in added_tokens
+            let extraStopTokens = ["<end_of_turn>", "<|eot_id|>", "<|endoftext|>", "<|im_end|>"]
+            for stopToken in extraStopTokens {
+                let encoded = tokenizer.encode(text: stopToken)
+                // Only add if encoding produces a single token (not a sequence)
+                if encoded.count == 1, let tokenId = encoded.first, !eosTokenIdsList.contains(tokenId) {
+                    eosTokenIdsList.append(tokenId)
+                    print("✓ Added stop token (from encode): '\(stopToken)' = \(tokenId)")
+                }
+            }
+
             // Set the EOS token IDs
             self.eosTokenIds = eosTokenIdsList
             print("✓ Using EOS token IDs: \(eosTokenIdsList)")
@@ -373,19 +385,23 @@ public final class Tokenizer: @unchecked Sendable {
                 }
                 return tokens
             } catch {
-                print("Error applying chat template: \(error)")
-                // Fallback: use template-specific prompt formatting for ALL messages (multi-turn)
-                print("Using fallback prompt formatting for template: \(templateName)")
+                if debugLevel >= 1 {
+                    print("Error applying chat template: \(error)")
+                    // Fallback: use template-specific prompt formatting for ALL messages (multi-turn)
+                    print("Using fallback prompt formatting for template: \(templateName)")
+                }
 
                 let formattedPrompt: String
                 switch templateName.lowercased() {
                 case "gemma", "gemma3":
                     // Gemma format: <bos><start_of_turn>role\n{content}<end_of_turn>\n...
+                    // Note: Gemma3 doesn't support "system" role - it uses "model" for system messages
                     var prompt = "<bos>"
                     for message in messagesArray {
                         let role = message["role"] as? String ?? "user"
                         let content = message["content"] as? String ?? ""
-                        let gemmaRole = role == "assistant" ? "model" : role
+                        // Map both "assistant" and "system" to "model" for Gemma3
+                        let gemmaRole = (role == "assistant" || role == "system") ? "model" : role
                         prompt += "<start_of_turn>\(gemmaRole)\n\(content)<end_of_turn>\n"
                     }
                     prompt += "<start_of_turn>model\n"
@@ -442,7 +458,9 @@ public final class Tokenizer: @unchecked Sendable {
                     formattedPrompt = prompt
                 }
 
-                print("Fallback formatted prompt (\(messagesArray.count) messages): \(formattedPrompt.prefix(200))...")
+                if debugLevel >= 1 {
+                    print("Fallback formatted prompt (\(messagesArray.count) messages): \(formattedPrompt.prefix(200))...")
+                }
                 return tokenizer.encode(text: formattedPrompt)
             }
         }

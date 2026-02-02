@@ -40,7 +40,36 @@ def check_file_exists(output_dir, base_name, lut_value):
         print(f"Warning: {lut_name}.mlmodelc not found, using {base_name}.mlmodelc instead")
         return base_name, 'none', None
 
-def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch, output_dir, argmax_in_model=False, rotate=False, sliding_window=None):
+def check_chunk_file_exists(output_dir, base_prefix, lut_value, chunk_suffix, rot_suffix=''):
+    """Check chunked FFN/PF file existence with optional LUT and rotate suffix."""
+    if lut_value == 'none':
+        name = f'{base_prefix}{chunk_suffix}{rot_suffix}'
+        return name, 'none'
+
+    lut_name = f'{base_prefix}_lut{lut_value}{chunk_suffix}{rot_suffix}'
+    if (os.path.exists(os.path.join(output_dir, f'{lut_name}.mlmodelc')) or
+            os.path.exists(os.path.join(output_dir, f'{lut_name}.mlpackage'))):
+        return lut_name, lut_value
+
+    fallback = f'{base_prefix}{chunk_suffix}{rot_suffix}'
+    print(f"Warning: {lut_name}.mlmodelc/.mlpackage not found, using {fallback}.mlmodelc instead")
+    return fallback, 'none'
+
+def generate_monolithic_meta(
+    model_name,
+    context,
+    batch,
+    lut_bits,
+    prefix,
+    arch,
+    output_dir,
+    argmax_in_model=False,
+    rotate=False,
+    sliding_window=None,
+    update_mask_prefill=False,
+    prefill_dynamic_slice=False,
+    single_cache=False,
+):
     """Generate meta.yaml for monolithic model format.
 
     Args:
@@ -100,6 +129,10 @@ def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch,
 
     argmax_line = f'\n    argmax_in_model: true' if argmax_in_model else ''
     sliding_window_line = f'\n    sliding_window: {sliding_window}' if sliding_window is not None else ''
+    update_mask_line = '\n    update_mask_prefill: true' if update_mask_prefill else ''
+    prefill_dynamic_slice_line = '\n    prefill_dynamic_slice: true' if prefill_dynamic_slice else ''
+    single_cache_line = '\n    single_cache: true' if single_cache else ''
+    single_cache_line = '\n    single_cache: true' if single_cache else ''
 
     # Build functions list based on rotate flag
     if rotate:
@@ -115,7 +148,7 @@ def generate_monolithic_meta(model_name, context, batch, lut_bits, prefix, arch,
 
     meta_parts.append(f'''    model_prefix: {prefix}
     monolithic_model: {model_name_file}
-    split_lm_head: {split_lm_head}{argmax_line}{sliding_window_line}
+    split_lm_head: {split_lm_head}{argmax_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}
 {functions_yaml}
 ''')
 
@@ -146,6 +179,28 @@ def main():
     if rotate:
         sys.argv.remove('--rotate')
 
+    # Check for --update-mask-prefill flag
+    update_mask_prefill = '--update-mask-prefill' in sys.argv
+    if update_mask_prefill:
+        sys.argv.remove('--update-mask-prefill')
+
+    # Check for --single-cache flag
+    single_cache = '--single-cache' in sys.argv
+    if single_cache:
+        sys.argv.remove('--single-cache')
+
+    # Prefill dynamic slice defaults to ON; use --static-prefill-slice to disable.
+    prefill_dynamic_slice = True
+    if '--static-prefill-slice' in sys.argv:
+        prefill_dynamic_slice = False
+        sys.argv.remove('--static-prefill-slice')
+    if '--dynamic-prefill-slice' in sys.argv:
+        prefill_dynamic_slice = True
+        sys.argv.remove('--dynamic-prefill-slice')
+    if '--prefill-dynamic-slice' in sys.argv:
+        prefill_dynamic_slice = True
+        sys.argv.remove('--prefill-dynamic-slice')
+
     # Check for --split-rotate flag (2 files per chunk: FFN and PF)
     split_rotate = '--split-rotate' in sys.argv
     if split_rotate:
@@ -162,7 +217,7 @@ def main():
 
     if is_monolithic:
         if len(sys.argv) != 11:
-            print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_bits> <lut_bits> <lut_bits> <num_chunks> <prefix> <arch> <output_dir> --monolithic [--argmax] [--rotate]")
+            print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_bits> <lut_bits> <lut_bits> <num_chunks> <prefix> <arch> <output_dir> --monolithic [--argmax] [--rotate] [--update-mask-prefill] [--dynamic-prefill-slice|--static-prefill-slice] [--single-cache] [--sliding-window N]")
             sys.exit(1)
         # For monolithic, all LUT values should be the same (use the first one)
         generate_monolithic_meta(
@@ -175,12 +230,15 @@ def main():
             output_dir=sys.argv[10],
             argmax_in_model=argmax_in_model,
             rotate=rotate,
-            sliding_window=sliding_window
+            sliding_window=sliding_window,
+            update_mask_prefill=update_mask_prefill,
+            prefill_dynamic_slice=prefill_dynamic_slice,
+            single_cache=single_cache,
         )
         return
 
     if len(sys.argv) != 11:
-        print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_emb> <lut_ffn> <lut_lmh> <num_chunks> <prefix> <arch> <output_dir> [--argmax]")
+        print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_emb> <lut_ffn> <lut_lmh> <num_chunks> <prefix> <arch> <output_dir> [--argmax] [--split-rotate] [--update-mask-prefill] [--dynamic-prefill-slice|--static-prefill-slice] [--single-cache] [--sliding-window N]")
         sys.exit(1)
 
     MODEL_NAME = sys.argv[1]
@@ -206,26 +264,19 @@ def main():
     lmhead_base = f'{PREFIX}_lm_head'
     lmhead_name, lut_lmh_actual, _ = check_file_exists(OUTPUT_DIR, lmhead_base, lut_lmh_bits)
 
-    # Check FFN (always use LUT if specified, as it's required for ANE) - use only bits for filename
+    # Check FFN/PF files (chunked; LUT is optional based on actual files)
     # FFN files include chunk suffix: e.g., qwen_FFN_PF_lut4_chunk_01of01.mlmodelc
+    ffn_base = f'{PREFIX}_FFN_PF'
+    chunk_suffix = f'_chunk_01of{int(NUM_CHUNKS):02d}'
+    ffn_name, lut_ffn_actual = check_chunk_file_exists(
+        OUTPUT_DIR, ffn_base, lut_ffn_bits, chunk_suffix, rot_suffix=''
+    )
     if split_rotate:
-        # Split-rotate mode: 2 files per chunk (non-rotate and rotate)
-        # Non-rotate file: infer + prefill
-        # Rotate file: infer_rotate + prefill_rotate (with _rot suffix)
-        ffn_base = f'{PREFIX}_FFN_PF'
-        if lut_ffn_bits != 'none':
-            ffn_name = f'{ffn_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}'
-            pf_name = f'{ffn_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}_rot'
-        else:
-            ffn_name = f'{ffn_base}_chunk_01of{int(NUM_CHUNKS):02d}'
-            pf_name = f'{ffn_base}_chunk_01of{int(NUM_CHUNKS):02d}_rot'
-    else:
-        # Standard mode: combined FFN_PF file
-        ffn_base = f'{PREFIX}_FFN_PF'
-        if lut_ffn_bits != 'none':
-            ffn_name = f'{ffn_base}_lut{lut_ffn_bits}_chunk_01of{int(NUM_CHUNKS):02d}'
-        else:
-            ffn_name = f'{ffn_base}_chunk_01of{int(NUM_CHUNKS):02d}'
+        pf_name, lut_pf_actual = check_chunk_file_exists(
+            OUTPUT_DIR, ffn_base, lut_ffn_actual, chunk_suffix, rot_suffix='_rot'
+        )
+        if lut_pf_actual != lut_ffn_actual:
+            print(f"Warning: rotate PF LUT ({lut_pf_actual}) differs from FFN LUT ({lut_ffn_actual})")
 
     # Add .mlmodelc extension to model paths
     embeddings_path = f'{embeddings_name}.mlmodelc'
@@ -262,8 +313,8 @@ def main():
     if lut_emb_per_channel is not None:
         meta_parts.append(f'    lut_embeddings_per_channel: {lut_emb_per_channel}')
 
-    meta_parts.append(f'    lut_ffn: {lut_ffn_bits}')
-    if lut_ffn_per_channel is not None:
+    meta_parts.append(f'    lut_ffn: {lut_ffn_actual}')
+    if lut_ffn_per_channel is not None and lut_ffn_actual != 'none':
         meta_parts.append(f'    lut_ffn_per_channel: {lut_ffn_per_channel}')
 
     meta_parts.append(f'    lut_lmhead: {lut_lmh_actual}')
@@ -279,13 +330,16 @@ def main():
 
     # Add sliding_window for Gemma3 models
     sliding_window_line = f'\n    sliding_window: {sliding_window}' if sliding_window is not None else ''
+    update_mask_line = '\n    update_mask_prefill: true' if update_mask_prefill else ''
+    prefill_dynamic_slice_line = '\n    prefill_dynamic_slice: true' if prefill_dynamic_slice else ''
+    single_cache_line = '\n    single_cache: true' if single_cache else ''
 
     meta_parts.append(f'''    num_chunks: {NUM_CHUNKS}
     model_prefix: {PREFIX}
     embeddings: {embeddings_path}
     lm_head: {lmhead_path}
     ffn: {ffn_path}{pf_line}
-    split_lm_head: {split_lm_head}{argmax_line}{split_rotate_line}{sliding_window_line}
+    split_lm_head: {split_lm_head}{argmax_line}{split_rotate_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}
 ''')
 
     meta = '\n'.join(meta_parts)
@@ -296,7 +350,7 @@ def main():
 
     print(f"Generated meta.yaml at: {output_file}")
     print(f"  lut_embeddings: {lut_emb_actual}" + (f" (per_channel: {lut_emb_per_channel})" if lut_emb_per_channel else ""))
-    print(f"  lut_ffn: {lut_ffn_bits}" + (f" (per_channel: {lut_ffn_per_channel})" if lut_ffn_per_channel else ""))
+    print(f"  lut_ffn: {lut_ffn_actual}" + (f" (per_channel: {lut_ffn_per_channel})" if lut_ffn_per_channel and lut_ffn_actual != 'none' else ""))
     print(f"  lut_lmhead: {lut_lmh_actual}" + (f" (per_channel: {lut_lmh_per_channel})" if lut_lmh_per_channel else ""))
 
 if __name__ == "__main__":

@@ -267,7 +267,7 @@ actor StorageService {
     }
 
     var defaultSystemPrompt: String {
-        UserDefaults.standard.object(forKey: "systemPrompt") as? String ?? "You are a helpful assistant."
+        UserDefaults.standard.object(forKey: "systemPrompt") as? String ?? ""  // Default: no system prompt (matches CLI)
     }
 
     var selectedModelId: String? {
@@ -289,6 +289,14 @@ actor StorageService {
 
     func saveDebugLevel(_ value: Int) {
         UserDefaults.standard.set(value, forKey: "debugLevel")
+    }
+
+    var repetitionDetectionEnabled: Bool {
+        UserDefaults.standard.object(forKey: "repetitionDetectionEnabled") as? Bool ?? false  // Default: off (matches CLI)
+    }
+
+    func saveRepetitionDetectionEnabled(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "repetitionDetectionEnabled")
     }
 
     func clearLastModel() {

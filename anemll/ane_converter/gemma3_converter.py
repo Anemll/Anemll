@@ -51,6 +51,7 @@ class Gemma3Converter(BaseConverter):
         argmax_in_model: bool = False,
         attention_size: int | None = None,
         fp16_scaled: bool = False,
+        prefill_dynamic_slice: bool = True,
     ) -> None:
         super().__init__(model)
         self.context_length = context_length
@@ -64,6 +65,9 @@ class Gemma3Converter(BaseConverter):
         self.num_chunks = num_chunks
         self.argmax_in_model = argmax_in_model
         self.fp16_scaled = fp16_scaled  # If True, exclude scaled tensors from LUT quantization
+        self.prefill_dynamic_slice = prefill_dynamic_slice
+        # Propagate to model config for prefill KV write behavior
+        setattr(self.model.model.config, "prefill_dynamic_slice", prefill_dynamic_slice)
         # attention_size controls the attention computation span
         # For Gemma3, must be at least sliding_window for local attention to work
         if attention_size is not None:
@@ -455,7 +459,7 @@ class Gemma3Converter(BaseConverter):
     # Public API
     # ------------------------------------------------------------------
     def convert(
-        self, part: str = "full"
+        self, part: str = "full", chunk_no: int | None = None
     ) -> ct.models.MLModel | List[ct.models.MLModel]:
         """Convert the wrapped model to CoreML format.
 
@@ -464,6 +468,7 @@ class Gemma3Converter(BaseConverter):
                  "full" - complete model (default)
                  "prefill" - prefill mode for initial sequence processing
                  "embeddings" - embeddings only (input_ids -> hidden_states)
+            chunk_no: If set (1-based), convert only this chunk for chunked parts.
 
         Returns:
             ct.models.MLModel: Converted model
@@ -472,6 +477,15 @@ class Gemma3Converter(BaseConverter):
         require_coreml()
         print("Calling preprocess()...")
         self.preprocess()
+
+        if chunk_no is not None:
+            chunk_parts = {"2", "2_rotate", "2_prefill", "2_prefill_rotate", "prefill"}
+            if part not in chunk_parts:
+                raise ValueError(f"--chunk-no is only valid for chunked parts: {sorted(chunk_parts)}")
+            if self.num_chunks <= 1:
+                raise ValueError("--chunk-no requires --chunk > 1")
+            if chunk_no < 1 or chunk_no > self.num_chunks:
+                raise ValueError(f"--chunk-no must be between 1 and {self.num_chunks}")
 
         if part in ("full", "all", "123"):
             print("Converting full model...")
@@ -482,37 +496,53 @@ class Gemma3Converter(BaseConverter):
         elif part in ("prefill", "2_prefill"):
             print("Converting prefill (fill mode)...")
             if self.num_chunks > 1:
-                mlmodel = [
-                    self.convert_part_2_prefill(self.model, i, self.num_chunks, force_rotation=False)
-                    for i in range(self.num_chunks)
-                ]
+                if chunk_no is not None:
+                    i = chunk_no - 1
+                    mlmodel = self.convert_part_2_prefill(self.model, i, self.num_chunks, force_rotation=False)
+                else:
+                    mlmodel = [
+                        self.convert_part_2_prefill(self.model, i, self.num_chunks, force_rotation=False)
+                        for i in range(self.num_chunks)
+                    ]
             else:
                 mlmodel = self.convert_part_2_prefill(self.model, force_rotation=False)
         elif part == "2":
             print("Converting FFN (infer - fill mode)...")
             if self.num_chunks > 1:
-                mlmodel = [
-                    self.convert_part_2(self.model, i, self.num_chunks, force_rotation=False)
-                    for i in range(self.num_chunks)
-                ]
+                if chunk_no is not None:
+                    i = chunk_no - 1
+                    mlmodel = self.convert_part_2(self.model, i, self.num_chunks, force_rotation=False)
+                else:
+                    mlmodel = [
+                        self.convert_part_2(self.model, i, self.num_chunks, force_rotation=False)
+                        for i in range(self.num_chunks)
+                    ]
             else:
                 mlmodel = self.convert_part_2(self.model, force_rotation=False)
         elif part == "2_rotate":
             print("Converting FFN (infer_rotate - rotation mode)...")
             if self.num_chunks > 1:
-                mlmodel = [
-                    self.convert_part_2(self.model, i, self.num_chunks, force_rotation=True)
-                    for i in range(self.num_chunks)
-                ]
+                if chunk_no is not None:
+                    i = chunk_no - 1
+                    mlmodel = self.convert_part_2(self.model, i, self.num_chunks, force_rotation=True)
+                else:
+                    mlmodel = [
+                        self.convert_part_2(self.model, i, self.num_chunks, force_rotation=True)
+                        for i in range(self.num_chunks)
+                    ]
             else:
                 mlmodel = self.convert_part_2(self.model, force_rotation=True)
         elif part == "2_prefill_rotate":
             print("Converting prefill (prefill_rotate - rotation mode)...")
             if self.num_chunks > 1:
-                mlmodel = [
-                    self.convert_part_2_prefill(self.model, i, self.num_chunks, force_rotation=True)
-                    for i in range(self.num_chunks)
-                ]
+                if chunk_no is not None:
+                    i = chunk_no - 1
+                    mlmodel = self.convert_part_2_prefill(self.model, i, self.num_chunks, force_rotation=True)
+                else:
+                    mlmodel = [
+                        self.convert_part_2_prefill(self.model, i, self.num_chunks, force_rotation=True)
+                        for i in range(self.num_chunks)
+                    ]
             else:
                 mlmodel = self.convert_part_2_prefill(self.model, force_rotation=True)
         elif part == "3":
@@ -702,115 +732,267 @@ class Gemma3Converter(BaseConverter):
             model.model.config.force_rotation_mode = force_rotation
             print(f"  force_rotation_mode = {force_rotation}")
 
-        class MonolithicWrapper(torch.nn.Module):
-            """Wrapper combining embeddings + transformer + LM head."""
+        # Disable dynamic prefill slicing when tracing rotation variants
+        original_prefill_dynamic_slice = getattr(model.model.config, "prefill_dynamic_slice", False)
+        effective_dynamic_slice = self.prefill_dynamic_slice and not bool(force_rotation)
+        if effective_dynamic_slice != original_prefill_dynamic_slice:
+            model.model.config.prefill_dynamic_slice = effective_dynamic_slice
 
-            def __init__(
-                self, model: Gemma3ForCausalLM, context_length: int, is_prefill: bool,
-                argmax_in_model: bool = False, is_prefill_rotate: bool = False
-            ) -> None:
-                super().__init__()
-                self.model = model
-                self.context_length = context_length
-                self.is_prefill = is_prefill
-                self.is_prefill_rotate = is_prefill_rotate
-                self.argmax_in_model = argmax_in_model
+        use_update_mask = is_prefill and not force_rotation and not self.prefill_dynamic_slice
 
-                # Determine LM head mode
-                if hasattr(model, "lm_head16_1"):
-                    self.lm_head_mode = "16"
-                    self.lm_heads = [
-                        getattr(model, f"lm_head16_{i}") for i in range(1, 17)
-                    ]
-                    self.chunk_size = 16384  # 262144 / 16
-                elif hasattr(model, "lm_head8_1"):
-                    self.lm_head_mode = "8"
-                    self.lm_heads = [
-                        getattr(model, f"lm_head8_{i}") for i in range(1, 9)
-                    ]
-                    self.chunk_size = 32768  # 262144 / 8
-                elif hasattr(model, "lm_head2_1"):
-                    self.lm_head_mode = "2"
-                    self.lm_heads = [model.lm_head2_1, model.lm_head2_2]
-                    self.chunk_size = 131072  # 262144 / 2
-                elif hasattr(model, "lm_head1"):
-                    self.lm_head_mode = "1"
-                    self.lm_head = model.lm_head1
-                    self.chunk_size = 262144
-                else:
-                    self.lm_head_mode = "linear"
-                    self.lm_head = model.lm_head
-                    self.chunk_size = 262144
+        if is_prefill and not force_rotation:
+            if use_update_mask:
+                class MonolithicWrapper(torch.nn.Module):
+                    """Wrapper combining embeddings + transformer + LM head (prefill with update_mask)."""
 
-            def forward(
-                self,
-                input_ids: torch.Tensor,
-                position_ids: torch.Tensor,
-                causal_mask: torch.Tensor,
-                current_pos: torch.Tensor,
-            ) -> tuple:
-                # Step 1: Embeddings (with Gemma3 scaling)
-                hidden_states = self.model.model.embed_tokens(input_ids)
-                hidden_states = hidden_states * self.model.model.embedding_scale
-                hidden_states = hidden_states.to(MODEL_DTYPE)
+                def __init__(
+                    self, model: Gemma3ForCausalLM, context_length: int, is_prefill: bool,
+                    argmax_in_model: bool = False, is_prefill_rotate: bool = False
+                ) -> None:
+                    super().__init__()
+                    self.model = model
+                    self.context_length = context_length
+                    self.is_prefill = is_prefill
+                    self.is_prefill_rotate = is_prefill_rotate
+                    self.argmax_in_model = argmax_in_model
 
-                # Step 2: Transformer layers (RoPE handled inside process_layers)
-                hidden_states = self.model.model.process_layers(
-                    hidden_states,
-                    position_ids,
-                    causal_mask,
-                    current_pos,
-                    start_layer=0,
-                    end_layer=None,
-                    IN_PREFILL=self.is_prefill,
-                    IN_PREFILL_ROTATE=self.is_prefill_rotate,
-                )
+                    # Determine LM head mode
+                    if hasattr(model, "lm_head16_1"):
+                        self.lm_head_mode = "16"
+                        self.lm_heads = [
+                            getattr(model, f"lm_head16_{i}") for i in range(1, 17)
+                        ]
+                        self.chunk_size = 16384  # 262144 / 16
+                    elif hasattr(model, "lm_head8_1"):
+                        self.lm_head_mode = "8"
+                        self.lm_heads = [
+                            getattr(model, f"lm_head8_{i}") for i in range(1, 9)
+                        ]
+                        self.chunk_size = 32768  # 262144 / 8
+                    elif hasattr(model, "lm_head2_1"):
+                        self.lm_head_mode = "2"
+                        self.lm_heads = [model.lm_head2_1, model.lm_head2_2]
+                        self.chunk_size = 131072  # 262144 / 2
+                    elif hasattr(model, "lm_head1"):
+                        self.lm_head_mode = "1"
+                        self.lm_head = model.lm_head1
+                        self.chunk_size = 262144
+                    else:
+                        self.lm_head_mode = "linear"
+                        self.lm_head = model.lm_head
+                        self.chunk_size = 262144
 
-                # Apply final normalization
-                hidden_states = self.model.model.norm(hidden_states)
+                def forward(
+                    self,
+                    input_ids: torch.Tensor,
+                    position_ids: torch.Tensor,
+                    causal_mask: torch.Tensor,
+                    current_pos: torch.Tensor,
+                    update_mask: torch.Tensor,
+                ) -> tuple:
+                    # Step 1: Embeddings (with Gemma3 scaling)
+                    hidden_states = self.model.model.embed_tokens(input_ids)
+                    hidden_states = hidden_states * self.model.model.embedding_scale
+                    hidden_states = hidden_states.to(MODEL_DTYPE)
 
-                # Step 3: LM Head
-                if self.lm_head_mode != "linear":
-                    hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
+                    # Step 2: Transformer layers (RoPE handled inside process_layers)
+                    hidden_states = self.model.model.process_layers(
+                        hidden_states,
+                        position_ids,
+                        causal_mask,
+                        current_pos,
+                        start_layer=0,
+                        end_layer=None,
+                        IN_PREFILL=self.is_prefill,
+                        IN_PREFILL_ROTATE=self.is_prefill_rotate,
+                        update_mask=update_mask,
+                    )
 
-                # Compute logits for each chunk
-                if self.lm_head_mode in ("16", "8", "2"):
-                    logits_list = [
-                        h(hidden_states).squeeze(2).transpose(1, 2)
-                        for h in self.lm_heads
-                    ]
-                elif self.lm_head_mode == "1":
-                    logits_list = [self.lm_head(hidden_states).squeeze(2).transpose(1, 2)]
-                else:
-                    logits_list = [self.lm_head(hidden_states)]
+                    # Apply final normalization
+                    hidden_states = self.model.model.norm(hidden_states)
 
-                # If argmax_in_model, compute argmax per chunk and return 2 tensors
-                # NOTE: We return LOCAL indices (0 to chunk_size-1), not global indices.
-                # The global offset is computed on the Python/Swift side as:
-                #   global_idx = local_idx + (best_chunk * chunk_size)
-                # This avoids baking constants into the CoreML model.
-                # NOTE: Using int16 for ANE compatibility - ANE doesn't support int32 for argmax.
-                # Local indices (0 to 16383) fit in int16 (max 32767).
-                if self.argmax_in_model:
-                    all_idx = []
-                    all_val = []
-                    for i, logits in enumerate(logits_list):
-                        # logits shape: [1, 1, chunk_size] for inference mode
-                        # Get argmax index within chunk (0 to chunk_size-1)
-                        chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)  # [1, 1, 1], int64
-                        # Cast to int32 for CoreML compatibility (int16 not supported for outputs)
-                        # Local indices 0-16383 fit easily in int32
-                        local_idx = chunk_argmax.to(torch.int32)  # [1, 1, 1]
-                        # Get max value
-                        max_val = torch.max(logits, dim=-1, keepdim=True).values  # [1, 1, 1]
-                        all_idx.append(local_idx)
-                        all_val.append(max_val)
-                    # Concatenate along last dim: [1, 1, num_chunks], then squeeze to [num_chunks]
-                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], int32 (LOCAL indices)
-                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], fp16
-                    return (argmax_idx, argmax_val)
-                else:
-                    return tuple(logits_list)
+                    # Prefill output: return only the first token to minimize output size
+                    return hidden_states[:, 0:1, :]
+            else:
+                class MonolithicWrapper(torch.nn.Module):
+                    """Wrapper combining embeddings + transformer + LM head (prefill, dynamic slice)."""
+
+                    def __init__(
+                        self, model: Gemma3ForCausalLM, context_length: int, is_prefill: bool,
+                        argmax_in_model: bool = False, is_prefill_rotate: bool = False
+                    ) -> None:
+                        super().__init__()
+                        self.model = model
+                        self.context_length = context_length
+                        self.is_prefill = is_prefill
+                        self.is_prefill_rotate = is_prefill_rotate
+                        self.argmax_in_model = argmax_in_model
+
+                        # Determine LM head mode
+                        if hasattr(model, "lm_head16_1"):
+                            self.lm_head_mode = "16"
+                            self.lm_heads = [
+                                getattr(model, f"lm_head16_{i}") for i in range(1, 17)
+                            ]
+                            self.chunk_size = 16384  # 262144 / 16
+                        elif hasattr(model, "lm_head8_1"):
+                            self.lm_head_mode = "8"
+                            self.lm_heads = [
+                                getattr(model, f"lm_head8_{i}") for i in range(1, 9)
+                            ]
+                            self.chunk_size = 32768  # 262144 / 8
+                        elif hasattr(model, "lm_head2_1"):
+                            self.lm_head_mode = "2"
+                            self.lm_heads = [model.lm_head2_1, model.lm_head2_2]
+                            self.chunk_size = 131072  # 262144 / 2
+                        elif hasattr(model, "lm_head1"):
+                            self.lm_head_mode = "1"
+                            self.lm_head = model.lm_head1
+                            self.chunk_size = 262144
+                        else:
+                            self.lm_head_mode = "linear"
+                            self.lm_head = model.lm_head
+                            self.chunk_size = 262144
+
+                    def forward(
+                        self,
+                        input_ids: torch.Tensor,
+                        position_ids: torch.Tensor,
+                        causal_mask: torch.Tensor,
+                        current_pos: torch.Tensor,
+                    ) -> tuple:
+                        # Step 1: Embeddings (with Gemma3 scaling)
+                        hidden_states = self.model.model.embed_tokens(input_ids)
+                        hidden_states = hidden_states * self.model.model.embedding_scale
+                        hidden_states = hidden_states.to(MODEL_DTYPE)
+
+                        # Step 2: Transformer layers (RoPE handled inside process_layers)
+                        hidden_states = self.model.model.process_layers(
+                            hidden_states,
+                            position_ids,
+                            causal_mask,
+                            current_pos,
+                            start_layer=0,
+                            end_layer=None,
+                            IN_PREFILL=self.is_prefill,
+                            IN_PREFILL_ROTATE=self.is_prefill_rotate,
+                        )
+
+                        # Apply final normalization
+                        hidden_states = self.model.model.norm(hidden_states)
+
+                        # Prefill output: return only the first token to minimize output size
+                        return hidden_states[:, 0:1, :]
+        else:
+            class MonolithicWrapper(torch.nn.Module):
+                """Wrapper combining embeddings + transformer + LM head."""
+
+                def __init__(
+                    self, model: Gemma3ForCausalLM, context_length: int, is_prefill: bool,
+                    argmax_in_model: bool = False, is_prefill_rotate: bool = False
+                ) -> None:
+                    super().__init__()
+                    self.model = model
+                    self.context_length = context_length
+                    self.is_prefill = is_prefill
+                    self.is_prefill_rotate = is_prefill_rotate
+                    self.argmax_in_model = argmax_in_model
+
+                    # Determine LM head mode
+                    if hasattr(model, "lm_head16_1"):
+                        self.lm_head_mode = "16"
+                        self.lm_heads = [
+                            getattr(model, f"lm_head16_{i}") for i in range(1, 17)
+                        ]
+                        self.chunk_size = 16384  # 262144 / 16
+                    elif hasattr(model, "lm_head8_1"):
+                        self.lm_head_mode = "8"
+                        self.lm_heads = [
+                            getattr(model, f"lm_head8_{i}") for i in range(1, 9)
+                        ]
+                        self.chunk_size = 32768  # 262144 / 8
+                    elif hasattr(model, "lm_head2_1"):
+                        self.lm_head_mode = "2"
+                        self.lm_heads = [model.lm_head2_1, model.lm_head2_2]
+                        self.chunk_size = 131072  # 262144 / 2
+                    elif hasattr(model, "lm_head1"):
+                        self.lm_head_mode = "1"
+                        self.lm_head = model.lm_head1
+                        self.chunk_size = 262144
+                    else:
+                        self.lm_head_mode = "linear"
+                        self.lm_head = model.lm_head
+                        self.chunk_size = 262144
+
+                def forward(
+                    self,
+                    input_ids: torch.Tensor,
+                    position_ids: torch.Tensor,
+                    causal_mask: torch.Tensor,
+                    current_pos: torch.Tensor,
+                ) -> tuple:
+                    # Step 1: Embeddings (with Gemma3 scaling)
+                    hidden_states = self.model.model.embed_tokens(input_ids)
+                    hidden_states = hidden_states * self.model.model.embedding_scale
+                    hidden_states = hidden_states.to(MODEL_DTYPE)
+
+                    # Step 2: Transformer layers (RoPE handled inside process_layers)
+                    hidden_states = self.model.model.process_layers(
+                        hidden_states,
+                        position_ids,
+                        causal_mask,
+                        current_pos,
+                        start_layer=0,
+                        end_layer=None,
+                        IN_PREFILL=self.is_prefill,
+                        IN_PREFILL_ROTATE=self.is_prefill_rotate,
+                    )
+
+                    # Apply final normalization
+                    hidden_states = self.model.model.norm(hidden_states)
+
+                    # Step 3: LM Head
+                    if self.lm_head_mode != "linear":
+                        hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
+
+                    # Compute logits for each chunk
+                    if self.lm_head_mode in ("16", "8", "2"):
+                        logits_list = [
+                            h(hidden_states).squeeze(2).transpose(1, 2)
+                            for h in self.lm_heads
+                        ]
+                    elif self.lm_head_mode == "1":
+                        logits_list = [self.lm_head(hidden_states).squeeze(2).transpose(1, 2)]
+                    else:
+                        logits_list = [self.lm_head(hidden_states)]
+
+                    # If argmax_in_model, compute argmax per chunk and return 2 tensors
+                    # NOTE: We return LOCAL indices (0 to chunk_size-1), not global indices.
+                    # The global offset is computed on the Python/Swift side as:
+                    #   global_idx = local_idx + (best_chunk * chunk_size)
+                    # This avoids baking constants into the CoreML model.
+                    # NOTE: Using int16 for ANE compatibility - ANE doesn't support int32 for argmax.
+                    # Local indices (0 to 16383) fit in int16 (max 32767).
+                    if self.argmax_in_model:
+                        all_idx = []
+                        all_val = []
+                        for i, logits in enumerate(logits_list):
+                            # logits shape: [1, 1, chunk_size] for inference mode
+                            # Get argmax index within chunk (0 to chunk_size-1)
+                            chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)  # [1, 1, 1], int64
+                            # Cast to int32 for CoreML compatibility (int16 not supported for outputs)
+                            # Local indices 0-16383 fit easily in int32
+                            local_idx = chunk_argmax.to(torch.int32)  # [1, 1, 1]
+                            # Get max value
+                            max_val = torch.max(logits, dim=-1, keepdim=True).values  # [1, 1, 1]
+                            all_idx.append(local_idx)
+                            all_val.append(max_val)
+                        # Concatenate along last dim: [1, 1, num_chunks], then squeeze to [num_chunks]
+                        argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], int32 (LOCAL indices)
+                        argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], fp16
+                        return (argmax_idx, argmax_val)
+                    else:
+                        return tuple(logits_list)
 
         # Determine if this is prefill with rotation (prefill_rotate function)
         is_prefill_rotate = is_prefill and force_rotation == True
@@ -838,6 +1020,8 @@ class Gemma3Converter(BaseConverter):
             mask_size = self.attention_size
             print(f"Unified cache mode: mask size = {mask_size}")
 
+        use_update_mask = is_prefill and not force_rotation and not self.prefill_dynamic_slice
+
         # Prepare inputs based on mode
         if is_prefill:
             sample_input_ids = torch.zeros(
@@ -851,6 +1035,13 @@ class Gemma3Converter(BaseConverter):
                 dtype=torch.float16,
                 device=TEST_DEVICE,
             )
+            sample_update_mask = None
+            if use_update_mask:
+                sample_update_mask = torch.zeros(
+                    (1, 1, mask_size, self.batch_size),
+                    dtype=torch.float16,
+                    device=TEST_DEVICE,
+                )
         else:
             sample_input_ids = torch.zeros(
                 (1, 1), dtype=torch.int32, device=TEST_DEVICE
@@ -863,6 +1054,7 @@ class Gemma3Converter(BaseConverter):
                 dtype=torch.float16,
                 device=TEST_DEVICE,
             )
+            sample_update_mask = None
 
         sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
 
@@ -871,18 +1063,32 @@ class Gemma3Converter(BaseConverter):
         print(f"  position_ids: {sample_position_ids.shape}")
         print(f"  causal_mask: {sample_causal_mask.shape}")
         print(f"  current_pos: {sample_current_pos.shape}")
+        if sample_update_mask is not None:
+            print(f"  update_mask: {sample_update_mask.shape}")
 
         print("Tracing monolithic model...")
         with torch.no_grad():
-            traced = torch.jit.trace(
-                wrapper,
-                (
-                    sample_input_ids,
-                    sample_position_ids,
-                    sample_causal_mask,
-                    sample_current_pos,
-                ),
-            )
+            if sample_update_mask is not None:
+                traced = torch.jit.trace(
+                    wrapper,
+                    (
+                        sample_input_ids,
+                        sample_position_ids,
+                        sample_causal_mask,
+                        sample_current_pos,
+                        sample_update_mask,
+                    ),
+                )
+            else:
+                traced = torch.jit.trace(
+                    wrapper,
+                    (
+                        sample_input_ids,
+                        sample_position_ids,
+                        sample_causal_mask,
+                        sample_current_pos,
+                    ),
+                )
         print("Tracing completed!")
 
         # Determine number of chunks based on LM head mode
@@ -916,22 +1122,30 @@ class Gemma3Converter(BaseConverter):
                 ]
 
         print("Starting CoreML conversion...")
+        inputs = [
+            ct.TensorType(
+                name="input_ids", shape=sample_input_ids.shape, dtype=np.int32
+            ),
+            ct.TensorType(
+                name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
+            ),
+            ct.TensorType(
+                name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
+            ),
+            ct.TensorType(
+                name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
+            ),
+        ]
+        if sample_update_mask is not None:
+            inputs.append(
+                ct.TensorType(
+                    name="update_mask", shape=sample_update_mask.shape, dtype=np.float16
+                )
+            )
+
         mlmodel = ct.convert(
             traced,
-            inputs=[
-                ct.TensorType(
-                    name="input_ids", shape=sample_input_ids.shape, dtype=np.int32
-                ),
-                ct.TensorType(
-                    name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
-                ),
-                ct.TensorType(
-                    name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
-                ),
-                ct.TensorType(
-                    name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
-                ),
-            ],
+            inputs=inputs,
             outputs=outputs,
             states=self.GetTransformerStates(model, part=None, prefix="model.model."),
             compute_precision=ct.precision.FLOAT16,
@@ -948,6 +1162,10 @@ class Gemma3Converter(BaseConverter):
             # multiprocessing pool hanging issues with large models on macOS
             self.postprocess(num_workers=None)
             mlmodel = self.converted_model
+
+        # Restore original prefill_dynamic_slice
+        if getattr(model.model.config, "prefill_dynamic_slice", None) != original_prefill_dynamic_slice:
+            model.model.config.prefill_dynamic_slice = original_prefill_dynamic_slice
 
         return mlmodel
 
@@ -1125,6 +1343,12 @@ class Gemma3Converter(BaseConverter):
         model.model.config.force_rotation_mode = force_rotation
         print(f"  force_rotation_mode = {force_rotation}")
 
+        # Disable dynamic prefill slicing when tracing rotation variants
+        original_prefill_dynamic_slice = getattr(model.model.config, "prefill_dynamic_slice", False)
+        effective_dynamic_slice = self.prefill_dynamic_slice and not bool(force_rotation)
+        if effective_dynamic_slice != original_prefill_dynamic_slice:
+            model.model.config.prefill_dynamic_slice = effective_dynamic_slice
+
         total_layers = model.config.num_hidden_layers
         if total_chunks > 1:
             # Balanced distribution: first `rem` chunks get one extra layer
@@ -1228,6 +1452,10 @@ class Gemma3Converter(BaseConverter):
             self.postprocess(num_workers=num_workers)
             mlmodel = self.converted_model
 
+        # Restore original prefill_dynamic_slice
+        if getattr(model.model.config, "prefill_dynamic_slice", None) != original_prefill_dynamic_slice:
+            model.model.config.prefill_dynamic_slice = original_prefill_dynamic_slice
+
         return mlmodel
 
     def convert_part_2_prefill(
@@ -1268,50 +1496,99 @@ class Gemma3Converter(BaseConverter):
         # Determine if this is prefill with rotation
         is_prefill_rotate = force_rotation
 
-        class PrefillWrapper(torch.nn.Module):
-            def __init__(self, model: Gemma3ForCausalLM, start_layer=0, end_layer=None,
-                        is_prefill_rotate=False):
-                super().__init__()
-                self.model = model  # Use Gemma3ForCausalLM as root
-                self.start_layer = start_layer
-                self.end_layer = end_layer
-                self.is_prefill_rotate = is_prefill_rotate
-                self.states = Gemma3Converter.GetTransformerStates(
-                    model, part="2_prefill", prefix="model.model.",
-                    start_layer=start_layer, end_layer=end_layer
-                )
+        use_update_mask = (not force_rotation) and (not self.prefill_dynamic_slice)
 
-            def forward(self, hidden_states, position_ids, causal_mask, current_pos):
-                # RoPE is now retrieved per-layer inside process_layers
-                # force_rotation_mode is read from config inside process_layers
-                out = self.model.model.process_layers(
-                    hidden_states,
-                    position_ids,
-                    causal_mask,
-                    current_pos,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                    IN_PREFILL=True,
-                    IN_PREFILL_ROTATE=self.is_prefill_rotate,
-                )
+        if use_update_mask:
+            class PrefillWrapper(torch.nn.Module):
+                def __init__(self, model: Gemma3ForCausalLM, start_layer=0, end_layer=None,
+                            is_prefill_rotate=False):
+                    super().__init__()
+                    self.model = model  # Use Gemma3ForCausalLM as root
+                    self.start_layer = start_layer
+                    self.end_layer = end_layer
+                    self.is_prefill_rotate = is_prefill_rotate
+                    self.states = Gemma3Converter.GetTransformerStates(
+                        model, part="2_prefill", prefix="model.model.",
+                        start_layer=start_layer, end_layer=end_layer
+                    )
 
-                # CRITICAL: Touch both caches to mark them as "used" for CoreML
-                # Chunks without global layers still need to declare kv_cache_global
-                # but CoreML errors on unused state inputs. This adds 0 to output
-                # but forces CoreML to track both states as used.
-                if hasattr(self.model.model, 'kv_cache_local') and hasattr(self.model.model, 'kv_cache_global'):
-                    dummy_local = self.model.model.kv_cache_local[0, 0, 0, 0] * 0.0
-                    dummy_global = self.model.model.kv_cache_global[0, 0, 0, 0] * 0.0
-                    out = out + (dummy_local + dummy_global).view(1, 1, 1)
+                def forward(self, hidden_states, position_ids, causal_mask, current_pos, update_mask):
+                    # RoPE is now retrieved per-layer inside process_layers
+                    # force_rotation_mode is read from config inside process_layers
+                    out = self.model.model.process_layers(
+                        hidden_states,
+                        position_ids,
+                        causal_mask,
+                        current_pos,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        IN_PREFILL=True,
+                        IN_PREFILL_ROTATE=self.is_prefill_rotate,
+                        update_mask=update_mask,
+                    )
 
-                # Skip normalization for prefill - data not used, only KV cache is updated!
-                # This follows the LLAMA pattern and avoids unnecessary computation
-                if self.end_layer is None or self.end_layer == len(self.model.model.layers):
-                    print("Skipping final normalization for prefill, data not used!")
-                    # Return only first token to minimize memory usage
-                    return out[:, 0:1, :]
+                    # CRITICAL: Touch both caches to mark them as "used" for CoreML
+                    # Chunks without global layers still need to declare kv_cache_global
+                    # but CoreML errors on unused state inputs. This adds 0 to output
+                    # but forces CoreML to track both states as used.
+                    if hasattr(self.model.model, 'kv_cache_local') and hasattr(self.model.model, 'kv_cache_global'):
+                        dummy_local = self.model.model.kv_cache_local[0, 0, 0, 0] * 0.0
+                        dummy_global = self.model.model.kv_cache_global[0, 0, 0, 0] * 0.0
+                        out = out + (dummy_local + dummy_global).view(1, 1, 1)
 
-                return out
+                    # Skip normalization for prefill - data not used, only KV cache is updated!
+                    # This follows the LLAMA pattern and avoids unnecessary computation
+                    if self.end_layer is None or self.end_layer == len(self.model.model.layers):
+                        print("Skipping final normalization for prefill, data not used!")
+                        # Return only first token to minimize memory usage
+                        return out[:, 0:1, :]
+
+                    return out
+        else:
+            class PrefillWrapper(torch.nn.Module):
+                def __init__(self, model: Gemma3ForCausalLM, start_layer=0, end_layer=None,
+                            is_prefill_rotate=False):
+                    super().__init__()
+                    self.model = model  # Use Gemma3ForCausalLM as root
+                    self.start_layer = start_layer
+                    self.end_layer = end_layer
+                    self.is_prefill_rotate = is_prefill_rotate
+                    self.states = Gemma3Converter.GetTransformerStates(
+                        model, part="2_prefill", prefix="model.model.",
+                        start_layer=start_layer, end_layer=end_layer
+                    )
+
+                def forward(self, hidden_states, position_ids, causal_mask, current_pos):
+                    # RoPE is now retrieved per-layer inside process_layers
+                    # force_rotation_mode is read from config inside process_layers
+                    out = self.model.model.process_layers(
+                        hidden_states,
+                        position_ids,
+                        causal_mask,
+                        current_pos,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        IN_PREFILL=True,
+                        IN_PREFILL_ROTATE=self.is_prefill_rotate,
+                    )
+
+                    # CRITICAL: Touch both caches to mark them as "used" for CoreML
+                    # Chunks without global layers still need to declare kv_cache_global
+                    # but CoreML errors on unused state inputs. This adds 0 to output
+                    # but forces CoreML to track both states as used.
+                    if hasattr(self.model.model, 'kv_cache_local') and hasattr(self.model.model, 'kv_cache_global'):
+                        dummy_local = self.model.model.kv_cache_local[0, 0, 0, 0] * 0.0
+                        dummy_global = self.model.model.kv_cache_global[0, 0, 0, 0] * 0.0
+                        out = out + (dummy_local + dummy_global).view(1, 1, 1)
+
+                    # Skip normalization for prefill - data not used, only KV cache is updated!
+                    # This follows the LLAMA pattern and avoids unnecessary computation
+                    if self.end_layer is None or self.end_layer == len(self.model.model.layers):
+                        print("Skipping final normalization for prefill, data not used!")
+                        # Return only first token to minimize memory usage
+                        return out[:, 0:1, :]
+
+                    return out
 
         wrapper = PrefillWrapper(model, start_layer, end_layer, is_prefill_rotate)
         wrapper.eval()
@@ -1334,27 +1611,48 @@ class Gemma3Converter(BaseConverter):
             device=TEST_DEVICE,
         )
         current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
+        update_mask = None
+        if use_update_mask:
+            mask_size = self.attention_size
+            update_mask = torch.zeros(
+                (1, 1, mask_size, self.batch_size),
+                dtype=torch.float16,
+                device=TEST_DEVICE,
+            )
 
-        traced = torch.jit.trace(
-            wrapper, (hidden_states, position_ids, causal_mask, current_pos)
-        )
+        if update_mask is not None:
+            traced = torch.jit.trace(
+                wrapper, (hidden_states, position_ids, causal_mask, current_pos, update_mask)
+            )
+        else:
+            traced = torch.jit.trace(
+                wrapper, (hidden_states, position_ids, causal_mask, current_pos)
+            )
+
+        inputs = [
+            ct.TensorType(
+                name="hidden_states", shape=hidden_states.shape, dtype=np.float16
+            ),
+            ct.TensorType(
+                name="position_ids", shape=position_ids.shape, dtype=np.int32
+            ),
+            ct.TensorType(
+                name="causal_mask", shape=causal_mask.shape, dtype=np.float16
+            ),
+            ct.TensorType(
+                name="current_pos", shape=current_pos.shape, dtype=np.int32
+            ),
+        ]
+        if update_mask is not None:
+            inputs.append(
+                ct.TensorType(
+                    name="update_mask", shape=update_mask.shape, dtype=np.float16
+                )
+            )
 
         mlmodel = ct.convert(
             traced,
-            inputs=[
-                ct.TensorType(
-                    name="hidden_states", shape=hidden_states.shape, dtype=np.float16
-                ),
-                ct.TensorType(
-                    name="position_ids", shape=position_ids.shape, dtype=np.int32
-                ),
-                ct.TensorType(
-                    name="causal_mask", shape=causal_mask.shape, dtype=np.float16
-                ),
-                ct.TensorType(
-                    name="current_pos", shape=current_pos.shape, dtype=np.int32
-                ),
-            ],
+            inputs=inputs,
             outputs=[ct.TensorType(name="output_hidden_states", dtype=np.float16)],
             states=wrapper.states,
             compute_precision=ct.precision.FLOAT16,
@@ -1387,30 +1685,60 @@ class Gemma3Converter(BaseConverter):
         require_coreml()
         print("Converting Gemma3 model for prefill mode...")
 
-        class PrefillWrapper(torch.nn.Module):
-            def __init__(
-                self, model: Gemma3ForCausalLM, context_length: int, batch_size: int
-            ) -> None:
-                super().__init__()
-                self.model = model
-                self.context_length = context_length
-                self.batch_size = batch_size
+        use_update_mask = not self.prefill_dynamic_slice
 
-            def forward(
-                self,
-                hidden_states: torch.Tensor,
-                position_ids: torch.Tensor,
-                causal_mask: torch.Tensor,
-                current_pos: torch.Tensor,
-            ) -> torch.Tensor:
-                # Prefill mode: only process transformer layers, skip embeddings and LM head
-                # This updates KV cache state without generating logits
-                return self.model.forward_prefill(
-                    hidden_states=hidden_states,
-                    position_ids=position_ids,
-                    causal_mask=causal_mask,
-                    current_pos=current_pos,
-                )
+        if use_update_mask:
+            class PrefillWrapper(torch.nn.Module):
+                def __init__(
+                    self, model: Gemma3ForCausalLM, context_length: int, batch_size: int
+                ) -> None:
+                    super().__init__()
+                    self.model = model
+                    self.context_length = context_length
+                    self.batch_size = batch_size
+
+                def forward(
+                    self,
+                    hidden_states: torch.Tensor,
+                    position_ids: torch.Tensor,
+                    causal_mask: torch.Tensor,
+                    current_pos: torch.Tensor,
+                    update_mask: torch.Tensor,
+                ) -> torch.Tensor:
+                    # Prefill mode: only process transformer layers, skip embeddings and LM head
+                    # This updates KV cache state without generating logits
+                    return self.model.forward_prefill(
+                        hidden_states=hidden_states,
+                        position_ids=position_ids,
+                        causal_mask=causal_mask,
+                        current_pos=current_pos,
+                        update_mask=update_mask,
+                    )
+        else:
+            class PrefillWrapper(torch.nn.Module):
+                def __init__(
+                    self, model: Gemma3ForCausalLM, context_length: int, batch_size: int
+                ) -> None:
+                    super().__init__()
+                    self.model = model
+                    self.context_length = context_length
+                    self.batch_size = batch_size
+
+                def forward(
+                    self,
+                    hidden_states: torch.Tensor,
+                    position_ids: torch.Tensor,
+                    causal_mask: torch.Tensor,
+                    current_pos: torch.Tensor,
+                ) -> torch.Tensor:
+                    # Prefill mode: only process transformer layers, skip embeddings and LM head
+                    # This updates KV cache state without generating logits
+                    return self.model.forward_prefill(
+                        hidden_states=hidden_states,
+                        position_ids=position_ids,
+                        causal_mask=causal_mask,
+                        current_pos=current_pos,
+                    )
 
         wrapper = PrefillWrapper(model, self.context_length, self.batch_size)
         wrapper.eval()
@@ -1435,23 +1763,44 @@ class Gemma3Converter(BaseConverter):
         sample_current_pos = torch.zeros(
             (1,), dtype=torch.int32, device=TEST_DEVICE
         )  # [1] - current position
+        sample_update_mask = None
+        if use_update_mask:
+            sample_update_mask = torch.zeros(
+                (1, 1, self.attention_size, self.batch_size),
+                dtype=torch.float16,
+                device=TEST_DEVICE,
+            )  # [1, 1, attention_size, batch_size]
 
         print("Prefill sample inputs created")
         print(f"sample_hidden_states shape: {sample_hidden_states.shape}")
         print(f"sample_position_ids shape: {sample_position_ids.shape}")
         print(f"sample_causal_mask shape: {sample_causal_mask.shape}")
         print(f"sample_current_pos shape: {sample_current_pos.shape}")
+        if sample_update_mask is not None:
+            print(f"sample_update_mask shape: {sample_update_mask.shape}")
 
         print("Starting torch.jit.trace for prefill...")
-        traced = torch.jit.trace(
-            wrapper,
-            (
-                sample_hidden_states,
-                sample_position_ids,
-                sample_causal_mask,
-                sample_current_pos,
-            ),
-        )
+        if sample_update_mask is not None:
+            traced = torch.jit.trace(
+                wrapper,
+                (
+                    sample_hidden_states,
+                    sample_position_ids,
+                    sample_causal_mask,
+                    sample_current_pos,
+                    sample_update_mask,
+                ),
+            )
+        else:
+            traced = torch.jit.trace(
+                wrapper,
+                (
+                    sample_hidden_states,
+                    sample_position_ids,
+                    sample_causal_mask,
+                    sample_current_pos,
+                ),
+            )
         print("torch.jit.trace for prefill completed!")
 
         print("Starting CoreML conversion for prefill...")
@@ -1472,6 +1821,9 @@ class Gemma3Converter(BaseConverter):
                 ct.TensorType(
                     name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
                 ),
+                *( [ct.TensorType(
+                    name="update_mask", shape=sample_update_mask.shape, dtype=np.float16
+                )] if sample_update_mask is not None else [] ),
             ],
             outputs=[
                 ct.TensorType(
@@ -1674,6 +2026,27 @@ def parse_args() -> argparse.Namespace:
         help="Split FFN/prefill into N chunks",
     )
     parser.add_argument(
+        "--chunk-no",
+        type=int,
+        default=None,
+        help="Convert only this chunk number (1-based) for chunked parts",
+    )
+    parser.add_argument(
+        "--dynamic-prefill-slice",
+        action="store_true",
+        help="Use dynamic slicing for prefill KV writes (default ON).",
+    )
+    parser.add_argument(
+        "--static-prefill-slice",
+        action="store_true",
+        help="Disable dynamic slicing for prefill KV writes (uses update_mask where applicable).",
+    )
+    parser.add_argument(
+        "--single-cache",
+        action="store_true",
+        help="Use a single unified KV cache instead of split local/global caches (Gemma3 only).",
+    )
+    parser.add_argument(
         "--part",
         type=str,
         choices=["1", "2", "2_rotate", "2_prefill", "2_prefill_rotate", "3", "all", "full", "prefill", "embeddings", "monolithic", "monolithic_rotate", "monolithic_prefill", "monolithic_prefill_rotate"],
@@ -1862,6 +2235,9 @@ def test_conversion(
     decorate: bool = False,
     fp16_scale: Optional[str] = None,
     clamp: Optional[float] = None,
+    prefill_dynamic_slice: bool = False,
+    single_cache: bool = False,
+    chunk_no: Optional[int] = None,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
     """Convert a Gemma3 model and save the result.
 
@@ -1929,6 +2305,17 @@ def test_conversion(
         f"test_conversion called with model_path={model_path}, prefix={prefix}, part={part}"
     )
 
+    if single_cache and part in [
+        "2_rotate",
+        "2_prefill_rotate",
+        "monolithic_rotate",
+        "monolithic_prefill_rotate",
+    ]:
+        raise ValueError(
+            "single-cache is not supported with rotate/prefill_rotate conversions. "
+            "Use context_length <= sliding_window or disable rotation conversions."
+        )
+
     # Track if FP16 scaling was applied (to exclude scaled tensors from LUT quantization)
     fp16_scaled = False
 
@@ -1972,11 +2359,22 @@ def test_conversion(
             f"Updated config: context_length={config.context_length}, state_length={config.state_length}, attention_size={config.attention_size}, sliding_window={config.sliding_window}, batch_size={config.batch_size}"
         )
 
+        if single_cache and context_length > config.sliding_window:
+            print(
+                f"WARNING: single-cache with context_length {context_length} > sliding_window {config.sliding_window}. "
+                "Rotation is unsupported in unified cache mode; use <= sliding_window or split cache."
+            )
+
         # Enable residual clamping if specified (alternative to FP16 scaling)
         if clamp is not None:
             config.enable_residual_clamp = True
             config.residual_clamp_value = clamp
             print(f"Enabling residual clamping at {clamp}")
+
+        if single_cache:
+            config.single_cache = True
+            config.use_split_cache = False
+            print("Single-cache mode: using unified KV cache (split cache disabled)")
 
         print("Creating model...")
         model = Gemma3ForCausalLM(config, enable_coreml=True)
@@ -2008,10 +2406,11 @@ def test_conversion(
         argmax_in_model=argmax_in_model,
         attention_size=attention_size,
         fp16_scaled=fp16_scaled,  # Exclude scaled tensors from LUT quantization
+        prefill_dynamic_slice=prefill_dynamic_slice,
     )
 
     print("Starting conversion...")
-    mlmodel = converter.convert(part=part)
+    mlmodel = converter.convert(part=part, chunk_no=chunk_no)
     print("Conversion completed!")
 
     print(f"Creating output directory: {output_dir}")
@@ -2024,6 +2423,9 @@ def test_conversion(
 
     effective_attention_size = attention_size if attention_size is not None else context_length
     for i, m in enumerate(models):
+        chunk_no_value = None
+        if part in ["2", "2_prefill"]:
+            chunk_no_value = chunk_no if chunk_no is not None else (i + 1)
         AddMetadata(
             m,
             {
@@ -2031,11 +2433,12 @@ def test_conversion(
                 "batch_size": batch_size if part in ["2_prefill", "prefill", "monolithic_prefill"] else None,
                 "lut_bits": lut_bits,
                 "num_chunks": num_chunks if part in ["2", "2_prefill"] else None,
-                "chunk_no": i + 1 if part in ["2", "2_prefill"] else None,
+                "chunk_no": chunk_no_value,
                 "split_part": (
                     ModelPart.FULL.value if part in ["full", "all", "123"] else part
                 ),
                 "attention_size": effective_attention_size,
+                "single_cache": single_cache,
             },
         )
         fname = f"{prefix}"
@@ -2092,7 +2495,8 @@ def test_conversion(
             fname += f"_{base}"
             if lut_bits is not None:
                 fname += f"_lut{lut_bits}"
-            fname += f"_chunk_{i+1:02d}of{num_chunks:02d}"
+            chunk_id = chunk_no if chunk_no is not None else (i + 1)
+            fname += f"_chunk_{chunk_id:02d}of{num_chunks:02d}"
         if part in ["full", "all", "123"]:
             fname += ""
         if part not in ["2", "2_rotate", "2_prefill", "2_prefill_rotate"]:
@@ -2113,6 +2517,15 @@ def main() -> None:
     print("Starting gemma3_converter main()...")
     args = parse_args()
     print(f"Parsed args: {args}")
+
+    # Dynamic prefill slice defaults to ON; allow --static-prefill-slice to disable.
+    prefill_dynamic_slice = True
+    if getattr(args, "static_prefill_slice", False):
+        prefill_dynamic_slice = False
+    elif getattr(args, "dynamic_prefill_slice", False):
+        prefill_dynamic_slice = True
+
+    single_cache = bool(getattr(args, "single_cache", False))
 
     model_path = args.model if args.model else "google/gemma-3n-E2B-it"
 
@@ -2159,6 +2572,9 @@ def main() -> None:
             decorate=args.decorate,
             fp16_scale=args.fp16_scale,
             clamp=args.clamp,
+            prefill_dynamic_slice=prefill_dynamic_slice,
+            single_cache=single_cache,
+            chunk_no=args.chunk_no,
         )
         print(f"Conversion completed successfully! Result: {type(result)}")
     except Exception as e:  # pragma: no cover - CLI tool

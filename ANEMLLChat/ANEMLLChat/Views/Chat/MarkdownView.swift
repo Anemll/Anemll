@@ -115,6 +115,12 @@ struct MarkdownView: View {
                 continue
             }
 
+            // Skip orphaned markdown markers (e.g., just "**" on a line)
+            if trimmed == "**" || trimmed == "*" || trimmed == "__" || trimmed == "_" {
+                i += 1
+                continue
+            }
+
             // Paragraph - collect consecutive non-special lines
             var paragraphLines: [String] = []
             while i < lines.count {

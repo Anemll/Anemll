@@ -96,6 +96,14 @@ if [ "$SKIP_CHECK" = false ]; then
         PIP_CMD="uv pip"
     fi
 
+    # If no pip/uv in PATH but coremltools is already importable (e.g. uv-managed env), allow it
+    if [ -z "$PIP_CMD" ]; then
+        if python -c "import coremltools" 2>/dev/null; then
+            PIP_CMD="python -m pip"
+            echo "Note: pip not in PATH but coremltools is importable (e.g. uv); continuing."
+        fi
+    fi
+
     if [ -z "$PIP_CMD" ]; then
         echo >&2 "pip is required but it's not installed. Aborting. (Issue #2)"
         echo "If using uv, try: uv pip install coremltools"

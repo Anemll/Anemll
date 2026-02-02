@@ -357,6 +357,10 @@ def load_metadata(model,args):
         metadata['batch_size'] = int(meta.get('com.anemll.batch_size', 64))
         metadata['lut_bits'] = int(meta.get('com.anemll.lut_bits', 0))
         metadata['num_chunks'] = int(meta.get('com.anemll.num_chunks', 1))
+        if getattr(args, 'update_mask_prefill', None) is not None:
+            metadata['update_mask_prefill'] = bool(args.update_mask_prefill)
+        if getattr(args, 'prefill_dynamic_slice', None) is not None:
+            metadata['prefill_dynamic_slice'] = bool(args.prefill_dynamic_slice)
         
         if not args.eval:
             print("\nExtracted Parameters:")
@@ -421,6 +425,8 @@ def load_metadata(model,args):
         metadata['batch_size'] = getattr(args, 'batch_size', 64)
         metadata['lut_bits'] = 4
         metadata['num_chunks'] = getattr(args, 'num_chunks', 4)
+        metadata['update_mask_prefill'] = bool(getattr(args, 'update_mask_prefill', False))
+        metadata['prefill_dynamic_slice'] = bool(getattr(args, 'prefill_dynamic_slice', False))
         if not args.eval:
             print("\nUsing parameters:")
             print(f"  Context Length: {metadata['context_length']}")
@@ -438,6 +444,10 @@ def load_metadata(model,args):
         metadata['num_chunks'] = args.num_chunks
         if not args.eval:
             print(f"\nOverriding num chunks from args: {args.num_chunks}")
+    if getattr(args, 'update_mask_prefill', None) is not None:
+        metadata['update_mask_prefill'] = bool(args.update_mask_prefill)
+    if getattr(args, 'prefill_dynamic_slice', None) is not None:
+        metadata['prefill_dynamic_slice'] = bool(args.prefill_dynamic_slice)
     
     return metadata
 
@@ -824,6 +834,39 @@ def make_causal_mask(length, start):
     mask[:, :, col_indices <= (row_indices + start)] = 0
     return mask
 
+def make_update_mask(mask_len, batch_pos, batch_size):
+    """Create update mask for batched KV writes."""
+    update_mask = np.zeros((1, 1, mask_len, batch_size), dtype=np.float16)
+    for i in range(batch_size):
+        pos = batch_pos + i
+        if pos < mask_len:
+            update_mask[0, 0, pos, i] = 1.0
+    return update_mask
+
+def _predict_with_optional_update_mask(model, inputs, state, update_mask):
+    if update_mask is None:
+        return model.predict(inputs, state)
+
+    supports = getattr(model, "_supports_update_mask", None)
+    if supports is False:
+        return model.predict(inputs, state)
+
+    inputs_with_mask = dict(inputs)
+    inputs_with_mask["update_mask"] = update_mask
+
+    if supports is True:
+        return model.predict(inputs_with_mask, state)
+
+    try:
+        output = model.predict(inputs_with_mask, state)
+        model._supports_update_mask = True
+        return output
+    except RuntimeError as e:
+        if "update_mask" in str(e):
+            model._supports_update_mask = False
+            return model.predict(inputs, state)
+        raise
+
 def initialize_causal_mask(context_length, eval_mode=False):
     """Initialize causal mask for transformer attention."""
     causal_mask = make_causal_mask(context_length, 0)
@@ -832,7 +875,8 @@ def initialize_causal_mask(context_length, eval_mode=False):
         print(f"\nInitialized causal mask for context length {context_length}")
     return causal_mask
 
-def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None, causal_mask=None, sliding_window=None):
+def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None,
+                causal_mask=None, sliding_window=None, single_token_mode=False, use_update_mask=True):
     """Run prefill on the input sequence.
 
     For Gemma3 with 4-function models:
@@ -851,53 +895,77 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
     if not has_rotation or sliding_window is None:
         sliding_window = context_length  # Effectively disables rotation mode
 
-    # Process in batches
+    # Process in full batches only with prefill
     batch_pos = 0
+    mask_len = max(context_length, sliding_window or 0)
+    if not single_token_mode:
+        while batch_pos + batch_size <= context_pos:
+            batch_end = batch_pos + batch_size
+
+            # Get current batch (exactly batch_size tokens)
+            batch_input = input_ids[:, batch_pos:batch_end]
+
+            # Generate position IDs for full batch size
+            position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+            batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
+
+            # Run embeddings
+            hidden_states = torch.from_numpy(
+                embed_model.predict({
+                    'input_ids': batch_input.numpy().astype(np.int32)
+                })['hidden_states']
+            )
+
+            # Determine which prefill function to use based on position
+            prefill_func_name = 'prefill_rotate' if batch_pos >= sliding_window and has_rotation else 'prefill'
+
+            # Run through FFN chunks with state
+            # Handle per-chunk states (list) or unified state (single object)
+            for chunk_idx, ffn_model in enumerate(ffn_models):
+                if isinstance(ffn_model, dict):
+                    inputs = {
+                        'hidden_states': hidden_states.numpy().astype(np.float16),  # [1, 64, hidden_size]
+                        'position_ids': position_ids.numpy().astype(np.int32),    # [64]
+                        'causal_mask': batch_causal_mask.numpy().astype(np.float16), # [1, 1, 64, context_length]
+                        'current_pos': np.array([batch_pos], dtype=np.int32)  # [1]
+                    }
+                    # Use per-chunk state if state is a list, otherwise use unified state
+                    chunk_state = state[chunk_idx] if isinstance(state, list) else state
+                    update_mask = make_update_mask(mask_len, batch_pos, batch_size) if use_update_mask else None
+                    output = _predict_with_optional_update_mask(ffn_model[prefill_func_name], inputs, chunk_state, update_mask)
+                    hidden_states = torch.from_numpy(output['output_hidden_states'])
+
+            batch_pos = batch_end
+
+    # Process remaining tokens one-at-a-time using infer (avoids padding issues)
     while batch_pos < context_pos:
-        batch_end = min(batch_pos + batch_size, context_pos)
-        current_batch_size = batch_end - batch_pos
+        token = input_ids[:, batch_pos:batch_pos + 1]
+        position_ids = torch.tensor([batch_pos], dtype=torch.int32)
+        single_causal_mask = causal_mask[:, :, batch_pos:batch_pos + 1, :]
 
-        # Get current batch
-        batch_input = input_ids[:, batch_pos:batch_end]
-
-        # Always pad to full batch size for prefill
-        batch_input = F.pad(
-            batch_input,
-            (0, batch_size - current_batch_size),
-            value=0
-        )
-
-        # Generate position IDs for full batch size
-        position_ids = torch.arange(batch_pos, batch_pos+batch_size, dtype=torch.int32)  # Changed: Always use full batch size
-        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos+batch_size, :]  # Changed: Use full batch size
+        # Determine which infer function to use
+        infer_func_name = 'infer_rotate' if (batch_pos >= sliding_window and has_rotation) else 'infer'
 
         # Run embeddings
         hidden_states = torch.from_numpy(
             embed_model.predict({
-                'input_ids': batch_input.numpy().astype(np.int32)
+                'input_ids': token.numpy().astype(np.int32)
             })['hidden_states']
         )
 
-        # Determine which prefill function to use based on position
-        # Use prefill_rotate for positions >= sliding_window
-        prefill_func_name = 'prefill_rotate' if batch_pos >= sliding_window and has_rotation else 'prefill'
-
-        # Run through FFN chunks with state
-        # Handle per-chunk states (list) or unified state (single object)
         for chunk_idx, ffn_model in enumerate(ffn_models):
             if isinstance(ffn_model, dict):
                 inputs = {
-                    'hidden_states': hidden_states.numpy().astype(np.float16),  # [1, 64, hidden_size]
-                    'position_ids': position_ids.numpy().astype(np.int32),    # [64]
-                    'causal_mask': batch_causal_mask.numpy().astype(np.float16), # [1, 1, 64, context_length]
-                    'current_pos': np.array([batch_pos], dtype=np.int32)  # [1]
+                    'hidden_states': hidden_states.numpy().astype(np.float16),
+                    'position_ids': position_ids.numpy().astype(np.int32),
+                    'causal_mask': single_causal_mask.numpy().astype(np.float16),
+                    'current_pos': np.array([batch_pos], dtype=np.int32)
                 }
-                # Use per-chunk state if state is a list, otherwise use unified state
                 chunk_state = state[chunk_idx] if isinstance(state, list) else state
-                output = ffn_model[prefill_func_name].predict(inputs, chunk_state)
+                output = ffn_model[infer_func_name].predict(inputs, chunk_state)
                 hidden_states = torch.from_numpy(output['output_hidden_states'])
 
-        batch_pos = batch_end
+        batch_pos += 1
 
     return torch.tensor([context_pos], dtype=torch.int32)
 
@@ -1129,10 +1197,17 @@ def create_unified_state(ffn_models, context_length, eval_mode=False, metadata=N
 
         return states
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False, no_think=False):
     """Interactive chat loop."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
+    update_mask_prefill = metadata.get('update_mask_prefill', False) if metadata else False
+    prefill_dynamic_slice = metadata.get('prefill_dynamic_slice', False) if metadata else False
+    single_token_mode = False
+    if not (update_mask_prefill or prefill_dynamic_slice):
+        single_token_mode = True
+        if not warmup and not eval_mode:
+            print("No update_mask_prefill or prefill_dynamic_slice; forcing single-token prefill for compatibility.")
     
     if not warmup and not eval_mode:
         print(f"\nUsing context length: {context_length}")
@@ -1140,11 +1215,12 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
         print("Type your message and press Enter to chat.")
     
     # Check if tokenizer has chat template and if it works
+    template_kwargs = {"enable_thinking": False} if no_think else {}
     has_chat_template = False
     try:
         # Test if chat template works
         test_messages = [{"role": "user", "content": "test"}]
-        tokenizer.apply_chat_template(test_messages, return_tensors="pt")
+        tokenizer.apply_chat_template(test_messages, return_tensors="pt", **template_kwargs)
         has_chat_template = True
         if not warmup and not eval_mode:
             print("\nUsing chat template for prompts")
@@ -1190,7 +1266,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 input_ids = tokenizer.apply_chat_template(
                     messages,
                     return_tensors="pt",
-                    add_generation_prompt=True
+                    add_generation_prompt=True,
+                    **template_kwargs
                 ).to(torch.int32)
             else:
                 # Manual formatting for Llama models without chat template
@@ -1233,7 +1310,9 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     batch_size,
                     state,
                     causal_mask,
-                    sliding_window
+                    sliding_window,
+                    single_token_mode=single_token_mode,
+                    use_update_mask=update_mask_prefill,
                 )
                 
                 # Calculate prefill timing
@@ -1384,6 +1463,8 @@ def parse_args():
     # Add no-template flag  
     parser.add_argument('--no-template', action='store_true',
                        help='Prefill the question itself and start inference directly without chat template')
+    parser.add_argument('--no-think', action='store_true',
+                       help='Disable thinking mode in chat templates (e.g., Qwen enable_thinking)')
     
     # Add eval mode flag
     parser.add_argument('--eval', action='store_true',
@@ -1460,6 +1541,9 @@ def parse_args():
 
                 # Check for argmax_in_model flag
                 args.argmax_in_model = params.get('argmax_in_model', False)
+                # Prefill behavior flags
+                args.update_mask_prefill = params.get('update_mask_prefill', False)
+                args.prefill_dynamic_slice = params.get('prefill_dynamic_slice', False)
 
                 # Set tokenizer path
                 if not args.tokenizer:
@@ -1561,6 +1645,9 @@ def parse_args():
 
                 # Check for argmax_in_model flag (for chunked models)
                 args.argmax_in_model = params.get('argmax_in_model', False)
+                # Prefill behavior flags
+                args.update_mask_prefill = params.get('update_mask_prefill', False)
+                args.prefill_dynamic_slice = params.get('prefill_dynamic_slice', False)
 
                 if not args.eval:
                     print(f"\nLoaded parameters from {args.meta}:")
@@ -1671,41 +1758,59 @@ def load_monolithic_model(args, metadata):
     return infer_model, infer_rotate_model, prefill_model, prefill_rotate_model, metadata
 
 
-def run_monolithic_prefill(model, input_ids, context_pos, context_length, batch_size, state, causal_mask):
+def run_monolithic_prefill(model, input_ids, context_pos, context_length, batch_size, state, causal_mask,
+                           infer_model=None, single_token_mode=False, mask_len=None, use_update_mask=True):
     """Run prefill on monolithic model."""
     batch_pos = 0
+    if mask_len is None:
+        mask_len = context_length
+
+    if not single_token_mode:
+        while batch_pos + batch_size <= context_pos:
+            batch_end = batch_pos + batch_size
+
+            # Get current batch
+            batch_input = input_ids[:, batch_pos:batch_end]
+
+            # Generate position IDs for full batch size
+            position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+            batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
+
+            # Run monolithic prefill (input_ids -> logits directly)
+            inputs = {
+                'input_ids': batch_input.numpy().astype(np.int32),
+                'position_ids': position_ids.numpy().astype(np.int32),
+                'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+                'current_pos': np.array([batch_pos], dtype=np.int32)
+            }
+            update_mask = make_update_mask(mask_len, batch_pos, batch_size) if use_update_mask else None
+            _predict_with_optional_update_mask(model, inputs, state, update_mask)
+
+            batch_pos = batch_end
+
+    # Process remaining tokens one-at-a-time using infer
+    single_model = infer_model if infer_model is not None else model
     while batch_pos < context_pos:
-        batch_end = min(batch_pos + batch_size, context_pos)
-        current_batch_size = batch_end - batch_pos
+        token = input_ids[:, batch_pos:batch_pos + 1]
+        position_ids = torch.tensor([batch_pos], dtype=torch.int32)
+        single_causal_mask = causal_mask[:, :, batch_pos:batch_pos + 1, :]
 
-        # Get current batch
-        batch_input = input_ids[:, batch_pos:batch_end]
-
-        # Pad to full batch size
-        batch_input = F.pad(batch_input, (0, batch_size - current_batch_size), value=0)
-
-        # Generate position IDs for full batch size
-        position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
-        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
-
-        # Run monolithic prefill (input_ids -> logits directly)
         inputs = {
-            'input_ids': batch_input.numpy().astype(np.int32),
+            'input_ids': token.numpy().astype(np.int32),
             'position_ids': position_ids.numpy().astype(np.int32),
-            'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+            'causal_mask': single_causal_mask.numpy().astype(np.float16),
             'current_pos': np.array([batch_pos], dtype=np.int32)
         }
-        output = model.predict(inputs, state)
-        # We don't need the output logits for prefill, just updating KV cache
-
-        batch_pos = batch_end
+        single_model.predict(inputs, state)
+        batch_pos += 1
 
     return torch.tensor([context_pos], dtype=torch.int32)
 
 
 def run_monolithic_prefill_with_rotation(prefill_model, prefill_rotate_model, input_ids, context_pos,
                                          context_length, batch_size, state, causal_mask, sliding_window,
-                                         infer_rotate_model=None):
+                                         infer_rotate_model=None, infer_model=None,
+                                         single_token_mode=False, mask_len=None, use_update_mask=True):
     """Run prefill with rotation support for long contexts.
 
     When context_pos > sliding_window, this splits the prefill into two phases:
@@ -1717,47 +1822,55 @@ def run_monolithic_prefill_with_rotation(prefill_model, prefill_rotate_model, in
     # If no rotation model or short context, use standard prefill
     if prefill_rotate_model is None or context_pos <= sliding_window:
         return run_monolithic_prefill(prefill_model, input_ids, context_pos, context_length,
-                                      batch_size, state, causal_mask)
+                                      batch_size, state, causal_mask,
+                                      infer_model=infer_model,
+                                      single_token_mode=single_token_mode,
+                                      mask_len=mask_len,
+                                      use_update_mask=use_update_mask)
 
     # Phase 1: Fill mode for positions 0 to sliding_window-1
     batch_pos = 0
-    while batch_pos < sliding_window:
-        batch_end = min(batch_pos + batch_size, sliding_window)
-        current_batch_size = batch_end - batch_pos
+    if mask_len is None:
+        mask_len = max(context_length, sliding_window)
+    if not single_token_mode:
+        while batch_pos + batch_size <= sliding_window:
+            batch_end = batch_pos + batch_size
 
-        batch_input = input_ids[:, batch_pos:batch_end]
-        batch_input = F.pad(batch_input, (0, batch_size - current_batch_size), value=0)
+            batch_input = input_ids[:, batch_pos:batch_end]
 
-        position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
-        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
+            position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+            batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
 
-        inputs = {
-            'input_ids': batch_input.numpy().astype(np.int32),
-            'position_ids': position_ids.numpy().astype(np.int32),
-            'causal_mask': batch_causal_mask.numpy().astype(np.float16),
-            'current_pos': np.array([batch_pos], dtype=np.int32)
-        }
-        prefill_model.predict(inputs, state)
-        batch_pos = batch_end
+            inputs = {
+                'input_ids': batch_input.numpy().astype(np.int32),
+                'position_ids': position_ids.numpy().astype(np.int32),
+                'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+                'current_pos': np.array([batch_pos], dtype=np.int32)
+            }
+            update_mask = make_update_mask(mask_len, batch_pos, batch_size) if use_update_mask else None
+            _predict_with_optional_update_mask(prefill_model, inputs, state, update_mask)
+            batch_pos = batch_end
 
     # Phase 2: Rotation mode for positions sliding_window to context_pos-1
     batch_pos = sliding_window
     # Process full batches with prefill_rotate
-    while batch_pos + batch_size <= context_pos:
-        batch_end = batch_pos + batch_size
+    if not single_token_mode:
+        while batch_pos + batch_size <= context_pos:
+            batch_end = batch_pos + batch_size
 
-        batch_input = input_ids[:, batch_pos:batch_end]
-        position_ids = torch.arange(batch_pos, batch_end, dtype=torch.int32)
-        batch_causal_mask = causal_mask[:, :, batch_pos:batch_end, :]
+            batch_input = input_ids[:, batch_pos:batch_end]
+            position_ids = torch.arange(batch_pos, batch_end, dtype=torch.int32)
+            batch_causal_mask = causal_mask[:, :, batch_pos:batch_end, :]
 
-        inputs = {
-            'input_ids': batch_input.numpy().astype(np.int32),
-            'position_ids': position_ids.numpy().astype(np.int32),
-            'causal_mask': batch_causal_mask.numpy().astype(np.float16),
-            'current_pos': np.array([batch_pos], dtype=np.int32)
-        }
-        prefill_rotate_model.predict(inputs, state)
-        batch_pos = batch_end
+            inputs = {
+                'input_ids': batch_input.numpy().astype(np.int32),
+                'position_ids': position_ids.numpy().astype(np.int32),
+                'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+                'current_pos': np.array([batch_pos], dtype=np.int32)
+            }
+            update_mask = make_update_mask(mask_len, batch_pos, batch_size) if use_update_mask else None
+            _predict_with_optional_update_mask(prefill_rotate_model, inputs, state, update_mask)
+            batch_pos = batch_end
 
     # Handle remainder tokens without padding (token-by-token rotation)
     if batch_pos < context_pos:
@@ -1775,23 +1888,23 @@ def run_monolithic_prefill_with_rotation(prefill_model, prefill_rotate_model, in
                 }
                 infer_rotate_model.predict(inputs, state)
                 batch_pos += 1
+        elif infer_model is not None:
+            while batch_pos < context_pos:
+                token = input_ids[:, batch_pos:batch_pos + 1]
+                position_ids = torch.tensor([batch_pos], dtype=torch.int32)
+                single_causal_mask = causal_mask[:, :, batch_pos:batch_pos + 1, :]
+
+                inputs = {
+                    'input_ids': token.numpy().astype(np.int32),
+                    'position_ids': position_ids.numpy().astype(np.int32),
+                    'causal_mask': single_causal_mask.numpy().astype(np.float16),
+                    'current_pos': position_ids.numpy().astype(np.int32)
+                }
+                infer_model.predict(inputs, state)
+                batch_pos += 1
         else:
-            # Fallback to padded batch if infer_rotate is unavailable
-            batch_end = context_pos
-            current_batch_size = batch_end - batch_pos
-            batch_input = input_ids[:, batch_pos:batch_end]
-            batch_input = F.pad(batch_input, (0, batch_size - current_batch_size), value=0)
-
-            position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
-            batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
-
-            inputs = {
-                'input_ids': batch_input.numpy().astype(np.int32),
-                'position_ids': position_ids.numpy().astype(np.int32),
-                'causal_mask': batch_causal_mask.numpy().astype(np.float16),
-                'current_pos': np.array([batch_pos], dtype=np.int32)
-            }
-            prefill_rotate_model.predict(inputs, state)
+            # Fallback: do nothing special if no infer model is available
+            pass
 
     return torch.tensor([context_pos], dtype=torch.int32)
 
@@ -1902,7 +2015,8 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
 
 def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state, causal_mask=None,
                          auto_prompt=None, warmup=False, save_file=None, max_tokens=None,
-                         no_template=False, eval_mode=False, infer_rotate_model=None, prefill_rotate_model=None):
+                         no_template=False, eval_mode=False, infer_rotate_model=None, prefill_rotate_model=None,
+                         no_think=False):
     """Chat loop for monolithic models.
 
     Args:
@@ -1927,6 +2041,13 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
     sliding_window = metadata.get('sliding_window', 512)  # For switching between infer modes
+    mask_len = max(metadata.get('state_length', context_length), sliding_window)
+    update_mask_prefill = metadata.get('update_mask_prefill', False)
+    single_token_mode = False
+    if not update_mask_prefill:
+        single_token_mode = True
+        if not eval_mode and not warmup:
+            print("update_mask_prefill not set; forcing single-token prefill for compatibility.")
 
     if not warmup and not eval_mode:
         print(f"\nUsing context length: {context_length}")
@@ -1937,10 +2058,11 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
         print("\nStarting chat session. Press Ctrl+D to exit.")
 
     # Check chat template
+    template_kwargs = {"enable_thinking": False} if no_think else {}
     has_chat_template = False
     try:
         test_messages = [{"role": "user", "content": "test"}]
-        tokenizer.apply_chat_template(test_messages, return_tensors="pt")
+        tokenizer.apply_chat_template(test_messages, return_tensors="pt", **template_kwargs)
         has_chat_template = True
         if not warmup and not eval_mode:
             print("\nUsing chat template for prompts")
@@ -1974,7 +2096,12 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                 input_ids = tokenizer(user_input, return_tensors="pt", add_special_tokens=True).input_ids.to(torch.int32)
             elif has_chat_template:
                 messages = [{"role": "user", "content": user_input}]
-                input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True).to(torch.int32)
+                input_ids = tokenizer.apply_chat_template(
+                    messages,
+                    return_tensors="pt",
+                    add_generation_prompt=True,
+                    **template_kwargs
+                ).to(torch.int32)
             else:
                 formatted_prompt = f"[INST] {user_input} [/INST]"
                 input_ids = tokenizer(formatted_prompt, return_tensors="pt", add_special_tokens=True).input_ids.to(torch.int32)
@@ -1993,7 +2120,9 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                 # Run prefill with monolithic model (uses rotation for pos >= sliding_window if available)
                 _ = run_monolithic_prefill_with_rotation(
                     prefill_model, prefill_rotate_model, input_ids, context_pos, context_length,
-                    batch_size, state, causal_mask, sliding_window, infer_rotate_model
+                    batch_size, state, causal_mask, sliding_window, infer_rotate_model,
+                    infer_model=infer_model, single_token_mode=single_token_mode, mask_len=mask_len,
+                    use_update_mask=update_mask_prefill
                 )
 
                 prefill_time = time.time() - prefill_start
@@ -2169,7 +2298,8 @@ def main():
                         warmup=True,
                         auto_prompt="who are you?",
                         no_template=args.no_template,
-                        eval_mode=args.eval
+                        eval_mode=args.eval,
+                        no_think=args.no_think
                     )
 
             # Main run
@@ -2187,7 +2317,8 @@ def main():
                 save_file=args.save,
                 max_tokens=args.max_tokens,
                 no_template=args.no_template,
-                eval_mode=args.eval
+                eval_mode=args.eval,
+                no_think=args.no_think
             )
 
         else:
@@ -2264,7 +2395,8 @@ def main():
                         warmup=True,
                         auto_prompt="who are you?",
                         no_template=args.no_template,
-                        eval_mode=args.eval
+                        eval_mode=args.eval,
+                        no_think=args.no_think
                     )
 
             # Main run
@@ -2281,7 +2413,8 @@ def main():
                 save_file=args.save,
                 max_tokens=args.max_tokens,
                 no_template=args.no_template,
-                eval_mode=args.eval
+                eval_mode=args.eval,
+                no_think=args.no_think
             )
         
     except Exception as e:

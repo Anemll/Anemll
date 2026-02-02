@@ -156,7 +156,7 @@ struct ChatView: View {
                         // Use larger threshold (80pt) so chevron hides when "close enough" to bottom
                         let threshold: CGFloat = 80
                         let contentBelow = geometry.contentSize.height > geometry.visibleRect.maxY + threshold
-                        print("[ScrollGeo] contentH=\(Int(geometry.contentSize.height)) visibleMaxY=\(Int(geometry.visibleRect.maxY)) below=\(contentBelow)")
+                        /*print("[ScrollGeo] contentH=\(Int(geometry.contentSize.height)) visibleMaxY=\(Int(geometry.visibleRect.maxY)) below=\(contentBelow)")*/
                         return contentBelow
                     } action: { oldValue, newValue in
                         if oldValue != newValue {
@@ -310,21 +310,21 @@ struct StreamingMessageView: View {
                 .fill(Color.secondary.opacity(0.45))
                 .frame(width: 3)
 
-            HStack(alignment: .bottom, spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
                 if content.isEmpty {
                     // Show thinking indicator when no content yet
                     thinkingDots
                 } else {
-                    // Show streaming text with cursor
-                    Text(content)
-                        .textSelection(.enabled)
-                        .lineSpacing(3)
+                    // Show streaming text with markdown rendering
+                    HStack(alignment: .bottom, spacing: 0) {
+                        MarkdownView(content: content, isUserMessage: false)
 
-                    // Blinking cursor
-                    Text("|")
-                        .fontWeight(.light)
-                        .opacity(cursorVisible ? 1 : 0)
-                        .animation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true), value: cursorVisible)
+                        // Blinking cursor
+                        Text("|")
+                            .fontWeight(.light)
+                            .opacity(cursorVisible ? 1 : 0)
+                            .animation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true), value: cursorVisible)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

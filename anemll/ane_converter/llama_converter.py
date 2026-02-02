@@ -1090,6 +1090,10 @@ def parse_args():
     parser.add_argument('--context-length', type=int, default=512, help='Maximum context length')
     parser.add_argument('--lut', type=str, default=None, help='Use LUT quantization with N bits, optionally specify per_channel as "bits,per_channel" (e.g., "6,4"). Default per_channel is 8')
     parser.add_argument('--chunk', type=int, default=None, help='Split into N chunks')
+    parser.add_argument('--dynamic-prefill-slice', action='store_true',
+                       help='Use dynamic slicing for prefill KV writes (default ON for meta generation; no-op here)')
+    parser.add_argument('--static-prefill-slice', action='store_true',
+                       help='Disable dynamic slicing for prefill KV writes (no-op here)')
     parser.add_argument('--part', type=str,
                        choices=['1', '2', '2_prefill', '3', 'all', 'monolithic', 'monolithic_prefill'],
                        default='all',

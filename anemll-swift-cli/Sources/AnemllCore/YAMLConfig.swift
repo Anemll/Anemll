@@ -25,6 +25,15 @@ public struct YAMLConfig: Sendable {
 
     // Gemma3 sliding window support (for 4-function models with rotation)
     public let slidingWindow: Int?  // nil means no rotation needed, 512 for Gemma3
+
+    // Update mask support for prefill (for proper multi-turn KV cache handling)
+    public let updateMaskPrefill: Bool  // If true, prefill expects update_mask input
+
+    // Dynamic slice prefill support (alternative to update_mask for batch prefill)
+    public let prefillDynamicSlice: Bool  // If true, model supports dynamic slice prefill
+
+    // Model prefix for template auto-detection
+    public let modelPrefix: String
     
     public init(from yamlString: String) throws {
         // Load YAML
@@ -65,6 +74,15 @@ public struct YAMLConfig: Sendable {
 
         // Sliding window support for Gemma3
         self.slidingWindow = yaml["sliding_window"] as? Int
+
+        // Update mask prefill support
+        self.updateMaskPrefill = yaml["update_mask_prefill"] as? Bool ?? false
+
+        // Dynamic slice prefill support
+        self.prefillDynamicSlice = yaml["prefill_dynamic_slice"] as? Bool ?? false
+
+        // Model prefix for template auto-detection
+        self.modelPrefix = yaml["model_prefix"] as? String ?? "llama"
 
         // Get the ffn_path
         let rawFFNPath = yaml["ffn_path"] as? String ?? ""
@@ -235,6 +253,18 @@ public struct YAMLConfig: Sendable {
                 slidingWindow = nil
             }
 
+            // Check for update_mask_prefill flag (for proper multi-turn KV cache handling)
+            let updateMaskPrefill = params["update_mask_prefill"] as? Bool ?? false
+            if updateMaskPrefill {
+                print("Update mask prefill enabled")
+            }
+
+            // Check for prefill_dynamic_slice flag (alternative batch prefill support)
+            let prefillDynamicSlice = params["prefill_dynamic_slice"] as? Bool ?? false
+            if prefillDynamicSlice {
+                print("Prefill dynamic slice enabled")
+            }
+
             // Build monolithic model path if applicable
             let monolithicModelPath: String?
             if isMonolithic {
@@ -283,7 +313,9 @@ public struct YAMLConfig: Sendable {
                 "lmhead_path": lmheadPath,
                 "split_lm_head": splitLMHead,
                 "is_monolithic": isMonolithic,
-                "argmax_in_model": argmaxInModel
+                "argmax_in_model": argmaxInModel,
+                "update_mask_prefill": updateMaskPrefill,
+                "prefill_dynamic_slice": prefillDynamicSlice
             ]
             if let monolithicPath = monolithicModelPath {
                 configDict["monolithic_model_path"] = monolithicPath

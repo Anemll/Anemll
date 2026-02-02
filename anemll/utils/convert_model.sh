@@ -57,6 +57,10 @@ ARGMAX_IN_MODEL=false
 SPLIT_ROTATE=false
 FP16_SCALE=""  # FP16 residual scaling for Gemma3 models
 CLAMP=""  # Runtime residual clamping for FP16 overflow prevention
+DYNAMIC_PREFILL_SLICE=true
+STATIC_PREFILL_SLICE=false
+SINGLE_CACHE=false
+CHUNK_NO=""
 
 # Default converter; may be overridden after parsing config.json
 CONVERTER="python3 -m anemll.ane_converter.llama_converter"
@@ -78,6 +82,10 @@ print_usage() {
     echo "                  Use 'bits,0' or 'bits,tensor' for per-tensor quantization"
     echo "                  Default per_channel is 8 if not specified"
     echo "  --lut3          LUT bits for LM head (default: 6)"
+    echo "  --dynamic-prefill-slice  Use dynamic slicing for prefill KV writes (default ON)"
+    echo "  --static-prefill-slice   Disable dynamic slicing for prefill KV writes"
+    echo "  --single-cache           Use unified KV cache (Gemma3 only; disables rotate)"
+    echo "  --chunk-no      Convert only this chunk number (1-based) for chunked parts"
     echo "                  Format: 'bits' or 'bits,per_channel' (e.g., '6' or '6,4')"
     echo "                  Use 'bits,0' or 'bits,tensor' for per-tensor quantization"
     echo "                  Default per_channel is 8 if not specified"
@@ -181,6 +189,23 @@ while [[ $# -gt 0 ]]; do
             ;;
         --clamp)
             CLAMP="$2"
+            shift 2
+            ;;
+        --dynamic-prefill-slice)
+            DYNAMIC_PREFILL_SLICE=true
+            shift
+            ;;
+        --static-prefill-slice)
+            DYNAMIC_PREFILL_SLICE=false
+            STATIC_PREFILL_SLICE=true
+            shift
+            ;;
+        --single-cache)
+            SINGLE_CACHE=true
+            shift
+            ;;
+        --chunk-no)
+            CHUNK_NO="$2"
             shift 2
             ;;
         *)
@@ -440,12 +465,34 @@ if [ "$ARGMAX_IN_MODEL" = true ]; then
     ARGMAX_PARAM="--argmax"
 fi
 
+# Dynamic prefill slice (default ON)
+DYNAMIC_PREFILL_SLICE_PARAM=""
+if [ "$STATIC_PREFILL_SLICE" = true ]; then
+    DYNAMIC_PREFILL_SLICE_PARAM="--static-prefill-slice"
+elif [ "$DYNAMIC_PREFILL_SLICE" = true ]; then
+    DYNAMIC_PREFILL_SLICE_PARAM="--dynamic-prefill-slice"
+fi
+
+SINGLE_CACHE_PARAM=""
+if [ "$SINGLE_CACHE" = true ]; then
+    if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
+        SINGLE_CACHE_PARAM="--single-cache"
+    else
+        echo "Warning: --single-cache is only supported for Gemma3; ignoring."
+    fi
+fi
+CHUNK_NO_PARAM=""
+if [ -n "$CHUNK_NO" ]; then
+    CHUNK_NO_PARAM="--chunk-no $CHUNK_NO"
+fi
+
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
     run_step 2 "Converting LM Head" "$CONVERTER \
         --part 3 \
         $LUT3_PARAM \
         $ARGMAX_PARAM \
         $FP16_SCALE_PARAM $CLAMP_PARAM \
+        $SINGLE_CACHE_PARAM \
         --context-length $CONTEXT_LENGTH \
         --context-length $CONTEXT_LENGTH \
         --prefix \"$PREFIX\" \
@@ -466,6 +513,8 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "3" ]; then
         --part 2 \
         $LUT2_PARAM \
         $FP16_SCALE_PARAM $CLAMP_PARAM \
+        $SINGLE_CACHE_PARAM \
+        $CHUNK_NO_PARAM \
         --chunk $NUM_CHUNKS \
         --context-length $CONTEXT_LENGTH \
         --batch-size $BATCH_SIZE \
@@ -480,7 +529,10 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "4" ]; then
     run_step 4 "Converting Prefill" "$CONVERTER \
         --part 2_prefill \
         $LUT2_PARAM \
+        $DYNAMIC_PREFILL_SLICE_PARAM \
         $FP16_SCALE_PARAM $CLAMP_PARAM \
+        $SINGLE_CACHE_PARAM \
+        $CHUNK_NO_PARAM \
         --chunk $NUM_CHUNKS \
         --context-length $CONTEXT_LENGTH \
         --batch-size $BATCH_SIZE \
@@ -495,11 +547,16 @@ fi
 # For Gemma3 models with context > sliding_window (512), we need rotation versions
 if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
     if [ $CONTEXT_LENGTH -gt $SLIDING_WINDOW ]; then
+        if [ "$SINGLE_CACHE" = true ]; then
+            echo "Skipping rotate conversions: --single-cache disables rotate/prefill_rotate."
+        else
         if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "4" ]; then
             run_step 4 "Converting FFN Rotate" "$CONVERTER \
                 --part 2_rotate \
                 $LUT2_PARAM \
                 $FP16_SCALE_PARAM $CLAMP_PARAM \
+                $SINGLE_CACHE_PARAM \
+                $CHUNK_NO_PARAM \
                 --chunk $NUM_CHUNKS \
                 --context-length $CONTEXT_LENGTH \
                 --batch-size $BATCH_SIZE \
@@ -513,13 +570,17 @@ if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
             run_step 4 "Converting Prefill Rotate" "$CONVERTER \
                 --part 2_prefill_rotate \
                 $LUT2_PARAM \
+                $DYNAMIC_PREFILL_SLICE_PARAM \
                 $FP16_SCALE_PARAM $CLAMP_PARAM \
+                $SINGLE_CACHE_PARAM \
+                $CHUNK_NO_PARAM \
                 --chunk $NUM_CHUNKS \
                 --context-length $CONTEXT_LENGTH \
                 --batch-size $BATCH_SIZE \
                 --prefix \"$PREFIX\" \
                 --model \"$MODEL_PATH\" \
                 --output \"$OUTPUT_DIR\""
+        fi
         fi
     fi
 fi
@@ -529,7 +590,7 @@ fi
 GEMMA3_FLAG=""
 SPLIT_ROTATE_FLAG=""
 if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
-    if [ $CONTEXT_LENGTH -gt $SLIDING_WINDOW ]; then
+    if [ $CONTEXT_LENGTH -gt $SLIDING_WINDOW ] && [ "$SINGLE_CACHE" != true ]; then
         GEMMA3_FLAG="--gemma3"
     fi
 fi
@@ -630,10 +691,24 @@ EOF_CONFIG
         if [[ \"$ARCH\" == \"gemma3\"* ]] && [ -n \"$SLIDING_WINDOW\" ]; then
             SLIDING_WINDOW_FLAG=\"--sliding-window $SLIDING_WINDOW\"
         fi
+        UPDATE_MASK_PREFILL_FLAG=\"\"
+        if [[ \"$ARCH\" == \"gemma3\"* ]] && [ \"$DYNAMIC_PREFILL_SLICE\" != true ]; then
+            UPDATE_MASK_PREFILL_FLAG=\"--update-mask-prefill\"
+        fi
+        PREFILL_DYNAMIC_SLICE_FLAG=\"\"
+        if [ \"$STATIC_PREFILL_SLICE\" = true ]; then
+            PREFILL_DYNAMIC_SLICE_FLAG=\"--static-prefill-slice\"
+        elif [ \"$DYNAMIC_PREFILL_SLICE\" = true ]; then
+            PREFILL_DYNAMIC_SLICE_FLAG=\"--dynamic-prefill-slice\"
+        fi
+        SINGLE_CACHE_META_FLAG=\"\"
+        if [ \"$SINGLE_CACHE\" = true ]; then
+            SINGLE_CACHE_META_FLAG=\"--single-cache\"
+        fi
         python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
-            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \$ARGMAX_META_FLAG \$SPLIT_ROTATE_META_FLAG \$SLIDING_WINDOW_FLAG
+            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \$ARGMAX_META_FLAG \$SPLIT_ROTATE_META_FLAG \$SLIDING_WINDOW_FLAG \$UPDATE_MASK_PREFILL_FLAG \$PREFILL_DYNAMIC_SLICE_FLAG \$SINGLE_CACHE_META_FLAG
     "
 fi
 

@@ -1139,6 +1139,16 @@ def parse_args() -> argparse.Namespace:
         help="Split FFN/prefill into N chunks",
     )
     parser.add_argument(
+        "--dynamic-prefill-slice",
+        action="store_true",
+        help="Use dynamic slicing for prefill KV writes (default ON for meta generation; no-op here).",
+    )
+    parser.add_argument(
+        "--static-prefill-slice",
+        action="store_true",
+        help="Disable dynamic slicing for prefill KV writes (no-op here).",
+    )
+    parser.add_argument(
         "--part",
         type=str,
         choices=["1", "2", "2_prefill", "3", "all", "full", "prefill", "embeddings", "monolithic", "monolithic_prefill"],

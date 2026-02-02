@@ -164,8 +164,8 @@ extension MessageBubble {
                 .foregroundStyle(.cyan)
             }
 
-            // Context token count
-            if let ctx = message.prefillTokens {
+            // History token count (matches CLI)
+            if let ctx = message.historyTokens {
                 HStack(spacing: 2) {
                     Image(systemName: "text.alignleft")
                         .font(.caption2)
@@ -213,6 +213,7 @@ extension MessageBubble {
             tokenCount: 15,
             prefillTime: 0.05,
             prefillTokens: 10,
+            historyTokens: 25,
             isComplete: true
         ))
 
@@ -224,6 +225,7 @@ extension MessageBubble {
             windowShifts: 2,
             prefillTime: 0.15,
             prefillTokens: 128,
+            historyTokens: 178,
             isComplete: true
         ))
 

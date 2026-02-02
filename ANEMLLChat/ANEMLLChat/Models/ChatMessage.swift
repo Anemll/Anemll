@@ -26,7 +26,8 @@ struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     var tokenCount: Int?
     var windowShifts: Int?
     var prefillTime: TimeInterval?
-    var prefillTokens: Int?       // Context window token count
+    var prefillTokens: Int?       // Input tokens (for prefill speed)
+    var historyTokens: Int?       // Total history tokens (input + output) - matches CLI
 
     // Generation state
     var isComplete: Bool
@@ -43,6 +44,7 @@ struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
         windowShifts: Int? = nil,
         prefillTime: TimeInterval? = nil,
         prefillTokens: Int? = nil,
+        historyTokens: Int? = nil,
         isComplete: Bool = true,
         wasCancelled: Bool = false,
         stopReason: String? = nil
@@ -56,6 +58,7 @@ struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
         self.windowShifts = windowShifts
         self.prefillTime = prefillTime
         self.prefillTokens = prefillTokens
+        self.historyTokens = historyTokens
         self.isComplete = isComplete
         self.wasCancelled = wasCancelled
         self.stopReason = stopReason
@@ -98,8 +101,8 @@ extension ChatMessage {
             parts.append(String(format: "%.1f t/s prefill", prefillSpeed))
         }
 
-        // Context token count
-        if let ctx = prefillTokens {
+        // History token count (matches CLI)
+        if let ctx = historyTokens {
             parts.append("\(ctx) ctx")
         }
 

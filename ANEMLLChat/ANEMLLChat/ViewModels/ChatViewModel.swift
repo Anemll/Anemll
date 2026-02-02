@@ -39,6 +39,9 @@ final class ChatViewModel {
     /// Current tokens per second
     var currentTokensPerSecond: Double = 0
 
+    /// Current history tokens during streaming (input + output so far)
+    var currentHistoryTokens: Int = 0
+
     // MARK: - Dependencies
 
     private let inferenceService = InferenceService.shared
@@ -151,6 +154,7 @@ final class ChatViewModel {
         streamingContent = ""
         currentWindowShifts = 0
         currentTokensPerSecond = 0
+        currentHistoryTokens = 0
         errorMessage = nil
 
         do {
@@ -173,6 +177,13 @@ final class ChatViewModel {
                         guard let self = self else { return }
                         self.currentWindowShifts += 1
                     }
+                },
+                onHistoryUpdate: { [weak self] historyTokens in
+                    Task { @MainActor in
+                        guard let self = self else { return }
+                        self.currentHistoryTokens = historyTokens
+                        self.updateStreamingMessage()
+                    }
                 }
             )
 
@@ -184,6 +195,7 @@ final class ChatViewModel {
                 windowShifts: result.windowShifts,
                 prefillTime: result.prefillTime,
                 prefillTokens: result.prefillTokens,
+                historyTokens: result.historyTokens,
                 isComplete: true,
                 wasCancelled: result.wasCancelled,
                 stopReason: result.stopReason
@@ -222,7 +234,8 @@ final class ChatViewModel {
 
         conversation.updateLastAssistantMessage(
             content: streamingContent,
-            windowShifts: currentWindowShifts
+            windowShifts: currentWindowShifts,
+            historyTokens: currentHistoryTokens > 0 ? currentHistoryTokens : nil
         )
 
         currentConversation = conversation

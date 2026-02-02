@@ -54,6 +54,7 @@ struct Conversation: Identifiable, Codable, Sendable {
         windowShifts: Int? = nil,
         prefillTime: TimeInterval? = nil,
         prefillTokens: Int? = nil,
+        historyTokens: Int? = nil,
         isComplete: Bool? = nil,
         wasCancelled: Bool? = nil,
         stopReason: String? = nil
@@ -77,6 +78,9 @@ struct Conversation: Identifiable, Codable, Sendable {
         }
         if let tokens = prefillTokens {
             messages[index].prefillTokens = tokens
+        }
+        if let history = historyTokens {
+            messages[index].historyTokens = history
         }
         if let complete = isComplete {
             messages[index].isComplete = complete

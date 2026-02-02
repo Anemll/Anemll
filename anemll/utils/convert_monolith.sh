@@ -26,6 +26,9 @@ FORCE_MLPROGRAM_COMPILE=false
 ALLOW_MISSING_WEIGHTS=false
 ARGMAX_IN_MODEL=false
 ATTENTION_WINDOW=""
+DYNAMIC_PREFILL_SLICE=true
+STATIC_PREFILL_SLICE=false
+SINGLE_CACHE=false
 
 # Default converter; may be overridden after parsing config.json
 CONVERTER="python3 -m anemll.ane_converter.llama_converter"
@@ -51,6 +54,9 @@ print_usage() {
     echo "  --force-mlprogram-compile  Force ML Program when compiling .mlpackage models"
     echo "  --allow-missing-weights  Continue conversion even if some weights are missing"
     echo "  --argmax        Compute argmax inside model (outputs idx+val pairs instead of logits)"
+    echo "  --dynamic-prefill-slice  Use dynamic slicing for prefill KV writes (default ON)"
+    echo "  --static-prefill-slice   Disable dynamic slicing for prefill KV writes"
+    echo "  --single-cache           Use unified KV cache (Gemma3 only; disables rotate)"
     echo ""
     echo "Steps:"
     echo "  1. Convert monolithic inference model (embed + FFN + lm_head)"
@@ -118,6 +124,19 @@ while [[ $# -gt 0 ]]; do
             ;;
         --argmax)
             ARGMAX_IN_MODEL=true
+            shift
+            ;;
+        --dynamic-prefill-slice)
+            DYNAMIC_PREFILL_SLICE=true
+            shift
+            ;;
+        --static-prefill-slice)
+            DYNAMIC_PREFILL_SLICE=false
+            STATIC_PREFILL_SLICE=true
+            shift
+            ;;
+        --single-cache)
+            SINGLE_CACHE=true
             shift
             ;;
         --help|-h)
@@ -316,11 +335,29 @@ if [ "$ARGMAX_IN_MODEL" = true ]; then
     ARGMAX_PARAM="--argmax"
 fi
 
+# Dynamic prefill slice (default ON)
+DYNAMIC_PREFILL_SLICE_PARAM=""
+if [ "$STATIC_PREFILL_SLICE" = true ]; then
+    DYNAMIC_PREFILL_SLICE_PARAM="--static-prefill-slice"
+elif [ "$DYNAMIC_PREFILL_SLICE" = true ]; then
+    DYNAMIC_PREFILL_SLICE_PARAM="--dynamic-prefill-slice"
+fi
+
+SINGLE_CACHE_PARAM=""
+if [ "$SINGLE_CACHE" = true ]; then
+    if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
+        SINGLE_CACHE_PARAM="--single-cache"
+    else
+        echo "Warning: --single-cache is only supported for Gemma3; ignoring."
+    fi
+fi
+
 # Step 1: Convert Monolithic Inference Model
 run_step 1 "Converting Monolithic Inference Model" "$CONVERTER \
     --part monolithic \
     $LUT_PARAM \
     $ARGMAX_PARAM \
+    $SINGLE_CACHE_PARAM \
     --context-length $CONTEXT_LENGTH \
     --batch-size $BATCH_SIZE \
     --prefix \"$PREFIX\" \
@@ -332,6 +369,8 @@ run_step 2 "Converting Monolithic Prefill Model" "$CONVERTER \
     --part monolithic_prefill \
     $LUT_PARAM \
     $ARGMAX_PARAM \
+    $DYNAMIC_PREFILL_SLICE_PARAM \
+    $SINGLE_CACHE_PARAM \
     --context-length $CONTEXT_LENGTH \
     --batch-size $BATCH_SIZE \
     --prefix \"$PREFIX\" \
@@ -340,6 +379,9 @@ run_step 2 "Converting Monolithic Prefill Model" "$CONVERTER \
 
 # For context > sliding_window, also convert rotation functions (4-function model for Gemma3)
 if [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
+    if [ "$SINGLE_CACHE" = true ]; then
+        echo "Skipping rotate conversions: --single-cache disables rotate/prefill_rotate."
+    else
     echo "Context > sliding_window ($SLIDING_WINDOW): Converting rotation functions for 4-function model support..."
 
     # Step 2b: Convert Monolithic Inference Rotate Model
@@ -347,6 +389,7 @@ if [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
         --part monolithic_rotate \
         $LUT_PARAM \
         $ARGMAX_PARAM \
+        $SINGLE_CACHE_PARAM \
         --context-length $CONTEXT_LENGTH \
         --batch-size $BATCH_SIZE \
         --prefix \"$PREFIX\" \
@@ -358,11 +401,14 @@ if [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
         --part monolithic_prefill_rotate \
         $LUT_PARAM \
         $ARGMAX_PARAM \
+        $DYNAMIC_PREFILL_SLICE_PARAM \
+        $SINGLE_CACHE_PARAM \
         --context-length $CONTEXT_LENGTH \
         --batch-size $BATCH_SIZE \
         --prefix \"$PREFIX\" \
         --model \"$MODEL_PATH\" \
         --output \"$OUTPUT_DIR\""
+    fi
 fi
 
 # Step 3: Combine into Multi-Function Model
@@ -437,7 +483,7 @@ EOF_CONFIG
         # Create meta.yaml for monolithic model
         # Add --rotate flag if context > sliding_window (4-function model)
         ROTATE_META_FLAG=\"\"
-        if [ \"$CONTEXT_LENGTH\" -gt \"$SLIDING_WINDOW\" ]; then
+        if [ \"$CONTEXT_LENGTH\" -gt \"$SLIDING_WINDOW\" ] && [ \"$SINGLE_CACHE\" != true ]; then
             ROTATE_META_FLAG=\"--rotate\"
         fi
         # Add sliding_window flag for Gemma3 models
@@ -445,11 +491,25 @@ EOF_CONFIG
         if [[ \"$ARCH\" == \"gemma3\"* ]] && [ -n \"$SLIDING_WINDOW\" ]; then
             SLIDING_WINDOW_FLAG=\"--sliding-window $SLIDING_WINDOW\"
         fi
+        UPDATE_MASK_PREFILL_FLAG=\"\"
+        if [[ \"$ARCH\" == \"gemma3\"* ]] && [ \"$DYNAMIC_PREFILL_SLICE\" != true ]; then
+            UPDATE_MASK_PREFILL_FLAG=\"--update-mask-prefill\"
+        fi
+        PREFILL_DYNAMIC_SLICE_FLAG=\"\"
+        if [ \"$STATIC_PREFILL_SLICE\" = true ]; then
+            PREFILL_DYNAMIC_SLICE_FLAG=\"--static-prefill-slice\"
+        elif [ \"$DYNAMIC_PREFILL_SLICE\" = true ]; then
+            PREFILL_DYNAMIC_SLICE_FLAG=\"--dynamic-prefill-slice\"
+        fi
+        SINGLE_CACHE_META_FLAG=\"\"
+        if [ \"$SINGLE_CACHE\" = true ]; then
+            SINGLE_CACHE_META_FLAG=\"--single-cache\"
+        fi
         python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \
             1 \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \
-            --monolithic $ARGMAX_PARAM $ROTATE_META_FLAG $SLIDING_WINDOW_FLAG
+            --monolithic $ARGMAX_PARAM $ROTATE_META_FLAG $SLIDING_WINDOW_FLAG $UPDATE_MASK_PREFILL_FLAG $PREFILL_DYNAMIC_SLICE_FLAG $SINGLE_CACHE_META_FLAG
     "
 fi
 

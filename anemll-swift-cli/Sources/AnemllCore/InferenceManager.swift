@@ -24,6 +24,13 @@ import Accelerate
     private let isMonolithic: Bool  // Monolithic model support
     private let argmaxInModel: Bool  // If true, model outputs argmax_idx/val pairs instead of logits
     private let slidingWindow: Int?  // Gemma3 sliding window - if set, use rotation functions when position >= slidingWindow
+    private var hasUpdateMask: Bool = false  // If true, prefill model expects update_mask input for KV cache writes
+    private var prefillDynamicSlice: Bool = false  // If true, model supports dynamic slice prefill (alternative batch prefill)
+
+    // Pre-allocated update_mask for batch prefill (infer doesn't use update_mask)
+    // Shape: [1, 1, contextLength, batchSize] - marks which positions to write for each token in batch
+    private var prefillUpdateMask: MLMultiArray?
+    private var prefillUpdateMaskBuffer: CVPixelBuffer?
 
     private var lmheadOutputBackings: [String: MLMultiArray]?
     private var hiddenStatesBackings_emb: [String: MLMultiArray]?  // For embed output
@@ -98,7 +105,7 @@ import Accelerate
     }
 
 
-    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil) throws {  // Make init throwing
+    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil, updateMaskPrefill: Bool = false, prefillDynamicSlice: Bool = false) throws {  // Make init throwing
         self.debugLevel = debugLevel
         self.isMonolithic = models.isMonolithic
         self.argmaxInModel = argmaxInModel
@@ -114,7 +121,29 @@ import Accelerate
 
         // Check if rotation functions are available
         let hasRotation = ffnChunks.first?.hasRotationSupport ?? false
-        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation)")
+
+        // Use update_mask_prefill from config, or fallback to model input detection
+        if updateMaskPrefill {
+            hasUpdateMask = true
+        } else if isMonolithic, let prefillModel = ffnChunks.first?.prefillModel {
+            // Fallback: detect from model inputs (for backward compatibility)
+            hasUpdateMask = prefillModel.modelDescription.inputDescriptionsByName["update_mask"] != nil
+        }
+
+        // Set prefill dynamic slice flag
+        self.prefillDynamicSlice = prefillDynamicSlice
+
+        // allowBatchPrefill = hasUpdateMask || prefillDynamicSlice (matching Python chat_full.py)
+        let allowBatchPrefill = hasUpdateMask || prefillDynamicSlice
+
+        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation), hasUpdateMask=\(hasUpdateMask), prefillDynamicSlice=\(prefillDynamicSlice), allowBatchPrefill=\(allowBatchPrefill)")
+
+        // Print prefill mode info (matching Python chat_full.py)
+        if allowBatchPrefill {
+            print("✅ Batch prefill enabled (partial batches supported)")
+        } else {
+            print("⚠️  No update_mask_prefill or prefill_dynamic_slice; partial batches use single-token prefill")
+        }
 
         // Create full causal mask - needed for attention
         self.fullCausalMask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: contextLength)], dataType: .float16)
@@ -174,6 +203,43 @@ import Accelerate
 
             // Pre-allocate prediction options
             argmaxInferOptions = MLPredictionOptions()
+        }
+
+        // Pre-allocate update_mask for prefill if model supports it
+        // Shape: [1, 1, contextLength, batchSize] - each column marks the write position for that token in batch
+        if hasUpdateMask && isMonolithic {
+            let ioAttributes: [String: Any] = [
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+            ]
+
+            // Create pixel buffer: width = batchSize, height = contextLength
+            var updateMaskBuffer: CVPixelBuffer?
+            let updateMaskStatus = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                batchSize, contextLength,
+                kCVPixelFormatType_OneComponent16Half,
+                ioAttributes as CFDictionary,
+                &updateMaskBuffer
+            )
+            guard updateMaskStatus == kCVReturnSuccess, let uBuf = updateMaskBuffer else {
+                throw InferenceError.inferenceError("Failed to create update_mask pixel buffer")
+            }
+            prefillUpdateMaskBuffer = uBuf
+            prefillUpdateMask = MLMultiArray(pixelBuffer: uBuf, shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: batchSize)])
+
+            // Initialize to zeros
+            CVPixelBufferLockBaseAddress(uBuf, [])
+            if let baseAddress = CVPixelBufferGetBaseAddress(uBuf) {
+                let totalElements = contextLength * batchSize
+                let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                for i in 0..<totalElements {
+                    ptr[i] = Float16(0.0)
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(uBuf, [])
+
+            print("Pre-allocated update_mask buffer: [\(contextLength), \(batchSize)]")
         }
 
         // Metal argmax is available but CPU Accelerate SIMD is faster for this workload
@@ -732,17 +798,18 @@ import Accelerate
             return try await runMonolithicPrefill(on: &contextTokens, contextPos: contextPos, tokenizer: tokenizer)
         }
         var batchPos = 0
-        while batchPos < contextPos {
-            let batchEnd = min(batchPos + batchSize, contextPos)
-            let currentBatchSize = batchEnd - batchPos
-            
+
+        // Process FULL batches only with prefill model (to avoid padding issues that corrupt KV cache)
+        while batchPos + batchSize <= contextPos {
+            let batchEnd = batchPos + batchSize
+
             if debugLevel >= 1 {
-                print("\nPrefill batch: \(batchPos) to \(batchEnd), currentBatchSize: \(currentBatchSize)")
+                print("\nPrefill batch: \(batchPos) to \(batchEnd), full batch of \(batchSize)")
             }
             
-            // Create input tensor for current batch
+            // Create input tensor for current batch (full batch)
             let batchInput = try MLMultiArray(shape: [1, NSNumber(value: batchSize)], dataType: .int32)
-            for i in 0..<currentBatchSize {
+            for i in 0..<batchSize {
                 batchInput[[0, i] as [NSNumber]] = NSNumber(value: contextTokens[batchPos + i])
             }
             
@@ -898,10 +965,33 @@ import Accelerate
             batchPos = batchEnd
         }
 
+        // Process remaining tokens one-at-a-time using infer model (avoids padding issues that corrupt KV cache)
+        if batchPos < contextPos {
+            if debugLevel >= 1 {
+                print("\nProcessing remaining \(contextPos - batchPos) tokens one-at-a-time with infer model")
+            }
+            while batchPos < contextPos {
+                // Use generateNextToken which processes single token through embed + FFN chunks + lmhead
+                // We don't need the returned token, just need to populate KV cache
+                let _ = try await generateNextToken(
+                    for: contextTokens[batchPos],
+                    currentPos: batchPos + 1,  // generateNextToken uses 1-indexed positions
+                    temperature: 0,
+                    tokenizer: tokenizer
+                )
+                if debugLevel >= 1 {
+                    print("  Prefill single token at pos \(batchPos): \(contextTokens[batchPos])")
+                }
+                batchPos += 1
+            }
+        }
+
         return contextPos
     }
 
     /// Run prefill for monolithic models - passes input_ids directly to the model
+    /// With update_mask: processes all tokens in batches (including partial batches)
+    /// Without update_mask: processes full batches with prefill, remaining one-at-a-time with infer
     private func runMonolithicPrefill(
         on contextTokens: inout [Int],
         contextPos: Int,
@@ -911,26 +1001,44 @@ import Accelerate
             print("\n=== Running Monolithic Prefill ===")
             print("Context position:", contextPos)
             print("Batch size:", batchSize)
+            print("Has update_mask:", hasUpdateMask)
         }
 
-        let monolithicModel = ffnChunks[0].prefillModel
+        let prefillModel = ffnChunks[0].prefillModel
+        let inferModel = ffnChunks[0].inferModel
 
         var batchPos = 0
+
+        // With update_mask OR prefill_dynamic_slice, we can process ALL tokens in batches (including partial batches)
+        // Without either, we can only process FULL batches, then remaining one-at-a-time
+        let processPartialWithPrefill = hasUpdateMask || prefillDynamicSlice
+
+        // Process batches with prefill model
         while batchPos < contextPos {
-            let batchEnd = min(batchPos + batchSize, contextPos)
-            let currentBatchSize = batchEnd - batchPos
+            let remainingTokens = contextPos - batchPos
+            let currentBatchSize = processPartialWithPrefill ? min(remainingTokens, batchSize) : batchSize
+
+            // Without update_mask, stop when we don't have a full batch
+            if !processPartialWithPrefill && remainingTokens < batchSize {
+                break
+            }
 
             if debugLevel >= 1 {
-                print("\nMonolithic prefill batch: \(batchPos) to \(batchEnd), currentBatchSize: \(currentBatchSize)")
+                let batchType = currentBatchSize == batchSize ? "full" : "partial"
+                print("\nMonolithic prefill batch: \(batchPos) to \(batchPos + currentBatchSize), \(batchType) batch (\(currentBatchSize) tokens)")
             }
 
-            // Create input tensor for current batch
+            // Create input tensor for current batch (padded to batchSize)
             let batchInput = try MLMultiArray(shape: [1, NSNumber(value: batchSize)], dataType: .int32)
-            for i in 0..<currentBatchSize {
-                batchInput[[0, i] as [NSNumber]] = NSNumber(value: contextTokens[batchPos + i])
+            for i in 0..<batchSize {
+                if i < currentBatchSize {
+                    batchInput[[0, i] as [NSNumber]] = NSNumber(value: contextTokens[batchPos + i])
+                } else {
+                    batchInput[[0, i] as [NSNumber]] = NSNumber(value: 0)  // Pad with zeros
+                }
             }
 
-            // Generate position IDs
+            // Generate position IDs for full batch (padded positions don't matter with update_mask)
             let positionIds = try MLMultiArray(shape: [NSNumber(value: batchSize)], dataType: .int32)
             for i in 0..<batchSize {
                 positionIds[i] = NSNumber(value: batchPos + i)
@@ -960,19 +1068,56 @@ import Accelerate
             let currentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
             currentPosArray[0] = NSNumber(value: batchPos)
 
-            // Create input feature provider - monolithic takes input_ids directly
-            let prefillInput = try MLDictionaryFeatureProvider(dictionary: [
+            // Build input dictionary
+            var inputDict: [String: MLMultiArray] = [
                 "input_ids": batchInput,
                 "position_ids": positionIds,
                 "causal_mask": batchCausalMask,
                 "current_pos": currentPosArray
-            ])
+            ]
+
+            // Add update_mask if model supports it
+            if hasUpdateMask, let updateMaskBuffer = prefillUpdateMaskBuffer, let updateMask = prefillUpdateMask {
+                // Populate update_mask: set 1.0 at position [batchPos + i, i] for each valid token
+                // Shape is [1, 1, contextLength, batchSize], stored as [contextLength, batchSize] in pixel buffer
+                CVPixelBufferLockBaseAddress(updateMaskBuffer, [])
+                if let baseAddress = CVPixelBufferGetBaseAddress(updateMaskBuffer) {
+                    let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                    let rowBytes = CVPixelBufferGetBytesPerRow(updateMaskBuffer)
+                    let stride = rowBytes / MemoryLayout<Float16>.size
+
+                    // Clear entire buffer first
+                    for row in 0..<contextLength {
+                        for col in 0..<batchSize {
+                            ptr[row * stride + col] = Float16(0.0)
+                        }
+                    }
+
+                    // Set 1.0 at the write positions for each token in the batch
+                    for i in 0..<currentBatchSize {
+                        let writePos = batchPos + i
+                        if writePos < contextLength {
+                            ptr[writePos * stride + i] = Float16(1.0)
+                        }
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(updateMaskBuffer, [])
+
+                inputDict["update_mask"] = updateMask
+
+                if debugLevel >= 1 {
+                    print("  update_mask set for positions \(batchPos) to \(batchPos + currentBatchSize - 1)")
+                }
+            }
+
+            // Create input feature provider
+            let prefillInput = try MLDictionaryFeatureProvider(dictionary: inputDict)
 
             // Run prediction on serial queue for consistent execution context
             var predictionError: Error?
             predictionQueue.sync { [self] in
                 do {
-                    _ = try monolithicModel.prediction(
+                    _ = try prefillModel.prediction(
                         from: prefillInput,
                         using: state,
                         options: MLPredictionOptions()
@@ -989,7 +1134,66 @@ import Accelerate
                 print("✅ Monolithic prefill batch completed")
             }
 
-            batchPos = batchEnd
+            batchPos += currentBatchSize
+        }
+
+        // Process remaining tokens one-at-a-time using infer model (only needed without update_mask)
+        if batchPos < contextPos {
+            if debugLevel >= 1 {
+                print("\nProcessing \(contextPos - batchPos) remaining tokens one-at-a-time")
+            }
+        }
+
+        while batchPos < contextPos {
+            let token = contextTokens[batchPos]
+
+            // Create single-token input
+            let tokenArray = try MLMultiArray(shape: [1, 1], dataType: .int32)
+            tokenArray[[0, 0] as [NSNumber]] = NSNumber(value: token)
+
+            // Single position ID
+            let positionIds = try MLMultiArray(shape: [1], dataType: .int32)
+            positionIds[0] = NSNumber(value: batchPos)
+
+            // Single-token causal mask
+            let singleMask = try MLMultiArray(
+                shape: [1, 1, 1, NSNumber(value: contextLength)],
+                dataType: .float16
+            )
+            for j in 0..<contextLength {
+                singleMask[[0, 0, 0, j] as [NSNumber]] = j <= batchPos
+                    ? NSNumber(value: Float(0.0))
+                    : NSNumber(value: Float(-Float.infinity))
+            }
+
+            // Current position
+            let currentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
+            currentPosArray[0] = NSNumber(value: batchPos)
+
+            let inferInput = try MLDictionaryFeatureProvider(dictionary: [
+                "input_ids": tokenArray,
+                "position_ids": positionIds,
+                "causal_mask": singleMask,
+                "current_pos": currentPosArray
+            ])
+
+            var predictionError: Error?
+            predictionQueue.sync { [self] in
+                do {
+                    _ = try inferModel.prediction(
+                        from: inferInput,
+                        using: state,
+                        options: MLPredictionOptions()
+                    )
+                } catch {
+                    predictionError = error
+                }
+            }
+            if let error = predictionError {
+                throw error
+            }
+
+            batchPos += 1
         }
 
         // Initialize argmax causal mask for token generation phase
@@ -1205,25 +1409,27 @@ import Accelerate
             throw InferenceError.inferenceError("Missing embed output backing")
         }
 
-        // Create position IDs (1D)
+        // Create position IDs (1D) - use currentPos-1 since currentPos is 1-indexed
+        let safePos = currentPos - 1
         let positionIds = try MLMultiArray(shape: [1], dataType: .int32)
-        positionIds[0] = NSNumber(value: currentPos-1)
+        positionIds[0] = NSNumber(value: safePos)
 
-        // Get causal mask for single token at the correct position
-        let causalMask = try getCausalMask(for: 1, at: currentPos)
+        // Get causal mask for single token - use safePos to match position_ids
+        // At position N, we should see positions 0 to N (not 0 to N+1)
+        let causalMask = try getCausalMask(for: 1, at: safePos)
 
         // Create current_pos as tensor
         let currentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
-        currentPosArray[0] = NSNumber(value: currentPos-1)
+        currentPosArray[0] = NSNumber(value: safePos)
 
         // Run through FFN chunks using FFN backing
         var currentHiddenStates = hiddenStates
 
         // Determine if we should use rotation mode (for Gemma3 with sliding window)
-        // Position is currentPos-1 since currentPos is 1-indexed
-        let useRotation = slidingWindow != nil && (currentPos - 1) >= slidingWindow!
+        // safePos is the actual 0-indexed position
+        let useRotation = slidingWindow != nil && safePos >= slidingWindow!
         if useRotation && debugLevel >= 1 {
-            print("Using rotation mode for position \(currentPos - 1) >= slidingWindow \(slidingWindow!)")
+            print("Using rotation mode for position \(safePos) >= slidingWindow \(slidingWindow!)")
         }
 
         for chunk in ffnChunks {
@@ -1541,8 +1747,9 @@ import Accelerate
         let positionIds = try MLMultiArray(shape: [1], dataType: .int32)
         positionIds[0] = NSNumber(value: safePos)
 
-        // Get causal mask for single token (use currentPos for mask, which handles the +1 offset internally)
-        let causalMask = try getCausalMask(for: 1, at: currentPos)
+        // Get causal mask for single token - use safePos (currentPos - 1) to match position_ids
+        // At position N, we should see positions 0 to N (not 0 to N+1)
+        let causalMask = try getCausalMask(for: 1, at: safePos)
 
         // Create current_pos tensor
         let currentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
@@ -1998,7 +2205,21 @@ import Accelerate
         if !GreedySearch {
             generatedTokenHistory.removeAll()
         }
-        
+
+        // Reset KV cache state for new conversation turn
+        // This ensures each generateResponse call starts fresh, which is required
+        // when the full conversation is re-tokenized for each turn
+        if let chunks = ffnChunks, !chunks.isEmpty {
+            // For monolithic models, create state from inferModel (matching initState behavior)
+            // This ensures state compatibility when switching between prefill and infer functions
+            if isMonolithic {
+                state = chunks[0].inferModel.makeState()
+            } else {
+                state = chunks[0].prefillModel.makeState()
+            }
+            lastArgmaxPosition = -1  // Reset argmax position tracking
+        }
+
         do {
 
             if debugLevel >= 1 {
@@ -2163,6 +2384,8 @@ import Accelerate
         hiddenStatesBackings_last = nil
         hiddenStatesBackings_emb_prefill = nil
         hiddenStatesBackings_ffn_prefill = nil
+        prefillUpdateMask = nil
+        prefillUpdateMaskBuffer = nil
         state = nil
         embedModel = nil
         lmheadModel = nil

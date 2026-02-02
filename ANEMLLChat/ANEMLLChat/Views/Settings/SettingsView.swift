@@ -24,12 +24,13 @@ struct SettingsView: View {
 
     @State private var temperature: Float = 0.0  // Default: greedy decoding
     @State private var maxTokens: Int = 512
-    @State private var systemPromptOption: SystemPromptOption = .modelDefault
+    @State private var systemPromptOption: SystemPromptOption = .noPrompt  // Default: no system prompt (matches CLI)
     @State private var customPrompt: String = ""
 
     @State private var showingLogs = false
     @State private var autoLoadLastModel = true
     @State private var debugLevel: Int = 0
+    @State private var repetitionDetectionEnabled = false  // Default: off (matches CLI)
 
     var body: some View {
         Form {
@@ -63,6 +64,10 @@ struct SettingsView: View {
         #endif
         .onAppear {
             loadSettings()
+        }
+        .onDisappear {
+            // Save settings when view closes (especially important for macOS which has no Done button)
+            saveSettings()
         }
         .sheet(isPresented: $showingLogs) {
             LogsView()
@@ -131,8 +136,12 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Toggle("Repetition Detection", isOn: $repetitionDetectionEnabled)
         } header: {
             Text("Generation")
+        } footer: {
+            Text(repetitionDetectionEnabled ? "Stops generation if repetitive patterns are detected" : "Generation continues until EOS or max tokens (CLI behavior)")
         }
     }
 
@@ -265,6 +274,7 @@ struct SettingsView: View {
         Task {
             autoLoadLastModel = await StorageService.shared.autoLoadLastModel
             debugLevel = await StorageService.shared.debugLevel
+            repetitionDetectionEnabled = await StorageService.shared.repetitionDetectionEnabled
         }
     }
 
@@ -290,9 +300,11 @@ struct SettingsView: View {
             await chatVM.saveSettings()
             await StorageService.shared.saveAutoLoadLastModel(autoLoadLastModel)
             await StorageService.shared.saveDebugLevel(debugLevel)
-            // Update InferenceService debug level
+            await StorageService.shared.saveRepetitionDetectionEnabled(repetitionDetectionEnabled)
+            // Update InferenceService settings
             await MainActor.run {
                 InferenceService.shared.debugLevel = debugLevel
+                InferenceService.shared.repetitionDetectionEnabled = repetitionDetectionEnabled
             }
         }
     }

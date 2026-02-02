@@ -37,7 +37,8 @@ struct GenerationResult: Sendable {
     let tokenCount: Int
     let windowShifts: Int
     let prefillTime: TimeInterval
-    let prefillTokens: Int        // Number of context tokens (input prompt tokens)
+    let prefillTokens: Int        // Number of input tokens (for prefill speed calculation)
+    let historyTokens: Int        // Total history tokens (input + output) - matches CLI
     let isComplete: Bool
     let wasCancelled: Bool
     let stopReason: String
@@ -128,8 +129,9 @@ final class InferenceService: ObservableObject {
     // Settings
     var temperature: Float = 0.0  // Default: greedy decoding
     var maxTokens: Int = 512
-    var systemPrompt: String = "[MODEL_DEFAULT]"  // Default: use model's default prompt
+    var systemPrompt: String = ""  // Default: no system prompt (matches CLI behavior)
     var debugLevel: Int = 0  // Debug verbosity: 0=off, 1=basic, 2=verbose
+    var repetitionDetectionEnabled: Bool = false  // Default: off (matches CLI behavior)
 
     private init() {
         // Load settings from storage
@@ -138,6 +140,7 @@ final class InferenceService: ObservableObject {
             maxTokens = await StorageService.shared.defaultMaxTokens
             systemPrompt = await StorageService.shared.defaultSystemPrompt
             debugLevel = await StorageService.shared.debugLevel
+            repetitionDetectionEnabled = await StorageService.shared.repetitionDetectionEnabled
         }
     }
 
@@ -242,7 +245,8 @@ final class InferenceService: ObservableObject {
     func generateResponse(
         for messages: [ChatMessage],
         onToken: @escaping @Sendable (String) -> Void,
-        onWindowShift: @escaping @Sendable () -> Void
+        onWindowShift: @escaping @Sendable () -> Void,
+        onHistoryUpdate: (@Sendable (Int) -> Void)? = nil  // Reports current historyTokens during generation
     ) async throws -> GenerationResult {
         guard let tokenizer = tokenizer,
               let inferenceManager = inferenceManager else {
@@ -281,14 +285,56 @@ final class InferenceService: ObservableObject {
             }
         }
 
-        // Tokenize with chat template
-        let inputTokens = tokenizer.applyChatTemplate(
+        // Get context limits (match CLI: use stateLength if available, otherwise contextLength)
+        let contextLength = config?.contextLength ?? 512
+        let stateLength = (config?.stateLength ?? 0) > 0 ? config!.stateLength : contextLength
+        let maxContextSize = stateLength - 100  // Leave room for response (match CLI/Python)
+
+        // Tokenize and check size
+        var inputTokens = tokenizer.applyChatTemplate(
             input: chatMessages,
             addGenerationPrompt: true
         )
 
+        // Trim history if exceeds context (match CLI behavior)
+        let originalSize = inputTokens.count
+        var historyTrimmed = false
+        while inputTokens.count > maxContextSize && chatMessages.count > 2 {
+            historyTrimmed = true
+            // Remove oldest message pair (user + assistant) like CLI does
+            // Skip system prompt if present (index 0)
+            let startIndex = (chatMessages.first?.role == "system") ? 1 : 0
+            if chatMessages.count > startIndex + 2 {
+                chatMessages.remove(at: startIndex)  // Remove oldest user
+                if chatMessages.count > startIndex {
+                    chatMessages.remove(at: startIndex)  // Remove oldest assistant
+                }
+                inputTokens = tokenizer.applyChatTemplate(
+                    input: chatMessages,
+                    addGenerationPrompt: true
+                )
+            } else {
+                break
+            }
+        }
+
+        if historyTrimmed {
+            print("[SYSTEM] History trimmed: \(originalSize) → \(inputTokens.count) tokens, \(chatMessages.count) msgs remaining")
+        }
+
+        // Debug: print messages being sent to tokenizer
+        print("===== [CHAT MESSAGES] \(chatMessages.count) messages being tokenized =====")
+        for (i, msg) in chatMessages.enumerated() {
+            let role = msg.isUser ? "user" : (msg.isAssistant ? "assistant" : "system")
+            let preview = msg.content.prefix(50)
+            print("  [\(i)] \(role): \(preview)\(msg.content.count > 50 ? "..." : "")")
+        }
+
+        print("===== [INFERENCE] Input tokens: \(inputTokens.count) / Context: \(contextLength) (max: \(maxContextSize)) =====")
+        if inputTokens.count > contextLength {
+            print("⚠️  WARNING: Input tokens (\(inputTokens.count)) exceed context length (\(contextLength))!")
+        }
         logDebug("Input tokens: \(inputTokens.count)", category: .inference)
-        print("===== [INFERENCE] Starting generation with \(inputTokens.count) input tokens =====")
 
         // Track statistics using thread-safe container
         let stats = GenerationStats()
@@ -297,6 +343,8 @@ final class InferenceService: ObservableObject {
         // Capture values we need in nonisolated closures
         let capturedRepetitionDetector = repetitionDetector
         let capturedInferenceManager = inferenceManager
+        let capturedRepetitionEnabled = repetitionDetectionEnabled
+        let inputTokenCount = inputTokens.count  // Capture for history calculation
 
         do {
             let (_, prefillTime, stopReason) = try await inferenceManager.generateResponse(
@@ -306,12 +354,14 @@ final class InferenceService: ObservableObject {
                 eosTokens: tokenizer.eosTokenIds,
                 tokenizer: tokenizer,
                 onToken: { token in
-                    // Check for repetition (non-isolated access)
-                    capturedRepetitionDetector.addToken(token)
-                    if capturedRepetitionDetector.isRepeating() {
-                        logWarning("Repetition detected, aborting", category: .inference)
-                        capturedInferenceManager.AbortGeneration(Code: 2)
-                        return
+                    // Check for repetition only if enabled (non-isolated access)
+                    if capturedRepetitionEnabled {
+                        capturedRepetitionDetector.addToken(token)
+                        if capturedRepetitionDetector.isRepeating() {
+                            logWarning("Repetition detected, aborting", category: .inference)
+                            capturedInferenceManager.AbortGeneration(Code: 2)
+                            return
+                        }
                     }
 
                     stats.tokenCount += 1
@@ -319,6 +369,12 @@ final class InferenceService: ObservableObject {
                     stats.generatedText += text
 
                     onToken(text)
+
+                    // Report current historyTokens (input + output so far)
+                    // Update every 5 tokens to avoid too frequent UI updates
+                    if stats.tokenCount % 5 == 0 || stats.tokenCount == 1 {
+                        onHistoryUpdate?(inputTokenCount + stats.tokenCount)
+                    }
                 },
                 onWindowShift: {
                     stats.windowShifts += 1
@@ -332,13 +388,17 @@ final class InferenceService: ObservableObject {
             logInfo("Generation complete: \(stats.tokenCount) tokens, \(String(format: "%.1f", tokensPerSecond)) tok/s", category: .inference)
             print("===== [INFERENCE] Complete: \(stats.tokenCount) tokens at \(String(format: "%.1f", tokensPerSecond)) tok/s =====")
 
+            // Total history tokens = input (prefill) + output (generated) - matches CLI behavior
+            let historyTokens = inputTokens.count + stats.tokenCount
+
             return GenerationResult(
                 text: stats.generatedText,
                 tokensPerSecond: tokensPerSecond,
                 tokenCount: stats.tokenCount,
                 windowShifts: stats.windowShifts,
                 prefillTime: prefillTime,
-                prefillTokens: inputTokens.count,
+                prefillTokens: inputTokens.count,  // For prefill speed calculation
+                historyTokens: historyTokens,       // Total history like CLI shows
                 isComplete: true,
                 wasCancelled: shouldCancel,
                 stopReason: stopReason
@@ -346,13 +406,15 @@ final class InferenceService: ObservableObject {
 
         } catch {
             if shouldCancel {
+                let historyTokens = inputTokens.count + stats.tokenCount
                 return GenerationResult(
                     text: stats.generatedText,
                     tokensPerSecond: 0,
                     tokenCount: stats.tokenCount,
                     windowShifts: stats.windowShifts,
                     prefillTime: 0,
-                    prefillTokens: inputTokens.count,
+                    prefillTokens: inputTokens.count,  // For prefill speed calculation
+                    historyTokens: historyTokens,       // Total history like CLI shows
                     isComplete: false,
                     wasCancelled: true,
                     stopReason: "cancelled"
