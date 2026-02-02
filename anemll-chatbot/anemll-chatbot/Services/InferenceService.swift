@@ -1403,23 +1403,27 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
                                 do {
                                     print("Initializing tokenizer from: \(localConfig.tokenizerModel)")
                                     let tokenizerPath = URL(fileURLWithPath: localConfig.tokenizerModel)
-                                    
+
+                                    // Get template from model prefix (gemma3, llama, qwen, etc.)
+                                    let template = modelConfig?.modelPrefix ?? "default"
+                                    print("Using chat template: \(template)")
+
                                     // Check if tokenizer model file exists
                                     if !FileManager.default.fileExists(atPath: tokenizerPath.path) {
                                         print("❌ ERROR: Tokenizer model file not found at path: \(tokenizerPath.path)")
                                         throw InferenceError.tokenizationFailed
                                     }
-                                    
+
                                     // Add retry logic for tokenizer initialization
                                     var tokenizerRetryCount = 0
                                     let maxRetries = 3
-                                    
+
                                     while tokenizerRetryCount < maxRetries {
                                         do {
                                             if tokenizerRetryCount > 0 {
                                                 print("Retrying tokenizer initialization (attempt \(tokenizerRetryCount + 1)/\(maxRetries))")
                                             }
-                                            self.tokenizer = try await Tokenizer(modelPath: tokenizerPath.path, debugLevel: 0)
+                                            self.tokenizer = try await Tokenizer(modelPath: tokenizerPath.path, template: template, debugLevel: 0)
                                             
                                             if self.tokenizer != nil {
                                                 print("✅ Tokenizer successfully initialized")
@@ -2183,23 +2187,19 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         
         // Ensure we're using the proper encoding method from the tokenizer that understands
         // chat formats and special tokens like BOS/EOS
-        var currentPrompt = tokenizer.applyChatTemplate(
+        let currentPrompt = tokenizer.applyChatTemplate(
             input: sanitizeMessagesForChatTemplate(messages: conversationMessages),
             addGenerationPrompt: true  // This will add the assistant prompt for us
         )
-        
-        // Check if we got a valid result
-        if currentPrompt.isEmpty {
-            print("⚠️ Warning: Template application returned empty token list, using fallback")
-            // Use a fallback approach - manually tokenize without template
-            currentPrompt = createFallbackPrompt(messages: conversationMessages, tokenizer: tokenizer)
-        } else {
-            // Log info about the final prompt that will be sent to the model
-            let decodedText = tokenizer.decode(tokens: currentPrompt, skipSpecialTokens: false)
-            print("\nDecoded prompt preview:")
-            print("\"\(decodedText.prefix(100))...\"")
-            print("Final prompt token count: \(currentPrompt.count) / Max Allowed: \(maxContextTokens)")
-        }
+
+        // AnemllCore's applyChatTemplate already has model-specific fallback formatting
+        // (gemma3, llama3, qwen3, deepseek, etc.) so no additional fallback needed here
+
+        // Log info about the final prompt that will be sent to the model
+        let decodedText = tokenizer.decode(tokens: currentPrompt, skipSpecialTokens: false)
+        print("\nDecoded prompt preview:")
+        print("\"\(decodedText.prefix(100))...\"")
+        print("Final prompt token count: \(currentPrompt.count) / Max Allowed: \(maxContextTokens)")
         
         // Safety Net: Hard Truncation
         // This handles cases where the estimation + buffer wasn't perfect or template added unexpected tokens
@@ -2882,66 +2882,7 @@ class InferenceService: ObservableObject, ModelLoadingProgressDelegate {
         print("Conversation trimmed: \(messages.count) messages → \(trimmedMessages.count) messages")
         return trimmedMessages
     }
-    
-    /// Creates a simple fallback prompt when the chat template fails
-    private func createFallbackPrompt(messages: [Tokenizer.ChatMessage], tokenizer: Tokenizer) -> [Int] {
-        print("Using fallback prompt creation method - improved version from chat_full.py")
-        
-        var prompt = [Int]()
-        
-        // Check if this is a DeepSeek model (based on tokens we see in the log)
-        let isDeepSeek = currentModelId?.lowercased().contains("deepseek") ?? false
-        
-        // Use model-specific tags
-        let userTag = isDeepSeek ? "<|User|>" : "<|user|>"
-        let assistantTag = isDeepSeek ? "<|Assistant|>" : "<|assistant|>"
-        
-        // Add beginning of sequence token first
-        if tokenizer.bosTokenId > 0 {
-            prompt.append(tokenizer.bosTokenId)
-            print("Added BOS token: \(tokenizer.bosTokenId)")
-        }
-        
-        // In chat_full.py style, we format the chat history using explicit tags
-        for (_, message) in messages.enumerated() {
-            // Add role tag based on message type
-            if message.isUser {
-                // For user messages, tokenize the appropriate user tag
-                let userTagTokens = tokenizer.tokenize(userTag)
-                prompt.append(contentsOf: userTagTokens)
-                print("Added user tag: \(userTag) - \(userTagTokens.count) tokens")
-            } else if message.isAssistant {
-                // For assistant messages, tokenize the appropriate assistant tag
-                let assistantTagTokens = tokenizer.tokenize(assistantTag)
-                prompt.append(contentsOf: assistantTagTokens)
-                print("Added assistant tag: \(assistantTag) - \(assistantTagTokens.count) tokens")
-            }
-            
-            // Add message content directly (not through chat template)
-            let contentTokens = tokenizer.tokenize(message.content)
-            prompt.append(contentsOf: contentTokens)
-            
-            let contentPreview = message.content.isEmpty ? "(empty)" : 
-                "\(message.content.prefix(min(30, message.content.count)))\(message.content.count > 30 ? "..." : "")"
-            print("Added message content: \(contentPreview) - \(contentTokens.count) tokens")
-        }
-        
-        // For the final assistant turn, add the assistant tag to prime for generation
-        if !messages.isEmpty && !messages.last!.isAssistant {
-            let assistantTagTokens = tokenizer.tokenize(assistantTag)
-            prompt.append(contentsOf: assistantTagTokens)
-            print("Added final assistant tag for generation: \(assistantTag) - \(assistantTagTokens.count) tokens")
-        }
-        
-        print("Created fallback prompt with \(prompt.count) tokens")
-        
-        // Debug: decode the prompt to see what we've created
-        let decodedPrompt = tokenizer.detokenize(prompt)
-        print("Fallback prompt preview: \"\(decodedPrompt.prefix(100))...\"")
-        
-        return prompt
-    }
-    
+
     // MARK: - Helper Methods for Batch Inference
     
     /// Pads a sequence of token IDs to a consistent length for batch inference

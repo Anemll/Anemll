@@ -22,15 +22,16 @@ struct SettingsView: View {
     @Environment(ChatViewModel.self) private var chatVM
     @Environment(\.dismiss) private var dismiss
 
-    @State private var temperature: Float = 0.0  // Default: greedy decoding
-    @State private var maxTokens: Int = 512
-    @State private var systemPromptOption: SystemPromptOption = .noPrompt  // Default: no system prompt (matches CLI)
+    @State private var temperature: Float = 0.0
+    @State private var maxTokens: Int = 2048
+    @State private var systemPromptOption: SystemPromptOption = .modelDefault
     @State private var customPrompt: String = ""
 
     @State private var showingLogs = false
     @State private var autoLoadLastModel = true
     @State private var debugLevel: Int = 0
-    @State private var repetitionDetectionEnabled = false  // Default: off (matches CLI)
+    @State private var repetitionDetectionEnabled = false
+    @State private var showingResetConfirmation = false
 
     var body: some View {
         Form {
@@ -243,6 +244,18 @@ struct SettingsView: View {
                 }
             }
             .buttonStyle(.plain)
+
+            Button(role: .destructive) {
+                showingResetConfirmation = true
+            } label: {
+                Label("Reset to Defaults", systemImage: "arrow.counterclockwise")
+            }
+            .confirmationDialog("Reset all settings to defaults?", isPresented: $showingResetConfirmation, titleVisibility: .visible) {
+                Button("Reset", role: .destructive) {
+                    resetToDefaults()
+                }
+                Button("Cancel", role: .cancel) {}
+            }
         } header: {
             Text("About")
         } footer: {
@@ -302,6 +315,32 @@ struct SettingsView: View {
             await StorageService.shared.saveDebugLevel(debugLevel)
             await StorageService.shared.saveRepetitionDetectionEnabled(repetitionDetectionEnabled)
             // Update InferenceService settings
+            await MainActor.run {
+                InferenceService.shared.debugLevel = debugLevel
+                InferenceService.shared.repetitionDetectionEnabled = repetitionDetectionEnabled
+            }
+        }
+    }
+
+    private func resetToDefaults() {
+        // Reset local state to defaults
+        temperature = StorageService.defaultTemperatureValue
+        maxTokens = StorageService.defaultMaxTokensValue
+        systemPromptOption = .modelDefault
+        customPrompt = ""
+        autoLoadLastModel = StorageService.defaultAutoLoadLastModelValue
+        debugLevel = StorageService.defaultDebugLevelValue
+        repetitionDetectionEnabled = StorageService.defaultRepetitionDetectionValue
+
+        // Save to storage
+        Task {
+            await StorageService.shared.resetToDefaults()
+            // Update view model
+            chatVM.temperature = temperature
+            chatVM.maxTokens = maxTokens
+            chatVM.systemPrompt = StorageService.defaultSystemPromptValue
+            await chatVM.saveSettings()
+            // Update InferenceService
             await MainActor.run {
                 InferenceService.shared.debugLevel = debugLevel
                 InferenceService.shared.repetitionDetectionEnabled = repetitionDetectionEnabled

@@ -257,17 +257,25 @@ actor StorageService {
 
     // MARK: - Settings
 
-    /// Default settings
+    /// Default values (used for Reset to Defaults and fresh install)
+    static let defaultTemperatureValue: Float = 0.0
+    static let defaultMaxTokensValue: Int = 2048
+    static let defaultSystemPromptValue: String = "[MODEL_DEFAULT]"  // Model's Default prompt
+    static let defaultDebugLevelValue: Int = 0
+    static let defaultRepetitionDetectionValue: Bool = false
+    static let defaultAutoLoadLastModelValue: Bool = true
+
+    /// Current settings (with defaults)
     var defaultTemperature: Float {
-        UserDefaults.standard.object(forKey: "temperature") as? Float ?? 0.7
+        UserDefaults.standard.object(forKey: "temperature") as? Float ?? Self.defaultTemperatureValue
     }
 
     var defaultMaxTokens: Int {
-        UserDefaults.standard.object(forKey: "maxTokens") as? Int ?? 512
+        UserDefaults.standard.object(forKey: "maxTokens") as? Int ?? Self.defaultMaxTokensValue
     }
 
     var defaultSystemPrompt: String {
-        UserDefaults.standard.object(forKey: "systemPrompt") as? String ?? ""  // Default: no system prompt (matches CLI)
+        UserDefaults.standard.object(forKey: "systemPrompt") as? String ?? Self.defaultSystemPromptValue
     }
 
     var selectedModelId: String? {
@@ -275,8 +283,7 @@ actor StorageService {
     }
 
     var autoLoadLastModel: Bool {
-        // Default to true if not set
-        UserDefaults.standard.object(forKey: "autoLoadLastModel") as? Bool ?? true
+        UserDefaults.standard.object(forKey: "autoLoadLastModel") as? Bool ?? Self.defaultAutoLoadLastModelValue
     }
 
     func saveAutoLoadLastModel(_ value: Bool) {
@@ -284,7 +291,7 @@ actor StorageService {
     }
 
     var debugLevel: Int {
-        UserDefaults.standard.object(forKey: "debugLevel") as? Int ?? 0
+        UserDefaults.standard.object(forKey: "debugLevel") as? Int ?? Self.defaultDebugLevelValue
     }
 
     func saveDebugLevel(_ value: Int) {
@@ -292,7 +299,7 @@ actor StorageService {
     }
 
     var repetitionDetectionEnabled: Bool {
-        UserDefaults.standard.object(forKey: "repetitionDetectionEnabled") as? Bool ?? false  // Default: off (matches CLI)
+        UserDefaults.standard.object(forKey: "repetitionDetectionEnabled") as? Bool ?? Self.defaultRepetitionDetectionValue
     }
 
     func saveRepetitionDetectionEnabled(_ value: Bool) {
@@ -317,5 +324,16 @@ actor StorageService {
 
     func saveSelectedModelId(_ value: String?) {
         UserDefaults.standard.set(value, forKey: "selectedModelId")
+    }
+
+    /// Reset all settings to defaults
+    func resetToDefaults() {
+        UserDefaults.standard.set(Self.defaultTemperatureValue, forKey: "temperature")
+        UserDefaults.standard.set(Self.defaultMaxTokensValue, forKey: "maxTokens")
+        UserDefaults.standard.set(Self.defaultSystemPromptValue, forKey: "systemPrompt")
+        UserDefaults.standard.set(Self.defaultDebugLevelValue, forKey: "debugLevel")
+        UserDefaults.standard.set(Self.defaultRepetitionDetectionValue, forKey: "repetitionDetectionEnabled")
+        UserDefaults.standard.set(Self.defaultAutoLoadLastModelValue, forKey: "autoLoadLastModel")
+        logInfo("Settings reset to defaults", category: .storage)
     }
 }

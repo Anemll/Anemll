@@ -134,10 +134,25 @@ pip install -e ".[dev]"
    - `Tokenizer.swift`: Tokenization handling
    - `YAMLConfig.swift`: Configuration file parsing
 
-5. **iOS/macOS Sample App** (`anemll-chatbot/`)
-   - SwiftUI-based chat interface
-   - Model management and downloading
-   - Core ML inference integration
+5. **iOS/macOS Sample Apps**
+   - `anemll-chatbot/`: SwiftUI-based chat interface for iOS/macOS
+   - `ANEMLLChat/`: macOS-specific chat application with enhanced UI
+   - Both apps share `AnemllCore` library for inference
+   - Model management, downloading, and Core ML inference integration
+
+### ANEMLLChat App Architecture
+
+The macOS `ANEMLLChat` app uses:
+- **InferenceService**: Manages model loading and text generation
+- **ChatViewModel**: Handles conversation state and UI updates
+- **StorageService**: Persists settings and conversations to UserDefaults
+
+**Key Settings** (stored in `com.anemll.chat` UserDefaults):
+- `systemPrompt`: Default is empty (matches CLI behavior)
+- `repetitionDetectionEnabled`: Default is `false` (matches CLI behavior)
+- `temperature`, `maxTokens`, `debugLevel`
+
+**History Trimming**: The app trims conversation history when it exceeds `stateLength - 100` tokens, matching CLI behavior. Old message pairs (user + assistant) are removed to fit within context.
 
 ### Conversion Pipeline
 
@@ -275,6 +290,22 @@ Currently supports:
 - DeepHermes (3B, 8B)
 
 Pre-converted models available at https://huggingface.co/anemll
+
+## ANEMLLChat vs CLI Parity
+
+The macOS ANEMLLChat app should match CLI (`anemllcli`) behavior:
+
+| Feature | CLI | App |
+|---------|-----|-----|
+| System prompt | Only if `--system` provided | Only if configured in Settings |
+| Repetition detection | None | Off by default (toggle in Settings) |
+| History trimming | Trims when > stateLength-100 | Same logic |
+| Context display | `[History: N tokens]` | `N ctx` (input + output tokens) |
+
+**Common Issues**:
+- If app gives different output than CLI, check Settings → System Prompt is "No Prompt"
+- If generation stops early, check Settings → Repetition Detection is OFF
+- Context mismatch: App now shows `historyTokens` (input + output) matching CLI
 
 #QWEN TEST
 export_coreml.py is a test file for Qwen export development

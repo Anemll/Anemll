@@ -244,9 +244,9 @@ class ChatService: ObservableObject {
         // Convert full chat history to Tokenizer.ChatMessage format
         var chatMessages: [Tokenizer.ChatMessage] = []
         
-        // First add system prompt if provided
+        // First add system prompt if provided (use .system(), not .assistant())
         if !systemPrompt.isEmpty {
-            chatMessages.append(.assistant(systemPrompt))
+            chatMessages.append(.system(systemPrompt))
         }
         
         // Add all previous messages from the chat history
