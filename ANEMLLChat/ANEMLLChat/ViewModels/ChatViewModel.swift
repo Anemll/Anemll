@@ -58,9 +58,21 @@ final class ChatViewModel {
         do {
             conversations = try await StorageService.shared.loadConversations()
             logInfo("Loaded \(conversations.count) conversations", category: .app)
+
+            if currentConversation == nil {
+                if let first = conversations.first {
+                    currentConversation = first
+                } else {
+                    newConversation()
+                }
+            }
         } catch {
             logError("Failed to load conversations: \(error)", category: .storage)
             errorMessage = "Failed to load conversations"
+
+            if currentConversation == nil {
+                newConversation()
+            }
         }
     }
 

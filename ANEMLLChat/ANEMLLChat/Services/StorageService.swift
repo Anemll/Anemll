@@ -42,7 +42,7 @@ actor StorageService {
 
     // MARK: - Directories
 
-    /// Documents directory URL
+    /// Documents directory URL (sandboxed on iOS, user's Documents on macOS)
     private var documentsDirectory: URL {
         fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
@@ -53,8 +53,16 @@ actor StorageService {
     }
 
     /// Models directory (for downloaded models)
+    /// - macOS: ~/Documents/ (directly in user's Documents for easy access)
+    /// - iOS: Documents/Models/ (in app's sandboxed Documents)
     var modelsDirectory: URL {
-        documentsDirectory.appendingPathComponent("Models", isDirectory: true)
+        #if os(macOS)
+        // Store directly in ~/Documents for easy Finder access (matches anemll-chatbot)
+        return fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Documents", isDirectory: true)
+        #else
+        // iOS: Store in app's Documents/Models (visible in Files app with UIFileSharingEnabled)
+        return documentsDirectory.appendingPathComponent("Models", isDirectory: true)
+        #endif
     }
 
     /// Ensure directory exists
@@ -180,7 +188,9 @@ actor StorageService {
 
     /// Get local path for a model
     func modelPath(for modelId: String) -> URL {
-        modelsDirectory.appendingPathComponent(modelId.replacingOccurrences(of: "/", with: "_"))
+        // Trim whitespace to prevent path issues from malformed model IDs
+        let cleanId = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
+        return modelsDirectory.appendingPathComponent(cleanId.replacingOccurrences(of: "/", with: "_"))
     }
 
     /// Check if a model is downloaded
@@ -194,13 +204,27 @@ actor StorageService {
     func deleteModel(_ modelId: String) async throws {
         let modelDir = modelPath(for: modelId)
 
+        logDebug("[DELETE] Model ID: '\(modelId)'", category: .storage)
+        logDebug("[DELETE] Computed path: \(modelDir.path)", category: .storage)
+        logDebug("[DELETE] File exists: \(fileManager.fileExists(atPath: modelDir.path))", category: .storage)
+
         if fileManager.fileExists(atPath: modelDir.path) {
             do {
                 try fileManager.removeItem(at: modelDir)
-                logInfo("Deleted model: \(modelId)", category: .storage)
+
+                // Verify deletion actually succeeded
+                if fileManager.fileExists(atPath: modelDir.path) {
+                    logError("[DELETE] FAILED - Directory still exists after removeItem!", category: .storage)
+                    throw StorageError.fileWriteFailed(NSError(domain: "StorageService", code: 1, userInfo: [NSLocalizedDescriptionKey: "Directory still exists after deletion"]))
+                }
+
+                logInfo("[DELETE] Successfully deleted model: \(modelId)", category: .storage)
             } catch {
+                logError("[DELETE] removeItem failed: \(error)", category: .storage)
                 throw StorageError.fileWriteFailed(error)
             }
+        } else {
+            logWarning("[DELETE] Directory not found at path: \(modelDir.path)", category: .storage)
         }
     }
 
@@ -257,6 +281,14 @@ actor StorageService {
 
     func saveAutoLoadLastModel(_ value: Bool) {
         UserDefaults.standard.set(value, forKey: "autoLoadLastModel")
+    }
+
+    var debugLevel: Int {
+        UserDefaults.standard.object(forKey: "debugLevel") as? Int ?? 0
+    }
+
+    func saveDebugLevel(_ value: Int) {
+        UserDefaults.standard.set(value, forKey: "debugLevel")
     }
 
     func clearLastModel() {

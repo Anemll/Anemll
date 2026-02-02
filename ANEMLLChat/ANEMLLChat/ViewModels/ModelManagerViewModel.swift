@@ -139,43 +139,16 @@ final class ModelManagerViewModel {
 
     // MARK: - Download
 
-    /// Download a model
+    /// Download a model (public API - sets state and starts download)
     func downloadModel(_ model: ModelInfo) async {
         guard !model.isDownloaded, !model.isDownloading else { return }
 
+        // Set state immediately so UI updates
         downloadingModelId = model.id
         updateModelDownloading(model.id, isDownloading: true)
 
-        logInfo("Starting download: \(model.id)", category: .download)
-
-        await DownloadService.shared.downloadModel(
-            model.id,
-            progress: { [weak self] progress in
-                Task { @MainActor in
-                    self?.downloadProgress = progress
-                    self?.updateModelProgress(model.id, progress: progress)
-                }
-            },
-            completion: { [weak self] result in
-                Task { @MainActor in
-                    guard let self = self else { return }
-
-                    switch result {
-                    case .success(let path):
-                        self.updateModelDownloaded(model.id, path: path)
-                        logInfo("Download complete: \(model.id)", category: .download)
-
-                    case .failure(let error):
-                        self.updateModelError(model.id, error: error.localizedDescription)
-                        self.errorMessage = error.localizedDescription
-                        logError("Download failed: \(error)", category: .download)
-                    }
-
-                    self.downloadingModelId = nil
-                    self.downloadProgress = nil
-                }
-            }
-        )
+        // Perform the actual download
+        await performDownload(model)
     }
 
     /// Cancel ongoing download
@@ -226,7 +199,16 @@ final class ModelManagerViewModel {
 
         isLoadingModel = true
         loadingModelId = model.id
+        loadingProgress = nil
         errorMessage = nil
+
+        // Start a task to poll InferenceService's loading progress
+        let progressTask = Task { @MainActor in
+            while !Task.isCancelled && isLoadingModel {
+                loadingProgress = InferenceService.shared.loadingProgress
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
 
         do {
             let modelURL = URL(fileURLWithPath: path)
@@ -243,8 +225,10 @@ final class ModelManagerViewModel {
             logError("Failed to load model: \(error)", category: .model)
         }
 
+        progressTask.cancel()
         isLoadingModel = false
         loadingModelId = nil
+        loadingProgress = nil
     }
 
     /// Unload the current model
@@ -276,43 +260,59 @@ final class ModelManagerViewModel {
     /// Add a custom model from URL and start download
     /// NOTE: This returns immediately after adding the model - download runs in background
     func addCustomModel(repoId: String, name: String) async {
-        logInfo("addCustomModel called: \(repoId)", category: .model)
+        // Trim whitespace from inputs to prevent path issues
+        let cleanRepoId = repoId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        logInfo("addCustomModel called: '\(cleanRepoId)'", category: .model)
+
+        // Validate repo ID format
+        guard !cleanRepoId.isEmpty, cleanRepoId.contains("/") else {
+            errorMessage = "Invalid repository ID format. Use: owner/repo-name"
+            logError("Invalid repo ID format: '\(cleanRepoId)'", category: .model)
+            return
+        }
 
         // Check if model already exists
-        if let existingIndex = availableModels.firstIndex(where: { $0.id == repoId }) {
+        if let existingIndex = availableModels.firstIndex(where: { $0.id == cleanRepoId }) {
             let existingModel = availableModels[existingIndex]
 
             // If already downloaded, just inform user
             if existingModel.isDownloaded {
-                errorMessage = "Model already downloaded: \(name)"
-                logInfo("Model already downloaded: \(repoId)", category: .model)
+                errorMessage = "Model already downloaded: \(cleanName)"
+                logInfo("Model already downloaded: \(cleanRepoId)", category: .model)
                 return
             }
 
             // If currently downloading, don't start another
             if existingModel.isDownloading {
-                logInfo("Model already downloading: \(repoId)", category: .model)
+                logInfo("Model already downloading: \(cleanRepoId)", category: .model)
                 return
             }
 
-            // Model exists but not downloaded - start download in background
-            logInfo("Starting download for existing model: \(repoId)", category: .model)
+            // Model exists but not downloaded - start download
+            logInfo("Starting download for existing model: \(cleanRepoId)", category: .model)
+
+            // Mark as downloading IMMEDIATELY so UI shows it
+            downloadingModelId = existingModel.id
+            updateModelDownloading(existingModel.id, isDownloading: true)
+
             Task {
-                await downloadModel(existingModel)
+                await performDownload(existingModel)
             }
             return
         }
 
         // New model - add to list
         let model = ModelInfo(
-            id: repoId,
-            name: name,
+            id: cleanRepoId,
+            name: cleanName.isEmpty ? cleanRepoId.components(separatedBy: "/").last ?? cleanRepoId : cleanName,
             description: "Custom model from HuggingFace",
             size: "Unknown"
         )
 
         availableModels.append(model)
-        logInfo("Added model to list: \(repoId), total models: \(availableModels.count)", category: .model)
+        logInfo("Added model to list: \(cleanRepoId), total models: \(availableModels.count)", category: .model)
 
         // Save to registry FIRST (before download starts)
         do {
@@ -322,10 +322,49 @@ final class ModelManagerViewModel {
             logError("Failed to save model registry: \(error)", category: .model)
         }
 
+        // Mark as downloading IMMEDIATELY so UI shows it in Downloading section
+        // This must happen BEFORE the async Task to avoid UI timing gap
+        downloadingModelId = model.id
+        updateModelDownloading(model.id, isDownloading: true)
+
         // Start download in background (don't await - return immediately)
         Task {
-            await downloadModel(model)
+            await performDownload(model)
         }
+    }
+
+    /// Internal download implementation (called after downloadingModelId is set)
+    private func performDownload(_ model: ModelInfo) async {
+        logInfo("Starting download: \(model.id)", category: .download)
+
+        await DownloadService.shared.downloadModel(
+            model.id,
+            progress: { [weak self] progress in
+                Task { @MainActor in
+                    self?.downloadProgress = progress
+                    self?.updateModelProgress(model.id, progress: progress)
+                }
+            },
+            completion: { [weak self] result in
+                Task { @MainActor in
+                    guard let self = self else { return }
+
+                    switch result {
+                    case .success(let path):
+                        self.updateModelDownloaded(model.id, path: path)
+                        logInfo("Download complete: \(model.id)", category: .download)
+
+                    case .failure(let error):
+                        self.updateModelError(model.id, error: error.localizedDescription)
+                        self.errorMessage = error.localizedDescription
+                        logError("Download failed: \(error)", category: .download)
+                    }
+
+                    self.downloadingModelId = nil
+                    self.downloadProgress = nil
+                }
+            }
+        )
     }
 
     // MARK: - Helpers

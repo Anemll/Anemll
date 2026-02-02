@@ -122,10 +122,14 @@ final class InferenceService: ObservableObject {
     private var shouldCancel = false
     private let repetitionDetector = RepetitionDetector()
 
+    // Model template (detected from model path)
+    private var currentTemplate: String = "default"
+
     // Settings
-    var temperature: Float = 0.7
+    var temperature: Float = 0.0  // Default: greedy decoding
     var maxTokens: Int = 512
-    var systemPrompt: String = "You are a helpful assistant."
+    var systemPrompt: String = "[MODEL_DEFAULT]"  // Default: use model's default prompt
+    var debugLevel: Int = 0  // Debug verbosity: 0=off, 1=basic, 2=verbose
 
     private init() {
         // Load settings from storage
@@ -133,6 +137,7 @@ final class InferenceService: ObservableObject {
             temperature = await StorageService.shared.defaultTemperature
             maxTokens = await StorageService.shared.defaultMaxTokens
             systemPrompt = await StorageService.shared.defaultSystemPrompt
+            debugLevel = await StorageService.shared.debugLevel
         }
     }
 
@@ -163,10 +168,12 @@ final class InferenceService: ObservableObject {
 
             // Load tokenizer
             loadingProgress = ModelLoadingProgress(percentage: 0.1, stage: "Loading tokenizer", detail: nil)
+            let detectedTemplate = detectTemplate(from: config)
+            currentTemplate = detectedTemplate
             tokenizer = try await Tokenizer(
                 modelPath: modelPath.path,
-                template: detectTemplate(from: config),
-                debugLevel: 0
+                template: detectedTemplate,
+                debugLevel: debugLevel
             )
 
             // Load models with progress
@@ -193,7 +200,7 @@ final class InferenceService: ObservableObject {
                 contextLength: config.contextLength,
                 batchSize: config.batchSize,
                 splitLMHead: config.splitLMHead,
-                debugLevel: 0,
+                debugLevel: debugLevel,
                 argmaxInModel: config.argmaxInModel,
                 slidingWindow: config.slidingWindow
             )
@@ -253,9 +260,14 @@ final class InferenceService: ObservableObject {
         // Convert messages to tokenizer format
         var chatMessages: [Tokenizer.ChatMessage] = []
 
-        // Add system prompt if not present
+        // Add system prompt if not present (resolve markers to actual prompts)
         if !messages.contains(where: { $0.role == .system }) {
-            chatMessages.append(.system(systemPrompt))
+            let resolvedPrompt = resolveSystemPrompt(systemPrompt)
+            print("===== [SYSTEM PROMPT] Template: \(currentTemplate), Raw: '\(systemPrompt)', Resolved: '\(resolvedPrompt)' =====")
+            logInfo("System prompt resolved: template=\(currentTemplate), prompt=\(resolvedPrompt)", category: .inference)
+            if !resolvedPrompt.isEmpty {
+                chatMessages.append(.system(resolvedPrompt))
+            }
         }
 
         for message in messages {
@@ -359,6 +371,57 @@ final class InferenceService: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    /// Resolve system prompt marker to actual prompt based on model template
+    private func resolveSystemPrompt(_ prompt: String) -> String {
+        // If empty or doesn't start with marker, return as-is
+        guard prompt.hasPrefix("[MODEL_") else {
+            return prompt
+        }
+
+        // Define default prompts for each model type
+        let defaultPrompts: [String: String] = [
+            "gemma": "You are a helpful assistant.",
+            "gemma3": "You are a helpful assistant.",
+            "llama": "You are a helpful, respectful and honest assistant.",
+            "llama3": "You are a helpful, respectful and honest assistant.",
+            "qwen": "You are Qwen, a helpful assistant.",
+            "qwen3": "You are Qwen, a helpful assistant.",
+            "deepseek": "You are a helpful assistant.",
+            "default": "You are a helpful assistant."
+        ]
+
+        // Thinking mode prompts (Qwen3 supports /think and /no_think)
+        let thinkingPrompts: [String: String] = [
+            "qwen": "You are Qwen, a helpful assistant. /think",
+            "qwen3": "You are Qwen, a helpful assistant. /think",
+            "gemma3": "You are a helpful assistant.",  // No explicit thinking mode
+            "llama3": "You are a helpful, respectful and honest assistant.",  // No explicit thinking mode
+            "default": "You are a helpful assistant."
+        ]
+
+        // Non-thinking mode prompts
+        let nonThinkingPrompts: [String: String] = [
+            "qwen": "You are Qwen, a helpful assistant. /no_think",
+            "qwen3": "You are Qwen, a helpful assistant. /no_think",
+            "gemma3": "You are a helpful assistant.",
+            "llama3": "You are a helpful, respectful and honest assistant.",
+            "default": "You are a helpful assistant."
+        ]
+
+        let template = currentTemplate.lowercased()
+
+        switch prompt {
+        case "[MODEL_DEFAULT]":
+            return defaultPrompts[template] ?? defaultPrompts["default"]!
+        case "[MODEL_THINKING]":
+            return thinkingPrompts[template] ?? thinkingPrompts["default"]!
+        case "[MODEL_NON_THINKING]":
+            return nonThinkingPrompts[template] ?? nonThinkingPrompts["default"]!
+        default:
+            return prompt
+        }
+    }
 
     private func detectTemplate(from config: YAMLConfig) -> String {
         // Detect template from model path or config

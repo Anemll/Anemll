@@ -12,14 +12,23 @@ struct DownloadProgressView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Progress bar
-            ProgressView(value: progress.progress)
-                .progressViewStyle(.linear)
+            // Progress bar with percentage
+            HStack(spacing: 8) {
+                ProgressView(value: progress.progress)
+                    .progressViewStyle(.linear)
 
-            // Stats row
+                Text(String(format: "%.0f%%", progress.progress * 100))
+                    .font(.caption)
+                    .fontWeight(.medium)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .frame(width: 36, alignment: .trailing)
+            }
+
+            // Stats row - simplified (no individual file names)
             HStack {
-                // Downloaded / Total
-                Text("\(progress.downloadedString) / \(progress.totalString)")
+                // Total downloaded
+                Text(progress.downloadedString)
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -36,25 +45,6 @@ struct DownloadProgressView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-            }
-
-            // Current file
-            HStack {
-                Image(systemName: "doc")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-
-                Text(progress.currentFile)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-
-                Spacer()
-
-                Text("\(progress.filesCompleted + 1)/\(progress.totalFiles)")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
             }
         }
     }
@@ -115,7 +105,7 @@ struct CircularDownloadProgress: View {
         DownloadProgressView(progress: DownloadProgress(
             totalBytes: 1_000_000_000,
             downloadedBytes: 350_000_000,
-            currentFile: "model_chunk_01of04.mlmodelc/weights/weight.bin",
+            currentFile: "",
             filesCompleted: 2,
             totalFiles: 8,
             bytesPerSecond: 15_000_000

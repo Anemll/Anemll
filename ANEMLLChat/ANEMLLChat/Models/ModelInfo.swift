@@ -134,15 +134,16 @@ extension ModelInfo {
 
 extension ModelInfo {
     /// Default available models from HuggingFace
+    /// Gemma 3 270M first (smallest/fastest), then 1B, then others
     static let defaultModels: [ModelInfo] = [
         ModelInfo(
-            id: "anemll/anemll-llama-3.2-1B-iOSv2.0",
-            name: "LLaMA 3.2 1B",
-            description: "Meta's LLaMA 3.2 1B optimized for iOS/macOS",
-            size: "1.6 GB",
-            sizeBytes: 1_740_000_000,
+            id: "anemll/anemll-google-gemma-3-270m-it-ctx512-monolithic_0.3.5",
+            name: "Gemma 3 270M",
+            description: "Google's Gemma 3 270M - fast & compact",
+            size: "0.5 GB",
+            sizeBytes: 500_000_000,
             contextLength: 512,
-            architecture: "llama"
+            architecture: "gemma"
         ),
         ModelInfo(
             id: "anemll/anemll-google-gemma-3-1b-it-ctx4096_0.3.4",
@@ -152,6 +153,15 @@ extension ModelInfo {
             sizeBytes: 1_600_000_000,
             contextLength: 4096,
             architecture: "gemma"
+        ),
+        ModelInfo(
+            id: "anemll/anemll-llama-3.2-1B-iOSv2.0",
+            name: "LLaMA 3.2 1B",
+            description: "Meta's LLaMA 3.2 1B optimized for iOS/macOS",
+            size: "1.6 GB",
+            sizeBytes: 1_740_000_000,
+            contextLength: 512,
+            architecture: "llama"
         ),
         ModelInfo(
             id: "anemll/anemll-Qwen3-4B-ctx1024_0.3.0",

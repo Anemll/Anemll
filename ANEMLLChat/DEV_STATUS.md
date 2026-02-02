@@ -80,6 +80,25 @@ xcodebuild -exportArchive \
 
 **Claude gotcha**: iOS export requires a valid signing team + provisioning profile. If `xcodebuild -exportArchive` fails, open the `.xcarchive` in Xcode Organizer and export there once to generate a working `ExportOptions.plist`, then reuse it for CLI exports.
 
+## Xcode Run Notes (Claude)
+
+### No Simulator Needed
+Do **not** launch an emulator/simulator. iPhone Mirroring is already connected and should be used for on-device testing. The device shows as a real iPhone target in Xcode.
+
+### Run on iPhone (via Mirroring)
+1) In Xcode, select the scheme **ANEMLLChat**.
+2) In the device picker, choose the **connected iPhone** (iOS 17.x in this setup). Do **not** pick a simulator.
+3) Press **Run** (▶). Xcode will build and deploy to the phone.
+4) Use the mirrored iPhone window to verify the UI.
+
+### Run on macOS
+1) In Xcode, select the scheme **ANEMLLChat**.
+2) Choose **My Mac** as the run destination.
+3) Press **Run** (▶). The macOS app launches locally.
+
+### Token Handling (Agent Host)
+If a bearer token fails (e.g., `/health` returns unauthorized), ask the user for the current token from the menu bar app UI and re-export it before retrying.
+
 ## Key Files
 
 ### App Structure
@@ -314,10 +333,46 @@ Created `Views/Chat/MarkdownView.swift` with full markdown support:
    - Shows "Loading..." text in green capsule-shaped background
    - Much more visible than the previous tiny spinner
 
+## Recent Fixes (2026-01-31 7:20 PM)
+
+1. **Model deletion bug investigation**
+   - Added debug logging to StorageService.deleteModel to track:
+     - Model ID being deleted
+     - Computed path for deletion
+     - Whether fileExists check passed
+     - Result of removeItem operation
+   - Added verification after deletion to confirm directory was actually removed
+   - Found: Some models had mismatched registry state (isDownloaded: false but folder exists)
+
+2. **Input validation for custom models**
+   - Added whitespace trimming to model IDs and names in ModelManagerViewModel.addCustomModel
+   - Added validation for repo ID format (must contain "/")
+   - Fixed modelPath function to trim whitespace from model IDs
+   - Found malformed model ID in registry: leading space in " anemll/anemll-Qwen..."
+
+3. **iOS Files app visibility**
+   - Added `UIFileSharingEnabled = true` to Info.plist
+   - Added `LSSupportsOpeningDocumentsInPlace = true` to Info.plist
+   - Added CoreML document type handler
+   - Models folder now visible in iOS Files app under "On My Phone/ANEMLLChat"
+
+4. **System prompt resolution** (from earlier session)
+   - Added SystemPromptOption enum with: Model's Default, Thinking, Non-Thinking, No Prompt, Custom
+   - Changed default temperature to 0.0 (greedy decoding)
+   - Added resolveSystemPrompt() in InferenceService for template-aware prompt resolution
+   - Supports Qwen /think and /no_think suffixes
+
+5. **Model storage location aligned with anemll-chatbot**
+   - macOS: Changed from `~/Documents/Models/` to `~/Documents/` (matches anemll-chatbot)
+   - iOS: Remains `Documents/Models/` (sandboxed, visible in Files app)
+   - Both apps now share the same model storage location on macOS
+   - **MIGRATION**: Existing models in `~/Documents/Models/` need to be moved to `~/Documents/`
+
 ## Known Issues / TODO
 
 1. ~~**CTX display** - Need to verify if "ctx" in message stats shows overall context buffer or just per-message tokens~~ ✓ VERIFIED - CTX shows **overall context** (grew from 22→410 tokens in multi-turn conversation)
 2. **App icon in dock** - May need dock cache refresh to show new icon
+3. **Model registry state mismatch** - Some models show isDownloaded: false in registry but folder exists on disk
 
 ## TODO
 

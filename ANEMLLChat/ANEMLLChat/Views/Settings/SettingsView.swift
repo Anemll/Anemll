@@ -7,16 +7,29 @@
 
 import SwiftUI
 
+// System prompt options
+enum SystemPromptOption: String, CaseIterable, Identifiable {
+    case modelDefault = "Model's Default"
+    case modelThinking = "Model's Default (Thinking)"
+    case modelNonThinking = "Model's Default (Non-Thinking)"
+    case noPrompt = "No Prompt"
+    case custom = "Custom"
+
+    var id: String { rawValue }
+}
+
 struct SettingsView: View {
     @Environment(ChatViewModel.self) private var chatVM
     @Environment(\.dismiss) private var dismiss
 
-    @State private var temperature: Float = 0.7
+    @State private var temperature: Float = 0.0  // Default: greedy decoding
     @State private var maxTokens: Int = 512
-    @State private var systemPrompt: String = "You are a helpful assistant."
+    @State private var systemPromptOption: SystemPromptOption = .modelDefault
+    @State private var customPrompt: String = ""
 
     @State private var showingLogs = false
     @State private var autoLoadLastModel = true
+    @State private var debugLevel: Int = 0
 
     var body: some View {
         Form {
@@ -127,13 +140,32 @@ struct SettingsView: View {
 
     private var systemPromptSection: some View {
         Section {
-            TextEditor(text: $systemPrompt)
-                .frame(minHeight: 100)
-                .font(.body)
+            Picker("Prompt", selection: $systemPromptOption) {
+                ForEach(SystemPromptOption.allCases) { option in
+                    Text(option.rawValue).tag(option)
+                }
+            }
+
+            if systemPromptOption == .custom {
+                TextEditor(text: $customPrompt)
+                    .frame(minHeight: 80)
+                    .font(.body)
+            }
         } header: {
             Text("System Prompt")
         } footer: {
-            Text("Initial instructions for the AI assistant")
+            switch systemPromptOption {
+            case .modelDefault:
+                Text("Uses the model's built-in default prompt")
+            case .modelThinking:
+                Text("Uses thinking/reasoning mode if supported")
+            case .modelNonThinking:
+                Text("Uses non-thinking mode if supported")
+            case .noPrompt:
+                Text("No system prompt - raw model output")
+            case .custom:
+                Text("Custom instructions for the AI")
+            }
         }
     }
 
@@ -141,6 +173,12 @@ struct SettingsView: View {
 
     private var logsSection: some View {
         Section {
+            Picker("Debug Level", selection: $debugLevel) {
+                Text("Off").tag(0)
+                Text("Basic").tag(1)
+                Text("Verbose").tag(2)
+            }
+
             Button {
                 showingLogs = true
             } label: {
@@ -154,6 +192,8 @@ struct SettingsView: View {
             .buttonStyle(.plain)
         } header: {
             Text("Debug")
+        } footer: {
+            Text("Debug level affects console output during model loading and inference")
         }
     }
 
@@ -206,21 +246,54 @@ struct SettingsView: View {
     private func loadSettings() {
         temperature = chatVM.temperature
         maxTokens = chatVM.maxTokens
-        systemPrompt = chatVM.systemPrompt
+
+        // Parse the stored system prompt to determine option
+        let storedPrompt = chatVM.systemPrompt
+        if storedPrompt.isEmpty {
+            systemPromptOption = .noPrompt
+        } else if storedPrompt.hasPrefix("[MODEL_DEFAULT]") {
+            systemPromptOption = .modelDefault
+        } else if storedPrompt.hasPrefix("[MODEL_THINKING]") {
+            systemPromptOption = .modelThinking
+        } else if storedPrompt.hasPrefix("[MODEL_NON_THINKING]") {
+            systemPromptOption = .modelNonThinking
+        } else {
+            systemPromptOption = .custom
+            customPrompt = storedPrompt
+        }
 
         Task {
             autoLoadLastModel = await StorageService.shared.autoLoadLastModel
+            debugLevel = await StorageService.shared.debugLevel
         }
     }
 
     private func saveSettings() {
         chatVM.temperature = temperature
         chatVM.maxTokens = maxTokens
-        chatVM.systemPrompt = systemPrompt
+
+        // Convert option to stored string
+        switch systemPromptOption {
+        case .modelDefault:
+            chatVM.systemPrompt = "[MODEL_DEFAULT]"
+        case .modelThinking:
+            chatVM.systemPrompt = "[MODEL_THINKING]"
+        case .modelNonThinking:
+            chatVM.systemPrompt = "[MODEL_NON_THINKING]"
+        case .noPrompt:
+            chatVM.systemPrompt = ""
+        case .custom:
+            chatVM.systemPrompt = customPrompt
+        }
 
         Task {
             await chatVM.saveSettings()
             await StorageService.shared.saveAutoLoadLastModel(autoLoadLastModel)
+            await StorageService.shared.saveDebugLevel(debugLevel)
+            // Update InferenceService debug level
+            await MainActor.run {
+                InferenceService.shared.debugLevel = debugLevel
+            }
         }
     }
 }

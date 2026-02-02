@@ -16,45 +16,43 @@ struct MessageBubble: View {
     let message: ChatMessage
 
     @State private var isHovering = false
+    @State private var showCopyButton = false
 
     private var isUser: Bool {
         message.role == .user
     }
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            if isUser {
-                Spacer(minLength: 60)
-            }
-
-            VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
-                // Message content with hover overlay
-                ZStack(alignment: .topTrailing) {
-                    messageContent
-                        .frame(maxWidth: isUser ? nil : .infinity, alignment: .leading)
-
-                    // Copy button (appears on hover for macOS, always visible touch target for iOS)
-                    if !message.content.isEmpty {
-                        copyButton
+        VStack(alignment: .leading, spacing: 6) {
+            // Message content with overlay
+            ZStack(alignment: .topTrailing) {
+                messageContent
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    #if os(iOS)
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showCopyButton.toggle()
+                        }
                     }
-                }
+                    #endif
 
-                // Stats (for assistant messages)
-                if !isUser && message.isComplete {
-                    statsView
+                // Copy button
+                if !message.content.isEmpty {
+                    copyButton
                 }
             }
-            .frame(maxWidth: isUser ? nil : .infinity, alignment: .leading)
-            #if os(macOS)
-            .onHover { hovering in
-                isHovering = hovering
-            }
-            #endif
 
-            if isUser {
-                // Only add right spacer for user messages (not assistant)
+            // Stats (for assistant messages)
+            if !isUser && message.isComplete {
+                statsView
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        #if os(macOS)
+        .onHover { hovering in
+            isHovering = hovering
+        }
+        #endif
     }
 
     // MARK: - Copy Button
@@ -73,20 +71,27 @@ struct MessageBubble: View {
                     .background(.ultraThinMaterial, in: Circle())
             }
             .buttonStyle(.plain)
-            .offset(x: -4, y: 4)
+            .offset(x: -6, y: -6)
             .transition(.opacity.combined(with: .scale))
         }
         #else
-        // iOS: context menu for copy (long press)
-        Color.clear
-            .frame(width: 1, height: 1)
-            .contextMenu {
-                Button {
-                    copyToClipboard()
-                } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
+        // iOS: show on tap (top-left for assistant, top-right for user)
+        if showCopyButton {
+            Button {
+                copyToClipboard()
+                withAnimation {
+                    showCopyButton = false
                 }
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .padding(8)
+                    .background(.ultraThinMaterial, in: Circle())
             }
+            .offset(x: -6, y: -6)
+            .transition(.scale.combined(with: .opacity))
+        }
         #endif
     }
 
@@ -102,39 +107,32 @@ struct MessageBubble: View {
     // MARK: - Message Content
 
     private var messageContent: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if message.content.isEmpty && !message.isComplete {
-                // Loading state
-                ProgressView()
-                    .controlSize(.small)
-            } else if isUser {
-                // User messages - simple text
-                Text(message.content)
-                    .textSelection(.enabled)
-            } else {
-                // Assistant messages - full markdown rendering
-                MarkdownView(content: message.content, isUserMessage: false)
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(bubbleBackground)
-        .foregroundStyle(isUser ? .white : .primary)
-    }
+        HStack(alignment: .top, spacing: 12) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(isUser ? Color.accentColor.opacity(0.9) : Color.secondary.opacity(0.45))
+                .frame(width: 3)
 
-    private var bubbleBackground: some View {
-        RoundedRectangle(cornerRadius: 18, style: .continuous)
-            .fill(isUser ? Color.accentColor : Color(platformSecondaryBackground))
+            VStack(alignment: .leading, spacing: 8) {
+                if message.content.isEmpty && !message.isComplete {
+                    // Loading state
+                    ProgressView()
+                        .controlSize(.small)
+                } else if isUser {
+                    // User messages - simple text
+                    Text(message.content)
+                        .textSelection(.enabled)
+                        .lineSpacing(3)
+                } else {
+                    // Assistant messages - full markdown rendering
+                    MarkdownView(content: message.content, isUserMessage: false)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 6)
+        .foregroundStyle(.primary)
     }
 }
-
-// MARK: - Platform Colors
-
-#if os(iOS)
-private let platformSecondaryBackground = UIColor.secondarySystemBackground
-#else
-private let platformSecondaryBackground = NSColor.controlBackgroundColor
-#endif
 
 // MARK: - Stats View
 

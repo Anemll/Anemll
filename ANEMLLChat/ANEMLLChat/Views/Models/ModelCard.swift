@@ -23,73 +23,73 @@ struct ModelCard: View {
     }
 
     var body: some View {
-        HStack(spacing: 12) {
-            // Status icon
+        HStack(alignment: .top, spacing: 12) {
+            // Status icon - only show on macOS to save space on iPhone
+            #if os(macOS)
             statusIcon
+            #endif
 
-            // Model info
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    // Button for name + info to show model details (takes priority over card tap)
+            // Model info - fixed layout for consistency
+            VStack(alignment: .leading, spacing: 2) {
+                // Row 1: Info button + Name - FULL WIDTH (spans above buttons)
+                HStack(spacing: 4) {
                     Button {
                         showingModelDetail = true
                     } label: {
-                        HStack(spacing: 4) {
-                            Text(model.name)
-                                .font(.headline)
-                                .foregroundStyle(.primary)
-
-                            Image(systemName: "info.circle")
-                                .font(.caption)
-                                .foregroundStyle(.blue)
-                        }
-                    }
-                    .buttonStyle(.plain)
-
-                    if isLoaded {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
+                        Image(systemName: "info.circle")
                             .font(.caption)
                     }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.blue)
+
+                    Text(model.name)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
                 }
+                .frame(height: 20)
 
-                Text(model.description)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                // Row 2: Description + Action buttons (buttons moved down)
+                HStack(spacing: 6) {
+                    Text(model.description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
 
+                    Spacer(minLength: 0)
+
+                    // Action buttons on same row as description
+                    actionButton
+                }
+                .frame(height: 28)
+
+                // Row 3: Metadata - compact format
                 HStack(spacing: 6) {
                     Text(model.size)
                         .font(.caption2)
-                        .fixedSize()
+                        .foregroundStyle(.secondary)
 
                     if let context = model.contextLength {
-                        Text("•")
+                        Text("\(context)ctx")
                             .font(.caption2)
-                        Text("\(context) ctx")
-                            .font(.caption2)
-                            .fixedSize()
+                            .foregroundStyle(.secondary)
                     }
 
                     if let arch = model.architecture {
                         Text(arch)
                             .font(.caption2)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
                             .background(Color.secondary.opacity(0.2), in: Capsule())
-                            .fixedSize()
                     }
+
+                    Spacer(minLength: 0)
                 }
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+                .frame(height: 18)
             }
-
-            Spacer()
-
-            // Action button
-            actionButton
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 8)
+        .padding(.horizontal, 4)
         .contentShape(Rectangle())
         .onTapGesture {
             handleTap()
@@ -189,16 +189,17 @@ struct ModelCard: View {
                 // Animated loading indicator - more visible
                 ModelLoadingIndicator()
             } else {
-                HStack(spacing: 8) {
-                    // Delete button - more visible on iOS
+                HStack(spacing: 6) {
+                    // Delete button
                     Button {
                         showingDeleteAlert = true
                     } label: {
                         Image(systemName: "trash")
-                            .font(.body)
+                            .font(.caption)
                     }
                     .buttonStyle(.bordered)
                     .tint(.red)
+                    .controlSize(.small)
 
                     // Load button
                     Button {
@@ -207,12 +208,14 @@ struct ModelCard: View {
                         }
                     } label: {
                         Text(isLoaded ? "Loaded" : "Load")
-                            .font(.caption)
+                            .font(.caption2)
                             .fontWeight(.medium)
+                            .fixedSize()  // Prevent text wrapping
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(isLoaded ? .green : .blue)
-                    .disabled(isLoaded || modelManager.loadingModelId != nil)
+                    .controlSize(.small)
+                    .disabled(isLoaded)
                 }
             }
 

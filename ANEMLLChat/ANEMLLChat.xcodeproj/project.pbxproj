@@ -294,7 +294,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.3.7;
-				PRODUCT_BUNDLE_IDENTIFIER = "anemll.anemll-chat.demo";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.anemll.chat";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
@@ -334,7 +334,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.3.7;
-				PRODUCT_BUNDLE_IDENTIFIER = "anemll.anemll-chat.demo";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.anemll.chat";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;

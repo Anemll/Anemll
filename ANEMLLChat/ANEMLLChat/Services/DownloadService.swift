@@ -93,6 +93,7 @@ actor DownloadService: NSObject {
     private var progressObservations: [String: NSKeyValueObservation] = [:]
     private var downloadCompletions: [String: CheckedContinuation<Void, Error>] = [:]
     private var currentFileSize: [String: Int64] = [:]
+    private var lastProgressUpdate: [String: Date] = [:]  // Throttle progress updates
 
     override private init() {
         super.init()
@@ -384,39 +385,48 @@ actor DownloadService: NSObject {
     private var progressTimers: [String: Task<Void, Never>] = [:]
 
     private func observeProgress(task: URLSessionDownloadTask, modelId: String) {
-        // Use KVO to observe progress - store observation to keep it alive
-        let observation = task.progress.observe(\.fractionCompleted) { [weak self] progress, _ in
+        // Use KVO to observe countOfBytesReceived directly on the task (more reliable than progress object)
+        let observation = task.observe(\.countOfBytesReceived) { [weak self] task, _ in
             Task {
-                await self?.handleProgressUpdate(for: modelId, completedBytes: progress.completedUnitCount, totalBytes: progress.totalUnitCount)
+                await self?.handleProgressUpdate(
+                    for: modelId,
+                    completedBytes: task.countOfBytesReceived,
+                    totalBytes: task.countOfBytesExpectedToReceive
+                )
             }
         }
 
         // Store observation to keep it alive for the duration of the download
         progressObservations[modelId] = observation
 
-        // Also start a timer-based polling for macOS (KVO may not fire frequently)
-        #if os(macOS)
+        // Start a timer-based polling as backup (KVO may not fire frequently on iOS or macOS)
         progressTimers[modelId]?.cancel()
         progressTimers[modelId] = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 second
+                try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 second for more frequent updates
                 guard !Task.isCancelled else { break }
-                let completed = task.progress.completedUnitCount
-                let total = task.progress.totalUnitCount
-                if completed > 0 || total > 0 {
+                let completed = task.countOfBytesReceived
+                let total = task.countOfBytesExpectedToReceive
+                if completed > 0 {
                     await self?.handleProgressUpdate(for: modelId, completedBytes: completed, totalBytes: total)
                 }
             }
         }
-        #endif
     }
 
     private func handleProgressUpdate(for modelId: String, completedBytes: Int64, totalBytes: Int64) {
+        let now = Date()
+
+        // Throttle: only update at most every 300ms to avoid excessive UI refreshes
+        if let lastUpdate = lastProgressUpdate[modelId],
+           now.timeIntervalSince(lastUpdate) < 0.3 {
+            return
+        }
+        lastProgressUpdate[modelId] = now
+
         // Update current file progress and notify
         let baseDownloaded = downloadedBytesTotal[modelId] ?? 0
         let currentTotal = baseDownloaded + completedBytes
-
-        let now = Date()
         let total = totalBytesExpected[modelId] ?? 0
 
         // Calculate speed using rolling average
@@ -552,6 +562,7 @@ actor DownloadService: NSObject {
         progressObservations.removeValue(forKey: modelId)
         downloadCompletions.removeValue(forKey: modelId)
         currentFileSize.removeValue(forKey: modelId)
+        lastProgressUpdate.removeValue(forKey: modelId)
 
         // Cancel progress timer (macOS)
         progressTimers[modelId]?.cancel()

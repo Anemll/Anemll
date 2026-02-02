@@ -276,9 +276,11 @@ struct MarkdownView: View {
         if let attributed = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
             Text(attributed)
                 .textSelection(.enabled)
+                .lineSpacing(3)
         } else {
             Text(text)
                 .textSelection(.enabled)
+                .lineSpacing(3)
         }
     }
 }

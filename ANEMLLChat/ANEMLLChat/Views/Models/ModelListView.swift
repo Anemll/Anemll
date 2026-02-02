@@ -18,6 +18,7 @@ struct ModelListView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var showingAddModel = false
+    @State private var scrollProxy: ScrollViewProxy?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,6 +37,7 @@ struct ModelListView: View {
             .padding(.horizontal, 4)
             #endif
 
+            ScrollViewReader { proxy in
             List {
                 // Active model (if any is loaded)
                 if let loadedId = modelManager.loadedModelId,
@@ -69,7 +71,7 @@ struct ModelListView: View {
             }
             #if os(iOS)
             .listStyle(.insetGrouped)
-            .contentMargins(.horizontal, 8, for: .scrollContent)
+            .contentMargins(.horizontal, 16, for: .scrollContent)
             #else
             .listStyle(.inset)
             #endif
@@ -86,6 +88,19 @@ struct ModelListView: View {
                     await modelManager.loadModels()
                 }
             }
+            .onAppear {
+                scrollProxy = proxy
+            }
+            // Scroll to downloading section when download starts
+            .onChange(of: modelManager.downloadingModelId) { oldValue, newValue in
+                if newValue != nil && oldValue == nil {
+                    // Download just started - scroll to show it
+                    withAnimation(.easeOut(duration: 0.3)) {
+                        proxy.scrollTo("downloading", anchor: .top)
+                    }
+                }
+            }
+            } // End ScrollViewReader
         }
         .sheet(isPresented: $showingAddModel) {
             AddModelView()
@@ -100,6 +115,7 @@ struct ModelListView: View {
                 dismiss()
             }
         }
+        // Stay in Models view during download - user can manually dismiss when ready
         // Error toast
         .errorToast(Binding(
             get: { modelManager.errorMessage },
@@ -221,12 +237,16 @@ struct ModelListView: View {
 
                     Spacer()
 
-                    Button("Cancel") {
+                    Button {
                         Task {
                             await modelManager.cancelDownload()
                         }
+                    } label: {
+                        Text("Cancel")
+                            .foregroundStyle(.red)
                     }
-                    .foregroundStyle(.red)
+                    .buttonStyle(.plain)
+                    .contentShape(Rectangle())
                 }
 
                 if let progress = modelManager.downloadProgress {
@@ -234,9 +254,15 @@ struct ModelListView: View {
                 }
             }
             .padding(.vertical, 4)
+            .contentShape(Rectangle()) // Prevent taps on empty space from propagating
+            .allowsHitTesting(true)
         } header: {
-            Text("Downloading")
+            HStack {
+                Text("Downloading")
+                Spacer()
+            }
         }
+        .id("downloading") // For scroll targeting
     }
 
     // MARK: - Error Section
