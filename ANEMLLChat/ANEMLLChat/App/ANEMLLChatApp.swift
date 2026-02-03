@@ -17,6 +17,10 @@ struct ANEMLLChatApp: App {
             ContentView()
                 .environment(chatViewModel)
                 .environment(modelManager)
+                #if os(iOS)
+                // Force dark mode on iOS/iPadOS/visionOS to match hardcoded dark backgrounds
+                .preferredColorScheme(.dark)
+                #endif
         }
         #if os(macOS)
         // Use titleBar style to show toolbar

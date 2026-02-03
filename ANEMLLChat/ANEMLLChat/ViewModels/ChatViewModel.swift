@@ -120,6 +120,24 @@ final class ChatViewModel {
         }
     }
 
+    /// Clear all conversations
+    func clearAllConversations() {
+        let conversationsToDelete = conversations
+        conversations.removeAll()
+        currentConversation = nil
+
+        Task {
+            for conversation in conversationsToDelete {
+                try? await StorageService.shared.deleteConversation(conversation.id)
+            }
+        }
+
+        // Create a new empty conversation
+        newConversation()
+
+        logDebug("Cleared all conversations", category: .app)
+    }
+
     // MARK: - Message Sending
 
     /// Send a message and generate a response

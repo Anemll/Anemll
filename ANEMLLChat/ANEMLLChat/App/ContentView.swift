@@ -11,11 +11,13 @@ struct ContentView: View {
     @Environment(ChatViewModel.self) private var chatVM
     @Environment(ModelManagerViewModel.self) private var modelManager
 
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    // Start with sidebar collapsed (detailOnly) on macOS
+    @State private var columnVisibility: NavigationSplitViewVisibility = .detailOnly
     @State private var showingModelSheet = false
     @State private var showingSettings = false
     @State private var showingConversationSheet = false
     @State private var hasCheckedInitialState = false
+    @State private var showingClearAllAlert = false
 
     var body: some View {
         #if os(iOS)
@@ -147,6 +149,25 @@ struct ContentView: View {
                 }
                 #endif
             }
+
+            #if os(macOS)
+            ToolbarItem(placement: .destructiveAction) {
+                Button(role: .destructive) {
+                    showingClearAllAlert = true
+                } label: {
+                    Label("Clear All", systemImage: "trash")
+                }
+                .disabled(chatVM.conversations.isEmpty)
+            }
+            #endif
+        }
+        .alert("Clear All Conversations", isPresented: $showingClearAllAlert) {
+            Button("Cancel", role: .cancel) { }
+            Button("Clear All", role: .destructive) {
+                chatVM.clearAllConversations()
+            }
+        } message: {
+            Text("This will delete all conversations. This action cannot be undone.")
         }
     }
 
@@ -254,7 +275,11 @@ struct ContentView: View {
                 Label("New Chat", systemImage: "plus.bubble")
                 #endif
             }
+            #if os(macOS)
+            .buttonStyle(.accessoryBar)
+            #else
             .buttonStyle(.bordered)
+            #endif
             .controlSize(.small)
 
             // Download progress indicator (when downloading in background)
@@ -309,12 +334,16 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            #if os(macOS)
+            .buttonStyle(.accessoryBar)
+            #else
             .buttonStyle(.bordered)
+            #endif
             .controlSize(.small)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(.background)
+        .modifier(ToolbarGlassModifier())
     }
 
     private var emptyState: some View {
@@ -555,6 +584,25 @@ private struct DownloadProgressPill: View {
         .onAppear {
             isAnimating = true
         }
+    }
+}
+
+// MARK: - Glass Effect Modifier (macOS 26+)
+
+private struct ToolbarGlassModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        if #available(macOS 26.0, *) {
+            content
+                .glassEffect(.regular)
+        } else {
+            content
+                .background(.background)
+        }
+        #else
+        content
+            .background(.background)
+        #endif
     }
 }
 

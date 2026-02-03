@@ -333,6 +333,38 @@ Created `Views/Chat/MarkdownView.swift` with full markdown support:
    - Shows "Loading..." text in green capsule-shaped background
    - Much more visible than the previous tiny spinner
 
+## Recent Fixes (2026-02-02 9:30 PM)
+
+1. **Settings - Prompt Options Renamed**
+   - "No Prompt" → "Default Prompt" (standard inference, no additional prompting) - now the DEFAULT
+   - "Model's Default" → "No Template" (raw inference without chat template)
+   - "Model's Default (Thinking)" → "Thinking Mode"
+   - "Model's Default (Non-Thinking)" → "Non-Thinking Mode"
+   - Added "Reset to Defaults" button in Settings
+
+2. **Copy Button Alignment Fixed**
+   - Changed from ZStack to overlay alignment
+   - Copy button now properly positioned at top-right
+   - Always clickable even for short text
+
+3. **Scroll/Chevron Behavior Improved**
+   - Fixed chevron not appearing during first long inference
+   - Added `onChange(of: chatVM.isGenerating)` to track generation state
+   - Added `onChange(of: chatVM.streamingContent)` to update during streaming
+   - Chevron now shows when content grows beyond visible area (>200 chars during streaming)
+   - Scroll behavior: shows dots first, then scrolls user question to top when tokens arrive
+
+4. **Liquid Glass UI (macOS 26+)**
+   - Added `InputBarGlassModifier` with `glassEffect(.regular.interactive())`
+   - Added `ScrollButtonGlassModifier` for scroll-to-bottom chevron
+   - Added `ToolbarGlassModifier` for toolbar
+   - Falls back to `.ultraThinMaterial` on older macOS versions
+
+5. **Reduced Bottom Padding**
+   - `contentBottomPadding` reduced from +120 to +48
+   - Bottom spacer reduced from 48px to 8px
+   - Fixed excessive whitespace at bottom of chat
+
 ## Recent Fixes (2026-01-31 7:20 PM)
 
 1. **Model deletion bug investigation**

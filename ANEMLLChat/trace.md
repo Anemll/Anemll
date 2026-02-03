@@ -399,3 +399,107 @@ private var contentBottomPadding: CGFloat {
 | Chevron at center | Added `.trailing` alignment + padding | ✅ Applied |
 | Content under gradient | Increased contentBottomPadding | ✅ Applied |
 | iPhone clicks not working | Known limitation | ⚠️ Manual test needed |
+
+---
+
+## Session: 2026-02-02 (macOS UI Improvements)
+
+### Task List
+1. Settings: Rename prompt options (No Prompt → Default Prompt, Model's Default → No Template)
+2. Copy button alignment - fix for short text
+3. Chevron scroll-down inconsistent on first long inference
+4. Implement Liquid Glass UI for macOS 26
+5. Sidebar collapsed by default, Clear All button
+
+### Changes Applied
+
+#### 1. Settings - Prompt Options Renamed
+**Files**: `SettingsView.swift`, `StorageService.swift`
+
+Renamed options for clarity:
+- "No Prompt" → "Default Prompt" (standard inference with chat template, no additional system prompt)
+- "Model's Default" → "No Template" (raw inference without any template)
+- "Model's Default (Thinking)" → "Thinking Mode"
+- "Model's Default (Non-Thinking)" → "Non-Thinking Mode"
+
+Default changed to "Default Prompt" (was "No Prompt").
+
+Added "Reset to Defaults" button at bottom of Settings.
+
+#### 2. Copy Button Alignment
+**File**: `MessageBubble.swift`
+
+Changed from ZStack to overlay alignment:
+```swift
+.overlay(alignment: .topTrailing) {
+    // Copy button
+}
+```
+Now always clickable even for short messages.
+
+#### 3. Chevron Scroll Behavior
+**File**: `ChatView.swift`
+
+Added tracking for scroll behavior during generation:
+```swift
+.onChange(of: chatVM.isGenerating) { _, isGenerating in
+    if isGenerating {
+        // Scroll to show dots below user's question
+        scrollProxy?.scrollTo("streaming", anchor: .bottom)
+    }
+}
+
+.onChange(of: chatVM.streamingContent) { _, content in
+    // When first tokens arrive, scroll question to top
+    if content.count > 20 && !hasScrolledToQuestion {
+        scrollProxy?.scrollTo(lastUserMessage.id, anchor: .top)
+    }
+    // Show chevron when content exceeds visible area
+    if content.count > 200 {
+        showScrollToBottom = true
+    }
+}
+```
+
+#### 4. Liquid Glass UI (macOS 26+)
+**Files**: `InputBar.swift`, `ChatView.swift`, `ContentView.swift`
+
+Added view modifiers with availability checks:
+```swift
+@available(macOS 26.0, iOS 26.0, *)
+struct InputBarGlassModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        content.glassEffect(.regular.interactive())
+    }
+}
+```
+
+Falls back to `.ultraThinMaterial` on older versions.
+
+#### 5. Bottom Padding Reduced
+**File**: `ChatView.swift`
+
+Fixed excessive whitespace:
+- `contentBottomPadding`: changed from `inputAccessoryHeight + 120` to `inputAccessoryHeight + 48`
+- Bottom spacer: reduced from 48px to 8px
+
+### Testing via macOS Agent
+
+Verified using AnemllAgentHost:
+1. ✅ Settings shows "Default Prompt" option
+2. ✅ "Reset to Defaults" button visible
+3. ✅ Chevron appears during long generation
+4. ✅ Scroll behavior: dots shown, then question scrolls to top
+5. ✅ Content spacing reasonable (no excessive whitespace)
+
+### Remaining Issues
+- Chevron visibility during first generation still needs fine-tuning
+- May need to force show chevron earlier during streaming
+
+### Files Modified
+- `SettingsView.swift` - Prompt option names, Reset to Defaults button
+- `StorageService.swift` - Default value for system prompt
+- `MessageBubble.swift` - Copy button overlay alignment
+- `ChatView.swift` - Scroll behavior, bottom padding, glass modifier
+- `InputBar.swift` - Glass effect modifier
+- `ContentView.swift` - Toolbar glass modifier

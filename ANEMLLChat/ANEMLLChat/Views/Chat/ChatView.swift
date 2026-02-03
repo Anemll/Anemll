@@ -18,6 +18,8 @@ struct ChatView: View {
     @State private var lastAutoScrollTime: Date = .distantPast
     @State private var inputAccessoryHeight: CGFloat = 0
     @State private var hasContentBelow = false  // True when content extends below visible area
+    @State private var wasAtBottomBeforeSend = false  // Track if user was at bottom when sending
+    @State private var hasScrolledToQuestion = false  // Track if we've done the initial scroll to question
 
     private let autoScrollInterval: TimeInterval = 0.07
     private let bottomVisibilityPadding: CGFloat = 4
@@ -25,7 +27,7 @@ struct ChatView: View {
     private let bottomScrimExtra: CGFloat = 56
 
     private var contentBottomPadding: CGFloat {
-        max(24, inputAccessoryHeight + 64)  // Extra padding to keep content above scrim
+        max(24, inputAccessoryHeight + 48)  // Padding to keep content above input box with some clearance
     }
 
     private var scrollButtonBottomPadding: CGFloat {
@@ -63,15 +65,20 @@ struct ChatView: View {
             if showScrollToBottom {
                 Button {
                     setScrollMode(.follow)
-                    scheduleAutoScroll(force: true)
+                    scrollToBottom(animated: true, toAbsoluteBottom: true)
+                    // Update chevron visibility after scroll
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(400))
+                        updateChevronVisibility()
+                    }
                 } label: {
                     Image(systemName: "chevron.down")
                         .font(.system(size: 16, weight: .medium))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(.primary)
                         .frame(width: 40, height: 40)
-                        .background(.thinMaterial, in: Circle())  // Glass effect
-                        .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 0.5))
+                        .modifier(ScrollButtonGlassModifier())
                 }
+                .buttonStyle(.plain)
                 .frame(maxWidth: .infinity, alignment: .center)  // Centered horizontally
                 .padding(.bottom, max(90, inputAccessoryHeight + 40))  // Above input bar
             }
@@ -92,10 +99,104 @@ struct ChatView: View {
         }
         .onChange(of: chatVM.currentConversation?.id) { _, _ in
             setScrollMode(.manual)
-            hasContentBelow = false  // Reset when switching conversations
+            // Don't reset hasContentBelow - let onScrollGeometryChange determine it
+            // Force chevron visibility check after content loads
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(200))
+                updateChevronVisibility()
+            }
         }
         .onChange(of: hasContentBelow) { _, _ in
             updateChevronVisibility()
+        }
+        .onChange(of: chatVM.isGenerating) { _, isGenerating in
+            if isGenerating {
+                // When generation starts:
+                // 1. Remember if user was at/near bottom
+                // 2. Set manual mode (no auto-scroll during generation)
+                // 3. Scroll up just enough to show the loading dots below user's question
+                wasAtBottomBeforeSend = !hasContentBelow
+                hasScrolledToQuestion = false
+                setScrollMode(.manual)
+
+                // If user was at bottom, scroll up just enough to show the dots
+                if wasAtBottomBeforeSend {
+                    // Hide chevron immediately - we're at/near bottom
+                    showScrollToBottom = false
+
+                    // Scroll to show the streaming indicator (dots) just below the user's question
+                    // This gives user feedback that generation has started
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(50))
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            // Scroll to streaming view with anchor near bottom
+                            // This shows: user question + dots + some space above input
+                            scrollProxy?.scrollTo("streaming", anchor: .bottom)
+                        }
+                    }
+                }
+            } else {
+                // When generation ends:
+                // - Reset tracking state
+                // - Scroll to last message to ensure proper geometry detection
+                // - Update chevron visibility
+                hasScrolledToQuestion = false
+
+                // Scroll to the completed message to update geometry
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(100))
+                    if let lastMsg = visibleMessages.last {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            scrollProxy?.scrollTo(lastMsg.id, anchor: .bottom)
+                        }
+                    }
+                    // Give scroll geometry time to update
+                    try? await Task.sleep(for: .milliseconds(150))
+                    updateChevronVisibility()
+
+                    // Set mode based on updated geometry
+                    if !hasContentBelow {
+                        setScrollMode(.follow)
+                    }
+                }
+            }
+        }
+        .onChange(of: chatVM.streamingContent) { _, content in
+            // During streaming:
+            // 1. When first tokens arrive (>20 chars) and user was at bottom - scroll to position question at top
+            // 2. Then let content fill downward (no more auto-scroll)
+            // 3. Update chevron visibility as content grows
+            if chatVM.isGenerating && !content.isEmpty {
+                // First tokens arrived - scroll so user's question is at the TOP of viewport
+                // Wait for at least ~20 chars so there's visible content before scrolling
+                if wasAtBottomBeforeSend && !hasScrolledToQuestion && content.count > 20 {
+                    hasScrolledToQuestion = true
+                    // Find the last user message ID to scroll to
+                    if let lastUserMessage = visibleMessages.last(where: { $0.role == .user }) {
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(50))
+                            withAnimation(.easeOut(duration: 0.3)) {
+                                // Scroll user's question to TOP of viewport (anchor: .top)
+                                // This positions the question at the very top with answer filling below
+                                scrollProxy?.scrollTo(lastUserMessage.id, anchor: .top)
+                            }
+                        }
+                    }
+                }
+
+                // As content grows, check if it extends below visible area
+                // During streaming, we assume content below if we've scrolled to question
+                // and have substantial content (likely extends below fold)
+                if hasScrolledToQuestion && content.count > 200 {
+                    // Content is likely below visible area, show chevron
+                    if !showScrollToBottom {
+                        showScrollToBottom = true
+                    }
+                }
+
+                // Also always update chevron based on geometry
+                updateChevronVisibility()
+            }
         }
         .onAppear {
             setScrollMode(.manual)
@@ -120,9 +221,9 @@ struct ChatView: View {
                                     .id("streaming")
                             }
 
-                            // Bottom anchor for scrolling - needs height to ensure full scroll
+                            // Bottom spacer - anchor point for scroll
                             Color.clear
-                                .frame(height: 100)
+                                .frame(height: 8)
                                 .id("bottom")
                         }
                         .padding(.horizontal, 18)
@@ -153,15 +254,15 @@ struct ChatView: View {
                     // iOS 18+: Detect when content extends below visible area
                     .onScrollGeometryChange(for: Bool.self) { geometry in
                         // Content is below visible if contentSize.height > visibleRect.maxY + threshold
-                        // Use larger threshold (80pt) so chevron hides when "close enough" to bottom
-                        let threshold: CGFloat = 80
+                        // The threshold accounts for contentBottomPadding (inputAccessoryHeight + 64 ≈ 150)
+                        // Using a generous threshold ensures chevron hides when scrolled near bottom
+                        let threshold: CGFloat = 180  // contentBottomPadding (~150) + small buffer
                         let contentBelow = geometry.contentSize.height > geometry.visibleRect.maxY + threshold
-                        /*print("[ScrollGeo] contentH=\(Int(geometry.contentSize.height)) visibleMaxY=\(Int(geometry.visibleRect.maxY)) below=\(contentBelow)")*/
+                        // print("[ScrollGeo] contentH=\(Int(geometry.contentSize.height)) visibleMaxY=\(Int(geometry.visibleRect.maxY)) below=\(contentBelow)")
                         return contentBelow
                     } action: { oldValue, newValue in
-                        if oldValue != newValue {
-                            hasContentBelow = newValue
-                        }
+                        // Always update hasContentBelow, even if value is same (for initial load)
+                        hasContentBelow = newValue
                     }
                 }
 
@@ -246,9 +347,14 @@ struct ChatView: View {
     }
 
     private func updateChevronVisibility() {
-        // Show chevron when content extends below visible area AND has messages
-        let shouldShow = hasContentBelow && visibleMessages.count >= 2
-        print("[ChevronV3] hasContentBelow=\(hasContentBelow) msgs=\(visibleMessages.count) shouldShow=\(shouldShow)")
+        // Show chevron ONLY when content actually extends below visible area
+        // We no longer show it just because we're in manual mode during generation
+        // The geometry-based hasContentBelow is the source of truth
+        let hasContent = visibleMessages.count >= 1 || chatVM.isGenerating
+        let shouldShow = hasContentBelow && hasContent
+
+        // Debug logging (can be removed in production)
+        // print("[ChevronV5] hasContentBelow=\(hasContentBelow) msgs=\(visibleMessages.count) generating=\(chatVM.isGenerating) shouldShow=\(shouldShow)")
 
         if showScrollToBottom != shouldShow {
             showScrollToBottom = shouldShow
@@ -285,15 +391,17 @@ struct ChatView: View {
         }
     }
 
-    private func scrollToBottom(animated: Bool) {
-        // hasContentBelow will be updated automatically by onScrollGeometryChange after scroll completes
-        // Use .bottom anchor to ensure full scroll to the absolute bottom
+    private func scrollToBottom(animated: Bool, toAbsoluteBottom: Bool = false) {
+        // Always scroll to "bottom" spacer when user clicks chevron
+        // This ensures we reach the absolute end of content
+        let targetId: AnyHashable = "bottom"
+
         if animated {
             withAnimation(.easeInOut(duration: 0.35)) {
-                scrollProxy?.scrollTo("bottom", anchor: .bottom)
+                scrollProxy?.scrollTo(targetId, anchor: .bottom)
             }
         } else {
-            scrollProxy?.scrollTo("bottom", anchor: .bottom)
+            scrollProxy?.scrollTo(targetId, anchor: .bottom)
         }
     }
 }
@@ -465,6 +573,28 @@ private let chatBackground = Color(platformBackground)
 private let platformSecondaryBackground = NSColor.controlBackgroundColor
 private let modelLoadingBackground = Color(platformSecondaryBackground)
 #endif
+
+// MARK: - Glass Effect Modifier (macOS 26+)
+
+private struct ScrollButtonGlassModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        if #available(macOS 26.0, *) {
+            content
+                .glassEffect(.regular.interactive())
+                .clipShape(Circle())
+        } else {
+            content
+                .background(.thinMaterial, in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 0.5))
+        }
+        #else
+        content
+            .background(.thinMaterial, in: Circle())
+            .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 0.5))
+        #endif
+    }
+}
 
 #Preview {
     NavigationStack {

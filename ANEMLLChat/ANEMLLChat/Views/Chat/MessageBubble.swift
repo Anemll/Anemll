@@ -24,23 +24,15 @@ struct MessageBubble: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // Message content with overlay
-            ZStack(alignment: .topTrailing) {
-                messageContent
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    #if os(iOS)
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            showCopyButton.toggle()
-                        }
-                    }
-                    #endif
-
-                // Copy button
-                if !message.content.isEmpty {
-                    copyButton
+            // Message content (overlay is inside messageContent now)
+            messageContent
+            #if os(iOS)
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showCopyButton.toggle()
                 }
             }
+            #endif
 
             // Stats (for assistant messages)
             if !isUser && message.isComplete {
@@ -49,7 +41,9 @@ struct MessageBubble: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         #if os(macOS)
+        .contentShape(Rectangle())  // Make entire area hoverable
         .onHover { hovering in
+            // No animation on hover change to prevent flicker
             isHovering = hovering
         }
         #endif
@@ -59,40 +53,20 @@ struct MessageBubble: View {
 
     @ViewBuilder
     private var copyButton: some View {
-        #if os(macOS)
-        // macOS: show on hover
-        if isHovering {
-            Button {
-                copyToClipboard()
-            } label: {
-                Image(systemName: "doc.on.doc")
-                    .font(.caption)
-                    .padding(6)
-                    .background(.ultraThinMaterial, in: Circle())
+        Button {
+            copyToClipboard()
+            #if os(iOS)
+            withAnimation {
+                showCopyButton = false
             }
-            .buttonStyle(.plain)
-            .offset(x: -6, y: -6)
-            .transition(.opacity.combined(with: .scale))
+            #endif
+        } label: {
+            Image(systemName: "doc.on.doc")
+                .font(.caption)
+                .padding(5)
+                .modifier(CopyButtonGlassModifier())
         }
-        #else
-        // iOS: show on tap (top-left for assistant, top-right for user)
-        if showCopyButton {
-            Button {
-                copyToClipboard()
-                withAnimation {
-                    showCopyButton = false
-                }
-            } label: {
-                Image(systemName: "doc.on.doc")
-                    .font(.caption)
-                    .foregroundStyle(.primary)
-                    .padding(8)
-                    .background(.ultraThinMaterial, in: Circle())
-            }
-            .offset(x: -6, y: -6)
-            .transition(.scale.combined(with: .opacity))
-        }
-        #endif
+        .buttonStyle(.plain)
     }
 
     private func copyToClipboard() {
@@ -112,25 +86,43 @@ struct MessageBubble: View {
                 .fill(isUser ? Color.accentColor.opacity(0.9) : Color.secondary.opacity(0.45))
                 .frame(width: 3)
 
-            VStack(alignment: .leading, spacing: 8) {
-                if message.content.isEmpty && !message.isComplete {
-                    // Loading state
-                    ProgressView()
-                        .controlSize(.small)
-                } else if isUser {
-                    // User messages - simple text
-                    Text(message.content)
-                        .textSelection(.enabled)
-                        .lineSpacing(3)
-                } else {
-                    // Assistant messages - full markdown rendering
-                    MarkdownView(content: message.content, isUserMessage: false)
+            // Text content with copy button overlay
+            // Use HStack to keep button close to text end
+            HStack(alignment: .top, spacing: 4) {
+                VStack(alignment: .leading, spacing: 8) {
+                    if message.content.isEmpty && !message.isComplete {
+                        // Loading state
+                        ProgressView()
+                            .controlSize(.small)
+                    } else if isUser {
+                        // User messages - simple text
+                        Text(message.content)
+                            .textSelection(.enabled)
+                            .lineSpacing(3)
+                    } else {
+                        // Assistant messages - full markdown rendering
+                        MarkdownView(content: message.content, isUserMessage: false)
+                    }
+                }
+
+                // Copy button inline (appears on hover, no text reflow since it's always in layout)
+                if !message.content.isEmpty {
+                    copyButton
+                        .opacity(shouldShowCopyButton ? 1 : 0)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.vertical, 6)
         .foregroundStyle(.primary)
+    }
+
+    private var shouldShowCopyButton: Bool {
+        #if os(macOS)
+        return isHovering
+        #else
+        return showCopyButton
+        #endif
     }
 }
 
@@ -197,6 +189,26 @@ extension MessageBubble {
             }
             .foregroundStyle(.orange)
         }
+    }
+}
+
+// MARK: - Glass Effect Modifier (macOS 26+)
+
+private struct CopyButtonGlassModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        if #available(macOS 26.0, *) {
+            content
+                .glassEffect(.regular.interactive())
+                .clipShape(Circle())
+        } else {
+            content
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        #else
+        content
+            .background(.ultraThinMaterial, in: Circle())
+        #endif
     }
 }
 

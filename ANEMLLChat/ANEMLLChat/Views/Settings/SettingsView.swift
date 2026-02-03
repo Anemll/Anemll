@@ -9,11 +9,11 @@ import SwiftUI
 
 // System prompt options
 enum SystemPromptOption: String, CaseIterable, Identifiable {
-    case modelDefault = "Model's Default"
-    case modelThinking = "Model's Default (Thinking)"
-    case modelNonThinking = "Model's Default (Non-Thinking)"
-    case noPrompt = "No Prompt"
-    case custom = "Custom"
+    case defaultPrompt = "Default Prompt"       // Basic inference with no additional prompting (DEFAULT)
+    case noTemplate = "No Template"             // Raw inference without chat template
+    case modelThinking = "Thinking Mode"        // Model's thinking/reasoning mode if supported
+    case modelNonThinking = "Non-Thinking Mode" // Model's non-thinking mode if supported
+    case custom = "Custom"                      // User-defined system prompt
 
     var id: String { rawValue }
 }
@@ -24,7 +24,7 @@ struct SettingsView: View {
 
     @State private var temperature: Float = 0.0
     @State private var maxTokens: Int = 2048
-    @State private var systemPromptOption: SystemPromptOption = .modelDefault
+    @State private var systemPromptOption: SystemPromptOption = .defaultPrompt
     @State private var customPrompt: String = ""
 
     @State private var showingLogs = false
@@ -165,16 +165,16 @@ struct SettingsView: View {
             Text("System Prompt")
         } footer: {
             switch systemPromptOption {
-            case .modelDefault:
-                Text("Uses the model's built-in default prompt")
+            case .defaultPrompt:
+                Text("Standard inference with chat template, no additional system prompt")
+            case .noTemplate:
+                Text("Raw inference without chat template - direct model output")
             case .modelThinking:
-                Text("Uses thinking/reasoning mode if supported")
+                Text("Uses thinking/reasoning mode if supported by the model")
             case .modelNonThinking:
-                Text("Uses non-thinking mode if supported")
-            case .noPrompt:
-                Text("No system prompt - raw model output")
+                Text("Uses non-thinking mode if supported by the model")
             case .custom:
-                Text("Custom instructions for the AI")
+                Text("Custom system prompt instructions for the AI")
             }
         }
     }
@@ -271,14 +271,17 @@ struct SettingsView: View {
 
         // Parse the stored system prompt to determine option
         let storedPrompt = chatVM.systemPrompt
-        if storedPrompt.isEmpty {
-            systemPromptOption = .noPrompt
-        } else if storedPrompt.hasPrefix("[MODEL_DEFAULT]") {
-            systemPromptOption = .modelDefault
+        if storedPrompt.isEmpty || storedPrompt == "[DEFAULT_PROMPT]" {
+            systemPromptOption = .defaultPrompt
+        } else if storedPrompt == "[NO_TEMPLATE]" {
+            systemPromptOption = .noTemplate
         } else if storedPrompt.hasPrefix("[MODEL_THINKING]") {
             systemPromptOption = .modelThinking
         } else if storedPrompt.hasPrefix("[MODEL_NON_THINKING]") {
             systemPromptOption = .modelNonThinking
+        } else if storedPrompt.hasPrefix("[MODEL_DEFAULT]") {
+            // Legacy: treat old MODEL_DEFAULT as defaultPrompt
+            systemPromptOption = .defaultPrompt
         } else {
             systemPromptOption = .custom
             customPrompt = storedPrompt
@@ -297,14 +300,14 @@ struct SettingsView: View {
 
         // Convert option to stored string
         switch systemPromptOption {
-        case .modelDefault:
-            chatVM.systemPrompt = "[MODEL_DEFAULT]"
+        case .defaultPrompt:
+            chatVM.systemPrompt = "[DEFAULT_PROMPT]"
+        case .noTemplate:
+            chatVM.systemPrompt = "[NO_TEMPLATE]"
         case .modelThinking:
             chatVM.systemPrompt = "[MODEL_THINKING]"
         case .modelNonThinking:
             chatVM.systemPrompt = "[MODEL_NON_THINKING]"
-        case .noPrompt:
-            chatVM.systemPrompt = ""
         case .custom:
             chatVM.systemPrompt = customPrompt
         }
@@ -326,7 +329,7 @@ struct SettingsView: View {
         // Reset local state to defaults
         temperature = StorageService.defaultTemperatureValue
         maxTokens = StorageService.defaultMaxTokensValue
-        systemPromptOption = .modelDefault
+        systemPromptOption = .defaultPrompt  // Default Prompt is the default setting
         customPrompt = ""
         autoLoadLastModel = StorageService.defaultAutoLoadLastModelValue
         debugLevel = StorageService.defaultDebugLevelValue

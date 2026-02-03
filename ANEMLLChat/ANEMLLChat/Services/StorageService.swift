@@ -260,7 +260,7 @@ actor StorageService {
     /// Default values (used for Reset to Defaults and fresh install)
     static let defaultTemperatureValue: Float = 0.0
     static let defaultMaxTokensValue: Int = 2048
-    static let defaultSystemPromptValue: String = "[MODEL_DEFAULT]"  // Model's Default prompt
+    static let defaultSystemPromptValue: String = "[DEFAULT_PROMPT]"  // Default Prompt - standard inference with no additional prompting
     static let defaultDebugLevelValue: Int = 0
     static let defaultRepetitionDetectionValue: Bool = false
     static let defaultAutoLoadLastModelValue: Bool = true

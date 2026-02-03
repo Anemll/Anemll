@@ -27,11 +27,7 @@ struct InputBar: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 26, style: .continuous)
-                    .stroke(inputBarBorder, lineWidth: 1)
-            )
+            .modifier(InputBarGlassModifier())
             .shadow(color: .black.opacity(0.2), radius: 12, y: 6)
 
             // Toast overlay - appears above input bar
@@ -158,6 +154,34 @@ private let inputFieldBackground = Color(platformTertiaryBackground)
 private let inputFieldBorder = Color.secondary.opacity(0.3)
 private let inputBarBorder = Color.secondary.opacity(0.2)
 #endif
+
+// MARK: - Glass Effect Modifier (macOS 26+)
+
+private struct InputBarGlassModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        if #available(macOS 26.0, *) {
+            content
+                .glassEffect(.regular.interactive())
+                .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+        } else {
+            content
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 26, style: .continuous)
+                        .stroke(inputBarBorder, lineWidth: 1)
+                )
+        }
+        #else
+        content
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .stroke(inputBarBorder, lineWidth: 1)
+            )
+        #endif
+    }
+}
 
 // MARK: - Loading Toast View
 
