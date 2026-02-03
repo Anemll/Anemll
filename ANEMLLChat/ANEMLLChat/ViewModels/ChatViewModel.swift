@@ -42,6 +42,24 @@ final class ChatViewModel {
     /// Current history tokens during streaming (input + output so far)
     var currentHistoryTokens: Int = 0
 
+    /// Request the chat view to scroll to bottom before inference starts
+    var pendingScrollToBottomRequest: UUID?
+
+    // UI lag tracing (debug)
+    private var lastUiLagLogTime: CFAbsoluteTime = 0
+    private let uiLagLogCooldown: CFAbsoluteTime = 0.5
+
+    /// Current debug level (mirrors inference service)
+    var debugLevel: Int {
+        inferenceService.debugLevel
+    }
+
+    /// Pause streaming UI updates while user is actively scrolling
+    var uiUpdatesPaused: Bool = false
+    private var pendingStreamingText: String = ""
+    private var pendingHistoryTokens: Int?
+    private var pendingWindowShifts: Int = 0
+
     // MARK: - Dependencies
 
     private let inferenceService = InferenceService.shared
@@ -175,6 +193,15 @@ final class ChatViewModel {
         currentHistoryTokens = 0
         errorMessage = nil
 
+        // Give the UI a chance to show the dots and scroll to the bottom before inference begins
+        let preScrollId = UUID()
+        pendingScrollToBottomRequest = preScrollId
+        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(400))
+        if pendingScrollToBottomRequest == preScrollId {
+            pendingScrollToBottomRequest = nil
+        }
+
         do {
             // Get messages for context (exclude the empty assistant message)
             let contextMessages = conversation.messages.filter {
@@ -184,23 +211,42 @@ final class ChatViewModel {
             let result = try await inferenceService.generateResponse(
                 for: contextMessages,
                 onToken: { [weak self] token in
+                    let enqueueTime = CFAbsoluteTimeGetCurrent()
                     Task { @MainActor in
                         guard let self = self else { return }
-                        self.streamingContent += token
-                        self.updateStreamingMessage()
+                        let delayMs = (CFAbsoluteTimeGetCurrent() - enqueueTime) * 1000
+                        self.traceMainThreadLag(kind: "token", delayMs: delayMs)
+                        if self.uiUpdatesPaused {
+                            self.pendingStreamingText += token
+                        } else {
+                            self.streamingContent += token
+                        }
                     }
                 },
                 onWindowShift: { [weak self] in
+                    let enqueueTime = CFAbsoluteTimeGetCurrent()
                     Task { @MainActor in
                         guard let self = self else { return }
-                        self.currentWindowShifts += 1
+                        let delayMs = (CFAbsoluteTimeGetCurrent() - enqueueTime) * 1000
+                        self.traceMainThreadLag(kind: "windowShift", delayMs: delayMs)
+                        if self.uiUpdatesPaused {
+                            self.pendingWindowShifts += 1
+                        } else {
+                            self.currentWindowShifts += 1
+                        }
                     }
                 },
                 onHistoryUpdate: { [weak self] historyTokens in
+                    let enqueueTime = CFAbsoluteTimeGetCurrent()
                     Task { @MainActor in
                         guard let self = self else { return }
-                        self.currentHistoryTokens = historyTokens
-                        self.updateStreamingMessage()
+                        let delayMs = (CFAbsoluteTimeGetCurrent() - enqueueTime) * 1000
+                        self.traceMainThreadLag(kind: "history", delayMs: delayMs)
+                        if self.uiUpdatesPaused {
+                            self.pendingHistoryTokens = historyTokens
+                        } else {
+                            self.currentHistoryTokens = historyTokens
+                        }
                     }
                 }
             )
@@ -241,22 +287,52 @@ final class ChatViewModel {
         streamingContent = ""
     }
 
+    func setUIUpdatesPaused(_ paused: Bool) {
+        guard paused != uiUpdatesPaused else { return }
+        uiUpdatesPaused = paused
+
+        if inferenceService.debugLevel >= 2 {
+            logDebug("[UI Pause] \(paused ? "paused" : "resumed") pendingChars=\(pendingStreamingText.count)", category: .ui)
+        }
+
+        if !paused {
+            flushPendingStreamingUpdates()
+        }
+    }
+
+    private func flushPendingStreamingUpdates() {
+        if !pendingStreamingText.isEmpty {
+            streamingContent += pendingStreamingText
+            pendingStreamingText = ""
+        }
+
+        if let history = pendingHistoryTokens {
+            currentHistoryTokens = history
+            pendingHistoryTokens = nil
+        }
+
+        if pendingWindowShifts > 0 {
+            currentWindowShifts += pendingWindowShifts
+            pendingWindowShifts = 0
+        }
+    }
+
+    private func traceMainThreadLag(kind: String, delayMs: Double) {
+        guard inferenceService.debugLevel >= 2 else { return }
+        guard delayMs >= 50 else { return }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - lastUiLagLogTime < uiLagLogCooldown {
+            return
+        }
+        lastUiLagLogTime = now
+
+        logWarning("[UI Lag] \(kind) update delayed \(Int(delayMs))ms", category: .ui)
+    }
+
     /// Cancel ongoing generation
     func cancelGeneration() {
         inferenceService.cancelGeneration()
-    }
-
-    /// Update the streaming message in the current conversation
-    private func updateStreamingMessage() {
-        guard var conversation = currentConversation else { return }
-
-        conversation.updateLastAssistantMessage(
-            content: streamingContent,
-            windowShifts: currentWindowShifts,
-            historyTokens: currentHistoryTokens > 0 ? currentHistoryTokens : nil
-        )
-
-        currentConversation = conversation
     }
 
     /// Update a conversation in the list

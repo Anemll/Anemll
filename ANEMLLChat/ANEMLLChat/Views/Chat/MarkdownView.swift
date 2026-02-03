@@ -11,11 +11,20 @@ struct MarkdownView: View {
     let content: String
     let isUserMessage: Bool
 
+    @State private var cachedContent: String = ""
+    @State private var cachedBlocks: [MarkdownBlock] = []
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(parseBlocks().enumerated()), id: \.offset) { _, block in
+            ForEach(Array(cachedBlocks.enumerated()), id: \.offset) { _, block in
                 renderBlock(block)
             }
+        }
+        .onAppear {
+            refreshCacheIfNeeded()
+        }
+        .onChange(of: content) { _, _ in
+            refreshCacheIfNeeded()
         }
     }
 
@@ -32,7 +41,7 @@ struct MarkdownView: View {
 
     // MARK: - Parsing
 
-    private func parseBlocks() -> [MarkdownBlock] {
+    private func parseBlocks(from content: String) -> [MarkdownBlock] {
         var blocks: [MarkdownBlock] = []
         let lines = content.components(separatedBy: "\n")
         var i = 0
@@ -139,6 +148,12 @@ struct MarkdownView: View {
         }
 
         return blocks
+    }
+
+    private func refreshCacheIfNeeded() {
+        guard content != cachedContent else { return }
+        cachedContent = content
+        cachedBlocks = parseBlocks(from: content)
     }
 
     private func parseTable(_ lines: [String]) -> MarkdownBlock? {
@@ -279,14 +294,44 @@ struct MarkdownView: View {
 
     @ViewBuilder
     private func renderInlineMarkdown(_ text: String) -> some View {
-        if let attributed = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
-            Text(attributed)
-                .textSelection(.enabled)
-                .lineSpacing(3)
+        InlineMarkdownText(text: text)
+    }
+}
+
+private struct InlineMarkdownText: View {
+    let text: String
+
+    @State private var cachedText: String = ""
+    @State private var cachedAttributed: AttributedString?
+
+    var body: some View {
+        Group {
+            if let attributed = cachedAttributed {
+                Text(attributed)
+            } else {
+                Text(text)
+            }
+        }
+        .textSelection(.enabled)
+        .lineSpacing(3)
+        .onAppear {
+            refreshCacheIfNeeded()
+        }
+        .onChange(of: text) { _, _ in
+            refreshCacheIfNeeded()
+        }
+    }
+
+    private func refreshCacheIfNeeded() {
+        guard text != cachedText else { return }
+        cachedText = text
+        if let attributed = try? AttributedString(
+            markdown: text,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            cachedAttributed = attributed
         } else {
-            Text(text)
-                .textSelection(.enabled)
-                .lineSpacing(3)
+            cachedAttributed = nil
         }
     }
 }

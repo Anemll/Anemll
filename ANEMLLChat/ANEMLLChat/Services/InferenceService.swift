@@ -261,65 +261,106 @@ final class InferenceService: ObservableObject {
             isGenerating = false
         }
 
-        // Convert messages to tokenizer format
-        var chatMessages: [Tokenizer.ChatMessage] = []
+        let capturedTemplate = currentTemplate
+        let capturedSystemPrompt = systemPrompt
+        let capturedConfig = config
+        let capturedTokenizerForPrep = tokenizer
 
-        // Add system prompt if not present (resolve markers to actual prompts)
-        if !messages.contains(where: { $0.role == .system }) {
-            let resolvedPrompt = resolveSystemPrompt(systemPrompt)
-            print("===== [SYSTEM PROMPT] Template: \(currentTemplate), Raw: '\(systemPrompt)', Resolved: '\(resolvedPrompt)' =====")
-            logInfo("System prompt resolved: template=\(currentTemplate), prompt=\(resolvedPrompt)", category: .inference)
-            if !resolvedPrompt.isEmpty {
-                chatMessages.append(.system(resolvedPrompt))
-            }
+        struct PreparedInput {
+            let chatMessages: [Tokenizer.ChatMessage]
+            let inputTokens: [Int]
+            let contextLength: Int
+            let maxContextSize: Int
+            let historyTrimmed: Bool
+            let originalSize: Int
         }
 
-        for message in messages {
-            switch message.role {
-            case .system:
-                chatMessages.append(.system(message.content))
-            case .user:
-                chatMessages.append(.user(message.content))
-            case .assistant:
-                chatMessages.append(.assistant(message.content))
-            }
-        }
+        let prepared = await Task.detached(priority: .userInitiated) {
+            () -> PreparedInput in
+            // Convert messages to tokenizer format
+            var chatMessages: [Tokenizer.ChatMessage] = []
 
-        // Get context limits (match CLI: use stateLength if available, otherwise contextLength)
-        let contextLength = config?.contextLength ?? 512
-        let stateLength = (config?.stateLength ?? 0) > 0 ? config!.stateLength : contextLength
-        let maxContextSize = stateLength - 100  // Leave room for response (match CLI/Python)
-
-        // Tokenize and check size
-        var inputTokens = tokenizer.applyChatTemplate(
-            input: chatMessages,
-            addGenerationPrompt: true
-        )
-
-        // Trim history if exceeds context (match CLI behavior)
-        let originalSize = inputTokens.count
-        var historyTrimmed = false
-        while inputTokens.count > maxContextSize && chatMessages.count > 2 {
-            historyTrimmed = true
-            // Remove oldest message pair (user + assistant) like CLI does
-            // Skip system prompt if present (index 0)
-            let startIndex = (chatMessages.first?.role == "system") ? 1 : 0
-            if chatMessages.count > startIndex + 2 {
-                chatMessages.remove(at: startIndex)  // Remove oldest user
-                if chatMessages.count > startIndex {
-                    chatMessages.remove(at: startIndex)  // Remove oldest assistant
-                }
-                inputTokens = tokenizer.applyChatTemplate(
-                    input: chatMessages,
-                    addGenerationPrompt: true
+            // Add system prompt if not present (resolve markers to actual prompts)
+            if !messages.contains(where: { $0.role == .system }) {
+                let resolvedPrompt = InferenceService.resolveSystemPrompt(
+                    capturedSystemPrompt,
+                    template: capturedTemplate
                 )
-            } else {
-                break
+                if !resolvedPrompt.isEmpty {
+                    chatMessages.append(.system(resolvedPrompt))
+                }
             }
+
+            for message in messages {
+                switch message.role {
+                case .system:
+                    chatMessages.append(.system(message.content))
+                case .user:
+                    chatMessages.append(.user(message.content))
+                case .assistant:
+                    chatMessages.append(.assistant(message.content))
+                }
+            }
+
+            // Get context limits (match CLI: use stateLength if available, otherwise contextLength)
+            let contextLength = capturedConfig?.contextLength ?? 512
+            let stateLength = (capturedConfig?.stateLength ?? 0) > 0 ? (capturedConfig?.stateLength ?? contextLength) : contextLength
+            let maxContextSize = stateLength - 100  // Leave room for response (match CLI/Python)
+
+            // Tokenize and check size
+            var inputTokens = capturedTokenizerForPrep.applyChatTemplate(
+                input: chatMessages,
+                addGenerationPrompt: true
+            )
+
+            // Trim history if exceeds context (match CLI behavior)
+            let originalSize = inputTokens.count
+            var historyTrimmed = false
+            while inputTokens.count > maxContextSize && chatMessages.count > 2 {
+                historyTrimmed = true
+                // Remove oldest message pair (user + assistant) like CLI does
+                // Skip system prompt if present (index 0)
+                let startIndex = (chatMessages.first?.role == "system") ? 1 : 0
+                if chatMessages.count > startIndex + 2 {
+                    chatMessages.remove(at: startIndex)  // Remove oldest user
+                    if chatMessages.count > startIndex {
+                        chatMessages.remove(at: startIndex)  // Remove oldest assistant
+                    }
+                    inputTokens = capturedTokenizerForPrep.applyChatTemplate(
+                        input: chatMessages,
+                        addGenerationPrompt: true
+                    )
+                } else {
+                    break
+                }
+            }
+
+            return PreparedInput(
+                chatMessages: chatMessages,
+                inputTokens: inputTokens,
+                contextLength: contextLength,
+                maxContextSize: maxContextSize,
+                historyTrimmed: historyTrimmed,
+                originalSize: originalSize
+            )
+        }.value
+
+        let chatMessages = prepared.chatMessages
+        let inputTokens = prepared.inputTokens
+        let contextLength = prepared.contextLength
+        let maxContextSize = prepared.maxContextSize
+
+        if !messages.contains(where: { $0.role == .system }) {
+            let resolvedPrompt = InferenceService.resolveSystemPrompt(
+                capturedSystemPrompt,
+                template: capturedTemplate
+            )
+            print("===== [SYSTEM PROMPT] Template: \(capturedTemplate), Raw: '\(capturedSystemPrompt)', Resolved: '\(resolvedPrompt)' =====")
+            logInfo("System prompt resolved: template=\(capturedTemplate), prompt=\(resolvedPrompt)", category: .inference)
         }
 
-        if historyTrimmed {
-            print("[SYSTEM] History trimmed: \(originalSize) → \(inputTokens.count) tokens, \(chatMessages.count) msgs remaining")
+        if prepared.historyTrimmed {
+            print("[SYSTEM] History trimmed: \(prepared.originalSize) → \(inputTokens.count) tokens, \(chatMessages.count) msgs remaining")
         }
 
         // Debug: print messages being sent to tokenizer
@@ -340,47 +381,94 @@ final class InferenceService: ObservableObject {
         let stats = GenerationStats()
         let startTime = Date()
 
-        // Capture values we need in nonisolated closures
+        // Capture values we need in detached task
         let capturedRepetitionDetector = repetitionDetector
         let capturedInferenceManager = inferenceManager
         let capturedRepetitionEnabled = repetitionDetectionEnabled
+        let capturedTemperature = temperature
+        let capturedMaxTokens = maxTokens
+        let capturedTokenizer = tokenizer
+        let capturedDebugLevel = debugLevel
         let inputTokenCount = inputTokens.count  // Capture for history calculation
 
         do {
-            let (_, prefillTime, stopReason) = try await inferenceManager.generateResponse(
-                initialTokens: inputTokens,
-                temperature: temperature,
-                maxTokens: maxTokens,
-                eosTokens: tokenizer.eosTokenIds,
-                tokenizer: tokenizer,
-                onToken: { token in
-                    // Check for repetition only if enabled (non-isolated access)
-                    if capturedRepetitionEnabled {
-                        capturedRepetitionDetector.addToken(token)
-                        if capturedRepetitionDetector.isRepeating() {
-                            logWarning("Repetition detected, aborting", category: .inference)
-                            capturedInferenceManager.AbortGeneration(Code: 2)
-                            return
-                        }
-                    }
+            let (prefillTime, stopReason) = try await Task.detached(priority: .userInitiated) {
+                () async throws -> (TimeInterval, String) in
+                var pendingText = ""
+                var lastEmitTime = CFAbsoluteTimeGetCurrent()
+                var lastHistoryEmitTime = lastEmitTime
+                let emitInterval: CFAbsoluteTime = 1.0 / 30.0
+                let minChunkChars = 48
+                var lastTokenLogTime = CFAbsoluteTimeGetCurrent()
+                var lastTokenCount = 0
 
-                    stats.tokenCount += 1
-                    let text = tokenizer.decode(tokens: [token])
-                    stats.generatedText += text
-
-                    onToken(text)
-
-                    // Report current historyTokens (input + output so far)
-                    // Update every 5 tokens to avoid too frequent UI updates
-                    if stats.tokenCount % 5 == 0 || stats.tokenCount == 1 {
-                        onHistoryUpdate?(inputTokenCount + stats.tokenCount)
-                    }
-                },
-                onWindowShift: {
-                    stats.windowShifts += 1
-                    onWindowShift()
+                if capturedDebugLevel >= 2 {
+                    logDebug("[Inference] start threadMain=\(Thread.isMainThread)", category: .inference)
                 }
-            )
+
+                func emitIfNeeded(force: Bool = false) {
+                    let now = CFAbsoluteTimeGetCurrent()
+                    let shouldEmit = force || now - lastEmitTime >= emitInterval || pendingText.count >= minChunkChars
+
+                    if shouldEmit, !pendingText.isEmpty {
+                        let chunk = pendingText
+                        pendingText = ""
+                        lastEmitTime = now
+                        onToken(chunk)
+                    }
+
+                    if let onHistoryUpdate, force || now - lastHistoryEmitTime >= emitInterval {
+                        lastHistoryEmitTime = now
+                        onHistoryUpdate(inputTokenCount + stats.tokenCount)
+                    }
+                }
+
+                let (_, prefillTime, stopReason) = try await capturedInferenceManager.generateResponse(
+                    initialTokens: inputTokens,
+                    temperature: capturedTemperature,
+                    maxTokens: capturedMaxTokens,
+                    eosTokens: capturedTokenizer.eosTokenIds,
+                    tokenizer: capturedTokenizer,
+                    onToken: { token in
+                        // Check for repetition only if enabled
+                        if capturedRepetitionEnabled {
+                            capturedRepetitionDetector.addToken(token)
+                            if capturedRepetitionDetector.isRepeating() {
+                                logWarning("Repetition detected, aborting", category: .inference)
+                                capturedInferenceManager.AbortGeneration(Code: 2)
+                                return
+                            }
+                        }
+
+                        stats.tokenCount += 1
+                        let text = capturedTokenizer.decode(tokens: [token])
+                        stats.generatedText += text
+
+                        pendingText += text
+                        emitIfNeeded()
+
+                        if capturedDebugLevel >= 2 {
+                            let now = CFAbsoluteTimeGetCurrent()
+                            if now - lastTokenLogTime >= 1.0 {
+                                let delta = stats.tokenCount - lastTokenCount
+                                lastTokenCount = stats.tokenCount
+                                lastTokenLogTime = now
+                                logDebug("[Decode] +\(delta) tok/s pendingChars=\(pendingText.count)", category: .inference)
+                            }
+                        }
+                    },
+                    onWindowShift: {
+                        stats.windowShifts += 1
+                        onWindowShift()
+                    }
+                )
+                emitIfNeeded(force: true)
+                return (prefillTime, stopReason)
+            }.value
+
+            if capturedDebugLevel >= 2 {
+                logDebug("[Inference] prefill=\(String(format: "%.3f", prefillTime))s stop=\(stopReason)", category: .inference)
+            }
 
             let totalTime = Date().timeIntervalSince(startTime)
             let tokensPerSecond = totalTime > 0 ? Double(stats.tokenCount) / totalTime : 0
@@ -391,6 +479,8 @@ final class InferenceService: ObservableObject {
             // Total history tokens = input (prefill) + output (generated) - matches CLI behavior
             let historyTokens = inputTokens.count + stats.tokenCount
 
+            let wasCancelled = shouldCancel || stopReason.hasPrefix("abort_generation1")
+
             return GenerationResult(
                 text: stats.generatedText,
                 tokensPerSecond: tokensPerSecond,
@@ -400,7 +490,7 @@ final class InferenceService: ObservableObject {
                 prefillTokens: inputTokens.count,  // For prefill speed calculation
                 historyTokens: historyTokens,       // Total history like CLI shows
                 isComplete: true,
-                wasCancelled: shouldCancel,
+                wasCancelled: wasCancelled,
                 stopReason: stopReason
             )
 
@@ -435,7 +525,7 @@ final class InferenceService: ObservableObject {
     // MARK: - Helpers
 
     /// Resolve system prompt marker to actual prompt based on model template
-    private func resolveSystemPrompt(_ prompt: String) -> String {
+    nonisolated private static func resolveSystemPrompt(_ prompt: String, template: String) -> String {
         // If empty or doesn't start with marker, return as-is
         guard prompt.hasPrefix("[MODEL_") else {
             return prompt
@@ -471,7 +561,7 @@ final class InferenceService: ObservableObject {
             "default": "You are a helpful assistant."
         ]
 
-        let template = currentTemplate.lowercased()
+        let template = template.lowercased()
 
         switch prompt {
         case "[MODEL_DEFAULT]":
