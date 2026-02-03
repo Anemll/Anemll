@@ -12,7 +12,7 @@ import AppKit
 import UIKit
 #endif
 
-struct MessageBubble: View {
+struct MessageBubble: View, Equatable {
     let message: ChatMessage
 
     @State private var isHovering = false
@@ -123,6 +123,10 @@ struct MessageBubble: View {
         #else
         return showCopyButton
         #endif
+    }
+
+    static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
+        lhs.message == rhs.message
     }
 }
 

@@ -123,7 +123,7 @@ extension Conversation {
 
     /// Preview of the last message
     var lastMessagePreview: String? {
-        guard let lastMessage = messages.last(where: { $0.role != .system }) else {
+        guard let lastMessage = messages.last(where: { $0.role != .system && !$0.content.isEmpty }) else {
             return nil
         }
         let preview = lastMessage.content.prefix(60)
