@@ -403,7 +403,7 @@ final class InferenceService: ObservableObject {
                 var lastTokenCount = 0
 
                 if capturedDebugLevel >= 2 {
-                    logDebug("[Inference] start threadMain=\(Thread.isMainThread)", category: .inference)
+                    logDebug("[Inference] start detached", category: .inference)
                 }
 
                 func emitIfNeeded(force: Bool = false) {

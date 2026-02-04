@@ -81,7 +81,9 @@ final class ChatViewModel {
             logInfo("Loaded \(conversations.count) conversations", category: .app)
 
             if currentConversation == nil {
-                if let first = conversations.first {
+                // Check if user wants to load last chat or start fresh
+                let loadLastChat = await StorageService.shared.loadLastChat
+                if loadLastChat, let first = conversations.first {
                     currentConversation = first
                 } else {
                     newConversation()

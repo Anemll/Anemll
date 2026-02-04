@@ -18,6 +18,7 @@ struct ContentView: View {
     @State private var showingConversationSheet = false
     @State private var hasCheckedInitialState = false
     @State private var showingClearAllAlert = false
+    @AppStorage("largeControls") private var largeControls = false
 
     var body: some View {
         #if os(iOS)
@@ -49,15 +50,23 @@ struct ContentView: View {
                     .environment(chatVM)
             }
         }
-        // Auto-show model list on fresh start when no models are downloaded
+        // Auto-show model list ONLY on true fresh start (never used before)
         .task {
             guard !hasCheckedInitialState else { return }
             hasCheckedInitialState = true
 
+            // Check if user has ever selected a model before (indicates not a fresh install)
+            let hasSelectedModelBefore = await StorageService.shared.selectedModelId != nil
+
+            // If user has used the app before, don't auto-show model list
+            if hasSelectedModelBefore {
+                return
+            }
+
             // Wait briefly for model list to load
             try? await Task.sleep(for: .milliseconds(500))
 
-            // If no models are downloaded, show model list automatically
+            // Only show on true fresh start: no downloaded models AND no previous selection
             if modelManager.downloadedModels.isEmpty && !modelManager.isLoadingModel {
                 showingModelSheet = true
             }
@@ -75,15 +84,23 @@ struct ContentView: View {
                 .environment(modelManager)
                 .environment(chatVM)
         }
-        // Auto-show model list on fresh start when no models are downloaded
+        // Auto-show model list ONLY on true fresh start (never used before)
         .task {
             guard !hasCheckedInitialState else { return }
             hasCheckedInitialState = true
 
+            // Check if user has ever selected a model before (indicates not a fresh install)
+            let hasSelectedModelBefore = await StorageService.shared.selectedModelId != nil
+
+            // If user has used the app before, don't auto-show model list
+            if hasSelectedModelBefore {
+                return
+            }
+
             // Wait briefly for model list to load
             try? await Task.sleep(for: .milliseconds(500))
 
-            // If no models are downloaded, show model list automatically
+            // Only show on true fresh start: no downloaded models AND no previous selection
             if modelManager.downloadedModels.isEmpty && !modelManager.isLoadingModel {
                 showingModelSheet = true
             }
@@ -203,9 +220,15 @@ struct ContentView: View {
     }
 
     private var iosOverlayControls: some View {
-        HStack {
+        let iconSize: CGFloat = largeControls ? 28 : 14
+        let statusDotSize: CGFloat = largeControls ? 12 : 6
+        let horizontalPadding: CGFloat = largeControls ? 20 : 12
+        let verticalPadding: CGFloat = largeControls ? 14 : 8
+        let spacing: CGFloat = largeControls ? 18 : 10
+
+        return HStack {
             Spacer()
-            HStack(spacing: 10) {
+            HStack(spacing: spacing) {
                 Button {
                     chatVM.newConversation()
                 } label: {
@@ -225,8 +248,8 @@ struct ContentView: View {
                         Image(systemName: "cpu")
                         Circle()
                             .fill(modelStatusColor)
-                            .frame(width: 6, height: 6)
-                            .offset(x: 3, y: 3)
+                            .frame(width: statusDotSize, height: statusDotSize)
+                            .offset(x: statusDotSize / 2, y: statusDotSize / 2)
                     }
                 }
 
@@ -236,10 +259,10 @@ struct ContentView: View {
                     Image(systemName: "gearshape")
                 }
             }
-            .font(.system(size: 14, weight: .semibold))
+            .font(.system(size: iconSize, weight: .semibold))
             .foregroundStyle(.primary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.horizontal, horizontalPadding)
+            .padding(.vertical, verticalPadding)
             .background(.ultraThinMaterial, in: Capsule())
             .overlay(
                 Capsule()
@@ -418,6 +441,8 @@ private struct ConversationListSheet: View {
     @Environment(ChatViewModel.self) private var chatVM
     @Environment(\.dismiss) private var dismiss
 
+    @State private var showingClearAlert = false
+
     let onClose: () -> Void
 
     var body: some View {
@@ -458,14 +483,33 @@ private struct ConversationListSheet: View {
                     }
                 }
                 ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        chatVM.newConversation()
-                        dismiss()
-                        onClose()
-                    } label: {
-                        Image(systemName: "plus")
+                    HStack(spacing: 16) {
+                        // Clear all button
+                        Button(role: .destructive) {
+                            showingClearAlert = true
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .disabled(chatVM.conversations.isEmpty)
+
+                        // New chat button
+                        Button {
+                            chatVM.newConversation()
+                            dismiss()
+                            onClose()
+                        } label: {
+                            Image(systemName: "plus")
+                        }
                     }
                 }
+            }
+            .alert("Clear All Chats?", isPresented: $showingClearAlert) {
+                Button("Cancel", role: .cancel) {}
+                Button("Clear All", role: .destructive) {
+                    chatVM.clearAllConversations()
+                }
+            } message: {
+                Text("This will delete all conversations. This action cannot be undone.")
             }
         }
     }
