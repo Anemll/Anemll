@@ -14,6 +14,8 @@ import UIKit
 
 struct MessageBubble: View, Equatable {
     let message: ChatMessage
+    let allowSelection: Bool
+    let enableMarkup: Bool
 
     @State private var isHovering = false
     @State private var showCopyButton = false
@@ -83,7 +85,7 @@ struct MessageBubble: View, Equatable {
     private var messageContent: some View {
         HStack(alignment: .top, spacing: 12) {
             RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(isUser ? Color.accentColor.opacity(0.9) : Color.secondary.opacity(0.45))
+                .fill(isUser ? Color.accentColor.opacity(0.9) : llmAccent)
                 .frame(width: 3)
 
             // Text content with copy button overlay
@@ -97,11 +99,17 @@ struct MessageBubble: View, Equatable {
                     } else if isUser {
                         // User messages - simple text
                         Text(message.content)
-                            .textSelection(.enabled)
+                            .selectable(allowSelection)
                             .lineSpacing(3)
                     } else {
-                        // Assistant messages - full markdown rendering
-                        MarkdownView(content: message.content, isUserMessage: false)
+                        // Assistant messages
+                        if enableMarkup {
+                            MarkdownView(content: message.content, isUserMessage: false, allowSelection: allowSelection)
+                        } else {
+                            Text(message.content)
+                                .selectable(allowSelection)
+                                .lineSpacing(3)
+                        }
                     }
                 }
 
@@ -126,9 +134,11 @@ struct MessageBubble: View, Equatable {
     }
 
     static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
-        lhs.message == rhs.message
+        lhs.message == rhs.message && lhs.allowSelection == rhs.allowSelection && lhs.enableMarkup == rhs.enableMarkup
     }
 }
+
+private let llmAccent = Color(red: 1.0, green: 0.62, blue: 0.2)
 
 // MARK: - Stats View
 
@@ -220,7 +230,7 @@ private struct CopyButtonGlassModifier: ViewModifier {
 
 #Preview {
     VStack(spacing: 16) {
-        MessageBubble(message: .user("Hello! How are you today?"))
+        MessageBubble(message: .user("Hello! How are you today?"), allowSelection: true, enableMarkup: true)
 
         MessageBubble(message: ChatMessage(
             role: .assistant,
@@ -231,7 +241,7 @@ private struct CopyButtonGlassModifier: ViewModifier {
             prefillTokens: 10,
             historyTokens: 25,
             isComplete: true
-        ))
+        ), allowSelection: true, enableMarkup: true)
 
         MessageBubble(message: ChatMessage(
             role: .assistant,
@@ -243,13 +253,13 @@ private struct CopyButtonGlassModifier: ViewModifier {
             prefillTokens: 128,
             historyTokens: 178,
             isComplete: true
-        ))
+        ), allowSelection: true, enableMarkup: true)
 
         MessageBubble(message: ChatMessage(
             role: .assistant,
             content: "",
             isComplete: false
-        ))
+        ), allowSelection: true, enableMarkup: true)
     }
     .padding()
 }

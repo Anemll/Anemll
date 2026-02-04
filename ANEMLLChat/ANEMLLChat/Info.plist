@@ -52,5 +52,9 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>ANEMLL Chat uses speech recognition to convert your voice to text for chat input.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>ANEMLL Chat needs microphone access to capture your voice for speech-to-text.</string>
 </dict>
 </plist>

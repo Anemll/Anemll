@@ -264,6 +264,11 @@ actor StorageService {
     static let defaultDebugLevelValue: Int = 0
     static let defaultRepetitionDetectionValue: Bool = false
     static let defaultAutoLoadLastModelValue: Bool = true
+    static let defaultEnableMarkupValue: Bool = true
+    static let defaultSendButtonOnLeftValue: Bool = false
+    static let defaultLoadLastChatValue: Bool = true  // Load last chat on startup by default
+    static let defaultLargeControlsValue: Bool = false  // Large controls for accessibility
+    static let defaultShowMicrophoneValue: Bool = true  // Show microphone button by default
 
     /// Current settings (with defaults)
     var defaultTemperature: Float {
@@ -306,6 +311,46 @@ actor StorageService {
         UserDefaults.standard.set(value, forKey: "repetitionDetectionEnabled")
     }
 
+    var enableMarkup: Bool {
+        UserDefaults.standard.object(forKey: "enableMarkup") as? Bool ?? Self.defaultEnableMarkupValue
+    }
+
+    func saveEnableMarkup(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "enableMarkup")
+    }
+
+    var sendButtonOnLeft: Bool {
+        UserDefaults.standard.object(forKey: "sendButtonOnLeft") as? Bool ?? Self.defaultSendButtonOnLeftValue
+    }
+
+    func saveSendButtonOnLeft(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "sendButtonOnLeft")
+    }
+
+    var loadLastChat: Bool {
+        UserDefaults.standard.object(forKey: "loadLastChat") as? Bool ?? Self.defaultLoadLastChatValue
+    }
+
+    func saveLoadLastChat(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "loadLastChat")
+    }
+
+    var largeControls: Bool {
+        UserDefaults.standard.object(forKey: "largeControls") as? Bool ?? Self.defaultLargeControlsValue
+    }
+
+    func saveLargeControls(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "largeControls")
+    }
+
+    var showMicrophone: Bool {
+        UserDefaults.standard.object(forKey: "showMicrophone") as? Bool ?? Self.defaultShowMicrophoneValue
+    }
+
+    func saveShowMicrophone(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "showMicrophone")
+    }
+
     func clearLastModel() {
         UserDefaults.standard.removeObject(forKey: "selectedModelId")
     }
@@ -334,6 +379,11 @@ actor StorageService {
         UserDefaults.standard.set(Self.defaultDebugLevelValue, forKey: "debugLevel")
         UserDefaults.standard.set(Self.defaultRepetitionDetectionValue, forKey: "repetitionDetectionEnabled")
         UserDefaults.standard.set(Self.defaultAutoLoadLastModelValue, forKey: "autoLoadLastModel")
+        UserDefaults.standard.set(Self.defaultEnableMarkupValue, forKey: "enableMarkup")
+        UserDefaults.standard.set(Self.defaultSendButtonOnLeftValue, forKey: "sendButtonOnLeft")
+        UserDefaults.standard.set(Self.defaultLoadLastChatValue, forKey: "loadLastChat")
+        UserDefaults.standard.set(Self.defaultLargeControlsValue, forKey: "largeControls")
+        UserDefaults.standard.set(Self.defaultShowMicrophoneValue, forKey: "showMicrophone")
         logInfo("Settings reset to defaults", category: .storage)
     }
 }

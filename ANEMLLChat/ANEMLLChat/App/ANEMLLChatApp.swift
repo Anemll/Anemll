@@ -12,6 +12,13 @@ struct ANEMLLChatApp: App {
     @State private var chatViewModel = ChatViewModel()
     @State private var modelManager = ModelManagerViewModel()
 
+    init() {
+        // Start UI freeze watchdog in debug builds
+        #if DEBUG
+        UIFreezeWatchdog.shared.start()
+        #endif
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()

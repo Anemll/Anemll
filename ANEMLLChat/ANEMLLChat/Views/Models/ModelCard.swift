@@ -40,7 +40,7 @@ struct ModelCard: View {
                             .font(.caption)
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(.blue)
+                    .foregroundStyle(.orange)
 
                     Text(model.name)
                         .font(.headline)
@@ -111,7 +111,7 @@ struct ModelCard: View {
                 } label: {
                     Label("Finder", systemImage: "folder")
                 }
-                .tint(.blue)
+                .tint(.orange)
                 #endif
             }
         }
@@ -147,8 +147,8 @@ struct ModelCard: View {
 
     private var statusBackground: Color {
         switch model.status {
-        case .available: return .blue.opacity(0.15)
-        case .downloading: return .orange.opacity(0.15)
+        case .available: return .orange.opacity(0.15)
+        case .downloading: return .yellow.opacity(0.15)
         case .downloaded: return .green.opacity(0.15)
         case .error: return .red.opacity(0.15)
         }
@@ -156,8 +156,8 @@ struct ModelCard: View {
 
     private var statusForeground: Color {
         switch model.status {
-        case .available: return .blue
-        case .downloading: return .orange
+        case .available: return .orange
+        case .downloading: return .yellow
         case .downloaded: return .green
         case .error: return .red
         }
@@ -178,7 +178,7 @@ struct ModelCard: View {
                     .font(.title2)
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.blue)
+            .foregroundStyle(.orange)
 
         case .downloading:
             ProgressView()
@@ -213,7 +213,7 @@ struct ModelCard: View {
                             .fixedSize()  // Prevent text wrapping
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(isLoaded ? .green : .blue)
+                    .tint(isLoaded ? .green : .orange)
                     .controlSize(.small)
                     .disabled(isLoaded)
                 }
@@ -383,113 +383,333 @@ struct ModelDetailView: View {
     @State private var metadata: ModelMetadata?
     @State private var isLoading = true
 
+    private let accentGradient = LinearGradient(
+        colors: [Color(red: 1.0, green: 0.6, blue: 0.2), Color(red: 1.0, green: 0.4, blue: 0.1)],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+
     var body: some View {
-        NavigationStack {
-            List {
-                // Basic Info Section
-                Section("Model Information") {
-                    DetailRow(label: "Name", value: model.name)
-                    DetailRow(label: "ID", value: model.id)
-                    DetailRow(label: "Size", value: model.size)
-                    if let arch = model.architecture {
-                        DetailRow(label: "Architecture", value: arch.capitalized)
-                    }
-                    DetailRow(label: "Status", value: statusText)
-                }
+        ScrollView {
+            VStack(spacing: 0) {
+                // Hero Header
+                headerSection
 
-                // Meta.yaml Details (if available)
-                if let meta = metadata {
-                    Section("Configuration") {
-                        DetailRow(label: "Version", value: meta.version)
-                        DetailRow(label: "Model Type", value: meta.modelType.capitalized)
-                        DetailRow(label: "Model Prefix", value: meta.modelPrefix)
+                // Content Cards
+                VStack(spacing: 16) {
+                    // Quick Stats Bar
+                    if let meta = metadata {
+                        quickStatsBar(meta: meta)
                     }
 
-                    Section("Parameters") {
-                        DetailRow(label: "Context Length", value: "\(meta.contextLength) tokens")
-                        DetailRow(label: "Batch Size", value: "\(meta.batchSize)")
-                        DetailRow(label: "Chunks", value: "\(meta.numChunks)")
-                        DetailRow(label: "Split LM Head", value: "\(meta.splitLMHead)")
+                    // Main Info Card
+                    infoCard
 
-                        if let sw = meta.slidingWindow {
-                            DetailRow(label: "Sliding Window", value: "\(sw)")
-                        }
-
-                        if meta.argmaxInModel {
-                            DetailRow(label: "Argmax in Model", value: "Yes")
-                        }
+                    // Configuration Card (if metadata available)
+                    if let meta = metadata {
+                        configurationCard(meta: meta)
+                        parametersCard(meta: meta)
+                        quantizationCard(meta: meta)
+                    } else if model.isDownloaded && !isLoading {
+                        noMetadataCard
+                    } else if !model.isDownloaded {
+                        downloadPromptCard
                     }
 
-                    Section("Quantization (LUT bits)") {
-                        if let lut = meta.lutFFN, lut > 0 {
-                            DetailRow(label: "FFN", value: "\(lut)-bit")
-                        } else {
-                            DetailRow(label: "FFN", value: "None")
-                        }
-
-                        if let lut = meta.lutLMHead, lut > 0 {
-                            DetailRow(label: "LM Head", value: "\(lut)-bit")
-                        } else {
-                            DetailRow(label: "LM Head", value: "None")
-                        }
-
-                        if let lut = meta.lutEmbeddings, lut > 0 {
-                            DetailRow(label: "Embeddings", value: "\(lut)-bit")
-                        } else {
-                            DetailRow(label: "Embeddings", value: "None")
-                        }
-                    }
-                } else if model.isDownloaded && !isLoading {
-                    Section {
-                        Text("Could not load model configuration")
-                            .foregroundStyle(.secondary)
-                    }
-                } else if !model.isDownloaded {
-                    Section {
-                        Text("Download the model to view detailed configuration")
-                            .foregroundStyle(.secondary)
+                    // Storage Card
+                    if let path = model.localPath {
+                        storageCard(path: path)
                     }
                 }
-
-                // Local Path (if downloaded)
-                if let path = model.localPath {
-                    Section("Storage") {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Local Path")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text(path)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 24)
             }
-            .navigationTitle("Model Details")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                }
+        }
+        .background(Color(white: 0.08))
+        .overlay(alignment: .topTrailing) {
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
             }
-            .task {
-                await loadMetadata()
+            .buttonStyle(.plain)
+            .padding(16)
+        }
+        .task {
+            await loadMetadata()
+        }
+    }
+
+    // MARK: - Hero Header
+
+    private var headerSection: some View {
+        VStack(spacing: 16) {
+            // Model Icon
+            ZStack {
+                Circle()
+                    .fill(accentGradient.opacity(0.2))
+                    .frame(width: 80, height: 80)
+
+                Circle()
+                    .strokeBorder(accentGradient, lineWidth: 2)
+                    .frame(width: 80, height: 80)
+
+                Image(systemName: architectureIcon)
+                    .font(.system(size: 32, weight: .medium))
+                    .foregroundStyle(accentGradient)
             }
+
+            // Model Name
+            Text(model.name)
+                .font(.title2)
+                .fontWeight(.bold)
+                .multilineTextAlignment(.center)
+
+            // Architecture Badge
+            if let arch = model.architecture {
+                Text(arch.uppercased())
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
+                    .background(accentGradient, in: Capsule())
+            }
+
+            // Status Badge
+            statusBadge
+        }
+        .padding(.vertical, 32)
+        .frame(maxWidth: .infinity)
+        .background(
+            LinearGradient(
+                colors: [Color(white: 0.12), Color(white: 0.08)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+
+    private var architectureIcon: String {
+        switch model.architecture?.lowercased() {
+        case "gemma": return "brain"
+        case "llama": return "hare"
+        case "qwen": return "sparkles"
+        case "deepseek": return "waveform.path.ecg"
+        default: return "cpu"
+        }
+    }
+
+    private var statusBadge: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 8, height: 8)
+            Text(statusText)
+                .font(.caption)
+                .fontWeight(.medium)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(statusColor.opacity(0.15), in: Capsule())
+        .foregroundStyle(statusColor)
+    }
+
+    private var statusColor: Color {
+        switch model.status {
+        case .available: return .orange
+        case .downloading: return .yellow
+        case .downloaded: return .green
+        case .error: return .red
         }
     }
 
     private var statusText: String {
         switch model.status {
-        case .available: return "Available for download"
+        case .available: return "Available"
         case .downloading: return "Downloading..."
         case .downloaded: return "Downloaded"
-        case .error(let msg): return "Error: \(msg)"
+        case .error: return "Error"
         }
     }
+
+    // MARK: - Quick Stats Bar
+
+    private func quickStatsBar(meta: ModelMetadata) -> some View {
+        HStack(spacing: 0) {
+            quickStat(value: "\(meta.contextLength)", label: "Context", icon: "text.alignleft")
+            Divider().frame(height: 40)
+            quickStat(value: "\(meta.batchSize)", label: "Batch", icon: "square.grid.2x2")
+            Divider().frame(height: 40)
+            quickStat(value: model.size, label: "Size", icon: "externaldrive")
+            Divider().frame(height: 40)
+            quickStat(value: "\(meta.numChunks)", label: "Chunks", icon: "square.stack.3d.up")
+        }
+        .padding(.vertical, 12)
+        .background(Color(white: 0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func quickStat(value: String, label: String, icon: String) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(.body, design: .rounded))
+                .fontWeight(.bold)
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: - Info Card
+
+    private var infoCard: some View {
+        DetailCard(title: "Model Information", icon: "info.circle.fill", iconColor: .orange) {
+            DetailCardRow(label: "Model ID", value: model.id, isMonospace: true)
+            DetailCardRow(label: "Size", value: model.size)
+            if let arch = model.architecture {
+                DetailCardRow(label: "Architecture", value: arch.capitalized)
+            }
+        }
+    }
+
+    // MARK: - Configuration Card
+
+    private func configurationCard(meta: ModelMetadata) -> some View {
+        DetailCard(title: "Configuration", icon: "gearshape.fill", iconColor: Color(red: 1.0, green: 0.5, blue: 0.2)) {
+            DetailCardRow(label: "Version", value: meta.version, badge: true)
+            DetailCardRow(label: "Model Type", value: meta.modelType.capitalized)
+            DetailCardRow(label: "Model Prefix", value: meta.modelPrefix, isMonospace: true)
+        }
+    }
+
+    // MARK: - Parameters Card
+
+    private func parametersCard(meta: ModelMetadata) -> some View {
+        DetailCard(title: "Parameters", icon: "slider.horizontal.3", iconColor: .orange) {
+            DetailCardRow(label: "Context Length", value: "\(meta.contextLength) tokens")
+            DetailCardRow(label: "Batch Size", value: "\(meta.batchSize)")
+            DetailCardRow(label: "Split LM Head", value: "\(meta.splitLMHead)")
+            if let sw = meta.slidingWindow {
+                DetailCardRow(label: "Sliding Window", value: "\(sw)")
+            }
+            DetailCardRow(label: "Argmax in Model", value: meta.argmaxInModel ? "Yes" : "No",
+                         valueColor: meta.argmaxInModel ? .green : .secondary)
+        }
+    }
+
+    // MARK: - Quantization Card
+
+    private func quantizationCard(meta: ModelMetadata) -> some View {
+        DetailCard(title: "Quantization", icon: "cube.fill", iconColor: Color(red: 1.0, green: 0.7, blue: 0.3)) {
+            HStack(spacing: 12) {
+                quantBadge(label: "FFN", bits: meta.lutFFN)
+                quantBadge(label: "LM Head", bits: meta.lutLMHead)
+                quantBadge(label: "Embed", bits: meta.lutEmbeddings)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private func quantBadge(label: String, bits: Int?) -> some View {
+        VStack(spacing: 4) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            if let bits = bits, bits > 0 {
+                Text("\(bits)-bit")
+                    .font(.system(.caption, design: .rounded))
+                    .fontWeight(.bold)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(quantColor(bits: bits), in: Capsule())
+            } else {
+                Text("FP16")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color(white: 0.2), in: Capsule())
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func quantColor(bits: Int) -> Color {
+        switch bits {
+        case 1...4: return .orange
+        case 5...6: return Color(red: 1.0, green: 0.5, blue: 0.2)
+        case 7...8: return Color(red: 0.9, green: 0.4, blue: 0.1)
+        default: return Color(red: 0.8, green: 0.3, blue: 0.1)
+        }
+    }
+
+    // MARK: - Storage Card
+
+    private func storageCard(path: String) -> some View {
+        DetailCard(title: "Storage", icon: "folder.fill", iconColor: Color(red: 1.0, green: 0.6, blue: 0.15)) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(path)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+
+                #if os(macOS)
+                Button {
+                    let url = URL(fileURLWithPath: path)
+                    NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: url.path)
+                } label: {
+                    Label("Show in Finder", systemImage: "folder.badge.gearshape")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                #endif
+            }
+        }
+    }
+
+    // MARK: - Placeholder Cards
+
+    private var noMetadataCard: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.title)
+                .foregroundStyle(.orange)
+            Text("Could not load model configuration")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 24)
+        .background(Color(white: 0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var downloadPromptCard: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "arrow.down.circle")
+                .font(.title)
+                .foregroundStyle(.orange)
+            Text("Download the model to view detailed configuration")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 24)
+        .background(Color(white: 0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - Load Metadata
 
     private func loadMetadata() async {
         isLoading = true
@@ -508,19 +728,68 @@ struct ModelDetailView: View {
     }
 }
 
-// MARK: - Detail Row
+// MARK: - Detail Card
 
-private struct DetailRow: View {
+private struct DetailCard<Content: View>: View {
+    let title: String
+    let icon: String
+    let iconColor: Color
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Header
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.subheadline)
+                    .foregroundStyle(iconColor)
+                Text(title)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+            }
+
+            // Content
+            content
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(white: 0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+// MARK: - Detail Card Row
+
+private struct DetailCardRow: View {
     let label: String
     let value: String
+    var isMonospace: Bool = false
+    var badge: Bool = false
+    var valueColor: Color = .primary
 
     var body: some View {
         HStack {
             Text(label)
+                .font(.subheadline)
                 .foregroundStyle(.secondary)
+
             Spacer()
-            Text(value)
-                .fontWeight(.medium)
+
+            if badge {
+                Text(value)
+                    .font(.caption)
+                    .fontWeight(.medium)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+                    .background(Color.orange, in: Capsule())
+            } else {
+                Text(value)
+                    .font(isMonospace ? .system(.subheadline, design: .monospaced) : .subheadline)
+                    .fontWeight(.medium)
+                    .foregroundStyle(valueColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
         }
     }
 }

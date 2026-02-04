@@ -10,6 +10,7 @@ import SwiftUI
 struct MarkdownView: View {
     let content: String
     let isUserMessage: Bool
+    let allowSelection: Bool
 
     @State private var cachedContent: String = ""
     @State private var cachedBlocks: [MarkdownBlock] = []
@@ -294,12 +295,13 @@ struct MarkdownView: View {
 
     @ViewBuilder
     private func renderInlineMarkdown(_ text: String) -> some View {
-        InlineMarkdownText(text: text)
+        InlineMarkdownText(text: text, allowSelection: allowSelection)
     }
 }
 
 private struct InlineMarkdownText: View {
     let text: String
+    let allowSelection: Bool
 
     @State private var cachedText: String = ""
     @State private var cachedAttributed: AttributedString?
@@ -312,7 +314,7 @@ private struct InlineMarkdownText: View {
                 Text(text)
             }
         }
-        .textSelection(.enabled)
+        .selectable(allowSelection)
         .lineSpacing(3)
         .onAppear {
             refreshCacheIfNeeded()
@@ -362,7 +364,7 @@ private struct InlineMarkdownText: View {
             let x = 10
             print(x)
             ```
-            """, isUserMessage: false)
+            """, isUserMessage: false, allowSelection: true)
         }
         .padding()
     }

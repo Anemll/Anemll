@@ -31,6 +31,11 @@ struct SettingsView: View {
     @State private var autoLoadLastModel = true
     @State private var debugLevel: Int = 0
     @State private var repetitionDetectionEnabled = false
+    @State private var enableMarkup = StorageService.defaultEnableMarkupValue
+    @State private var sendButtonOnLeft = StorageService.defaultSendButtonOnLeftValue
+    @State private var loadLastChat = StorageService.defaultLoadLastChatValue
+    @State private var largeControls = StorageService.defaultLargeControlsValue
+    @State private var showMicrophone = StorageService.defaultShowMicrophoneValue
     @State private var showingResetConfirmation = false
 
     var body: some View {
@@ -40,6 +45,9 @@ struct SettingsView: View {
 
             // Generation settings
             generationSection
+
+            // Display settings
+            displaySection
 
             // System prompt
             systemPromptSection
@@ -80,6 +88,7 @@ struct SettingsView: View {
     private var modelSection: some View {
         Section {
             Toggle("Auto-load last model", isOn: $autoLoadLastModel)
+            Toggle("Load last chat on startup", isOn: $loadLastChat)
 
             Button(role: .destructive) {
                 Task {
@@ -91,7 +100,7 @@ struct SettingsView: View {
         } header: {
             Text("Model")
         } footer: {
-            Text("When enabled, the app will automatically load the last used model on startup")
+            Text(loadLastChat ? "App will restore your last conversation on startup" : "App will start with a new chat on startup")
         }
     }
 
@@ -176,6 +185,27 @@ struct SettingsView: View {
             case .custom:
                 Text("Custom system prompt instructions for the AI")
             }
+        }
+    }
+
+    // MARK: - Display Section
+
+    private var displaySection: some View {
+        Section {
+            Toggle("Enable Markup", isOn: $enableMarkup)
+            Toggle("Send Button on Left", isOn: $sendButtonOnLeft)
+            Toggle("Show Microphone", isOn: $showMicrophone)
+            #if os(iOS) || os(visionOS)
+            Toggle("Large Controls", isOn: $largeControls)
+            #endif
+        } header: {
+            Text("Display")
+        } footer: {
+            #if os(iOS) || os(visionOS)
+            Text(largeControls ? "Send button and toolbar icons are enlarged for easier touch" : "Standard control sizes")
+            #else
+            Text(showMicrophone ? "Voice input button is shown next to the text field" : "Voice input button is hidden")
+            #endif
         }
     }
 
@@ -291,6 +321,11 @@ struct SettingsView: View {
             autoLoadLastModel = await StorageService.shared.autoLoadLastModel
             debugLevel = await StorageService.shared.debugLevel
             repetitionDetectionEnabled = await StorageService.shared.repetitionDetectionEnabled
+            enableMarkup = await StorageService.shared.enableMarkup
+            sendButtonOnLeft = await StorageService.shared.sendButtonOnLeft
+            loadLastChat = await StorageService.shared.loadLastChat
+            largeControls = await StorageService.shared.largeControls
+            showMicrophone = await StorageService.shared.showMicrophone
         }
     }
 
@@ -317,6 +352,11 @@ struct SettingsView: View {
             await StorageService.shared.saveAutoLoadLastModel(autoLoadLastModel)
             await StorageService.shared.saveDebugLevel(debugLevel)
             await StorageService.shared.saveRepetitionDetectionEnabled(repetitionDetectionEnabled)
+            await StorageService.shared.saveEnableMarkup(enableMarkup)
+            await StorageService.shared.saveSendButtonOnLeft(sendButtonOnLeft)
+            await StorageService.shared.saveLoadLastChat(loadLastChat)
+            await StorageService.shared.saveLargeControls(largeControls)
+            await StorageService.shared.saveShowMicrophone(showMicrophone)
             // Update InferenceService settings
             await MainActor.run {
                 InferenceService.shared.debugLevel = debugLevel
@@ -334,6 +374,11 @@ struct SettingsView: View {
         autoLoadLastModel = StorageService.defaultAutoLoadLastModelValue
         debugLevel = StorageService.defaultDebugLevelValue
         repetitionDetectionEnabled = StorageService.defaultRepetitionDetectionValue
+        enableMarkup = StorageService.defaultEnableMarkupValue
+        sendButtonOnLeft = StorageService.defaultSendButtonOnLeftValue
+        loadLastChat = StorageService.defaultLoadLastChatValue
+        largeControls = StorageService.defaultLargeControlsValue
+        showMicrophone = StorageService.defaultShowMicrophoneValue
 
         // Save to storage
         Task {
