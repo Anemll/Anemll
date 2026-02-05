@@ -22,6 +22,18 @@ struct ModelCard: View {
         modelManager.loadedModelId == model.id
     }
 
+    /// Check if model has oversized weights that WILL cause issues on THIS device
+    private var hasWeightWarning: Bool {
+        guard model.isDownloaded else { return false }
+        return modelManager.hasOversizedWeights(for: model) && DeviceType.requiresWeightSizeLimit
+    }
+
+    /// Check if model has oversized weights (informational - for Mac users)
+    private var hasLargeWeights: Bool {
+        guard model.isDownloaded else { return false }
+        return modelManager.hasOversizedWeights(for: model)
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             // Status icon - only show on macOS to save space on iPhone
@@ -31,7 +43,7 @@ struct ModelCard: View {
 
             // Model info - fixed layout for consistency
             VStack(alignment: .leading, spacing: 2) {
-                // Row 1: Info button + Name - FULL WIDTH (spans above buttons)
+                // Row 1: Info button + Name + Warning - FULL WIDTH (spans above buttons)
                 HStack(spacing: 4) {
                     Button {
                         showingModelDetail = true
@@ -46,6 +58,20 @@ struct ModelCard: View {
                         .font(.headline)
                         .foregroundStyle(.primary)
                         .lineLimit(1)
+
+                    // Weight warning indicator - red for this device, orange for info on Mac
+                    if hasWeightWarning {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                            .help("Model has weight files >1GB which may not load on this device")
+                    } else if hasLargeWeights {
+                        // Informational indicator on Mac - model won't work on iPhone/iPad
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .help("Model has weight files >1GB - won't load on iPhone or non-M-series iPad")
+                    }
                 }
                 .frame(height: 20)
 
@@ -142,6 +168,19 @@ struct ModelCard: View {
             Image(systemName: model.statusIcon)
                 .font(.title3)
                 .foregroundStyle(statusForeground)
+
+            // Warning badge overlay for models with large weights
+            if hasWeightWarning || hasLargeWeights {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(hasWeightWarning ? .red : .orange)
+                    .background(
+                        Circle()
+                            .fill(Color(.systemBackground))
+                            .frame(width: 18, height: 18)
+                    )
+                    .offset(x: 14, y: 14)
+            }
         }
     }
 
@@ -379,9 +418,12 @@ struct ModelMetadata: Sendable {
 struct ModelDetailView: View {
     let model: ModelInfo
     @Environment(\.dismiss) private var dismiss
+    @Environment(ModelManagerViewModel.self) private var modelManager
 
     @State private var metadata: ModelMetadata?
     @State private var isLoading = true
+    @State private var weightDetails: (largest: Int64, largestName: String, files: [(name: String, size: Int64)])?
+    @State private var weightWarning: String?
 
     private let accentGradient = LinearGradient(
         colors: [Color(red: 1.0, green: 0.6, blue: 0.2), Color(red: 1.0, green: 0.4, blue: 0.1)],
@@ -414,6 +456,11 @@ struct ModelDetailView: View {
                         noMetadataCard
                     } else if !model.isDownloaded {
                         downloadPromptCard
+                    }
+
+                    // Weight Files Card (for downloaded models)
+                    if model.isDownloaded {
+                        weightFilesCard
                     }
 
                     // Storage Card
@@ -652,6 +699,92 @@ struct ModelDetailView: View {
         }
     }
 
+    // MARK: - Weight Files Card
+
+    @ViewBuilder
+    private var weightFilesCard: some View {
+        DetailCard(title: "Weight Files", icon: "scalemass.fill", iconColor: Color(red: 0.6, green: 0.8, blue: 1.0)) {
+            VStack(alignment: .leading, spacing: 12) {
+                if let details = weightDetails {
+                    // Largest weight file
+                    DetailCardRow(
+                        label: "Largest Weight",
+                        value: formatBytes(details.largest),
+                        valueColor: details.largest > DeviceType.maxWeightFileSize ? .red : .primary
+                    )
+
+                    DetailCardRow(
+                        label: "From Model",
+                        value: details.largestName,
+                        isMonospace: true
+                    )
+
+                    DetailCardRow(
+                        label: "Total Weight Files",
+                        value: "\(details.files.count)"
+                    )
+
+                    // Warning if weight exceeds 1GB
+                    if let warning = weightWarning {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.white)
+                                .font(.system(size: 14))
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Device Compatibility Warning")
+                                    .font(.caption)
+                                    .fontWeight(.semibold)
+                                    .foregroundStyle(.white)
+
+                                Text(warning)
+                                    .font(.caption2)
+                                    .foregroundStyle(.white.opacity(0.9))
+                                    .lineLimit(3)
+                            }
+
+                            Spacer()
+                        }
+                        .padding(10)
+                        .background(Color.red.opacity(0.85), in: RoundedRectangle(cornerRadius: 8))
+                    } else if details.largest > DeviceType.maxWeightFileSize {
+                        // Show informational message for Mac users
+                        HStack(spacing: 8) {
+                            Image(systemName: "info.circle.fill")
+                                .foregroundStyle(.orange)
+                                .font(.system(size: 14))
+
+                            Text("Weight file exceeds 1GB. This model may not load on iPhone or non-M-series iPad.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(8)
+                        .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                } else if isLoading {
+                    HStack {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading weight info...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("No weight files found")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useGB, .useMB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+
     // MARK: - Storage Card
 
     private func storageCard(path: String) -> some View {
@@ -725,6 +858,10 @@ struct ModelDetailView: View {
             .path
 
         metadata = ModelMetadata.load(from: metaPath)
+
+        // Load weight file details
+        weightDetails = modelManager.getWeightFileDetails(for: model)
+        weightWarning = modelManager.getWeightSizeWarning(for: model)
     }
 }
 

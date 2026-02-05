@@ -68,7 +68,7 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         case iPad
         case iPhone
         case other
-        
+
         static var current: DeviceType {
             #if os(macOS)
             return .mac
@@ -85,6 +85,73 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
             }
             #endif
         }
+
+        /// Check if the device has an M-series chip (Apple Silicon)
+        /// Returns true for M1/M2/M3/M4 Macs and iPads
+        /// Returns false for iPhones and iPads with Bionic chips (A-series)
+        static var hasMSeriesChip: Bool {
+            #if os(macOS)
+            // On macOS, check if running on Apple Silicon
+            var sysinfo = utsname()
+            uname(&sysinfo)
+            let machine = withUnsafePointer(to: &sysinfo.machine) {
+                $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+                    String(validatingUTF8: $0)
+                }
+            }
+            // Apple Silicon Macs report arm64 architecture
+            return machine?.contains("arm64") ?? false
+            #elseif targetEnvironment(macCatalyst)
+            // Mac Catalyst apps run on Apple Silicon Macs
+            return true
+            #else
+            // For iOS devices, check the machine identifier
+            var sysinfo = utsname()
+            uname(&sysinfo)
+            let machine = withUnsafePointer(to: &sysinfo.machine) {
+                $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+                    String(validatingUTF8: $0)
+                }
+            }
+            guard let identifier = machine else { return false }
+
+            // iPads with M-series chips:
+            // iPad Pro 11" (3rd gen+): iPad13,4-11, iPad14,3-4, iPad16,3-4
+            // iPad Pro 12.9" (5th gen+): iPad13,8-11, iPad14,5-6, iPad16,5-6
+            // iPad Air (5th gen+): iPad13,16-17, iPad14,8-9
+            let mSeriesIPads = [
+                "iPad13,4", "iPad13,5", "iPad13,6", "iPad13,7",  // iPad Pro 11" 3rd gen (M1)
+                "iPad13,8", "iPad13,9", "iPad13,10", "iPad13,11", // iPad Pro 12.9" 5th gen (M1)
+                "iPad13,16", "iPad13,17",                         // iPad Air 5th gen (M1)
+                "iPad14,3", "iPad14,4",                           // iPad Pro 11" 4th gen (M2)
+                "iPad14,5", "iPad14,6",                           // iPad Pro 12.9" 6th gen (M2)
+                "iPad14,8", "iPad14,9",                           // iPad Air 6th gen (M2)
+                "iPad16,3", "iPad16,4",                           // iPad Pro 11" 5th gen (M4)
+                "iPad16,5", "iPad16,6",                           // iPad Pro 13" 1st gen (M4)
+            ]
+            return mSeriesIPads.contains(identifier)
+            #endif
+        }
+
+        /// Check if device requires weight file size limit (1GB per weight file)
+        /// iPhone and non-M-series iPads have this limitation
+        static var requiresWeightSizeLimit: Bool {
+            switch current {
+            case .iPhone:
+                return true
+            case .iPad:
+                return !hasMSeriesChip
+            case .mac, .macCatalyst:
+                // Future Mac models might use Bionic chips
+                // For now, assume all Macs support large weights
+                return false
+            case .other:
+                return true  // Be conservative for unknown devices
+            }
+        }
+
+        /// Maximum weight file size in bytes (1GB for limited devices)
+        static let maxWeightFileSize: Int64 = 1_073_741_824  // 1 GB
     }
     
     // Hugging Face model repository information
@@ -1843,6 +1910,16 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
                         }
                     }
 
+                    // Check for weight file size issues after successful download
+                    if let warning = self.getWeightSizeWarning(modelId: modelId) {
+                        print("⚠️ [WeightCheck] Post-download warning: \(warning)")
+                        NotificationCenter.default.post(
+                            name: Notification.Name("ModelWeightSizeWarning"),
+                            object: nil,
+                            userInfo: ["modelId": modelId, "warning": warning]
+                        )
+                    }
+
                     // Call completion handler with success
                     self.logDownload("✅ SUCCESS: Download completed for \(modelId)")
                     self.stopDownloadWatchdog(for: modelId)
@@ -3577,20 +3654,208 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         return allRequiredFilesExist
     }
 
+    /// Check if any weight files in the model exceed the 1GB limit for devices with Bionic chips
+    /// - Parameter modelId: The model ID to check
+    /// - Returns: A tuple containing (hasOversizedWeights, oversizedFiles) where oversizedFiles contains file names and sizes
+    public func checkWeightFileSizes(modelId: String) -> (hasOversizedWeights: Bool, oversizedFiles: [(name: String, size: Int64)]) {
+        let modelDir = getModelPath(for: modelId)
+        var oversizedFiles: [(name: String, size: Int64)] = []
+        let maxSize = DeviceType.maxWeightFileSize  // 1 GB
+
+        guard fileManager.fileExists(atPath: modelDir.path) else {
+            print("[WeightCheck] Model directory not found: \(modelDir.path)")
+            return (false, [])
+        }
+
+        // Helper function to get file size
+        func getFileSize(at path: String) -> Int64 {
+            do {
+                let attributes = try fileManager.attributesOfItem(atPath: path)
+                if let size = attributes[.size] as? Int64 {
+                    return size
+                }
+            } catch {
+                // Ignore errors
+            }
+            return 0
+        }
+
+        // Helper to format size
+        func formatSize(_ size: Int64) -> String {
+            let formatter = ByteCountFormatter()
+            formatter.allowedUnits = [.useGB, .useMB]
+            formatter.countStyle = .file
+            return formatter.string(fromByteCount: size)
+        }
+
+        print("[WeightCheck] Checking weight sizes for model: \(modelId)")
+        print("[WeightCheck] Model directory: \(modelDir.path)")
+        print("[WeightCheck] Device requires weight limit: \(DeviceType.requiresWeightSizeLimit)")
+        print("[WeightCheck] Max weight size: \(formatSize(maxSize))")
+
+        // Check all .mlmodelc directories for weight.bin files
+        do {
+            let contents = try fileManager.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil)
+            let mlmodelcDirs = contents.filter { $0.pathExtension == "mlmodelc" }
+
+            print("[WeightCheck] Found \(mlmodelcDirs.count) .mlmodelc directories")
+
+            for mlmodelcDir in mlmodelcDirs {
+                let dirName = mlmodelcDir.lastPathComponent
+
+                // Check both possible weight file locations
+                let weightPaths = [
+                    mlmodelcDir.appendingPathComponent("weights/weight.bin"),
+                    mlmodelcDir.appendingPathComponent("weight.bin")
+                ]
+
+                for weightPath in weightPaths {
+                    if fileManager.fileExists(atPath: weightPath.path) {
+                        let size = getFileSize(at: weightPath.path)
+                        print("[WeightCheck] \(dirName): \(formatSize(size))")
+                        if size > maxSize {
+                            print("[WeightCheck] ⚠️ OVERSIZED: \(dirName) exceeds 1GB limit!")
+                            oversizedFiles.append((name: dirName, size: size))
+                        }
+                        break  // Found weight file, no need to check other path
+                    }
+                }
+            }
+        } catch {
+            print("[WeightCheck] Error checking weight file sizes: \(error)")
+        }
+
+        if oversizedFiles.isEmpty {
+            print("[WeightCheck] ✅ All weight files are within size limits")
+        } else {
+            print("[WeightCheck] ❌ Found \(oversizedFiles.count) oversized weight file(s)")
+        }
+
+        return (!oversizedFiles.isEmpty, oversizedFiles)
+    }
+
+    /// Check if the model may have loading issues on the current device due to weight file size
+    /// - Parameter modelId: The model ID to check
+    /// - Returns: Warning message if there's an issue, nil otherwise
+    public func getWeightSizeWarning(modelId: String) -> String? {
+        // Only check on devices that have the 1GB weight file limit
+        guard DeviceType.requiresWeightSizeLimit else {
+            return nil
+        }
+
+        let (hasOversized, oversizedFiles) = checkWeightFileSizes(modelId: modelId)
+        guard hasOversized else {
+            return nil
+        }
+
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useGB, .useMB]
+        formatter.countStyle = .file
+
+        let fileList = oversizedFiles.map { "\($0.name): \(formatter.string(fromByteCount: $0.size))" }.joined(separator: ", ")
+        let deviceName: String
+        switch DeviceType.current {
+        case .iPhone:
+            deviceName = "iPhone"
+        case .iPad:
+            deviceName = "this iPad (non-M-series)"
+        default:
+            deviceName = "this device"
+        }
+
+        return "Model may not load on \(deviceName). Weight file(s) exceed 1GB limit: \(fileList)"
+    }
+
+    /// Get detailed weight file information for display in model info
+    /// - Parameter modelId: The model ID to check
+    /// - Returns: Tuple with (largestWeightSize, largestWeightName, allWeightFiles) or nil if not downloaded
+    public func getWeightFileDetails(modelId: String) -> (largest: Int64, largestName: String, files: [(name: String, size: Int64)])? {
+        let modelDir = getModelPath(for: modelId)
+
+        guard fileManager.fileExists(atPath: modelDir.path) else {
+            return nil
+        }
+
+        var weightFiles: [(name: String, size: Int64)] = []
+
+        // Helper function to get file size
+        func getFileSize(at path: String) -> Int64 {
+            do {
+                let attributes = try fileManager.attributesOfItem(atPath: path)
+                if let size = attributes[.size] as? Int64 {
+                    return size
+                }
+            } catch {
+                // Ignore errors
+            }
+            return 0
+        }
+
+        // Check all .mlmodelc directories for weight.bin files
+        do {
+            let contents = try fileManager.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil)
+            let mlmodelcDirs = contents.filter { $0.pathExtension == "mlmodelc" }
+
+            for mlmodelcDir in mlmodelcDirs {
+                let dirName = mlmodelcDir.lastPathComponent
+
+                // Check both possible weight file locations
+                let weightPaths = [
+                    mlmodelcDir.appendingPathComponent("weights/weight.bin"),
+                    mlmodelcDir.appendingPathComponent("weight.bin")
+                ]
+
+                for weightPath in weightPaths {
+                    if fileManager.fileExists(atPath: weightPath.path) {
+                        let size = getFileSize(at: weightPath.path)
+                        if size > 0 {
+                            weightFiles.append((name: dirName, size: size))
+                        }
+                        break  // Found weight file, no need to check other path
+                    }
+                }
+            }
+        } catch {
+            print("Error getting weight file details: \(error)")
+            return nil
+        }
+
+        guard !weightFiles.isEmpty else {
+            return nil
+        }
+
+        // Find the largest weight file
+        let sorted = weightFiles.sorted { $0.size > $1.size }
+        let largest = sorted.first!
+
+        return (largest: largest.size, largestName: largest.name, files: weightFiles)
+    }
+
     /// Loads a model for inference when user clicks the Load button
     @MainActor
     public func loadModel(_ model: Model) {
         print("🔄 User requested to load model: \(model.name)")
-        
+
         // First check if model is downloaded
         if !model.isDownloaded {
             print("⚠️ Cannot load model that is not downloaded: \(model.id)")
             return
         }
-        
+
+        // Check for weight file size issues on limited devices
+        if let warning = getWeightSizeWarning(modelId: model.id) {
+            print("⚠️ [WeightCheck] \(warning)")
+            // Post a notification so UI can show the warning
+            NotificationCenter.default.post(
+                name: Notification.Name("ModelWeightSizeWarning"),
+                object: nil,
+                userInfo: ["modelId": model.id, "warning": warning]
+            )
+        }
+
         // Select the model first (this will update the UI)
         selectModel(model)
-        
+
         // Get the model path
         let modelPath = getModelPath(for: model.id)
         print("📂 Model path for loading: \(modelPath.path)")

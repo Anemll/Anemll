@@ -19,6 +19,8 @@ struct ModelListItemHorizontal: View {
     let hasIncompleteFiles: Bool
     // Add error message property
     let errorMessage: String?
+    // Warning message for weight file size issues (>1GB on iPhone/Bionic iPad)
+    var weightSizeWarning: String? = nil
     
     // Constants for uniform button sizing
     private let buttonWidth: CGFloat = 80
@@ -75,7 +77,7 @@ struct ModelListItemHorizontal: View {
                         Text("Size: \(formatFileSize(model.size))")
                             .font(.caption)
                             .foregroundColor(.secondary)
-                            
+
                         if isDownloaded && hasIncompleteFiles {
                             HStack(spacing: 4) {
                                 Image(systemName: "exclamationmark.triangle.fill")
@@ -93,12 +95,25 @@ struct ModelListItemHorizontal: View {
                             }
                         }
                     }
+
+                    // Warning for weight file size issues on iPhone/Bionic iPad
+                    if isDownloaded && !hasIncompleteFiles, let warning = weightSizeWarning {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.red)
+                                .font(.caption)
+                            Text(warning)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .lineLimit(2)
+                        }
+                    }
                 }
                 .contentShape(Rectangle())
                 .onTapGesture {
                     onShowInfo()
                 }
-                
+
                 Spacer()
             }
             

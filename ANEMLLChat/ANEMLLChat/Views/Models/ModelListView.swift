@@ -121,6 +121,24 @@ struct ModelListView: View {
             get: { modelManager.errorMessage },
             set: { modelManager.errorMessage = $0 }
         ))
+        // Weight size warning alert
+        // Note: Don't call cancelLoadModel in the binding setter - it clears pendingLoadModel
+        // before the button action runs. Only cancel explicitly via the Cancel button.
+        .alert("Large Weight Files", isPresented: Binding(
+            get: { modelManager.showWeightWarningAlert },
+            set: { modelManager.showWeightWarningAlert = $0 }
+        )) {
+            Button("Cancel", role: .cancel) {
+                modelManager.cancelLoadModel()
+            }
+            Button("Load Anyway") {
+                Task {
+                    await modelManager.confirmLoadModel()
+                }
+            }
+        } message: {
+            Text(modelManager.weightWarningMessage ?? "This model has weight files that may not load correctly on this device.")
+        }
     }
 
     // MARK: - Computed Properties

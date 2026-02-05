@@ -185,6 +185,8 @@ struct ModelManagementView: View {
     @State private var refreshID = UUID()
     @State private var showModelLoadConfirmation = false
     @State private var selectedModel: Model? = nil
+    @State private var showWeightSizeWarning = false
+    @State private var weightSizeWarningMessage = ""
     @Environment(\.dismiss) private var dismiss
     
     // Add a view will appear handler
@@ -430,7 +432,7 @@ struct ModelManagementView: View {
             }
         }
         .alert("Delete Model", isPresented: $showDeleteConfirmation) {
-            Button("Cancel", role: .cancel) { 
+            Button("Cancel", role: .cancel) {
                 modelToDelete = nil
             }
             Button("Delete", role: .destructive) {
@@ -445,6 +447,16 @@ struct ModelManagementView: View {
             } else {
                 Text("Are you sure you want to delete this model? This will remove all model files from your device.")
             }
+        }
+        .alert("Device Compatibility Warning", isPresented: $showWeightSizeWarning) {
+            Button("Continue Anyway") {
+                showWeightSizeWarning = false
+            }
+            Button("Cancel", role: .cancel) {
+                showWeightSizeWarning = false
+            }
+        } message: {
+            Text(weightSizeWarningMessage)
         }
     }
     
@@ -1675,7 +1687,22 @@ struct ModelManagementView: View {
             // Update the UI when loading state changes
             refreshModels(fullRefresh: true)
         }
-        
+
+        // Add observer for weight file size warnings
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("ModelWeightSizeWarning"),
+            object: nil,
+            queue: .main
+        ) { notification in
+            if let userInfo = notification.userInfo,
+               let warning = userInfo["warning"] as? String {
+                Task { @MainActor in
+                    self.weightSizeWarningMessage = warning
+                    self.showWeightSizeWarning = true
+                }
+            }
+        }
+
         // print("🔔 ModelManagementView observers set up")
     }
     
@@ -1963,7 +1990,8 @@ struct AvailableModelsSection: View {
                         onCancelDownload: { onCancelDownload(model) },
                         onShowInfo: { onShowInfo(model) },
                         hasIncompleteFiles: modelsWithIncompleteFiles.contains(model.id),
-                        errorMessage: modelErrors[model.id]
+                        errorMessage: modelErrors[model.id],
+                        weightSizeWarning: model.isDownloaded ? modelService.getWeightSizeWarning(modelId: model.id) : nil
                     )
                 }
             }
@@ -2333,6 +2361,25 @@ struct ModelInfoSheet: View {
                         infoRow(title: "Description", value: model.description)
                     }
                     infoRow(title: "Status", value: model.isDownloaded ? "Downloaded" : "Not Downloaded")
+
+                    // Show largest weight file size for downloaded models
+                    if model.isDownloaded,
+                       let weightDetails = modelService.getWeightFileDetails(modelId: model.id) {
+                        infoRow(title: "Largest Weight", value: formatFileSize(Int(weightDetails.largest)))
+                        infoRow(title: "Weight Files", value: "\(weightDetails.files.count) file(s)")
+
+                        // Show warning color if largest weight exceeds 1GB
+                        if weightDetails.largest > ModelService.DeviceType.maxWeightFileSize {
+                            HStack {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                                    .font(.caption)
+                                Text("Exceeds 1GB limit for iPhone/non-M iPads")
+                                    .font(.caption)
+                                    .foregroundColor(.orange)
+                            }
+                        }
+                    }
                 }
                 
                 if isLoadingInfo {
@@ -2381,15 +2428,40 @@ struct ModelInfoSheet: View {
                                         .fontWeight(.medium)
                                         .foregroundColor(sizeVerificationIsValid ? .green : .orange)
                                 }
-                                
+
                                 Text(sizeVerificationResults)
                                     .font(.system(.footnote, design: .monospaced))
                             }
                             .padding(.vertical, 4)
                         }
                     }
+
+                    // Device compatibility warning section
+                    if let warning = modelService.getWeightSizeWarning(modelId: model.id) {
+                        Section(header: Text("Device Compatibility")) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundColor(.red)
+                                    Text("Weight File Size Warning")
+                                        .fontWeight(.medium)
+                                        .foregroundColor(.red)
+                                }
+
+                                Text(warning)
+                                    .font(.footnote)
+                                    .foregroundColor(.secondary)
+
+                                Text("Models with weight files larger than 1GB may fail to load on iPhone and non-M-series iPads due to memory constraints.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .padding(.top, 4)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
                 }
-                
+
                 if let sourceURL = additionalInfo["source_url"], !sourceURL.isEmpty {
                     Section(header: Text("Source")) {
                         let displayURL = formatSourceURL(sourceURL)

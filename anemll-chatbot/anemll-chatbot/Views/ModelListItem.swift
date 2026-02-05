@@ -19,6 +19,8 @@ struct ModelListItem: View {
     let hasIncompleteFiles: Bool
     // Error message for incomplete/corrupt files
     var errorMessage: String? = nil
+    // Warning message for weight file size issues (>1GB on iPhone/Bionic iPad)
+    var weightSizeWarning: String? = nil
 
     // Format file size nicely
     private func formatFileSize(_ size: Int) -> String {
@@ -86,6 +88,32 @@ struct ModelListItem: View {
                 }
                 .padding(10)
                 .background(Color.orange)
+                .cornerRadius(8)
+            }
+
+            // Warning banner for weight file size issues on iPhone/Bionic iPad
+            if isDownloaded && !hasIncompleteFiles, let warning = weightSizeWarning {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.white)
+                        .font(.system(size: 14))
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Device Compatibility Warning")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.white)
+
+                        Text(warning)
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.9))
+                            .lineLimit(3)
+                    }
+
+                    Spacer()
+                }
+                .padding(10)
+                .background(Color.red.opacity(0.85))
                 .cornerRadius(8)
             }
             
