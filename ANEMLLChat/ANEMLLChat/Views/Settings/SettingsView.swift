@@ -31,6 +31,11 @@ struct SettingsView: View {
     @State private var autoLoadLastModel = true
     @State private var debugLevel: Int = 0
     @State private var repetitionDetectionEnabled = false
+    @State private var debugDisablePrefill = StorageService.defaultDebugDisablePrefillValue
+    @State private var debugContextCap = StorageService.defaultDebugContextCapValue
+    @State private var debugDisableIOBackings = StorageService.defaultDebugDisableIOBackingsValue
+    @State private var debugRepeatInferCount = StorageService.defaultDebugRepeatInferCountValue
+    @State private var debugRepeatOnlyDivergence = StorageService.defaultDebugRepeatOnlyDivergenceValue
     @State private var enableMarkup = StorageService.defaultEnableMarkupValue
     @State private var sendButtonOnLeft = StorageService.defaultSendButtonOnLeftValue
     @State private var loadLastChat = StorageService.defaultLoadLastChatValue
@@ -54,6 +59,11 @@ struct SettingsView: View {
 
             // Logs
             logsSection
+
+            // Debug inference (debug builds only)
+            if DebugInferenceOptions.isEnabled {
+                debugInferenceSection
+            }
 
             // About
             aboutSection
@@ -237,6 +247,42 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Debug Inference Section
+
+    private var debugInferenceSection: some View {
+        Section {
+            Toggle("Disable Prefill (Inference Only)", isOn: $debugDisablePrefill)
+
+            Toggle("Disable CoreML I/O Backings (CVPixelBuffer)", isOn: $debugDisableIOBackings)
+
+            Stepper(value: $debugContextCap, in: 0...512, step: 16) {
+                HStack {
+                    Text("Context Cap")
+                    Spacer()
+                    Text(debugContextCap == 0 ? "Off" : "\(debugContextCap)")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+
+            Stepper(value: $debugRepeatInferCount, in: 0...4, step: 1) {
+                HStack {
+                    Text("Repeat Infer (2-4)")
+                    Spacer()
+                    Text(debugRepeatInferCount < 2 ? "Off" : "\(debugRepeatInferCount)x")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+
+            Toggle("Only Log Divergence", isOn: $debugRepeatOnlyDivergence)
+        } header: {
+            Text("Debug Inference")
+        } footer: {
+            Text("Disables prefill, CoreML I/O backings, caps the input context, and optionally repeats token inference for divergence testing (heavy). Requires model reload. Debug builds only.")
+        }
+    }
+
     // MARK: - About Section
 
     private var aboutSection: some View {
@@ -321,6 +367,11 @@ struct SettingsView: View {
             autoLoadLastModel = await StorageService.shared.autoLoadLastModel
             debugLevel = await StorageService.shared.debugLevel
             repetitionDetectionEnabled = await StorageService.shared.repetitionDetectionEnabled
+            debugDisablePrefill = await StorageService.shared.debugDisablePrefill
+            debugContextCap = await StorageService.shared.debugContextCap
+            debugDisableIOBackings = await StorageService.shared.debugDisableIOBackings
+            debugRepeatInferCount = await StorageService.shared.debugRepeatInferCount
+            debugRepeatOnlyDivergence = await StorageService.shared.debugRepeatOnlyDivergence
             enableMarkup = await StorageService.shared.enableMarkup
             sendButtonOnLeft = await StorageService.shared.sendButtonOnLeft
             loadLastChat = await StorageService.shared.loadLastChat
@@ -352,6 +403,11 @@ struct SettingsView: View {
             await StorageService.shared.saveAutoLoadLastModel(autoLoadLastModel)
             await StorageService.shared.saveDebugLevel(debugLevel)
             await StorageService.shared.saveRepetitionDetectionEnabled(repetitionDetectionEnabled)
+            await StorageService.shared.saveDebugDisablePrefill(debugDisablePrefill)
+            await StorageService.shared.saveDebugContextCap(debugContextCap)
+            await StorageService.shared.saveDebugDisableIOBackings(debugDisableIOBackings)
+            await StorageService.shared.saveDebugRepeatInferCount(debugRepeatInferCount)
+            await StorageService.shared.saveDebugRepeatOnlyDivergence(debugRepeatOnlyDivergence)
             await StorageService.shared.saveEnableMarkup(enableMarkup)
             await StorageService.shared.saveSendButtonOnLeft(sendButtonOnLeft)
             await StorageService.shared.saveLoadLastChat(loadLastChat)
@@ -361,6 +417,19 @@ struct SettingsView: View {
             await MainActor.run {
                 InferenceService.shared.debugLevel = debugLevel
                 InferenceService.shared.repetitionDetectionEnabled = repetitionDetectionEnabled
+                if DebugInferenceOptions.isEnabled {
+                    InferenceService.shared.debugDisablePrefill = debugDisablePrefill
+                    InferenceService.shared.debugContextCap = debugContextCap
+                    InferenceService.shared.debugDisableIOBackings = debugDisableIOBackings
+                    InferenceService.shared.debugRepeatInferCount = debugRepeatInferCount
+                    InferenceService.shared.debugRepeatOnlyDivergence = debugRepeatOnlyDivergence
+                } else {
+                    InferenceService.shared.debugDisablePrefill = false
+                    InferenceService.shared.debugContextCap = 0
+                    InferenceService.shared.debugDisableIOBackings = false
+                    InferenceService.shared.debugRepeatInferCount = 0
+                    InferenceService.shared.debugRepeatOnlyDivergence = false
+                }
             }
         }
     }
@@ -374,6 +443,10 @@ struct SettingsView: View {
         autoLoadLastModel = StorageService.defaultAutoLoadLastModelValue
         debugLevel = StorageService.defaultDebugLevelValue
         repetitionDetectionEnabled = StorageService.defaultRepetitionDetectionValue
+        debugDisablePrefill = StorageService.defaultDebugDisablePrefillValue
+        debugContextCap = StorageService.defaultDebugContextCapValue
+        debugDisableIOBackings = StorageService.defaultDebugDisableIOBackingsValue
+        debugRepeatInferCount = StorageService.defaultDebugRepeatInferCountValue
         enableMarkup = StorageService.defaultEnableMarkupValue
         sendButtonOnLeft = StorageService.defaultSendButtonOnLeftValue
         loadLastChat = StorageService.defaultLoadLastChatValue
@@ -392,6 +465,17 @@ struct SettingsView: View {
             await MainActor.run {
                 InferenceService.shared.debugLevel = debugLevel
                 InferenceService.shared.repetitionDetectionEnabled = repetitionDetectionEnabled
+                if DebugInferenceOptions.isEnabled {
+                    InferenceService.shared.debugDisablePrefill = debugDisablePrefill
+                    InferenceService.shared.debugContextCap = debugContextCap
+                    InferenceService.shared.debugDisableIOBackings = debugDisableIOBackings
+                    InferenceService.shared.debugRepeatInferCount = debugRepeatInferCount
+                } else {
+                    InferenceService.shared.debugDisablePrefill = false
+                    InferenceService.shared.debugContextCap = 0
+                    InferenceService.shared.debugDisableIOBackings = false
+                    InferenceService.shared.debugRepeatInferCount = 0
+                }
             }
         }
     }

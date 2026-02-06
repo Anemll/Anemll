@@ -263,6 +263,11 @@ actor StorageService {
     static let defaultSystemPromptValue: String = "[DEFAULT_PROMPT]"  // Default Prompt - standard inference with no additional prompting
     static let defaultDebugLevelValue: Int = 0
     static let defaultRepetitionDetectionValue: Bool = false
+    static let defaultDebugDisablePrefillValue: Bool = false
+    static let defaultDebugContextCapValue: Int = 0
+    static let defaultDebugDisableIOBackingsValue: Bool = false
+    static let defaultDebugRepeatInferCountValue: Int = 0
+    static let defaultDebugRepeatOnlyDivergenceValue: Bool = false
     static let defaultAutoLoadLastModelValue: Bool = true
     static let defaultEnableMarkupValue: Bool = true
     static let defaultSendButtonOnLeftValue: Bool = false
@@ -309,6 +314,46 @@ actor StorageService {
 
     func saveRepetitionDetectionEnabled(_ value: Bool) {
         UserDefaults.standard.set(value, forKey: "repetitionDetectionEnabled")
+    }
+
+    var debugDisablePrefill: Bool {
+        UserDefaults.standard.object(forKey: "debugDisablePrefill") as? Bool ?? Self.defaultDebugDisablePrefillValue
+    }
+
+    func saveDebugDisablePrefill(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "debugDisablePrefill")
+    }
+
+    var debugContextCap: Int {
+        UserDefaults.standard.object(forKey: "debugContextCap") as? Int ?? Self.defaultDebugContextCapValue
+    }
+
+    func saveDebugContextCap(_ value: Int) {
+        UserDefaults.standard.set(value, forKey: "debugContextCap")
+    }
+
+    var debugDisableIOBackings: Bool {
+        UserDefaults.standard.object(forKey: "debugDisableIOBackings") as? Bool ?? Self.defaultDebugDisableIOBackingsValue
+    }
+
+    func saveDebugDisableIOBackings(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "debugDisableIOBackings")
+    }
+
+    var debugRepeatInferCount: Int {
+        UserDefaults.standard.object(forKey: "debugRepeatInferCount") as? Int ?? Self.defaultDebugRepeatInferCountValue
+    }
+
+    func saveDebugRepeatInferCount(_ value: Int) {
+        UserDefaults.standard.set(value, forKey: "debugRepeatInferCount")
+    }
+
+    var debugRepeatOnlyDivergence: Bool {
+        UserDefaults.standard.object(forKey: "debugRepeatOnlyDivergence") as? Bool ?? Self.defaultDebugRepeatOnlyDivergenceValue
+    }
+
+    func saveDebugRepeatOnlyDivergence(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "debugRepeatOnlyDivergence")
     }
 
     var enableMarkup: Bool {
@@ -378,6 +423,11 @@ actor StorageService {
         UserDefaults.standard.set(Self.defaultSystemPromptValue, forKey: "systemPrompt")
         UserDefaults.standard.set(Self.defaultDebugLevelValue, forKey: "debugLevel")
         UserDefaults.standard.set(Self.defaultRepetitionDetectionValue, forKey: "repetitionDetectionEnabled")
+        UserDefaults.standard.set(Self.defaultDebugDisablePrefillValue, forKey: "debugDisablePrefill")
+        UserDefaults.standard.set(Self.defaultDebugContextCapValue, forKey: "debugContextCap")
+        UserDefaults.standard.set(Self.defaultDebugDisableIOBackingsValue, forKey: "debugDisableIOBackings")
+        UserDefaults.standard.set(Self.defaultDebugRepeatInferCountValue, forKey: "debugRepeatInferCount")
+        UserDefaults.standard.set(Self.defaultDebugRepeatOnlyDivergenceValue, forKey: "debugRepeatOnlyDivergence")
         UserDefaults.standard.set(Self.defaultAutoLoadLastModelValue, forKey: "autoLoadLastModel")
         UserDefaults.standard.set(Self.defaultEnableMarkupValue, forKey: "enableMarkup")
         UserDefaults.standard.set(Self.defaultSendButtonOnLeftValue, forKey: "sendButtonOnLeft")

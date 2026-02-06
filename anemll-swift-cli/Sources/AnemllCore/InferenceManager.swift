@@ -1,6 +1,7 @@
 import CoreVideo
 @preconcurrency import CoreML
 import CoreFoundation
+import Dispatch
 import Metal
 import IOSurface
 import Accelerate
@@ -60,6 +61,10 @@ import Accelerate
     // Sampling configuration (defaults to greedy for backward compatibility)
     private var samplingConfig: SamplingConfig = .greedy
     private var generatedTokenHistory: [Int] = []
+    private var disablePrefill: Bool = false
+    private var disableIOBackings: Bool = false
+    private var debugRepeatInferCount: Int = 0
+    private var debugRepeatOnlyDivergence: Bool = false
 
     // Metal-based argmax for GPU processing (avoids CPU/ANE sync issues)
     private var metalArgmax: MetalArgmax?
@@ -87,6 +92,48 @@ import Accelerate
         let value: Float
         let index: Int
     }
+
+    private struct FloatBuffer {
+        let count: Int
+        let float16Ptr: UnsafePointer<Float16>?
+        let float32Ptr: UnsafePointer<Float>?
+        let unlock: (() -> Void)?
+    }
+
+    private func getFloatBuffer(from array: MLMultiArray) throws -> FloatBuffer {
+        if let pixelBuffer = array.pixelBuffer {
+            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+            guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+                throw InferenceError.inferenceError("Could not get base address for pixel buffer")
+            }
+            return FloatBuffer(
+                count: array.count,
+                float16Ptr: baseAddress.assumingMemoryBound(to: Float16.self),
+                float32Ptr: nil,
+                unlock: { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+            )
+        }
+
+        switch array.dataType {
+        case .float16:
+            return FloatBuffer(
+                count: array.count,
+                float16Ptr: array.dataPointer.assumingMemoryBound(to: Float16.self),
+                float32Ptr: nil,
+                unlock: nil
+            )
+        case .float32:
+            return FloatBuffer(
+                count: array.count,
+                float16Ptr: nil,
+                float32Ptr: array.dataPointer.assumingMemoryBound(to: Float.self),
+                unlock: nil
+            )
+        default:
+            throw InferenceError.inferenceError("Unsupported logits data type: \(array.dataType)")
+        }
+    }
     
     public func AbortGeneration( Code : Int)
     {
@@ -104,8 +151,27 @@ import Accelerate
         self.GreedySearch = !config.doSample
     }
 
+    /// Debug option: disable prefill and generate using only the last token.
+    public func setDisablePrefill(_ value: Bool) {
+        self.disablePrefill = value
+    }
 
-    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil, updateMaskPrefill: Bool = false, prefillDynamicSlice: Bool = false) throws {  // Make init throwing
+    /// Debug option: repeat next-token inference N times (2-4) to detect divergence.
+    public func setDebugRepeatInferCount(_ value: Int) {
+        if value < 2 {
+            self.debugRepeatInferCount = 0
+        } else {
+            self.debugRepeatInferCount = min(value, 4)
+        }
+    }
+
+    /// Debug option: when true, suppress per-run repeat logs and only emit divergence.
+    public func setDebugRepeatOnlyDivergence(_ value: Bool) {
+        self.debugRepeatOnlyDivergence = value
+    }
+
+
+    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil, updateMaskPrefill: Bool = false, prefillDynamicSlice: Bool = false, disableIOBackings: Bool = false) throws {  // Make init throwing
         self.debugLevel = debugLevel
         self.isMonolithic = models.isMonolithic
         self.argmaxInModel = argmaxInModel
@@ -118,6 +184,7 @@ import Accelerate
         self.batchSize = batchSize
         self.splitLMHead = splitLMHead
         self.v110 = v110 // Set the v110 flag based on the parameter
+        self.disableIOBackings = disableIOBackings
 
         // Check if rotation functions are available
         let hasRotation = ffnChunks.first?.hasRotationSupport ?? false
@@ -136,7 +203,7 @@ import Accelerate
         // allowBatchPrefill = hasUpdateMask || prefillDynamicSlice (matching Python chat_full.py)
         let allowBatchPrefill = hasUpdateMask || prefillDynamicSlice
 
-        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation), hasUpdateMask=\(hasUpdateMask), prefillDynamicSlice=\(prefillDynamicSlice), allowBatchPrefill=\(allowBatchPrefill)")
+        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation), hasUpdateMask=\(hasUpdateMask), prefillDynamicSlice=\(prefillDynamicSlice), allowBatchPrefill=\(allowBatchPrefill), disableIOBackings=\(disableIOBackings)")
 
         // Print prefill mode info (matching Python chat_full.py)
         if allowBatchPrefill {
@@ -162,35 +229,49 @@ import Accelerate
             argmaxPositionIds = try MLMultiArray(shape: [1], dataType: .int32)
             argmaxCurrentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
 
-            // Causal mask [1, 1, 1, contextLength] - IOSurface-backed fp16 pixel buffer
-            let ioAttributes: [String: Any] = [
-                kCVPixelBufferMetalCompatibilityKey as String: true,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
-            ]
-
-            var maskBuffer: CVPixelBuffer?
-            let maskStatus = CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                contextLength, 1,
-                kCVPixelFormatType_OneComponent16Half,
-                ioAttributes as CFDictionary,
-                &maskBuffer
-            )
-            guard maskStatus == kCVReturnSuccess, let mBuf = maskBuffer else {
-                throw InferenceError.inferenceError("Failed to create causal mask pixel buffer")
-            }
-            argmaxCausalMaskBuffer = mBuf
-            argmaxCausalMask = MLMultiArray(pixelBuffer: mBuf, shape: [1, 1, 1, NSNumber(value: contextLength)])
-
-            // Initialize causal mask with -inf
-            CVPixelBufferLockBaseAddress(mBuf, [])
-            if let baseAddress = CVPixelBufferGetBaseAddress(mBuf) {
-                let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+            // Causal mask [1, 1, 1, contextLength]
+            if disableIOBackings {
+                argmaxCausalMaskBuffer = nil
+                argmaxCausalMask = try MLMultiArray(
+                    shape: [1, 1, 1, NSNumber(value: contextLength)],
+                    dataType: .float16
+                )
+                // Initialize causal mask with -inf
+                let ptr = argmaxCausalMask!.dataPointer.assumingMemoryBound(to: Float16.self)
                 for i in 0..<contextLength {
                     ptr[i] = Float16(-Float.infinity)
                 }
+            } else {
+                // IOSurface-backed fp16 pixel buffer for ANE synchronization
+                let ioAttributes: [String: Any] = [
+                    kCVPixelBufferMetalCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+                ]
+
+                var maskBuffer: CVPixelBuffer?
+                let maskStatus = CVPixelBufferCreate(
+                    kCFAllocatorDefault,
+                    contextLength, 1,
+                    kCVPixelFormatType_OneComponent16Half,
+                    ioAttributes as CFDictionary,
+                    &maskBuffer
+                )
+                guard maskStatus == kCVReturnSuccess, let mBuf = maskBuffer else {
+                    throw InferenceError.inferenceError("Failed to create causal mask pixel buffer")
+                }
+                argmaxCausalMaskBuffer = mBuf
+                argmaxCausalMask = MLMultiArray(pixelBuffer: mBuf, shape: [1, 1, 1, NSNumber(value: contextLength)])
+
+                // Initialize causal mask with -inf
+                CVPixelBufferLockBaseAddress(mBuf, [])
+                if let baseAddress = CVPixelBufferGetBaseAddress(mBuf) {
+                    let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                    for i in 0..<contextLength {
+                        ptr[i] = Float16(-Float.infinity)
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(mBuf, [])
             }
-            CVPixelBufferUnlockBaseAddress(mBuf, [])
             lastArgmaxPosition = -1
 
             // Pre-allocate input feature provider (reused for all inferences)
@@ -208,36 +289,50 @@ import Accelerate
         // Pre-allocate update_mask for prefill if model supports it
         // Shape: [1, 1, contextLength, batchSize] - each column marks the write position for that token in batch
         if hasUpdateMask && isMonolithic {
-            let ioAttributes: [String: Any] = [
-                kCVPixelBufferMetalCompatibilityKey as String: true,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
-            ]
-
-            // Create pixel buffer: width = batchSize, height = contextLength
-            var updateMaskBuffer: CVPixelBuffer?
-            let updateMaskStatus = CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                batchSize, contextLength,
-                kCVPixelFormatType_OneComponent16Half,
-                ioAttributes as CFDictionary,
-                &updateMaskBuffer
-            )
-            guard updateMaskStatus == kCVReturnSuccess, let uBuf = updateMaskBuffer else {
-                throw InferenceError.inferenceError("Failed to create update_mask pixel buffer")
-            }
-            prefillUpdateMaskBuffer = uBuf
-            prefillUpdateMask = MLMultiArray(pixelBuffer: uBuf, shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: batchSize)])
-
-            // Initialize to zeros
-            CVPixelBufferLockBaseAddress(uBuf, [])
-            if let baseAddress = CVPixelBufferGetBaseAddress(uBuf) {
+            if disableIOBackings {
+                prefillUpdateMaskBuffer = nil
+                prefillUpdateMask = try MLMultiArray(
+                    shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: batchSize)],
+                    dataType: .float16
+                )
+                // Initialize to zeros
                 let totalElements = contextLength * batchSize
-                let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                let ptr = prefillUpdateMask!.dataPointer.assumingMemoryBound(to: Float16.self)
                 for i in 0..<totalElements {
                     ptr[i] = Float16(0.0)
                 }
+            } else {
+                let ioAttributes: [String: Any] = [
+                    kCVPixelBufferMetalCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+                ]
+
+                // Create pixel buffer: width = batchSize, height = contextLength
+                var updateMaskBuffer: CVPixelBuffer?
+                let updateMaskStatus = CVPixelBufferCreate(
+                    kCFAllocatorDefault,
+                    batchSize, contextLength,
+                    kCVPixelFormatType_OneComponent16Half,
+                    ioAttributes as CFDictionary,
+                    &updateMaskBuffer
+                )
+                guard updateMaskStatus == kCVReturnSuccess, let uBuf = updateMaskBuffer else {
+                    throw InferenceError.inferenceError("Failed to create update_mask pixel buffer")
+                }
+                prefillUpdateMaskBuffer = uBuf
+                prefillUpdateMask = MLMultiArray(pixelBuffer: uBuf, shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: batchSize)])
+
+                // Initialize to zeros
+                CVPixelBufferLockBaseAddress(uBuf, [])
+                if let baseAddress = CVPixelBufferGetBaseAddress(uBuf) {
+                    let totalElements = contextLength * batchSize
+                    let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                    for i in 0..<totalElements {
+                        ptr[i] = Float16(0.0)
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(uBuf, [])
             }
-            CVPixelBufferUnlockBaseAddress(uBuf, [])
 
             print("Pre-allocated update_mask buffer: [\(contextLength), \(batchSize)]")
         }
@@ -337,6 +432,45 @@ import Accelerate
             self.state = ffnChunks[0].prefillModel.makeState()
         }
     }
+
+    private func resetStateForPrefill() {
+        guard let chunks = ffnChunks, !chunks.isEmpty else {
+            return
+        }
+        if isMonolithic {
+            state = chunks[0].inferModel.makeState()
+        } else {
+            state = chunks[0].prefillModel.makeState()
+        }
+        lastArgmaxPosition = -1
+    }
+
+    private func rebuildStateForContext(
+        _ tokens: [Int],
+        contextPos: Int,
+        tokenizer: Tokenizer
+    ) async throws -> Int {
+        if tokens.isEmpty || contextPos <= 0 {
+            return 0
+        }
+        let safePos = min(contextPos, tokens.count)
+        if disablePrefill {
+            var pos = 0
+            while pos < safePos {
+                let _ = try await generateNextToken(
+                    for: tokens[pos],
+                    currentPos: pos + 1,
+                    temperature: 0,
+                    tokenizer: tokenizer
+                )
+                pos += 1
+            }
+            return safePos
+        } else {
+            var tmpTokens = tokens
+            return try await runPrefill(on: &tmpTokens, contextPos: safePos, tokenizer: tokenizer)
+        }
+    }
     
     public func ToggeDebugLevel()  {
         if (debugLevel == 0 ) {
@@ -389,6 +523,13 @@ import Accelerate
             }
 
             let shape = constraint.shape
+
+            if disableIOBackings {
+                // Use standard MLMultiArray output backings (no CVPixelBuffer)
+                let outputBacking = try MLMultiArray(shape: shape, dataType: constraint.dataType)
+                outputBackingsDict[featureName] = outputBacking
+                continue
+            }
 
             // Calculate dimensions for pixel buffer
             let lastDim = shape.last?.intValue ?? 1
@@ -459,6 +600,17 @@ import Accelerate
             let lastDim = shape.last?.intValue ?? 2048
             self.hidden_states = lastDim
             let otherDims = shape.dropLast().reduce(1) { $0 * $1.intValue }
+
+            if disableIOBackings {
+                let dataType = constraint.dataType
+                hiddenStatesBackings_emb = ["hidden_states": try MLMultiArray(shape: shape, dataType: dataType)]
+                hiddenStatesBackings_ffn = ["output_hidden_states": try MLMultiArray(shape: shape, dataType: dataType)]
+
+                if debugLevel >= 1 {
+                    print("Single-token embed backing shape:", shape.map { $0.intValue })
+                }
+                return
+            }
             
             let attributes: [String: Any] = [
                 kCVPixelBufferMetalCompatibilityKey as String: true
@@ -516,6 +668,17 @@ import Accelerate
         let hiddenSize = constraint.shape.last?.intValue ?? self.hidden_states
     
         let shape: [NSNumber] = [1, 1, NSNumber(value: hiddenSize)]
+
+        if disableIOBackings {
+            let backing = try MLMultiArray(shape: shape, dataType: constraint.dataType)
+            hiddenStatesBackings_last = ["output_hidden_states": backing]
+
+            if debugLevel >= 1 {
+                print("\nLast Chunk Backing Initialized:")
+                print("Shape: \(shape.map { $0.intValue })")
+            }
+            return
+        }
         
         let attributes: [String: Any] = [
             kCVPixelBufferMetalCompatibilityKey as String: true
@@ -554,6 +717,16 @@ import Accelerate
             print("Hidden size:", hiddenSize)
             print("Batch size:", batchSize)
             print("Prefill backing shape:", shape.map { $0.intValue })
+        }
+
+        if disableIOBackings {
+            hiddenStatesBackings_emb_prefill = ["hidden_states": try MLMultiArray(shape: shape, dataType: .float16)]
+            hiddenStatesBackings_ffn_prefill = ["output_hidden_states": try MLMultiArray(shape: shape, dataType: .float16)]
+
+            if debugLevel >= 1 {
+                print("Embed prefill backing created with shape:", shape.map { $0.intValue })
+            }
+            return
         }
 
         // Embedding prefill backing
@@ -656,7 +829,16 @@ import Accelerate
                 let otherDims = shape.dropLast().reduce(1) { $0 * $1.intValue }
 
                 if bufferIndex == 0 {
-                    print("  \(featureName): shape=\(shape.map { $0.intValue }), pixelBuffer=\(lastDim)x\(otherDims)")
+                    if disableIOBackings {
+                        print("  \(featureName): shape=\(shape.map { $0.intValue }) (MLMultiArray)")
+                    } else {
+                        print("  \(featureName): shape=\(shape.map { $0.intValue }), pixelBuffer=\(lastDim)x\(otherDims)")
+                    }
+                }
+
+                if disableIOBackings {
+                    outputBackingsDict[featureName] = try MLMultiArray(shape: shape, dataType: constraint.dataType)
+                    continue
                 }
 
                 // IOSurface-backed buffer for ANE compatibility and polling
@@ -1077,31 +1259,48 @@ import Accelerate
             ]
 
             // Add update_mask if model supports it
-            if hasUpdateMask, let updateMaskBuffer = prefillUpdateMaskBuffer, let updateMask = prefillUpdateMask {
+            if hasUpdateMask, let updateMask = prefillUpdateMask {
                 // Populate update_mask: set 1.0 at position [batchPos + i, i] for each valid token
-                // Shape is [1, 1, contextLength, batchSize], stored as [contextLength, batchSize] in pixel buffer
-                CVPixelBufferLockBaseAddress(updateMaskBuffer, [])
-                if let baseAddress = CVPixelBufferGetBaseAddress(updateMaskBuffer) {
-                    let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
-                    let rowBytes = CVPixelBufferGetBytesPerRow(updateMaskBuffer)
-                    let stride = rowBytes / MemoryLayout<Float16>.size
+                // Shape is [1, 1, contextLength, batchSize]
+                if let updateMaskBuffer = prefillUpdateMaskBuffer {
+                    // Pixel buffer path
+                    CVPixelBufferLockBaseAddress(updateMaskBuffer, [])
+                    if let baseAddress = CVPixelBufferGetBaseAddress(updateMaskBuffer) {
+                        let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                        let rowBytes = CVPixelBufferGetBytesPerRow(updateMaskBuffer)
+                        let stride = rowBytes / MemoryLayout<Float16>.size
 
-                    // Clear entire buffer first
-                    for row in 0..<contextLength {
-                        for col in 0..<batchSize {
-                            ptr[row * stride + col] = Float16(0.0)
+                        // Clear entire buffer first
+                        for row in 0..<contextLength {
+                            for col in 0..<batchSize {
+                                ptr[row * stride + col] = Float16(0.0)
+                            }
+                        }
+
+                        // Set 1.0 at the write positions for each token in the batch
+                        for i in 0..<currentBatchSize {
+                            let writePos = batchPos + i
+                            if writePos < contextLength {
+                                ptr[writePos * stride + i] = Float16(1.0)
+                            }
                         }
                     }
-
-                    // Set 1.0 at the write positions for each token in the batch
+                    CVPixelBufferUnlockBaseAddress(updateMaskBuffer, [])
+                } else {
+                    // MLMultiArray path
+                    let ptr = updateMask.dataPointer.assumingMemoryBound(to: Float16.self)
+                    let rowStride = batchSize
+                    let totalElements = contextLength * batchSize
+                    for i in 0..<totalElements {
+                        ptr[i] = Float16(0.0)
+                    }
                     for i in 0..<currentBatchSize {
                         let writePos = batchPos + i
                         if writePos < contextLength {
-                            ptr[writePos * stride + i] = Float16(1.0)
+                            ptr[writePos * rowStride + i] = Float16(1.0)
                         }
                     }
                 }
-                CVPixelBufferUnlockBaseAddress(updateMaskBuffer, [])
 
                 inputDict["update_mask"] = updateMask
 
@@ -1198,20 +1397,31 @@ import Accelerate
 
         // Initialize argmax causal mask for token generation phase
         // After prefill at contextPos, positions 0..contextPos-1 should be visible
-        if argmaxInModel, let maskBuffer = argmaxCausalMaskBuffer {
-            CVPixelBufferLockBaseAddress(maskBuffer, [])
-            if let baseAddress = CVPixelBufferGetBaseAddress(maskBuffer) {
-                let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
-                // Reset mask to -inf and set visible positions
+        if argmaxInModel {
+            if let maskBuffer = argmaxCausalMaskBuffer {
+                CVPixelBufferLockBaseAddress(maskBuffer, [])
+                if let baseAddress = CVPixelBufferGetBaseAddress(maskBuffer) {
+                    let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                    // Reset mask to -inf and set visible positions
+                    for i in 0..<contextLength {
+                        ptr[i] = Float16(-Float.infinity)
+                    }
+                    for j in 0..<min(contextPos, contextLength) {
+                        ptr[j] = Float16(0.0)
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(maskBuffer, [])
+                lastArgmaxPosition = contextPos - 1
+            } else if let maskArray = argmaxCausalMask {
+                let ptr = maskArray.dataPointer.assumingMemoryBound(to: Float16.self)
                 for i in 0..<contextLength {
                     ptr[i] = Float16(-Float.infinity)
                 }
                 for j in 0..<min(contextPos, contextLength) {
                     ptr[j] = Float16(0.0)
                 }
+                lastArgmaxPosition = contextPos - 1
             }
-            CVPixelBufferUnlockBaseAddress(maskBuffer, [])
-            lastArgmaxPosition = contextPos - 1
         }
 
         return contextPos
@@ -1523,20 +1733,11 @@ import Accelerate
                         let localLogitsPart = logitsPart
                         let localOffset = (partIndex - 1) * logitsPart.count
                         
-                        guard let pixelBuffer = localLogitsPart.pixelBuffer else {
-                            throw InferenceError.inferenceError("Missing or invalid \(logitsKey) in output backings")
-                        }
-                        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-                        defer {
-                            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-                        }
-                        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                            throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
-                        }
+                        let buffer = try self.getFloatBuffer(from: localLogitsPart)
+                        defer { buffer.unlock?() }
                         
                         #if arch(arm64)
-                        let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
-                        let count = localLogitsPart.count
+                        let count = buffer.count
                         var localMaxValue: Float = -Float.infinity
                         var localMaxIndex = 0
                         
@@ -1548,12 +1749,24 @@ import Accelerate
                             }
                         }
                         
-                        for j in start..<count {
-                            let value = Float(buffer[j])
-                            if value > localMaxValue {
-                                localMaxValue = value
-                                localMaxIndex = localOffset + j
+                        if let f16 = buffer.float16Ptr {
+                            for j in start..<count {
+                                let value = Float(f16[j])
+                                if value > localMaxValue {
+                                    localMaxValue = value
+                                    localMaxIndex = localOffset + j
+                                }
                             }
+                        } else if let f32 = buffer.float32Ptr {
+                            for j in start..<count {
+                                let value = f32[j]
+                                if value > localMaxValue {
+                                    localMaxValue = value
+                                    localMaxIndex = localOffset + j
+                                }
+                            }
+                        } else {
+                            throw InferenceError.inferenceError("No logits buffer for \(logitsKey)")
                         }
                         return PartialMax(value: localMaxValue, index: localMaxIndex)
                         #else
@@ -1591,20 +1804,11 @@ import Accelerate
                         let localLogitsPart = logitsPart
                         let localOffset = (partIndex - 1) * logitsPart.count
                         
-                        guard let pixelBuffer = localLogitsPart.pixelBuffer else {
-                            throw InferenceError.inferenceError("Missing or invalid \(logitsKey) in output backings")
-                        }
-                        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-                        defer {
-                            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-                        }
-                        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                            throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
-                        }
+                        let buffer = try self.getFloatBuffer(from: localLogitsPart)
+                        defer { buffer.unlock?() }
                         
                         #if arch(arm64)
-                        let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
-                        let count = localLogitsPart.count
+                        let count = buffer.count
                         
                         // Only keep top candidates from this chunk - avoid huge arrays
                         var topCandidates: [(Int, Float)] = []
@@ -1616,24 +1820,48 @@ import Accelerate
                             start = 2
                         }
                         
-                        for j in start..<count {
-                            let value = Float(buffer[j])
-                            let globalIndex = localOffset + j
-                            
-                            if topCandidates.count < chunkK {
-                                topCandidates.append((globalIndex, value))
-                                if topCandidates.count == chunkK {
-                                    topCandidates.sort { $0.1 > $1.1 }
-                                }
-                            } else if value > topCandidates[chunkK - 1].1 {
-                                topCandidates[chunkK - 1] = (globalIndex, value)
-                                // Bubble up
-                                var idx = chunkK - 1
-                                while idx > 0 && topCandidates[idx].1 > topCandidates[idx - 1].1 {
-                                    topCandidates.swapAt(idx, idx - 1)
-                                    idx -= 1
+                        if let f16 = buffer.float16Ptr {
+                            for j in start..<count {
+                                let value = Float(f16[j])
+                                let globalIndex = localOffset + j
+                                
+                                if topCandidates.count < chunkK {
+                                    topCandidates.append((globalIndex, value))
+                                    if topCandidates.count == chunkK {
+                                        topCandidates.sort { $0.1 > $1.1 }
+                                    }
+                                } else if value > topCandidates[chunkK - 1].1 {
+                                    topCandidates[chunkK - 1] = (globalIndex, value)
+                                    // Bubble up
+                                    var idx = chunkK - 1
+                                    while idx > 0 && topCandidates[idx].1 > topCandidates[idx - 1].1 {
+                                        topCandidates.swapAt(idx, idx - 1)
+                                        idx -= 1
+                                    }
                                 }
                             }
+                        } else if let f32 = buffer.float32Ptr {
+                            for j in start..<count {
+                                let value = f32[j]
+                                let globalIndex = localOffset + j
+                                
+                                if topCandidates.count < chunkK {
+                                    topCandidates.append((globalIndex, value))
+                                    if topCandidates.count == chunkK {
+                                        topCandidates.sort { $0.1 > $1.1 }
+                                    }
+                                } else if value > topCandidates[chunkK - 1].1 {
+                                    topCandidates[chunkK - 1] = (globalIndex, value)
+                                    // Bubble up
+                                    var idx = chunkK - 1
+                                    while idx > 0 && topCandidates[idx].1 > topCandidates[idx - 1].1 {
+                                        topCandidates.swapAt(idx, idx - 1)
+                                        idx -= 1
+                                    }
+                                }
+                            }
+                        } else {
+                            throw InferenceError.inferenceError("No logits buffer for \(logitsKey)")
                         }
                         return topCandidates
                         #else
@@ -1929,19 +2157,12 @@ import Accelerate
                 let chunkOffset = chunkIdx * 16384
 
                 guard let logitsPart = currentBackings[logitsKey],
-                      let pixelBuffer = logitsPart.pixelBuffer else {
+                      let buffer = try? self.getFloatBuffer(from: logitsPart) else {
                     return
                 }
+                defer { buffer.unlock?() }
 
-                CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-                defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-
-                guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                    return
-                }
-
-                let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
-                let totalCount = logitsPart.count
+                let totalCount = buffer.count
                 let subChunkSize = totalCount / parallelFactor
 
                 var subStart = subIdx * subChunkSize
@@ -1956,25 +2177,32 @@ import Accelerate
                     return
                 }
 
-                var floatBuffer = [Float](repeating: 0, count: effectiveCount)
+                if let f16 = buffer.float16Ptr {
+                    var floatBuffer = [Float](repeating: 0, count: effectiveCount)
 
-                buffer.advanced(by: subStart).withMemoryRebound(to: UInt16.self, capacity: effectiveCount) { uint16Ptr in
-                    var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: uint16Ptr),
-                                           height: 1, width: vImagePixelCount(effectiveCount),
-                                           rowBytes: effectiveCount * 2)
-                    floatBuffer.withUnsafeMutableBufferPointer { floatPtr in
-                        var dst = vImage_Buffer(data: floatPtr.baseAddress!,
+                    f16.advanced(by: subStart).withMemoryRebound(to: UInt16.self, capacity: effectiveCount) { uint16Ptr in
+                        var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: uint16Ptr),
                                                height: 1, width: vImagePixelCount(effectiveCount),
-                                               rowBytes: effectiveCount * 4)
-                        vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
+                                               rowBytes: effectiveCount * 2)
+                        floatBuffer.withUnsafeMutableBufferPointer { floatPtr in
+                            var dst = vImage_Buffer(data: floatPtr.baseAddress!,
+                                                   height: 1, width: vImagePixelCount(effectiveCount),
+                                                   rowBytes: effectiveCount * 4)
+                            vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
+                        }
                     }
+
+                    var maxValue: Float = -Float.infinity
+                    var maxIndex: vDSP_Length = 0
+                    vDSP_maxvi(floatBuffer, 1, &maxValue, &maxIndex, vDSP_Length(effectiveCount))
+
+                    partialResults[taskIdx] = (maxValue, chunkOffset + subStart + Int(maxIndex))
+                } else if let f32 = buffer.float32Ptr {
+                    var maxValue: Float = -Float.infinity
+                    var maxIndex: vDSP_Length = 0
+                    vDSP_maxvi(f32.advanced(by: subStart), 1, &maxValue, &maxIndex, vDSP_Length(effectiveCount))
+                    partialResults[taskIdx] = (maxValue, chunkOffset + subStart + Int(maxIndex))
                 }
-
-                var maxValue: Float = -Float.infinity
-                var maxIndex: vDSP_Length = 0
-                vDSP_maxvi(floatBuffer, 1, &maxValue, &maxIndex, vDSP_Length(effectiveCount))
-
-                partialResults[taskIdx] = (maxValue, chunkOffset + subStart + Int(maxIndex))
             }
 
             // Find global max from partial results
@@ -1998,21 +2226,23 @@ import Accelerate
 
             for i in 1...splitLMHead {
                 let logitsKey = "logits\(i)"
-                guard let logitsPart = currentBackings[logitsKey],
-                      let pixelBuffer = logitsPart.pixelBuffer else {
+                guard let logitsPart = currentBackings[logitsKey] else {
                     throw InferenceError.inferenceError("Missing \(logitsKey)")
                 }
 
-                CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-                defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+                let buffer = try getFloatBuffer(from: logitsPart)
+                defer { buffer.unlock?() }
 
-                guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                    throw InferenceError.inferenceError("No base address for \(logitsKey)")
-                }
-
-                let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
-                for j in 0..<logitsPart.count {
-                    allLogits.append(Float(buffer[j]))
+                if let f16 = buffer.float16Ptr {
+                    for j in 0..<buffer.count {
+                        allLogits.append(Float(f16[j]))
+                    }
+                } else if let f32 = buffer.float32Ptr {
+                    for j in 0..<buffer.count {
+                        allLogits.append(f32[j])
+                    }
+                } else {
+                    throw InferenceError.inferenceError("No logits buffer for \(logitsKey)")
                 }
             }
 
@@ -2031,7 +2261,7 @@ import Accelerate
     public func generateNextTokenArgmaxSync(
         for lastToken: Int,
         currentPos: Int
-    ) throws -> Int {
+    ) throws -> (token: Int, score: Float) {
         guard argmaxInModel else {
             throw InferenceError.inferenceError("generateNextTokenArgmaxSync called but argmaxInModel is false")
         }
@@ -2056,9 +2286,11 @@ import Accelerate
         positionIds.dataPointer.assumingMemoryBound(to: Int32.self)[0] = Int32(safePos)
         currentPosArray.dataPointer.assumingMemoryBound(to: Int32.self)[0] = Int32(safePos)
 
-        // Use pre-allocated causal mask with efficient single-value update via pixel buffer
-        guard let maskBuffer = argmaxCausalMaskBuffer else {
-            throw InferenceError.inferenceError("Pre-allocated argmax causal mask buffer not initialized")
+        // Use pre-allocated causal mask with efficient single-value update
+        let maskBuffer = argmaxCausalMaskBuffer
+        let maskArray = argmaxCausalMask
+        guard maskBuffer != nil || maskArray != nil else {
+            throw InferenceError.inferenceError("Pre-allocated argmax causal mask not initialized")
         }
 
         // Only update the mask if position changed (incremental update)
@@ -2066,11 +2298,15 @@ import Accelerate
         if lastArgmaxPosition != safePos {
             // Set the new position to 0 (make visible) using direct pixel buffer access
             if safePos < contextLength {
-                CVPixelBufferLockBaseAddress(maskBuffer, [])
-                if let baseAddress = CVPixelBufferGetBaseAddress(maskBuffer) {
-                    baseAddress.assumingMemoryBound(to: Float16.self)[safePos] = Float16(0.0)
+                if let maskBuffer {
+                    CVPixelBufferLockBaseAddress(maskBuffer, [])
+                    if let baseAddress = CVPixelBufferGetBaseAddress(maskBuffer) {
+                        baseAddress.assumingMemoryBound(to: Float16.self)[safePos] = Float16(0.0)
+                    }
+                    CVPixelBufferUnlockBaseAddress(maskBuffer, [])
+                } else if let maskArray {
+                    maskArray.dataPointer.assumingMemoryBound(to: Float16.self)[safePos] = Float16(0.0)
                 }
-                CVPixelBufferUnlockBaseAddress(maskBuffer, [])
             }
             lastArgmaxPosition = safePos
         }
@@ -2129,7 +2365,7 @@ import Accelerate
         // Compute global token ID: local_idx + (chunk * chunk_size)
         let globalIdx = bestLocalIdx + (bestChunk * chunkSize)
 
-        return globalIdx
+        return (globalIdx, bestVal)
     }
 
     /// Shifts the context window if needed (similar to the Python code).
@@ -2232,10 +2468,39 @@ import Accelerate
             
             // Create mutable copy of initialTokens
             var contextTokens = initialTokens
-            
-            // Run prefill with mutable copy
-            var currentPos = try await runPrefill(on: &contextTokens, contextPos: contextTokens.count, tokenizer: tokenizer)
-            let prefillTime = CFAbsoluteTimeGetCurrent() - startTime
+
+            if contextTokens.isEmpty {
+                busy = false
+                return (generatedTokens, 0, "empty_input")
+            }
+
+            // Optional debug mode: disable batch prefill and build KV cache using infer-only path
+            var currentPos: Int
+            let prefillTime: TimeInterval
+            if disablePrefill {
+                if debugLevel >= 1 {
+                    print("\n[Debug] Prefill disabled: using infer-only prefill over \(contextTokens.count) tokens")
+                }
+                var pos = 0
+                while pos < contextTokens.count {
+                    let _ = try await generateNextToken(
+                        for: contextTokens[pos],
+                        currentPos: pos + 1,
+                        temperature: 0,
+                        tokenizer: tokenizer
+                    )
+                    if debugLevel >= 1 {
+                        print("  Debug infer prefill token at pos \(pos): \(contextTokens[pos])")
+                    }
+                    pos += 1
+                }
+                currentPos = contextTokens.count
+                prefillTime = 0
+            } else {
+                // Run prefill with mutable copy
+                currentPos = try await runPrefill(on: &contextTokens, contextPos: contextTokens.count, tokenizer: tokenizer)
+                prefillTime = CFAbsoluteTimeGetCurrent() - startTime
+            }
             
             while generatedTokens.count < maxTokens {
                 // Check if we need to shift the context window
@@ -2292,14 +2557,110 @@ import Accelerate
                     break
                 }
 
+                if debugRepeatInferCount >= 2 {
+                    let repeatCount = min(debugRepeatInferCount, 4)
+                    let prefixTokens = Array(contextTokens.prefix(currentPos))
+                    let lastToken = prefixTokens[currentPos - 1]
+                    let savedMonolithicTokenCounter = monolithicTokenCounter
+
+                    if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                        print("\n[DebugRepeat] Running \(repeatCount)x infer repeat at pos \(currentPos - 1)")
+                    }
+
+                    var repeatTokens: [Int] = []
+                    var repeatDurationsNs: [UInt64] = []
+                    var repeatScores: [Float?] = []
+                    var foundMatch = false
+
+                    for i in 0..<repeatCount {
+                        let startNs = DispatchTime.now().uptimeNanoseconds
+                        let token: Int
+                        if argmaxInModel && isMonolithic {
+                            let result = try generateNextTokenArgmaxSync(for: lastToken, currentPos: currentPos)
+                            token = result.token
+                            repeatScores.append(result.score)
+                            if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                                print("[DebugRepeat] argmax score=\(result.score)")
+                            }
+                        } else {
+                            token = try await generateNextToken(
+                                for: lastToken,
+                                currentPos: currentPos,
+                                temperature: temperature,
+                                tokenizer: tokenizer
+                            )
+                            repeatScores.append(nil)
+                        }
+                        let endNs = DispatchTime.now().uptimeNanoseconds
+                        let durationNs = endNs - startNs
+
+                        repeatTokens.append(token)
+                        repeatDurationsNs.append(durationNs)
+
+                        if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                            let decoded = tokenizer.decode(tokens: [token], skipSpecialTokens: false)
+                            print("[DebugRepeat] run \(i + 1): token=\(token) (\(decoded)) durationNs=\(durationNs)")
+                        }
+
+                        if i == 1, repeatTokens[0] == repeatTokens[1] {
+                            if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                                print("[DebugRepeat] match on run2 (t1 == t2)")
+                            }
+                            foundMatch = true
+                            break
+                        }
+                        if i == 2, token == repeatTokens[0] || token == repeatTokens[1] {
+                            if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                                print("[DebugRepeat] match on run3 (t3 == t1 or t2)")
+                            }
+                            foundMatch = true
+                            break
+                        }
+                        if i == 3 {
+                            let matches = repeatTokens.dropLast().contains(token)
+                            if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                                if matches {
+                                    print("[DebugRepeat] match on run4 (t4 matches a previous token)")
+                                } else {
+                                    print("[DebugRepeat] no match after run4")
+                                }
+                            }
+                            foundMatch = matches
+                        }
+                    }
+
+                    if !foundMatch && repeatTokens.count >= repeatCount {
+                        if debugLevel >= 1 {
+                            let decoded = tokenizer.decode(tokens: repeatTokens, skipSpecialTokens: false)
+                            let runsDetails = repeatTokens.enumerated().map { idx, tok -> String in
+                                let dec = tokenizer.decode(tokens: [tok], skipSpecialTokens: false)
+                                let durUs = idx < repeatDurationsNs.count ? repeatDurationsNs[idx] / 1_000 : 0
+                                let score = (argmaxInModel && isMonolithic && idx < repeatScores.count) ? repeatScores[idx] : nil
+                                if let s = score {
+                                    return "#\(idx + 1) tok=\(tok) \"\(dec)\" durUs=\(durUs) score=\(String(format: "%.4f", s))"
+                                } else {
+                                    return "#\(idx + 1) tok=\(tok) \"\(dec)\" durUs=\(durUs)"
+                                }
+                            }.joined(separator: "; ")
+
+                            print("[DebugRepeat] divergence at pos \(currentPos - 1): tokens=\(repeatTokens) decoded=\(decoded) runs=[\(runsDetails)]")
+                        }
+                    }
+                    monolithicTokenCounter = savedMonolithicTokenCounter
+                }
+
                 // Use synchronous path for argmax mode (eliminates async overhead for ~10% speedup)
                 // Async path is used for logits mode which needs sampling
                 let nextToken: Int
                 if argmaxInModel && isMonolithic {
-                    nextToken = try generateNextTokenArgmaxSync(
+                    let result = try generateNextTokenArgmaxSync(
                         for: contextTokens[currentPos - 1],
                         currentPos: currentPos
                     )
+                    nextToken = result.token
+                    if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                        print("[Argmax] token=\(nextToken) score=\(result.score)")
+                    }
                 } else {
                     nextToken = try await generateNextToken(
                         for: contextTokens[currentPos - 1],

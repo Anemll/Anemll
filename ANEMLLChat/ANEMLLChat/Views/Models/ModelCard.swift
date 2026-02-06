@@ -176,7 +176,11 @@ struct ModelCard: View {
                     .foregroundStyle(hasWeightWarning ? .red : .orange)
                     .background(
                         Circle()
+                            #if os(macOS)
+                            .fill(Color(NSColor.windowBackgroundColor))
+                            #else
                             .fill(Color(.systemBackground))
+                            #endif
                             .frame(width: 18, height: 18)
                     )
                     .offset(x: 14, y: 14)
@@ -972,3 +976,4 @@ private struct ModelLoadingIndicator: View {
         }
     }
 }
+

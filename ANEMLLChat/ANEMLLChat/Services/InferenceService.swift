@@ -132,6 +132,11 @@ final class InferenceService: ObservableObject {
     var systemPrompt: String = ""  // Default: no system prompt (matches CLI behavior)
     var debugLevel: Int = 0  // Debug verbosity: 0=off, 1=basic, 2=verbose
     var repetitionDetectionEnabled: Bool = false  // Default: off (matches CLI behavior)
+    var debugDisablePrefill: Bool = false
+    var debugContextCap: Int = 0
+    var debugDisableIOBackings: Bool = false
+    var debugRepeatInferCount: Int = 0
+    var debugRepeatOnlyDivergence: Bool = false
 
     private init() {
         // Load settings from storage
@@ -141,6 +146,11 @@ final class InferenceService: ObservableObject {
             systemPrompt = await StorageService.shared.defaultSystemPrompt
             debugLevel = await StorageService.shared.debugLevel
             repetitionDetectionEnabled = await StorageService.shared.repetitionDetectionEnabled
+            debugDisablePrefill = await StorageService.shared.debugDisablePrefill
+            debugContextCap = await StorageService.shared.debugContextCap
+            debugDisableIOBackings = await StorageService.shared.debugDisableIOBackings
+            debugRepeatInferCount = await StorageService.shared.debugRepeatInferCount
+            debugRepeatOnlyDivergence = await StorageService.shared.debugRepeatOnlyDivergence
         }
     }
 
@@ -205,7 +215,8 @@ final class InferenceService: ObservableObject {
                 splitLMHead: config.splitLMHead,
                 debugLevel: debugLevel,
                 argmaxInModel: config.argmaxInModel,
-                slidingWindow: config.slidingWindow
+                slidingWindow: config.slidingWindow,
+                disableIOBackings: DebugInferenceOptions.isEnabled ? debugDisableIOBackings : false
             )
             print("===== [MODEL CONFIG] splitLMHead=\(config.splitLMHead), context=\(config.contextLength), batch=\(config.batchSize), argmax=\(config.argmaxInModel) =====")
 
@@ -346,7 +357,7 @@ final class InferenceService: ObservableObject {
         }.value
 
         let chatMessages = prepared.chatMessages
-        let inputTokens = prepared.inputTokens
+        var inputTokens = prepared.inputTokens
         let contextLength = prepared.contextLength
         let maxContextSize = prepared.maxContextSize
 
@@ -361,6 +372,12 @@ final class InferenceService: ObservableObject {
 
         if prepared.historyTrimmed {
             print("[SYSTEM] History trimmed: \(prepared.originalSize) → \(inputTokens.count) tokens, \(chatMessages.count) msgs remaining")
+        }
+
+        if DebugInferenceOptions.isEnabled && debugContextCap > 0 && inputTokens.count > debugContextCap {
+            let originalSize = inputTokens.count
+            inputTokens = Array(inputTokens.suffix(debugContextCap))
+            print("[DEBUG] Context cap applied: \(originalSize) → \(inputTokens.count) tokens")
         }
 
         // Debug: print messages being sent to tokenizer
@@ -389,6 +406,9 @@ final class InferenceService: ObservableObject {
         let capturedMaxTokens = maxTokens
         let capturedTokenizer = tokenizer
         let capturedDebugLevel = debugLevel
+        let capturedDebugDisablePrefill = debugDisablePrefill
+        let capturedDebugRepeatInferCount = debugRepeatInferCount
+        let capturedDebugRepeatOnlyDivergence = debugRepeatOnlyDivergence
         let inputTokenCount = inputTokens.count  // Capture for history calculation
 
         do {
@@ -421,6 +441,16 @@ final class InferenceService: ObservableObject {
                         lastHistoryEmitTime = now
                         onHistoryUpdate(inputTokenCount + stats.tokenCount)
                     }
+                }
+
+                if DebugInferenceOptions.isEnabled {
+                    capturedInferenceManager.setDisablePrefill(capturedDebugDisablePrefill)
+                    capturedInferenceManager.setDebugRepeatInferCount(capturedDebugRepeatInferCount)
+                    capturedInferenceManager.setDebugRepeatOnlyDivergence(capturedDebugRepeatOnlyDivergence)
+                } else {
+                    capturedInferenceManager.setDisablePrefill(false)
+                    capturedInferenceManager.setDebugRepeatInferCount(0)
+                    capturedInferenceManager.setDebugRepeatOnlyDivergence(false)
                 }
 
                 let (_, prefillTime, stopReason) = try await capturedInferenceManager.generateResponse(
