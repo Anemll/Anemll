@@ -1,6 +1,8 @@
+import Foundation
 import CoreVideo
 @preconcurrency import CoreML
 import CoreFoundation
+import Dispatch
 import Metal
 import IOSurface
 import Accelerate
@@ -35,9 +37,12 @@ import Accelerate
     private var lmheadOutputBackings: [String: MLMultiArray]?
     private var hiddenStatesBackings_emb: [String: MLMultiArray]?  // For embed output
     private var hiddenStatesBackings_ffn: [String: MLMultiArray]?  // For FFN input/output
+    private var hiddenStatesBackings_ffnPingPong: [[String: MLMultiArray]] = []  // Alternating FFN outputs for infer
     private var hiddenStatesBackings_last: [String: MLMultiArray]?  // Prefill the last chunk
+    private var hiddenStatesBackings_lastPingPong: [[String: MLMultiArray]] = []  // Alternating last-chunk outputs for prefill
     private var hiddenStatesBackings_emb_prefill: [String: MLMultiArray]?  // For embed output in prefill
     private var hiddenStatesBackings_ffn_prefill: [String: MLMultiArray]?  // For FFN output in prefill
+    private var hiddenStatesBackings_ffn_prefillPingPong: [[String: MLMultiArray]] = []  // Alternating FFN outputs for prefill
 
     // Ring buffer for monolithic models to avoid ANE race conditions
     // Using N=16 depth to ensure buffer isn't reused while still being read
@@ -60,6 +65,24 @@ import Accelerate
     // Sampling configuration (defaults to greedy for backward compatibility)
     private var samplingConfig: SamplingConfig = .greedy
     private var generatedTokenHistory: [Int] = []
+    private var disablePrefill: Bool = false
+    private var disableIOBackings: Bool = false
+    private var debugRepeatInferCount: Int = 0
+    private var debugRepeatOnlyDivergence: Bool = false
+    private var debugCompareKVStateEveryToken: Bool = true
+    private var debugPredictReadDelayMs: Double = 0.0
+
+    // Debug: store hidden states for divergence analysis
+    private var debugCapturedEmbeddings: MLMultiArray?
+    private var debugCapturedFinalHidden: MLMultiArray?
+    
+    // Debug: KV cache state comparison
+    // Since MLState is opaque, we verify state consistency by re-running inference
+    private var debugSavedState: MLState?
+
+    private let hiddenStateSimilarityThreshold: Float = 0.9999
+    private let kvStateSimilarityThreshold: Float = 0.99999
+    private let maxDebugPredictReadDelayMs: Double = 500.0
 
     // Metal-based argmax for GPU processing (avoids CPU/ANE sync issues)
     private var metalArgmax: MetalArgmax?
@@ -87,6 +110,48 @@ import Accelerate
         let value: Float
         let index: Int
     }
+
+    private struct FloatBuffer {
+        let count: Int
+        let float16Ptr: UnsafePointer<Float16>?
+        let float32Ptr: UnsafePointer<Float>?
+        let unlock: (() -> Void)?
+    }
+
+    private func getFloatBuffer(from array: MLMultiArray) throws -> FloatBuffer {
+        if let pixelBuffer = array.pixelBuffer {
+            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+            guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+                throw InferenceError.inferenceError("Could not get base address for pixel buffer")
+            }
+            return FloatBuffer(
+                count: array.count,
+                float16Ptr: baseAddress.assumingMemoryBound(to: Float16.self),
+                float32Ptr: nil,
+                unlock: { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+            )
+        }
+
+        switch array.dataType {
+        case .float16:
+            return FloatBuffer(
+                count: array.count,
+                float16Ptr: array.dataPointer.assumingMemoryBound(to: Float16.self),
+                float32Ptr: nil,
+                unlock: nil
+            )
+        case .float32:
+            return FloatBuffer(
+                count: array.count,
+                float16Ptr: nil,
+                float32Ptr: array.dataPointer.assumingMemoryBound(to: Float.self),
+                unlock: nil
+            )
+        default:
+            throw InferenceError.inferenceError("Unsupported logits data type: \(array.dataType)")
+        }
+    }
     
     public func AbortGeneration( Code : Int)
     {
@@ -104,8 +169,480 @@ import Accelerate
         self.GreedySearch = !config.doSample
     }
 
+    /// Debug option: disable prefill and generate using only the last token.
+    public func setDisablePrefill(_ value: Bool) {
+        self.disablePrefill = value
+    }
 
-    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil, updateMaskPrefill: Bool = false, prefillDynamicSlice: Bool = false) throws {  // Make init throwing
+    /// Debug option: repeat next-token inference N times (2-4) to detect divergence.
+    public func setDebugRepeatInferCount(_ value: Int) {
+        if value < 2 {
+            self.debugRepeatInferCount = 0
+        } else {
+            self.debugRepeatInferCount = min(value, 4)
+        }
+    }
+
+    /// Debug option: when true, suppress per-run repeat logs and only emit divergence.
+    public func setDebugRepeatOnlyDivergence(_ value: Bool) {
+        self.debugRepeatOnlyDivergence = value
+    }
+
+    /// Debug option: compare KV cache snapshots on every repeated token, not just token divergence.
+    public func setDebugCompareKVStateEveryToken(_ value: Bool) {
+        self.debugCompareKVStateEveryToken = value
+    }
+
+    /// Debug option: delay between prediction completion and output read (0...500ms, fractional allowed).
+    public func setDebugPredictReadDelayMs(_ value: Int) {
+        setDebugPredictReadDelayMs(Double(value))
+    }
+
+    /// Debug option: delay between prediction completion and output read (0...500ms, fractional allowed).
+    public func setDebugPredictReadDelayMs(_ value: Double) {
+        if value.isFinite {
+            self.debugPredictReadDelayMs = min(max(value, 0.0), maxDebugPredictReadDelayMs)
+        } else {
+            self.debugPredictReadDelayMs = 0.0
+        }
+    }
+
+    private func maybeDelayBeforeReadingPredictionOutputsSync() {
+        guard debugPredictReadDelayMs > 0 else { return }
+        Thread.sleep(forTimeInterval: debugPredictReadDelayMs / 1000.0)
+    }
+
+    private func maybeDelayBeforeReadingPredictionOutputs() async {
+        guard debugPredictReadDelayMs > 0 else { return }
+        let delayNs = UInt64((debugPredictReadDelayMs * 1_000_000.0).rounded())
+        try? await Task.sleep(nanoseconds: delayNs)
+    }
+
+    private var ioSurfacePixelBufferAttributes: [String: Any] {
+        [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+        ]
+    }
+
+    private func runStatefulPredictionOnQueue(
+        model: MLModel,
+        input: MLFeatureProvider,
+        options: MLPredictionOptions
+    ) throws {
+        var predictionError: Error?
+        predictionQueue.sync { [self] in
+            do {
+                _ = try model.prediction(from: input, using: state, options: options)
+            } catch {
+                predictionError = error
+            }
+        }
+        if let error = predictionError {
+            throw error
+        }
+    }
+
+    private func cosineFromAccumulators(dot: Float, normA: Float, normB: Float) -> Float {
+        let denominator = sqrt(normA) * sqrt(normB)
+        if denominator == 0 {
+            return 0.0
+        }
+        return dot / denominator
+    }
+
+    private func bytesPerElement(for dataType: MLMultiArrayDataType) -> Int {
+        switch dataType {
+        case .float16:
+            return MemoryLayout<Float16>.size
+        case .float32:
+            return MemoryLayout<Float>.size
+        case .double:
+            return MemoryLayout<Double>.size
+        case .int32:
+            return MemoryLayout<Int32>.size
+        case .int8:
+            return MemoryLayout<Int8>.size
+        @unknown default:
+            return MemoryLayout<Float16>.size
+        }
+    }
+
+    /// Compute cosine similarity between two MLMultiArrays (for hidden state comparison)
+    private func cosineSimilarity(_ a: MLMultiArray, _ b: MLMultiArray) -> Float {
+        guard a.count == b.count else {
+            print("⚠️ Array size mismatch: \(a.count) vs \(b.count)")
+            return -1.0
+        }
+
+        let count = a.count
+        var dotProduct: Float = 0.0
+        var normA: Float = 0.0
+        var normB: Float = 0.0
+
+        if a.dataType == .float16, b.dataType == .float16 {
+            let ptrA = a.dataPointer.assumingMemoryBound(to: Float16.self)
+            let ptrB = b.dataPointer.assumingMemoryBound(to: Float16.self)
+            for i in 0..<count {
+                let valA = Float(ptrA[i])
+                let valB = Float(ptrB[i])
+                dotProduct += valA * valB
+                normA += valA * valA
+                normB += valB * valB
+            }
+            return cosineFromAccumulators(dot: dotProduct, normA: normA, normB: normB)
+        }
+
+        if a.dataType == .float32, b.dataType == .float32 {
+            let ptrA = a.dataPointer.assumingMemoryBound(to: Float.self)
+            let ptrB = b.dataPointer.assumingMemoryBound(to: Float.self)
+            for i in 0..<count {
+                let valA = ptrA[i]
+                let valB = ptrB[i]
+                dotProduct += valA * valB
+                normA += valA * valA
+                normB += valB * valB
+            }
+            return cosineFromAccumulators(dot: dotProduct, normA: normA, normB: normB)
+        }
+
+        for i in 0..<count {
+            let valA = a[i].floatValue
+            let valB = b[i].floatValue
+            dotProduct += valA * valB
+            normA += valA * valA
+            normB += valB * valB
+        }
+
+        return cosineFromAccumulators(dot: dotProduct, normA: normA, normB: normB)
+    }
+
+    /// Copy MLMultiArray for comparison (deep copy)
+    private func copyMLMultiArray(_ source: MLMultiArray) -> MLMultiArray? {
+        do {
+            let copy = try MLMultiArray(shape: source.shape, dataType: source.dataType)
+            let byteCount = source.count * bytesPerElement(for: source.dataType)
+
+            if let pixelBuffer = source.pixelBuffer {
+                CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+                defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+                guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                    print("Failed to get base address for pixel buffer-backed MLMultiArray")
+                    return nil
+                }
+
+                let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
+                let width = CVPixelBufferGetWidth(pixelBuffer)
+                let height = CVPixelBufferGetHeight(pixelBuffer)
+                let elementBytes = bytesPerElement(for: source.dataType)
+                let logicalRowBytes = width * elementBytes
+                let expectedDataBytes = logicalRowBytes * height
+
+                let dstRaw = copy.dataPointer
+                if rowBytes == logicalRowBytes && expectedDataBytes == byteCount {
+                    dstRaw.copyMemory(from: baseAddress, byteCount: byteCount)
+                } else {
+                    // Handle row padding in CVPixelBuffer safely.
+                    let srcU8 = baseAddress.assumingMemoryBound(to: UInt8.self)
+                    let dstU8 = dstRaw.assumingMemoryBound(to: UInt8.self)
+                    let rows = min(height, max(1, byteCount / max(1, logicalRowBytes)))
+                    for row in 0..<rows {
+                        let srcRow = UnsafeRawPointer(srcU8.advanced(by: row * rowBytes))
+                        let dstRow = UnsafeMutableRawPointer(dstU8.advanced(by: row * logicalRowBytes))
+                        dstRow.copyMemory(from: srcRow, byteCount: min(logicalRowBytes, byteCount - (row * logicalRowBytes)))
+                    }
+                }
+            } else {
+                let srcPtr = source.dataPointer
+                let dstPtr = copy.dataPointer
+                dstPtr.copyMemory(from: srcPtr, byteCount: byteCount)
+            }
+            return copy
+        } catch {
+            print("Failed to copy MLMultiArray: \(error)")
+            return nil
+        }
+    }
+    
+    /// Get state buffer names from the model
+    private func getStateBufferNames() -> [String] {
+        guard let ffnChunks = ffnChunks, !ffnChunks.isEmpty else {
+            return []
+        }
+        
+        // For non-monolithic models, check the prefillModel state description
+        let model = isMonolithic ? ffnChunks[0].inferModel : ffnChunks[0].prefillModel
+        
+        // Get state description - this contains buffer names
+        let stateDesc = model.modelDescription.stateDescriptionsByName
+        return Array(stateDesc.keys).sorted()
+    }
+    
+    /// Capture a snapshot of all KV cache buffers from the current state
+    /// Returns a dictionary of buffer_name -> copied MLMultiArray
+    private func captureKVCacheSnapshot() -> [String: MLMultiArray] {
+        guard let state = state else {
+            return [:]
+        }
+        
+        let bufferNames = getStateBufferNames()
+        var snapshot: [String: MLMultiArray] = [:]
+
+        // Read state buffers on the same serial lane as stateful predictions.
+        predictionQueue.sync {
+            for name in bufferNames {
+                let copied = state.withMultiArray(for: name) { array -> MLMultiArray? in
+                    copyMLMultiArray(array)
+                }
+
+                if let copied = copied {
+                    snapshot[name] = copied
+                }
+            }
+        }
+        
+        return snapshot
+    }
+    
+    /// Compare two KV cache snapshots and return detailed similarity metrics
+    private func compareKVCacheSnapshots(_ snapshot1: [String: MLMultiArray], _ snapshot2: [String: MLMultiArray]) -> (overallSimilarity: Float, perBufferSimilarity: [String: Float], divergentBuffers: [String]) {
+        
+        var similarities: [Float] = []
+        var perBuffer: [String: Float] = [:]
+        var divergent: [String] = []
+        
+        let allKeys = Set(snapshot1.keys).union(snapshot2.keys)
+        
+        for key in allKeys.sorted() {
+            guard let array1 = snapshot1[key], let array2 = snapshot2[key] else {
+                // Buffer missing in one snapshot
+                perBuffer[key] = -1.0
+                divergent.append(key)
+                continue
+            }
+            
+            let similarity = cosineSimilarity(array1, array2)
+            perBuffer[key] = similarity
+            similarities.append(similarity)
+            
+            if similarity < kvStateSimilarityThreshold {
+                divergent.append(key)
+            }
+        }
+        
+        let overall = similarities.isEmpty ? 1.0 : similarities.reduce(0, +) / Float(similarities.count)
+        
+        return (overall, perBuffer, divergent)
+    }
+
+    private struct KVBlockSimilarity {
+        let blockIndex: Int
+        let fullSimilarity: Float
+        let focusTokenSimilarity: Float?
+        let maxAbsDiff: Float
+        let otherTokenMaxAbsDiff: Float?
+    }
+
+    private func isRowMajorContiguous(shape: [Int], strides: [Int]) -> Bool {
+        guard shape.count == strides.count, !shape.isEmpty else { return false }
+        var expectedStride = 1
+        for axis in stride(from: shape.count - 1, through: 0, by: -1) {
+            if strides[axis] != expectedStride {
+                return false
+            }
+            expectedStride *= shape[axis]
+        }
+        return true
+    }
+
+    private func blockLabel(for blockIndex: Int, totalBlocks: Int) -> String {
+        if totalBlocks > 1, totalBlocks % 2 == 0 {
+            let layer = blockIndex / 2
+            let slot = blockIndex % 2
+            return "block \(blockIndex) (layer \(layer), slot \(slot))"
+        }
+        return "block \(blockIndex)"
+    }
+
+    private func analyzeKVBufferBlocks(_ before: MLMultiArray, _ after: MLMultiArray, focusTokenIndex: Int?) -> (shape: [Int], blockMetrics: [KVBlockSimilarity])? {
+        let shapeA = before.shape.map { $0.intValue }
+        let shapeB = after.shape.map { $0.intValue }
+
+        guard before.count == after.count,
+              shapeA == shapeB,
+              before.dataType == .float16,
+              after.dataType == .float16 else {
+            return nil
+        }
+
+        let shape = shapeA
+        let strides = before.strides.map { $0.intValue }
+
+        guard !shape.isEmpty, isRowMajorContiguous(shape: shape, strides: strides) else {
+            return nil
+        }
+
+        let ptrA = before.dataPointer.assumingMemoryBound(to: Float16.self)
+        let ptrB = after.dataPointer.assumingMemoryBound(to: Float16.self)
+
+        let blockCount = max(1, shape[0])
+        let blockStride = strides[0]
+        let blockElementCount = max(1, shape.dropFirst().reduce(1, *))
+        var metrics: [KVBlockSimilarity] = []
+        metrics.reserveCapacity(blockCount)
+
+        for block in 0..<blockCount {
+            let blockBase = block * blockStride
+
+            var dot: Float = 0
+            var normA: Float = 0
+            var normB: Float = 0
+            var maxAbsDiff: Float = 0
+
+            for idx in 0..<blockElementCount {
+                let aVal = Float(ptrA[blockBase + idx])
+                let bVal = Float(ptrB[blockBase + idx])
+                dot += aVal * bVal
+                normA += aVal * aVal
+                normB += bVal * bVal
+                maxAbsDiff = max(maxAbsDiff, abs(aVal - bVal))
+            }
+
+            var focusTokenSimilarity: Float? = nil
+            var otherTokenMaxAbsDiff: Float? = nil
+
+            if let tokenIndex = focusTokenIndex {
+                if shape.count == 4, tokenIndex >= 0, tokenIndex < shape[2] {
+                    let headCount = shape[1]
+                    let tokenStride = strides[2]
+                    let headStride = strides[1]
+                    let dimCount = shape[3]
+                    let dimStride = strides[3]
+
+                    var tokenDot: Float = 0
+                    var tokenNormA: Float = 0
+                    var tokenNormB: Float = 0
+                    var nonTokenMaxDiff: Float = 0
+
+                    for head in 0..<headCount {
+                        for tok in 0..<shape[2] {
+                            for dim in 0..<dimCount {
+                                let offset = blockBase + head * headStride + tok * tokenStride + dim * dimStride
+                                let aVal = Float(ptrA[offset])
+                                let bVal = Float(ptrB[offset])
+                                let absDiff = abs(aVal - bVal)
+                                if tok == tokenIndex {
+                                    tokenDot += aVal * bVal
+                                    tokenNormA += aVal * aVal
+                                    tokenNormB += bVal * bVal
+                                } else {
+                                    nonTokenMaxDiff = max(nonTokenMaxDiff, absDiff)
+                                }
+                            }
+                        }
+                    }
+                    focusTokenSimilarity = cosineFromAccumulators(dot: tokenDot, normA: tokenNormA, normB: tokenNormB)
+                    otherTokenMaxAbsDiff = nonTokenMaxDiff
+                } else if shape.count == 3, tokenIndex >= 0, tokenIndex < shape[1] {
+                    let tokenStride = strides[1]
+                    let dimCount = shape[2]
+                    let dimStride = strides[2]
+
+                    var tokenDot: Float = 0
+                    var tokenNormA: Float = 0
+                    var tokenNormB: Float = 0
+                    var nonTokenMaxDiff: Float = 0
+
+                    for tok in 0..<shape[1] {
+                        for dim in 0..<dimCount {
+                            let offset = blockBase + tok * tokenStride + dim * dimStride
+                            let aVal = Float(ptrA[offset])
+                            let bVal = Float(ptrB[offset])
+                            let absDiff = abs(aVal - bVal)
+                            if tok == tokenIndex {
+                                tokenDot += aVal * bVal
+                                tokenNormA += aVal * aVal
+                                tokenNormB += bVal * bVal
+                            } else {
+                                nonTokenMaxDiff = max(nonTokenMaxDiff, absDiff)
+                            }
+                        }
+                    }
+                    focusTokenSimilarity = cosineFromAccumulators(dot: tokenDot, normA: tokenNormA, normB: tokenNormB)
+                    otherTokenMaxAbsDiff = nonTokenMaxDiff
+                }
+            }
+
+            metrics.append(
+                KVBlockSimilarity(
+                    blockIndex: block,
+                    fullSimilarity: cosineFromAccumulators(dot: dot, normA: normA, normB: normB),
+                    focusTokenSimilarity: focusTokenSimilarity,
+                    maxAbsDiff: maxAbsDiff,
+                    otherTokenMaxAbsDiff: otherTokenMaxAbsDiff
+                )
+            )
+        }
+
+        return (shape, metrics)
+    }
+
+    private func printKVBlockDivergenceAnalysis(
+        previousSnapshot: [String: MLMultiArray],
+        currentSnapshot: [String: MLMultiArray],
+        divergentBuffers: [String],
+        focusTokenIndex: Int
+    ) {
+        guard !divergentBuffers.isEmpty else {
+            return
+        }
+
+        print("\n  Block-by-block KV cache analysis (focus token index \(focusTokenIndex)):")
+        for bufferName in divergentBuffers.prefix(4) {
+            guard let before = previousSnapshot[bufferName], let after = currentSnapshot[bufferName] else {
+                continue
+            }
+
+            guard let analysis = analyzeKVBufferBlocks(before, after, focusTokenIndex: focusTokenIndex) else {
+                let shape = before.shape.map { $0.intValue }
+                print("    \(bufferName): unsupported detailed analysis (dtype=\(before.dataType), shape=\(shape))")
+                continue
+            }
+
+            let changedBlocks = analysis.blockMetrics.filter { $0.fullSimilarity < kvStateSimilarityThreshold }
+            let totalBlocks = analysis.blockMetrics.count
+
+            if changedBlocks.isEmpty {
+                print("    \(bufferName): no per-block divergence despite buffer-level mismatch")
+                continue
+            }
+
+            print("    \(bufferName) shape=\(analysis.shape): \(changedBlocks.count)/\(totalBlocks) blocks diverged")
+
+            let worstBlocks = changedBlocks.sorted { $0.fullSimilarity < $1.fullSimilarity }.prefix(6)
+            for block in worstBlocks {
+                let label = blockLabel(for: block.blockIndex, totalBlocks: totalBlocks)
+                var line = "      \(label): full=\(String(format: "%.8f", block.fullSimilarity)), maxAbsDiff=\(String(format: "%.6f", block.maxAbsDiff))"
+                if let focusSimilarity = block.focusTokenSimilarity {
+                    line += ", focusTok=\(String(format: "%.8f", focusSimilarity))"
+                }
+                if let otherDiff = block.otherTokenMaxAbsDiff {
+                    line += ", otherTokMaxAbsDiff=\(String(format: "%.6f", otherDiff))"
+                }
+                print(line)
+            }
+
+            let eps: Float = 1e-5
+            let changedOnlyAtFocus = changedBlocks.allSatisfy { ($0.otherTokenMaxAbsDiff ?? 0.0) < eps }
+            if changedOnlyAtFocus, changedBlocks.contains(where: { ($0.focusTokenSimilarity ?? 1.0) < kvStateSimilarityThreshold }) {
+                print("      -> changes are concentrated at focus token \(focusTokenIndex)")
+            }
+        }
+    }
+
+
+    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil, updateMaskPrefill: Bool = false, prefillDynamicSlice: Bool = false, disableIOBackings: Bool = false) throws {  // Make init throwing
         self.debugLevel = debugLevel
         self.isMonolithic = models.isMonolithic
         self.argmaxInModel = argmaxInModel
@@ -118,6 +655,7 @@ import Accelerate
         self.batchSize = batchSize
         self.splitLMHead = splitLMHead
         self.v110 = v110 // Set the v110 flag based on the parameter
+        self.disableIOBackings = disableIOBackings
 
         // Check if rotation functions are available
         let hasRotation = ffnChunks.first?.hasRotationSupport ?? false
@@ -136,7 +674,7 @@ import Accelerate
         // allowBatchPrefill = hasUpdateMask || prefillDynamicSlice (matching Python chat_full.py)
         let allowBatchPrefill = hasUpdateMask || prefillDynamicSlice
 
-        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation), hasUpdateMask=\(hasUpdateMask), prefillDynamicSlice=\(prefillDynamicSlice), allowBatchPrefill=\(allowBatchPrefill)")
+        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation), hasUpdateMask=\(hasUpdateMask), prefillDynamicSlice=\(prefillDynamicSlice), allowBatchPrefill=\(allowBatchPrefill), disableIOBackings=\(disableIOBackings)")
 
         // Print prefill mode info (matching Python chat_full.py)
         if allowBatchPrefill {
@@ -162,35 +700,49 @@ import Accelerate
             argmaxPositionIds = try MLMultiArray(shape: [1], dataType: .int32)
             argmaxCurrentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
 
-            // Causal mask [1, 1, 1, contextLength] - IOSurface-backed fp16 pixel buffer
-            let ioAttributes: [String: Any] = [
-                kCVPixelBufferMetalCompatibilityKey as String: true,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
-            ]
-
-            var maskBuffer: CVPixelBuffer?
-            let maskStatus = CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                contextLength, 1,
-                kCVPixelFormatType_OneComponent16Half,
-                ioAttributes as CFDictionary,
-                &maskBuffer
-            )
-            guard maskStatus == kCVReturnSuccess, let mBuf = maskBuffer else {
-                throw InferenceError.inferenceError("Failed to create causal mask pixel buffer")
-            }
-            argmaxCausalMaskBuffer = mBuf
-            argmaxCausalMask = MLMultiArray(pixelBuffer: mBuf, shape: [1, 1, 1, NSNumber(value: contextLength)])
-
-            // Initialize causal mask with -inf
-            CVPixelBufferLockBaseAddress(mBuf, [])
-            if let baseAddress = CVPixelBufferGetBaseAddress(mBuf) {
-                let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+            // Causal mask [1, 1, 1, contextLength]
+            if disableIOBackings {
+                argmaxCausalMaskBuffer = nil
+                argmaxCausalMask = try MLMultiArray(
+                    shape: [1, 1, 1, NSNumber(value: contextLength)],
+                    dataType: .float16
+                )
+                // Initialize causal mask with -inf
+                let ptr = argmaxCausalMask!.dataPointer.assumingMemoryBound(to: Float16.self)
                 for i in 0..<contextLength {
                     ptr[i] = Float16(-Float.infinity)
                 }
+            } else {
+                // IOSurface-backed fp16 pixel buffer for ANE synchronization
+                let ioAttributes: [String: Any] = [
+                    kCVPixelBufferMetalCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+                ]
+
+                var maskBuffer: CVPixelBuffer?
+                let maskStatus = CVPixelBufferCreate(
+                    kCFAllocatorDefault,
+                    contextLength, 1,
+                    kCVPixelFormatType_OneComponent16Half,
+                    ioAttributes as CFDictionary,
+                    &maskBuffer
+                )
+                guard maskStatus == kCVReturnSuccess, let mBuf = maskBuffer else {
+                    throw InferenceError.inferenceError("Failed to create causal mask pixel buffer")
+                }
+                argmaxCausalMaskBuffer = mBuf
+                argmaxCausalMask = MLMultiArray(pixelBuffer: mBuf, shape: [1, 1, 1, NSNumber(value: contextLength)])
+
+                // Initialize causal mask with -inf
+                CVPixelBufferLockBaseAddress(mBuf, [])
+                if let baseAddress = CVPixelBufferGetBaseAddress(mBuf) {
+                    let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                    for i in 0..<contextLength {
+                        ptr[i] = Float16(-Float.infinity)
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(mBuf, [])
             }
-            CVPixelBufferUnlockBaseAddress(mBuf, [])
             lastArgmaxPosition = -1
 
             // Pre-allocate input feature provider (reused for all inferences)
@@ -208,36 +760,50 @@ import Accelerate
         // Pre-allocate update_mask for prefill if model supports it
         // Shape: [1, 1, contextLength, batchSize] - each column marks the write position for that token in batch
         if hasUpdateMask && isMonolithic {
-            let ioAttributes: [String: Any] = [
-                kCVPixelBufferMetalCompatibilityKey as String: true,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
-            ]
-
-            // Create pixel buffer: width = batchSize, height = contextLength
-            var updateMaskBuffer: CVPixelBuffer?
-            let updateMaskStatus = CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                batchSize, contextLength,
-                kCVPixelFormatType_OneComponent16Half,
-                ioAttributes as CFDictionary,
-                &updateMaskBuffer
-            )
-            guard updateMaskStatus == kCVReturnSuccess, let uBuf = updateMaskBuffer else {
-                throw InferenceError.inferenceError("Failed to create update_mask pixel buffer")
-            }
-            prefillUpdateMaskBuffer = uBuf
-            prefillUpdateMask = MLMultiArray(pixelBuffer: uBuf, shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: batchSize)])
-
-            // Initialize to zeros
-            CVPixelBufferLockBaseAddress(uBuf, [])
-            if let baseAddress = CVPixelBufferGetBaseAddress(uBuf) {
+            if disableIOBackings {
+                prefillUpdateMaskBuffer = nil
+                prefillUpdateMask = try MLMultiArray(
+                    shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: batchSize)],
+                    dataType: .float16
+                )
+                // Initialize to zeros
                 let totalElements = contextLength * batchSize
-                let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                let ptr = prefillUpdateMask!.dataPointer.assumingMemoryBound(to: Float16.self)
                 for i in 0..<totalElements {
                     ptr[i] = Float16(0.0)
                 }
+            } else {
+                let ioAttributes: [String: Any] = [
+                    kCVPixelBufferMetalCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+                ]
+
+                // Create pixel buffer: width = batchSize, height = contextLength
+                var updateMaskBuffer: CVPixelBuffer?
+                let updateMaskStatus = CVPixelBufferCreate(
+                    kCFAllocatorDefault,
+                    batchSize, contextLength,
+                    kCVPixelFormatType_OneComponent16Half,
+                    ioAttributes as CFDictionary,
+                    &updateMaskBuffer
+                )
+                guard updateMaskStatus == kCVReturnSuccess, let uBuf = updateMaskBuffer else {
+                    throw InferenceError.inferenceError("Failed to create update_mask pixel buffer")
+                }
+                prefillUpdateMaskBuffer = uBuf
+                prefillUpdateMask = MLMultiArray(pixelBuffer: uBuf, shape: [1, 1, NSNumber(value: contextLength), NSNumber(value: batchSize)])
+
+                // Initialize to zeros
+                CVPixelBufferLockBaseAddress(uBuf, [])
+                if let baseAddress = CVPixelBufferGetBaseAddress(uBuf) {
+                    let totalElements = contextLength * batchSize
+                    let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                    for i in 0..<totalElements {
+                        ptr[i] = Float16(0.0)
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(uBuf, [])
             }
-            CVPixelBufferUnlockBaseAddress(uBuf, [])
 
             print("Pre-allocated update_mask buffer: [\(contextLength), \(batchSize)]")
         }
@@ -337,6 +903,45 @@ import Accelerate
             self.state = ffnChunks[0].prefillModel.makeState()
         }
     }
+
+    private func resetStateForPrefill() {
+        guard let chunks = ffnChunks, !chunks.isEmpty else {
+            return
+        }
+        if isMonolithic {
+            state = chunks[0].inferModel.makeState()
+        } else {
+            state = chunks[0].prefillModel.makeState()
+        }
+        lastArgmaxPosition = -1
+    }
+
+    private func rebuildStateForContext(
+        _ tokens: [Int],
+        contextPos: Int,
+        tokenizer: Tokenizer
+    ) async throws -> Int {
+        if tokens.isEmpty || contextPos <= 0 {
+            return 0
+        }
+        let safePos = min(contextPos, tokens.count)
+        if disablePrefill {
+            var pos = 0
+            while pos < safePos {
+                let _ = try await generateNextToken(
+                    for: tokens[pos],
+                    currentPos: pos + 1,
+                    temperature: 0,
+                    tokenizer: tokenizer
+                )
+                pos += 1
+            }
+            return safePos
+        } else {
+            var tmpTokens = tokens
+            return try await runPrefill(on: &tmpTokens, contextPos: safePos, tokenizer: tokenizer)
+        }
+    }
     
     public func ToggeDebugLevel()  {
         if (debugLevel == 0 ) {
@@ -390,15 +995,19 @@ import Accelerate
 
             let shape = constraint.shape
 
+            if disableIOBackings {
+                // Use standard MLMultiArray output backings (no CVPixelBuffer)
+                let outputBacking = try MLMultiArray(shape: shape, dataType: constraint.dataType)
+                outputBackingsDict[featureName] = outputBacking
+                continue
+            }
+
             // Calculate dimensions for pixel buffer
             let lastDim = shape.last?.intValue ?? 1
             let otherDims = shape.dropLast().reduce(1) { $0 * $1.intValue }
 
             // Create IOSurface-backed pixel buffer
-            let attributes: [String: Any] = [
-                //kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-                kCVPixelBufferMetalCompatibilityKey as String: true
-            ]
+            let attributes = ioSurfacePixelBufferAttributes
 
             var pixelBuffer: CVPixelBuffer?
             let status = CVPixelBufferCreate(
@@ -459,10 +1068,25 @@ import Accelerate
             let lastDim = shape.last?.intValue ?? 2048
             self.hidden_states = lastDim
             let otherDims = shape.dropLast().reduce(1) { $0 * $1.intValue }
+            hiddenStatesBackings_ffnPingPong.removeAll(keepingCapacity: true)
+
+            if disableIOBackings {
+                let dataType = constraint.dataType
+                hiddenStatesBackings_emb = ["hidden_states": try MLMultiArray(shape: shape, dataType: dataType)]
+                hiddenStatesBackings_ffnPingPong = [
+                    ["output_hidden_states": try MLMultiArray(shape: shape, dataType: dataType)],
+                    ["output_hidden_states": try MLMultiArray(shape: shape, dataType: dataType)]
+                ]
+                hiddenStatesBackings_ffn = hiddenStatesBackings_ffnPingPong.first
+
+                if debugLevel >= 1 {
+                    print("Single-token embed backing shape:", shape.map { $0.intValue })
+                    print("Single-token FFN ping-pong buffers: \(hiddenStatesBackings_ffnPingPong.count)")
+                }
+                return
+            }
             
-            let attributes: [String: Any] = [
-                kCVPixelBufferMetalCompatibilityKey as String: true
-            ]
+            let attributes = ioSurfacePixelBufferAttributes
             
             // Create embed output backing
             var embedPixelBuffer: CVPixelBuffer?
@@ -486,23 +1110,29 @@ import Accelerate
                 print("Single-token embed backing shape:", shape.map { $0.intValue })
             }
             
-            // Create FFN output backing
-            var ffnPixelBuffer: CVPixelBuffer?
-            let ffnStatus = CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                lastDim,
-                otherDims,
-                kCVPixelFormatType_OneComponent16Half,
-                attributes as CFDictionary,
-                &ffnPixelBuffer
-            )
-            
-            guard ffnStatus == kCVReturnSuccess, let ffnBuffer = ffnPixelBuffer else {
-                throw InferenceError.inferenceError("Failed to create pixel buffer for FFN output")
+            // Create two FFN output backings and alternate them to avoid read/write reuse hazards.
+            for slot in 0..<2 {
+                var ffnPixelBuffer: CVPixelBuffer?
+                let ffnStatus = CVPixelBufferCreate(
+                    kCFAllocatorDefault,
+                    lastDim,
+                    otherDims,
+                    kCVPixelFormatType_OneComponent16Half,
+                    attributes as CFDictionary,
+                    &ffnPixelBuffer
+                )
+
+                guard ffnStatus == kCVReturnSuccess, let ffnBuffer = ffnPixelBuffer else {
+                    throw InferenceError.inferenceError("Failed to create pixel buffer for FFN output slot \(slot)")
+                }
+
+                hiddenStatesBackings_ffnPingPong.append(["output_hidden_states": MLMultiArray(pixelBuffer: ffnBuffer, shape: shape)])
             }
-            
-            // Store FFN input/output backing
-            hiddenStatesBackings_ffn = ["output_hidden_states": MLMultiArray(pixelBuffer: ffnBuffer, shape: shape)]
+
+            hiddenStatesBackings_ffn = hiddenStatesBackings_ffnPingPong.first
+            if debugLevel >= 1 {
+                print("Single-token FFN ping-pong buffers: \(hiddenStatesBackings_ffnPingPong.count)")
+            }
         }
     }
 
@@ -516,44 +1146,75 @@ import Accelerate
         let hiddenSize = constraint.shape.last?.intValue ?? self.hidden_states
     
         let shape: [NSNumber] = [1, 1, NSNumber(value: hiddenSize)]
-        
-        let attributes: [String: Any] = [
-            kCVPixelBufferMetalCompatibilityKey as String: true
-        ]
-        
-        var pixelBuffer: CVPixelBuffer?
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            hiddenSize,  // width
-            1,          // height (batch=1)
-            kCVPixelFormatType_OneComponent16Half,
-            attributes as CFDictionary,
-            &pixelBuffer
-        )
-        
-        guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
-            throw InferenceError.inferenceError("Failed to create last chunk pixel buffer: \(status)")
+        hiddenStatesBackings_lastPingPong.removeAll(keepingCapacity: true)
+
+        if disableIOBackings {
+            hiddenStatesBackings_lastPingPong = [
+                ["output_hidden_states": try MLMultiArray(shape: shape, dataType: constraint.dataType)],
+                ["output_hidden_states": try MLMultiArray(shape: shape, dataType: constraint.dataType)]
+            ]
+            hiddenStatesBackings_last = hiddenStatesBackings_lastPingPong.first
+
+            if debugLevel >= 1 {
+                print("\nLast Chunk Backing Initialized:")
+                print("Shape: \(shape.map { $0.intValue })")
+                print("Last-chunk ping-pong buffers: \(hiddenStatesBackings_lastPingPong.count)")
+            }
+            return
         }
         
-        let backing = MLMultiArray(pixelBuffer: buffer, shape: shape)
-        hiddenStatesBackings_last = ["output_hidden_states": backing]
+        for slot in 0..<2 {
+            var pixelBuffer: CVPixelBuffer?
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                hiddenSize,  // width
+                1,           // height (batch=1)
+                kCVPixelFormatType_OneComponent16Half,
+                ioSurfacePixelBufferAttributes as CFDictionary,
+                &pixelBuffer
+            )
+
+            guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
+                throw InferenceError.inferenceError("Failed to create last chunk pixel buffer slot \(slot): \(status)")
+            }
+
+            hiddenStatesBackings_lastPingPong.append(["output_hidden_states": MLMultiArray(pixelBuffer: buffer, shape: shape)])
+        }
+        hiddenStatesBackings_last = hiddenStatesBackings_lastPingPong.first
         
         if debugLevel >= 1 {
             print("\nLast Chunk Backing Initialized:")
             print("Shape: \(shape.map { $0.intValue })")
+            print("Last-chunk ping-pong buffers: \(hiddenStatesBackings_lastPingPong.count)")
         }
     }
     
     private func initializePrefillBackings() throws {
         let hiddenSize = self.hidden_states  // Adjust based on your model's hidden size
         let shape: [NSNumber] = [1, NSNumber(value: batchSize), NSNumber(value: hiddenSize)]
-        let attributes: [String: Any] = [kCVPixelBufferMetalCompatibilityKey as String: true]
+        let attributes = ioSurfacePixelBufferAttributes
+        hiddenStatesBackings_ffn_prefillPingPong.removeAll(keepingCapacity: true)
 
         if debugLevel >= 1 {
             print("\n=== Prefill Backing Initialization ===")
             print("Hidden size:", hiddenSize)
             print("Batch size:", batchSize)
             print("Prefill backing shape:", shape.map { $0.intValue })
+        }
+
+        if disableIOBackings {
+            hiddenStatesBackings_emb_prefill = ["hidden_states": try MLMultiArray(shape: shape, dataType: .float16)]
+            hiddenStatesBackings_ffn_prefillPingPong = [
+                ["output_hidden_states": try MLMultiArray(shape: shape, dataType: .float16)],
+                ["output_hidden_states": try MLMultiArray(shape: shape, dataType: .float16)]
+            ]
+            hiddenStatesBackings_ffn_prefill = hiddenStatesBackings_ffn_prefillPingPong.first
+
+            if debugLevel >= 1 {
+                print("Embed prefill backing created with shape:", shape.map { $0.intValue })
+                print("FFN prefill ping-pong buffers: \(hiddenStatesBackings_ffn_prefillPingPong.count)")
+            }
+            return
         }
 
         // Embedding prefill backing
@@ -575,20 +1236,26 @@ import Accelerate
             print("Embed prefill backing created with shape:", shape.map { $0.intValue })
         }
 
-        // FFN prefill backing
-        var ffnPixelBuffer: CVPixelBuffer?
-        let ffnStatus = CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            hiddenSize,
-            batchSize,
-            kCVPixelFormatType_OneComponent16Half,
-            attributes as CFDictionary,
-            &ffnPixelBuffer
-        )
-        guard ffnStatus == kCVReturnSuccess, let ffnBuffer = ffnPixelBuffer else {
-            throw InferenceError.inferenceError("Failed to create FFN prefill pixel buffer")
+        // FFN prefill backing ping-pong
+        for slot in 0..<2 {
+            var ffnPixelBuffer: CVPixelBuffer?
+            let ffnStatus = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                hiddenSize,
+                batchSize,
+                kCVPixelFormatType_OneComponent16Half,
+                attributes as CFDictionary,
+                &ffnPixelBuffer
+            )
+            guard ffnStatus == kCVReturnSuccess, let ffnBuffer = ffnPixelBuffer else {
+                throw InferenceError.inferenceError("Failed to create FFN prefill pixel buffer slot \(slot)")
+            }
+            hiddenStatesBackings_ffn_prefillPingPong.append(["output_hidden_states": MLMultiArray(pixelBuffer: ffnBuffer, shape: shape)])
         }
-        hiddenStatesBackings_ffn_prefill = ["output_hidden_states": MLMultiArray(pixelBuffer: ffnBuffer, shape: shape)]
+        hiddenStatesBackings_ffn_prefill = hiddenStatesBackings_ffn_prefillPingPong.first
+        if debugLevel >= 1 {
+            print("FFN prefill ping-pong buffers: \(hiddenStatesBackings_ffn_prefillPingPong.count)")
+        }
     }
 
     private func initializeMonolithicOutputBackings() throws {
@@ -656,7 +1323,16 @@ import Accelerate
                 let otherDims = shape.dropLast().reduce(1) { $0 * $1.intValue }
 
                 if bufferIndex == 0 {
-                    print("  \(featureName): shape=\(shape.map { $0.intValue }), pixelBuffer=\(lastDim)x\(otherDims)")
+                    if disableIOBackings {
+                        print("  \(featureName): shape=\(shape.map { $0.intValue }) (MLMultiArray)")
+                    } else {
+                        print("  \(featureName): shape=\(shape.map { $0.intValue }), pixelBuffer=\(lastDim)x\(otherDims)")
+                    }
+                }
+
+                if disableIOBackings {
+                    outputBackingsDict[featureName] = try MLMultiArray(shape: shape, dataType: constraint.dataType)
+                    continue
                 }
 
                 // IOSurface-backed buffer for ANE compatibility and polling
@@ -854,6 +1530,7 @@ import Accelerate
                 print("About to run embedding model prediction...")
             }
             let _ = try await embedModel.prediction(from: embedInput, options: embedOptions)
+            await maybeDelayBeforeReadingPredictionOutputs()
             if debugLevel >= 1 {
                 print("Embedding model prediction completed successfully")
             }
@@ -888,6 +1565,7 @@ import Accelerate
                 // Assign output backing BEFORE predict
                 // Check what shape the model expects by looking at its OUTPUT description
                 var useLastChunkBacking = false
+                var selectedBackings: [String: MLMultiArray]?
 
                 // Use the appropriate model to check output description based on rotation mode
                 let modelToCheck = useRotation ? (chunk.prefillRotateModel ?? chunk.prefillModel) : chunk.prefillModel
@@ -902,18 +1580,28 @@ import Accelerate
                 }
 
                 if useLastChunkBacking && !v110 {
-                    if let backings = hiddenStatesBackings_last {
-                        ffnOptions.outputBackings = backings  // Shape: [1, 1, hidden_states]
+                    let pool = hiddenStatesBackings_lastPingPong.isEmpty
+                        ? (hiddenStatesBackings_last.map { [$0] } ?? [])
+                        : hiddenStatesBackings_lastPingPong
+                    if !pool.isEmpty {
+                        let chosenBackings = pool[index % pool.count]
+                        selectedBackings = chosenBackings
+                        ffnOptions.outputBackings = chosenBackings  // Shape: [1, 1, hidden_states]
                         if debugLevel >= 1 {
-                            print("Using last chunk backing with shape:", backings["output_hidden_states"]?.shape.map { $0.intValue } ?? [])
+                            print("Using last chunk backing slot \(index % pool.count) with shape:", selectedBackings?["output_hidden_states"]?.shape.map { $0.intValue } ?? [])
                         }
                     }
                 } else {
                     // For models expecting batch shape or when v110=true
-                    if let backings = hiddenStatesBackings_ffn_prefill {
-                        ffnOptions.outputBackings = backings  // Shape: [1, batch_size, hidden_states]
+                    let pool = hiddenStatesBackings_ffn_prefillPingPong.isEmpty
+                        ? (hiddenStatesBackings_ffn_prefill.map { [$0] } ?? [])
+                        : hiddenStatesBackings_ffn_prefillPingPong
+                    if !pool.isEmpty {
+                        let chosenBackings = pool[index % pool.count]
+                        selectedBackings = chosenBackings
+                        ffnOptions.outputBackings = chosenBackings  // Shape: [1, batch_size, hidden_states]
                         if debugLevel >= 1 {
-                            print("Using FFN prefill backing with shape:", backings["output_hidden_states"]?.shape.map { $0.intValue } ?? [])
+                            print("Using FFN prefill backing slot \(index % pool.count) with shape:", selectedBackings?["output_hidden_states"]?.shape.map { $0.intValue } ?? [])
                         }
                     }
                 }
@@ -930,32 +1618,27 @@ import Accelerate
 
                 // Use rotation function if available and batchPos >= slidingWindow
                 if useRotation, let prefillRotateModel = chunk.prefillRotateModel {
-                    _ = try await prefillRotateModel.prediction(
-                        from: prefillInput,
-                        using: state,
+                    try runStatefulPredictionOnQueue(
+                        model: prefillRotateModel,
+                        input: prefillInput,
                         options: ffnOptions
                     )
                 } else {
-                    // Run prediction with the assigned output backing
-                    _ = try await chunk.prefillModel.prediction(
-                        from: prefillInput,
-                        using: state,
+                    try runStatefulPredictionOnQueue(
+                        model: chunk.prefillModel,
+                        input: prefillInput,
                         options: ffnOptions
                     )
                 }
+                await maybeDelayBeforeReadingPredictionOutputs()
 
-                // Update currentHiddenStates - use the appropriate backing based on what model expects
-                if useLastChunkBacking && !v110 {
-                    guard let nextHiddenStates = hiddenStatesBackings_last?["output_hidden_states"] else {
+                guard let nextHiddenStates = selectedBackings?["output_hidden_states"] else {
+                    if useLastChunkBacking && !v110 {
                         throw InferenceError.inferenceError("Missing last chunk output backing")
                     }
-                    currentHiddenStates = nextHiddenStates  // Shape: [1, 1, hidden_states]
-                } else {
-                    guard let nextHiddenStates = hiddenStatesBackings_ffn_prefill?["output_hidden_states"] else {
-                        throw InferenceError.inferenceError("Missing FFN prefill output backing")
-                    }
-                    currentHiddenStates = nextHiddenStates  // Shape: [1, batch_size, hidden_states]
+                    throw InferenceError.inferenceError("Missing FFN prefill output backing")
                 }
+                currentHiddenStates = nextHiddenStates
 
                 if debugLevel >= 2 {
                     debugTensor(currentHiddenStates, prefix: "FFN chunk \(index + 1) output")
@@ -1077,31 +1760,48 @@ import Accelerate
             ]
 
             // Add update_mask if model supports it
-            if hasUpdateMask, let updateMaskBuffer = prefillUpdateMaskBuffer, let updateMask = prefillUpdateMask {
+            if hasUpdateMask, let updateMask = prefillUpdateMask {
                 // Populate update_mask: set 1.0 at position [batchPos + i, i] for each valid token
-                // Shape is [1, 1, contextLength, batchSize], stored as [contextLength, batchSize] in pixel buffer
-                CVPixelBufferLockBaseAddress(updateMaskBuffer, [])
-                if let baseAddress = CVPixelBufferGetBaseAddress(updateMaskBuffer) {
-                    let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
-                    let rowBytes = CVPixelBufferGetBytesPerRow(updateMaskBuffer)
-                    let stride = rowBytes / MemoryLayout<Float16>.size
+                // Shape is [1, 1, contextLength, batchSize]
+                if let updateMaskBuffer = prefillUpdateMaskBuffer {
+                    // Pixel buffer path
+                    CVPixelBufferLockBaseAddress(updateMaskBuffer, [])
+                    if let baseAddress = CVPixelBufferGetBaseAddress(updateMaskBuffer) {
+                        let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                        let rowBytes = CVPixelBufferGetBytesPerRow(updateMaskBuffer)
+                        let stride = rowBytes / MemoryLayout<Float16>.size
 
-                    // Clear entire buffer first
-                    for row in 0..<contextLength {
-                        for col in 0..<batchSize {
-                            ptr[row * stride + col] = Float16(0.0)
+                        // Clear entire buffer first
+                        for row in 0..<contextLength {
+                            for col in 0..<batchSize {
+                                ptr[row * stride + col] = Float16(0.0)
+                            }
+                        }
+
+                        // Set 1.0 at the write positions for each token in the batch
+                        for i in 0..<currentBatchSize {
+                            let writePos = batchPos + i
+                            if writePos < contextLength {
+                                ptr[writePos * stride + i] = Float16(1.0)
+                            }
                         }
                     }
-
-                    // Set 1.0 at the write positions for each token in the batch
+                    CVPixelBufferUnlockBaseAddress(updateMaskBuffer, [])
+                } else {
+                    // MLMultiArray path
+                    let ptr = updateMask.dataPointer.assumingMemoryBound(to: Float16.self)
+                    let rowStride = batchSize
+                    let totalElements = contextLength * batchSize
+                    for i in 0..<totalElements {
+                        ptr[i] = Float16(0.0)
+                    }
                     for i in 0..<currentBatchSize {
                         let writePos = batchPos + i
                         if writePos < contextLength {
-                            ptr[writePos * stride + i] = Float16(1.0)
+                            ptr[writePos * rowStride + i] = Float16(1.0)
                         }
                     }
                 }
-                CVPixelBufferUnlockBaseAddress(updateMaskBuffer, [])
 
                 inputDict["update_mask"] = updateMask
 
@@ -1198,20 +1898,31 @@ import Accelerate
 
         // Initialize argmax causal mask for token generation phase
         // After prefill at contextPos, positions 0..contextPos-1 should be visible
-        if argmaxInModel, let maskBuffer = argmaxCausalMaskBuffer {
-            CVPixelBufferLockBaseAddress(maskBuffer, [])
-            if let baseAddress = CVPixelBufferGetBaseAddress(maskBuffer) {
-                let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
-                // Reset mask to -inf and set visible positions
+        if argmaxInModel {
+            if let maskBuffer = argmaxCausalMaskBuffer {
+                CVPixelBufferLockBaseAddress(maskBuffer, [])
+                if let baseAddress = CVPixelBufferGetBaseAddress(maskBuffer) {
+                    let ptr = baseAddress.assumingMemoryBound(to: Float16.self)
+                    // Reset mask to -inf and set visible positions
+                    for i in 0..<contextLength {
+                        ptr[i] = Float16(-Float.infinity)
+                    }
+                    for j in 0..<min(contextPos, contextLength) {
+                        ptr[j] = Float16(0.0)
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(maskBuffer, [])
+                lastArgmaxPosition = contextPos - 1
+            } else if let maskArray = argmaxCausalMask {
+                let ptr = maskArray.dataPointer.assumingMemoryBound(to: Float16.self)
                 for i in 0..<contextLength {
                     ptr[i] = Float16(-Float.infinity)
                 }
                 for j in 0..<min(contextPos, contextLength) {
                     ptr[j] = Float16(0.0)
                 }
+                lastArgmaxPosition = contextPos - 1
             }
-            CVPixelBufferUnlockBaseAddress(maskBuffer, [])
-            lastArgmaxPosition = contextPos - 1
         }
 
         return contextPos
@@ -1365,7 +2076,8 @@ import Accelerate
         for lastToken: Int,
         currentPos: Int,
         temperature: Float,
-        tokenizer: Tokenizer? = nil
+        tokenizer: Tokenizer? = nil,
+        captureHiddenStates: Bool = false  // Enable hidden state capture for debugging
     ) async throws -> Int {
         guard let ffnChunks = ffnChunks else {
             throw InferenceError.inferenceError("ffnChunks is nil before generateNextToken")
@@ -1403,10 +2115,16 @@ import Accelerate
             embedOptions.outputBackings = backings
         }
         let _ = try await embedModel.prediction(from: embedInput, options: embedOptions)
+        await maybeDelayBeforeReadingPredictionOutputs()
 
         // Get hidden states from embed backing
         guard let hiddenStates = hiddenStatesBackings_emb?["hidden_states"] else {
             throw InferenceError.inferenceError("Missing embed output backing")
+        }
+
+        // Capture embeddings if requested
+        if captureHiddenStates {
+            debugCapturedEmbeddings = copyMLMultiArray(hiddenStates)
         }
 
         // Create position IDs (1D) - use currentPos-1 since currentPos is 1-indexed
@@ -1432,9 +2150,14 @@ import Accelerate
             print("Using rotation mode for position \(safePos) >= slidingWindow \(slidingWindow!)")
         }
 
-        for chunk in ffnChunks {
+        let ffnInferPool = hiddenStatesBackings_ffnPingPong.isEmpty
+            ? (hiddenStatesBackings_ffn.map { [$0] } ?? [])
+            : hiddenStatesBackings_ffnPingPong
+
+        for (chunkIndex, chunk) in ffnChunks.enumerated() {
             let ffnOptions = MLPredictionOptions()
-            if let backings = hiddenStatesBackings_ffn {
+            let selectedBackings = ffnInferPool.isEmpty ? nil : ffnInferPool[chunkIndex % ffnInferPool.count]
+            if let backings = selectedBackings {
                 ffnOptions.outputBackings = backings
             }
 
@@ -1447,12 +2170,21 @@ import Accelerate
 
             // Use rotation function if available and position >= slidingWindow
             if useRotation, let inferRotateModel = chunk.inferRotateModel {
-                let _ = try await inferRotateModel.prediction(from: inferInput, using: state, options: ffnOptions)
+                try runStatefulPredictionOnQueue(
+                    model: inferRotateModel,
+                    input: inferInput,
+                    options: ffnOptions
+                )
             } else {
-                let _ = try await chunk.inferModel.prediction(from: inferInput, using: state, options: ffnOptions)
+                try runStatefulPredictionOnQueue(
+                    model: chunk.inferModel,
+                    input: inferInput,
+                    options: ffnOptions
+                )
             }
+            await maybeDelayBeforeReadingPredictionOutputs()
 
-            guard let nextHiddenStates = hiddenStatesBackings_ffn?["output_hidden_states"] else {
+            guard let nextHiddenStates = selectedBackings?["output_hidden_states"] ?? hiddenStatesBackings_ffn?["output_hidden_states"] else {
                 throw InferenceError.inferenceError("Missing FFN output backing")
             }
             currentHiddenStates = nextHiddenStates
@@ -1460,6 +2192,11 @@ import Accelerate
 
         debugHiddenStates(currentHiddenStates, prefix: "Final hidden states to LM head")
         
+        // Capture final hidden states before LM head if requested
+        if captureHiddenStates {
+            debugCapturedFinalHidden = copyMLMultiArray(currentHiddenStates)
+        }
+
         // Run LM head with final hidden states
         let lmOptions = MLPredictionOptions()
         if let backings = lmheadOutputBackings {
@@ -1468,6 +2205,7 @@ import Accelerate
 
         let lmInput = try MLDictionaryFeatureProvider(dictionary: ["hidden_states": currentHiddenStates])
         let _ = try await lmheadModel.prediction(from: lmInput, options: lmOptions)
+        await maybeDelayBeforeReadingPredictionOutputs()
         
         guard let outputBackings = lmheadOutputBackings else {
             throw InferenceError.inferenceError("Output backings not initialized")
@@ -1483,25 +2221,76 @@ import Accelerate
             let numChunks = splitLMHead
             let chunkSize = 16384  // 262144 / 16 for Gemma3
 
+            // Collect ALL chunk data for debugging
+            var allChunkData: [(chunk: Int, localIdx: Int, val: Float)] = []
+            
             // Find the chunk with highest value
             var bestChunk = 0
+            var bestLocalIdx = 0
             var bestVal: Float = -Float.infinity
+            
             for i in 0..<numChunks {
+                let localIdx = idxArray[i].intValue
                 let val = Float(valArray[i].floatValue)
+                allChunkData.append((chunk: i, localIdx: localIdx, val: val))
+                
                 if val > bestVal {
                     bestVal = val
                     bestChunk = i
+                    bestLocalIdx = localIdx
                 }
             }
 
-            // Get the local index from the best chunk and convert to global index
-            let localIdx = idxArray[bestChunk].intValue
-            let globalIdx = bestChunk * chunkSize + localIdx
+            // Get the global index
+            let globalIdx = bestLocalIdx + (bestChunk * chunkSize)
 
             if debugLevel >= 1 {
-                print("\nLM head argmax mode:")
-                print("  Best chunk: \(bestChunk), local_idx: \(localIdx), global_idx: \(globalIdx)")
-                print("  Best value: \(bestVal)")
+                // Sort by value to see top candidates
+                let sorted = allChunkData.sorted { $0.val > $1.val }
+                
+                print("\n=== LM Head Argmax Debug (Non-Monolithic) ===")
+                print("Position: \(currentPos - 1)")
+                print("Top 5 chunks:")
+                for i in 0..<min(5, sorted.count) {
+                    let c = sorted[i]
+                    let gIdx = c.localIdx + (c.chunk * chunkSize)
+                    let marker = (c.chunk == bestChunk) ? " <-- SELECTED" : ""
+                    print("  #\(i+1): chunk=\(String(format: "%2d", c.chunk)), localIdx=\(String(format: "%5d", c.localIdx)), globalIdx=\(String(format: "%6d", gIdx)), val=\(String(format: "%.8f", c.val))\(marker)")
+                    
+                    // Decode token if we have tokenizer
+                    if let tokenizer = tokenizer {
+                        let decoded = tokenizer.decode(tokens: [gIdx], skipSpecialTokens: false)
+                        print("       decoded: \"\(decoded)\"")
+                    }
+                }
+                
+                // Check if top values are very close (precision issue indicator)
+                if sorted.count >= 2 {
+                    let diff = abs(sorted[0].val - sorted[1].val)
+                    print("\nValue comparison:")
+                    print("  top-1 val: \(String(format: "%.8f", sorted[0].val))")
+                    print("  top-2 val: \(String(format: "%.8f", sorted[1].val))")
+                    print("  difference: \(String(format: "%.8f", diff))")
+                    
+                    if diff < 0.001 {
+                        print("  ⚠️ WARNING: Values are very close - potential precision/race issue!")
+                    }
+                    if diff < 0.0001 {
+                        print("  🔴 CRITICAL: Values differ by less than 0.0001 - likely non-determinism!")
+                    }
+                }
+                
+                // Platform info
+                #if os(iOS)
+                print("\nPlatform: iOS (potential A-series ANE issue)")
+                #elseif os(macOS)
+                print("\nPlatform: macOS (M-series)")
+                #else
+                print("\nPlatform: Other")
+                #endif
+                
+                print("Result: chunk=\(bestChunk), local_idx=\(bestLocalIdx), global_idx=\(globalIdx), val=\(String(format: "%.8f", bestVal))")
+                print("=========================================\n")
             }
 
             return globalIdx
@@ -1523,20 +2312,11 @@ import Accelerate
                         let localLogitsPart = logitsPart
                         let localOffset = (partIndex - 1) * logitsPart.count
                         
-                        guard let pixelBuffer = localLogitsPart.pixelBuffer else {
-                            throw InferenceError.inferenceError("Missing or invalid \(logitsKey) in output backings")
-                        }
-                        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-                        defer {
-                            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-                        }
-                        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                            throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
-                        }
+                        let buffer = try self.getFloatBuffer(from: localLogitsPart)
+                        defer { buffer.unlock?() }
                         
                         #if arch(arm64)
-                        let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
-                        let count = localLogitsPart.count
+                        let count = buffer.count
                         var localMaxValue: Float = -Float.infinity
                         var localMaxIndex = 0
                         
@@ -1548,12 +2328,24 @@ import Accelerate
                             }
                         }
                         
-                        for j in start..<count {
-                            let value = Float(buffer[j])
-                            if value > localMaxValue {
-                                localMaxValue = value
-                                localMaxIndex = localOffset + j
+                        if let f16 = buffer.float16Ptr {
+                            for j in start..<count {
+                                let value = Float(f16[j])
+                                if value > localMaxValue {
+                                    localMaxValue = value
+                                    localMaxIndex = localOffset + j
+                                }
                             }
+                        } else if let f32 = buffer.float32Ptr {
+                            for j in start..<count {
+                                let value = f32[j]
+                                if value > localMaxValue {
+                                    localMaxValue = value
+                                    localMaxIndex = localOffset + j
+                                }
+                            }
+                        } else {
+                            throw InferenceError.inferenceError("No logits buffer for \(logitsKey)")
                         }
                         return PartialMax(value: localMaxValue, index: localMaxIndex)
                         #else
@@ -1591,20 +2383,11 @@ import Accelerate
                         let localLogitsPart = logitsPart
                         let localOffset = (partIndex - 1) * logitsPart.count
                         
-                        guard let pixelBuffer = localLogitsPart.pixelBuffer else {
-                            throw InferenceError.inferenceError("Missing or invalid \(logitsKey) in output backings")
-                        }
-                        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-                        defer {
-                            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-                        }
-                        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                            throw InferenceError.inferenceError("Could not get base address for \(logitsKey)")
-                        }
+                        let buffer = try self.getFloatBuffer(from: localLogitsPart)
+                        defer { buffer.unlock?() }
                         
                         #if arch(arm64)
-                        let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
-                        let count = localLogitsPart.count
+                        let count = buffer.count
                         
                         // Only keep top candidates from this chunk - avoid huge arrays
                         var topCandidates: [(Int, Float)] = []
@@ -1616,24 +2399,48 @@ import Accelerate
                             start = 2
                         }
                         
-                        for j in start..<count {
-                            let value = Float(buffer[j])
-                            let globalIndex = localOffset + j
-                            
-                            if topCandidates.count < chunkK {
-                                topCandidates.append((globalIndex, value))
-                                if topCandidates.count == chunkK {
-                                    topCandidates.sort { $0.1 > $1.1 }
-                                }
-                            } else if value > topCandidates[chunkK - 1].1 {
-                                topCandidates[chunkK - 1] = (globalIndex, value)
-                                // Bubble up
-                                var idx = chunkK - 1
-                                while idx > 0 && topCandidates[idx].1 > topCandidates[idx - 1].1 {
-                                    topCandidates.swapAt(idx, idx - 1)
-                                    idx -= 1
+                        if let f16 = buffer.float16Ptr {
+                            for j in start..<count {
+                                let value = Float(f16[j])
+                                let globalIndex = localOffset + j
+                                
+                                if topCandidates.count < chunkK {
+                                    topCandidates.append((globalIndex, value))
+                                    if topCandidates.count == chunkK {
+                                        topCandidates.sort { $0.1 > $1.1 }
+                                    }
+                                } else if value > topCandidates[chunkK - 1].1 {
+                                    topCandidates[chunkK - 1] = (globalIndex, value)
+                                    // Bubble up
+                                    var idx = chunkK - 1
+                                    while idx > 0 && topCandidates[idx].1 > topCandidates[idx - 1].1 {
+                                        topCandidates.swapAt(idx, idx - 1)
+                                        idx -= 1
+                                    }
                                 }
                             }
+                        } else if let f32 = buffer.float32Ptr {
+                            for j in start..<count {
+                                let value = f32[j]
+                                let globalIndex = localOffset + j
+                                
+                                if topCandidates.count < chunkK {
+                                    topCandidates.append((globalIndex, value))
+                                    if topCandidates.count == chunkK {
+                                        topCandidates.sort { $0.1 > $1.1 }
+                                    }
+                                } else if value > topCandidates[chunkK - 1].1 {
+                                    topCandidates[chunkK - 1] = (globalIndex, value)
+                                    // Bubble up
+                                    var idx = chunkK - 1
+                                    while idx > 0 && topCandidates[idx].1 > topCandidates[idx - 1].1 {
+                                        topCandidates.swapAt(idx, idx - 1)
+                                        idx -= 1
+                                    }
+                                }
+                            }
+                        } else {
+                            throw InferenceError.inferenceError("No logits buffer for \(logitsKey)")
                         }
                         return topCandidates
                         #else
@@ -1792,6 +2599,7 @@ import Accelerate
             if let error = predictionError {
                 throw error
             }
+            maybeDelayBeforeReadingPredictionOutputsSync()
 
             // Read from backings - data is synced after prediction completes
             guard let idxArray = currentBackings["argmax_idx"],
@@ -1894,6 +2702,7 @@ import Accelerate
         if let error = predictionError {
             throw error
         }
+        maybeDelayBeforeReadingPredictionOutputsSync()
 
         // Process logits - try Metal GPU argmax first, fallback to CPU
         if GreedySearch {
@@ -1929,19 +2738,12 @@ import Accelerate
                 let chunkOffset = chunkIdx * 16384
 
                 guard let logitsPart = currentBackings[logitsKey],
-                      let pixelBuffer = logitsPart.pixelBuffer else {
+                      let buffer = try? self.getFloatBuffer(from: logitsPart) else {
                     return
                 }
+                defer { buffer.unlock?() }
 
-                CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-                defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-
-                guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                    return
-                }
-
-                let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
-                let totalCount = logitsPart.count
+                let totalCount = buffer.count
                 let subChunkSize = totalCount / parallelFactor
 
                 var subStart = subIdx * subChunkSize
@@ -1956,25 +2758,32 @@ import Accelerate
                     return
                 }
 
-                var floatBuffer = [Float](repeating: 0, count: effectiveCount)
+                if let f16 = buffer.float16Ptr {
+                    var floatBuffer = [Float](repeating: 0, count: effectiveCount)
 
-                buffer.advanced(by: subStart).withMemoryRebound(to: UInt16.self, capacity: effectiveCount) { uint16Ptr in
-                    var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: uint16Ptr),
-                                           height: 1, width: vImagePixelCount(effectiveCount),
-                                           rowBytes: effectiveCount * 2)
-                    floatBuffer.withUnsafeMutableBufferPointer { floatPtr in
-                        var dst = vImage_Buffer(data: floatPtr.baseAddress!,
+                    f16.advanced(by: subStart).withMemoryRebound(to: UInt16.self, capacity: effectiveCount) { uint16Ptr in
+                        var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: uint16Ptr),
                                                height: 1, width: vImagePixelCount(effectiveCount),
-                                               rowBytes: effectiveCount * 4)
-                        vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
+                                               rowBytes: effectiveCount * 2)
+                        floatBuffer.withUnsafeMutableBufferPointer { floatPtr in
+                            var dst = vImage_Buffer(data: floatPtr.baseAddress!,
+                                                   height: 1, width: vImagePixelCount(effectiveCount),
+                                                   rowBytes: effectiveCount * 4)
+                            vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
+                        }
                     }
+
+                    var maxValue: Float = -Float.infinity
+                    var maxIndex: vDSP_Length = 0
+                    vDSP_maxvi(floatBuffer, 1, &maxValue, &maxIndex, vDSP_Length(effectiveCount))
+
+                    partialResults[taskIdx] = (maxValue, chunkOffset + subStart + Int(maxIndex))
+                } else if let f32 = buffer.float32Ptr {
+                    var maxValue: Float = -Float.infinity
+                    var maxIndex: vDSP_Length = 0
+                    vDSP_maxvi(f32.advanced(by: subStart), 1, &maxValue, &maxIndex, vDSP_Length(effectiveCount))
+                    partialResults[taskIdx] = (maxValue, chunkOffset + subStart + Int(maxIndex))
                 }
-
-                var maxValue: Float = -Float.infinity
-                var maxIndex: vDSP_Length = 0
-                vDSP_maxvi(floatBuffer, 1, &maxValue, &maxIndex, vDSP_Length(effectiveCount))
-
-                partialResults[taskIdx] = (maxValue, chunkOffset + subStart + Int(maxIndex))
             }
 
             // Find global max from partial results
@@ -1998,21 +2807,23 @@ import Accelerate
 
             for i in 1...splitLMHead {
                 let logitsKey = "logits\(i)"
-                guard let logitsPart = currentBackings[logitsKey],
-                      let pixelBuffer = logitsPart.pixelBuffer else {
+                guard let logitsPart = currentBackings[logitsKey] else {
                     throw InferenceError.inferenceError("Missing \(logitsKey)")
                 }
 
-                CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-                defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+                let buffer = try getFloatBuffer(from: logitsPart)
+                defer { buffer.unlock?() }
 
-                guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                    throw InferenceError.inferenceError("No base address for \(logitsKey)")
-                }
-
-                let buffer = baseAddress.assumingMemoryBound(to: Float16.self)
-                for j in 0..<logitsPart.count {
-                    allLogits.append(Float(buffer[j]))
+                if let f16 = buffer.float16Ptr {
+                    for j in 0..<buffer.count {
+                        allLogits.append(Float(f16[j]))
+                    }
+                } else if let f32 = buffer.float32Ptr {
+                    for j in 0..<buffer.count {
+                        allLogits.append(f32[j])
+                    }
+                } else {
+                    throw InferenceError.inferenceError("No logits buffer for \(logitsKey)")
                 }
             }
 
@@ -2031,7 +2842,7 @@ import Accelerate
     public func generateNextTokenArgmaxSync(
         for lastToken: Int,
         currentPos: Int
-    ) throws -> Int {
+    ) throws -> (token: Int, score: Float) {
         guard argmaxInModel else {
             throw InferenceError.inferenceError("generateNextTokenArgmaxSync called but argmaxInModel is false")
         }
@@ -2056,9 +2867,11 @@ import Accelerate
         positionIds.dataPointer.assumingMemoryBound(to: Int32.self)[0] = Int32(safePos)
         currentPosArray.dataPointer.assumingMemoryBound(to: Int32.self)[0] = Int32(safePos)
 
-        // Use pre-allocated causal mask with efficient single-value update via pixel buffer
-        guard let maskBuffer = argmaxCausalMaskBuffer else {
-            throw InferenceError.inferenceError("Pre-allocated argmax causal mask buffer not initialized")
+        // Use pre-allocated causal mask with efficient single-value update
+        let maskBuffer = argmaxCausalMaskBuffer
+        let maskArray = argmaxCausalMask
+        guard maskBuffer != nil || maskArray != nil else {
+            throw InferenceError.inferenceError("Pre-allocated argmax causal mask not initialized")
         }
 
         // Only update the mask if position changed (incremental update)
@@ -2066,11 +2879,15 @@ import Accelerate
         if lastArgmaxPosition != safePos {
             // Set the new position to 0 (make visible) using direct pixel buffer access
             if safePos < contextLength {
-                CVPixelBufferLockBaseAddress(maskBuffer, [])
-                if let baseAddress = CVPixelBufferGetBaseAddress(maskBuffer) {
-                    baseAddress.assumingMemoryBound(to: Float16.self)[safePos] = Float16(0.0)
+                if let maskBuffer {
+                    CVPixelBufferLockBaseAddress(maskBuffer, [])
+                    if let baseAddress = CVPixelBufferGetBaseAddress(maskBuffer) {
+                        baseAddress.assumingMemoryBound(to: Float16.self)[safePos] = Float16(0.0)
+                    }
+                    CVPixelBufferUnlockBaseAddress(maskBuffer, [])
+                } else if let maskArray {
+                    maskArray.dataPointer.assumingMemoryBound(to: Float16.self)[safePos] = Float16(0.0)
                 }
-                CVPixelBufferUnlockBaseAddress(maskBuffer, [])
             }
             lastArgmaxPosition = safePos
         }
@@ -2096,8 +2913,13 @@ import Accelerate
         }
         inferOptions.outputBackings = currentBackings
 
-        // Run prediction directly (no queue overhead since we're already synchronous)
-        _ = try monolithicModel.prediction(from: inferInput, using: state, options: inferOptions)
+        // Run on the same serial lane as other stateful predictions.
+        try runStatefulPredictionOnQueue(
+            model: monolithicModel,
+            input: inferInput,
+            options: inferOptions
+        )
+        maybeDelayBeforeReadingPredictionOutputsSync()
 
         // Read from output backings (data is stable now)
         guard let idxArray = currentBackings["argmax_idx"],
@@ -2129,7 +2951,7 @@ import Accelerate
         // Compute global token ID: local_idx + (chunk * chunk_size)
         let globalIdx = bestLocalIdx + (bestChunk * chunkSize)
 
-        return globalIdx
+        return (globalIdx, bestVal)
     }
 
     /// Shifts the context window if needed (similar to the Python code).
@@ -2232,11 +3054,43 @@ import Accelerate
             
             // Create mutable copy of initialTokens
             var contextTokens = initialTokens
+
+            if contextTokens.isEmpty {
+                busy = false
+                return (generatedTokens, 0, "empty_input")
+            }
+
+            // Optional debug mode: disable batch prefill and build KV cache using infer-only path
+            var currentPos: Int
+            let prefillTime: TimeInterval
+            if disablePrefill {
+                if debugLevel >= 1 {
+                    print("\n[Debug] Prefill disabled: using infer-only prefill over \(contextTokens.count) tokens")
+                }
+                var pos = 0
+                while pos < contextTokens.count {
+                    let _ = try await generateNextToken(
+                        for: contextTokens[pos],
+                        currentPos: pos + 1,
+                        temperature: 0,
+                        tokenizer: tokenizer
+                    )
+                    if debugLevel >= 1 {
+                        print("  Debug infer prefill token at pos \(pos): \(contextTokens[pos])")
+                    }
+                    pos += 1
+                }
+                currentPos = contextTokens.count
+                prefillTime = 0
+            } else {
+                // Run prefill with mutable copy
+                currentPos = try await runPrefill(on: &contextTokens, contextPos: contextTokens.count, tokenizer: tokenizer)
+                prefillTime = CFAbsoluteTimeGetCurrent() - startTime
+            }
             
-            // Run prefill with mutable copy
-            var currentPos = try await runPrefill(on: &contextTokens, contextPos: contextTokens.count, tokenizer: tokenizer)
-            let prefillTime = CFAbsoluteTimeGetCurrent() - startTime
-            
+            var firstKVStateDivergencePosition: Int?
+            var printedKVStateLegend = false
+
             while generatedTokens.count < maxTokens {
                 // Check if we need to shift the context window
                 if currentPos >= contextLength - 2 {
@@ -2292,14 +3146,297 @@ import Accelerate
                     break
                 }
 
+                if debugRepeatInferCount >= 2 {
+                    let repeatCount = min(debugRepeatInferCount, 4)
+                    let prefixTokens = Array(contextTokens.prefix(currentPos))
+                    let lastToken = prefixTokens[currentPos - 1]
+                    let savedMonolithicTokenCounter = monolithicTokenCounter
+
+                    if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                        print("\n[DebugRepeat] Running \(repeatCount)x infer repeat at pos \(currentPos - 1)")
+                    }
+
+                    var repeatTokens: [Int] = []
+                    var repeatDurationsNs: [UInt64] = []
+                    var repeatScores: [Float?] = []
+                    var foundMatch = false
+                    
+                    // Store original debug level
+                    let savedDebugLevel = debugLevel
+                    
+                    // Storage for hidden state comparisons
+                    var capturedEmbeddings: [MLMultiArray?] = []
+                    var capturedFinalHidden: [MLMultiArray?] = []
+                    
+                    // Capture KV cache state BEFORE first run
+                    let initialKVSnapshot = captureKVCacheSnapshot()
+                    
+                    // We'll also save snapshots after each run to compare
+                    var kvSnapshots: [[String: MLMultiArray]] = []
+
+                    var kvInitialToRun1Similarity: Float?
+                    var kvRun1ToRun2Similarity: Float?
+                    var kvPerBufferRun1ToRun2: [String: Float] = [:]
+                    var kvDivergentAfterRun1: [String] = []
+                    var kvDivergentRun1ToRun2: [String] = []
+                    var kvRun1ToRun2Diverged = false
+
+                    for i in 0..<repeatCount {
+                        // Enable detailed logging for divergence analysis on repeat runs
+                        if i > 0 && !foundMatch {
+                            debugLevel = max(savedDebugLevel, 1)  // Ensure at least level 1
+                        }
+                        
+                        let startNs = DispatchTime.now().uptimeNanoseconds
+                        let token: Int
+                        
+                        // Enable hidden state capture for non-monolithic models
+                        let shouldCaptureHidden = !isMonolithic && argmaxInModel
+                        
+                        if argmaxInModel && isMonolithic {
+                            let result = try generateNextTokenArgmaxSync(for: lastToken, currentPos: currentPos)
+                            token = result.token
+                            repeatScores.append(result.score)
+                            capturedEmbeddings.append(nil)  // Not captured for monolithic
+                            capturedFinalHidden.append(nil)
+                            if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                                print("[DebugRepeat] argmax score=\(result.score)")
+                            }
+                        } else {
+                            token = try await generateNextToken(
+                                for: lastToken,
+                                currentPos: currentPos,
+                                temperature: temperature,
+                                tokenizer: tokenizer,
+                                captureHiddenStates: shouldCaptureHidden
+                            )
+                            repeatScores.append(nil)
+                            
+                            // Capture hidden states if available
+                            if shouldCaptureHidden {
+                                capturedEmbeddings.append(debugCapturedEmbeddings)
+                                capturedFinalHidden.append(debugCapturedFinalHidden)
+                            } else {
+                                capturedEmbeddings.append(nil)
+                                capturedFinalHidden.append(nil)
+                            }
+                        }
+                        let endNs = DispatchTime.now().uptimeNanoseconds
+                        let durationNs = endNs - startNs
+                        let durationUs = durationNs / 1_000
+
+                        repeatTokens.append(token)
+                        repeatDurationsNs.append(durationNs)
+                        
+                        // Capture KV cache state AFTER this run
+                        kvSnapshots.append(captureKVCacheSnapshot())
+
+                        if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                            let decoded = tokenizer.decode(tokens: [token], skipSpecialTokens: false)
+                            print("[DebugRepeat] run \(i + 1): token=\(token) (\(decoded)) durationUs=\(durationUs)")
+                        }
+
+                        if i == 1, repeatTokens[0] == repeatTokens[1] {
+                            if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                                print("[DebugRepeat] match on run2 (t1 == t2)")
+                            }
+                            foundMatch = true
+                            break
+                        }
+                        if i == 2, token == repeatTokens[0] || token == repeatTokens[1] {
+                            if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                                print("[DebugRepeat] match on run3 (t3 == t1 or t2)")
+                            }
+                            foundMatch = true
+                            break
+                        }
+                        if i == 3 {
+                            let matches = repeatTokens.dropLast().contains(token)
+                            if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                                if matches {
+                                    print("[DebugRepeat] match on run4 (t4 matches a previous token)")
+                                } else {
+                                    print("[DebugRepeat] no match after run4")
+                                }
+                            }
+                            foundMatch = matches
+                        }
+                    }
+                    
+                    // Restore debug level
+                    debugLevel = savedDebugLevel
+
+                    let tokenDiverged = !foundMatch && repeatTokens.count >= repeatCount
+
+                    if (debugCompareKVStateEveryToken || tokenDiverged), kvSnapshots.count >= 2 {
+                        let (sim0, _, divergent0) = compareKVCacheSnapshots(initialKVSnapshot, kvSnapshots[0])
+                        let (sim12, perBuffer12, divergent12) = compareKVCacheSnapshots(kvSnapshots[0], kvSnapshots[1])
+
+                        kvInitialToRun1Similarity = sim0
+                        kvRun1ToRun2Similarity = sim12
+                        kvPerBufferRun1ToRun2 = perBuffer12
+                        kvDivergentAfterRun1 = divergent0
+                        kvDivergentRun1ToRun2 = divergent12
+                        kvRun1ToRun2Diverged = sim12 < kvStateSimilarityThreshold || !divergent12.isEmpty
+
+                        if debugCompareKVStateEveryToken {
+                            if !printedKVStateLegend {
+                                print("[DebugRepeat][State] note: initial->run1 reflects expected KV write; divergence is judged by run1->run2")
+                                printedKVStateLegend = true
+                            }
+                            // Always print state similarity for every repeated token so small drift is visible early.
+                            if initialKVSnapshot.isEmpty || kvSnapshots[0].isEmpty || kvSnapshots[1].isEmpty {
+                                print("[DebugRepeat][State] pos \(currentPos - 1) no KV state buffers captured")
+                            } else {
+                                print("[DebugRepeat][State] pos \(currentPos - 1) initial->run1=\(String(format: "%.8f", sim0)) run1->run2=\(String(format: "%.8f", sim12))")
+
+                                if let worst = perBuffer12.min(by: { $0.value < $1.value }) {
+                                    print("[DebugRepeat][State] worst run1->run2 buffer: \(worst.key)=\(String(format: "%.8f", worst.value))")
+                                }
+                            }
+
+                            if kvRun1ToRun2Diverged {
+                                if firstKVStateDivergencePosition == nil {
+                                    firstKVStateDivergencePosition = currentPos - 1
+                                    print("\n[DebugRepeat][State] first KV divergence observed at pos \(currentPos - 1)")
+                                }
+
+                                if !tokenDiverged {
+                                    print("\n" + String(repeating: "-", count: 80))
+                                    print("🟠 KV STATE DIVERGENCE (tokens still matched) at position \(currentPos - 1)")
+                                    print(String(repeating: "-", count: 80))
+                                }
+
+                                if !kvDivergentRun1ToRun2.isEmpty {
+                                    print("[DebugRepeat][State] divergent buffers: \(kvDivergentRun1ToRun2.prefix(6).joined(separator: ", "))\(kvDivergentRun1ToRun2.count > 6 ? "... (\(kvDivergentRun1ToRun2.count) total)" : "")")
+                                }
+
+                                if !tokenDiverged {
+                                    printKVBlockDivergenceAnalysis(
+                                        previousSnapshot: kvSnapshots[0],
+                                        currentSnapshot: kvSnapshots[1],
+                                        divergentBuffers: kvDivergentRun1ToRun2,
+                                        focusTokenIndex: currentPos - 1
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    if tokenDiverged {
+                        if debugLevel >= 1 {
+                            let decoded = tokenizer.decode(tokens: repeatTokens, skipSpecialTokens: false)
+                            let runsDetails = repeatTokens.enumerated().map { idx, tok -> String in
+                                let dec = tokenizer.decode(tokens: [tok], skipSpecialTokens: false)
+                                let durUs = idx < repeatDurationsNs.count ? repeatDurationsNs[idx] / 1_000 : 0
+                                let score = (argmaxInModel && isMonolithic && idx < repeatScores.count) ? repeatScores[idx] : nil
+                                if let s = score {
+                                    return "#\(idx + 1) tok=\(tok) \"\(dec)\" durUs=\(durUs) score=\(String(format: "%.4f", s))"
+                                } else {
+                                    return "#\(idx + 1) tok=\(tok) \"\(dec)\" durUs=\(durUs)"
+                                }
+                            }.joined(separator: "; ")
+
+                            print("\n" + String(repeating: "=", count: 80))
+                            print("🔴 DIVERGENCE DETECTED at position \(currentPos - 1)")
+                            print(String(repeating: "=", count: 80))
+                            print("Tokens: \(repeatTokens)")
+                            print("Decoded: \(decoded)")
+                            print("Runs: [\(runsDetails)]")
+                            
+                            // Compare hidden states if captured
+                            if capturedEmbeddings.count >= 2, 
+                               let embed0 = capturedEmbeddings[0],
+                               let embed1 = capturedEmbeddings[1] {
+                                let embedSim = cosineSimilarity(embed0, embed1)
+                                print("\n📊 Hidden State Analysis:")
+                                print("  Embedding cosine similarity (run1 vs run2): \(String(format: "%.8f", embedSim))")
+                                
+                                if embedSim < hiddenStateSimilarityThreshold {
+                                    print("  ⚠️ Embeddings diverged! (< \(hiddenStateSimilarityThreshold))")
+                                } else {
+                                    print("  ✅ Embeddings identical")
+                                }
+                            }
+                            
+                            if capturedFinalHidden.count >= 2,
+                               let final0 = capturedFinalHidden[0],
+                               let final1 = capturedFinalHidden[1] {
+                               let finalSim = cosineSimilarity(final0, final1)
+                                print("  Final hidden cosine similarity (run1 vs run2): \(String(format: "%.8f", finalSim))")
+                                
+                                if finalSim < hiddenStateSimilarityThreshold {
+                                    print("  ⚠️ Final hidden states diverged! (< \(hiddenStateSimilarityThreshold))")
+                                    print("  → Issue is in FFN/state processing")
+                                } else {
+                                    print("  ✅ Final hidden states identical")
+                                    print("  → Issue is in LM head argmax computation")
+                                }
+                            }
+                            
+                            // Additional KV cache analysis - compare actual state buffers
+                            // Check if KV cache was modified DURING the inference runs
+                            if let sim0 = kvInitialToRun1Similarity,
+                               let sim12 = kvRun1ToRun2Similarity {
+                                print("\n🔍 KV Cache State Buffer Analysis:")
+                                print("  Initial → After Run1: \(String(format: "%.8f", sim0))")
+
+                                if !kvDivergentAfterRun1.isEmpty && debugLevel >= 2 {
+                                    print("    Divergent buffers after run1: \(kvDivergentAfterRun1.prefix(3).joined(separator: ", "))\(kvDivergentAfterRun1.count > 3 ? "... (\(kvDivergentAfterRun1.count) total)" : "")")
+                                }
+
+                                print("  After Run1 → After Run2: \(String(format: "%.8f", sim12))")
+                                
+                                if !kvDivergentRun1ToRun2.isEmpty && debugLevel >= 2 {
+                                    print("    Divergent buffers: \(kvDivergentRun1ToRun2.prefix(3).joined(separator: ", "))\(kvDivergentRun1ToRun2.count > 3 ? "... (\(kvDivergentRun1ToRun2.count) total)" : "")")
+                                }
+                                
+                                // Analysis
+                                if kvRun1ToRun2Diverged {
+                                    print("  🔴 CRITICAL: KV cache state diverged between identical runs!")
+                                    print("  → State buffers are being modified non-deterministically")
+                                    print("  → This is an iOS ANE bug: same input + same initial state ≠ same final state")
+                                    
+                                    if debugLevel >= 2 && !kvDivergentRun1ToRun2.isEmpty {
+                                        print("\n  Per-buffer divergence analysis:")
+                                        for bufferName in kvDivergentRun1ToRun2.prefix(5) {
+                                            if let similarity = kvPerBufferRun1ToRun2[bufferName] {
+                                                print("    \(bufferName): \(String(format: "%.8f", similarity))")
+                                            }
+                                        }
+                                    }
+
+                                    printKVBlockDivergenceAnalysis(
+                                        previousSnapshot: kvSnapshots[0],
+                                        currentSnapshot: kvSnapshots[1],
+                                        divergentBuffers: kvDivergentRun1ToRun2,
+                                        focusTokenIndex: currentPos - 1
+                                    )
+                                } else {
+                                    print("  ✅ KV cache state is deterministic")
+                                    print("  → State buffers are identical after both runs")
+                                    print("  → Divergence must be in the forward pass computation (not state)")
+                                }
+                            }
+                            
+                            print(String(repeating: "=", count: 80) + "\n")
+                        }
+                    }
+                    monolithicTokenCounter = savedMonolithicTokenCounter
+                }
+
                 // Use synchronous path for argmax mode (eliminates async overhead for ~10% speedup)
                 // Async path is used for logits mode which needs sampling
                 let nextToken: Int
                 if argmaxInModel && isMonolithic {
-                    nextToken = try generateNextTokenArgmaxSync(
+                    let result = try generateNextTokenArgmaxSync(
                         for: contextTokens[currentPos - 1],
                         currentPos: currentPos
                     )
+                    nextToken = result.token
+                    if debugLevel >= 1 && !debugRepeatOnlyDivergence {
+                        print("[Argmax] token=\(nextToken) score=\(result.score)")
+                    }
                 } else {
                     nextToken = try await generateNextToken(
                         for: contextTokens[currentPos - 1],
@@ -2381,9 +3518,12 @@ import Accelerate
         lmheadOutputBackings = nil
         hiddenStatesBackings_emb = nil
         hiddenStatesBackings_ffn = nil
+        hiddenStatesBackings_ffnPingPong.removeAll(keepingCapacity: false)
         hiddenStatesBackings_last = nil
+        hiddenStatesBackings_lastPingPong.removeAll(keepingCapacity: false)
         hiddenStatesBackings_emb_prefill = nil
         hiddenStatesBackings_ffn_prefill = nil
+        hiddenStatesBackings_ffn_prefillPingPong.removeAll(keepingCapacity: false)
         prefillUpdateMask = nil
         prefillUpdateMaskBuffer = nil
         state = nil
