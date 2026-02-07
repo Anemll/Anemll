@@ -7,6 +7,11 @@ import Metal
 import IOSurface
 import Accelerate
 
+#if arch(x86_64)
+// Fallback for builds that don't support native Float16 paths on Intel.
+private typealias Float16 = Float
+#endif
+
 /// Manages inference by wrapping a CoreML model and handling state.
 @preconcurrency public final class InferenceManager: @unchecked Sendable {
     private var hidden_states: Int = -1
@@ -643,6 +648,9 @@ import Accelerate
 
 
     public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil, updateMaskPrefill: Bool = false, prefillDynamicSlice: Bool = false, disableIOBackings: Bool = false) throws {  // Make init throwing
+#if arch(x86_64)
+        throw InferenceError.inferenceError("x86_64 has no Apple Neural Engine and is unsupported by this application.")
+#endif
         self.debugLevel = debugLevel
         self.isMonolithic = models.isMonolithic
         self.argmaxInModel = argmaxInModel
