@@ -20,11 +20,50 @@ swift run -c release anemllcli --meta <path_to_model>/meta.yaml
 swift run -c release anemllcli --help
 ```
 
-# Example running model from anemll.anemll-chat.demo container
-swift run -c release anemllcli --meta ~/Library/Containers/anemll.anemll-chat.demo/Data/Documents/Models/llama_3_2_1b_iosv2_0/meta.yaml --prompt "List US Presidents"
+Example running model from `anemll.anemll-chat.demo` container:
 
-# Example running model from anemll.anemll-chat.demo container and save output to file ( for automated test)
-swift run -c release anemllcli --meta ~/Library/Containers/anemll.anemll-chat.demo/Data/Documents/Models/llama_3_2_1b_iosv2_0/meta.yaml --prompt "who are you" --save /tmp/chat.txt
+```bash
+swift run -c release anemllcli \
+  --meta ~/Library/Containers/anemll.anemll-chat.demo/Data/Documents/Models/llama_3_2_1b_iosv2_0/meta.yaml \
+  --prompt "List US Presidents"
+```
+
+Example with saved output (for automated tests):
+
+```bash
+swift run -c release anemllcli \
+  --meta ~/Library/Containers/anemll.anemll-chat.demo/Data/Documents/Models/llama_3_2_1b_iosv2_0/meta.yaml \
+  --prompt "who are you" \
+  --save /tmp/chat.txt
+```
+
+## Divergence Debug Run
+
+Use these flags when reproducing state/KV divergence:
+
+```bash
+swift run -c release anemllcli \
+  --meta <path_to_model>/meta.yaml \
+  --prompt "what is apple neural engine?" \
+  --temperature 0 \
+  --debug-level 1 \
+  --debug-single-token-prefill \
+  --debug-disable-io-backings \
+  --debug-repeat-infer-count 2 \
+  --debug-compare-kv-state-every-token true \
+  --debug-predict-read-delay-ms 0
+```
+
+`--debug-predict-read-delay-ms` accepts fractional milliseconds. Useful sweep points:
+`0`, `0.3`, `0.5`, `1`, `2`, `3`, `5`, `8`, `10`.
+
+Optional noise reduction:
+
+```bash
+--debug-repeat-only-divergence
+```
+
+The same divergence flags are available in `anemllcli_adv`.
 
 ## License
 

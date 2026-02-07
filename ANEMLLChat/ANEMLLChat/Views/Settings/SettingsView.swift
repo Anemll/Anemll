@@ -36,12 +36,15 @@ struct SettingsView: View {
     @State private var debugDisableIOBackings = StorageService.defaultDebugDisableIOBackingsValue
     @State private var debugRepeatInferCount = StorageService.defaultDebugRepeatInferCountValue
     @State private var debugRepeatOnlyDivergence = StorageService.defaultDebugRepeatOnlyDivergenceValue
+    @State private var debugCompareKVStateEveryToken = StorageService.defaultDebugCompareKVStateEveryTokenValue
+    @State private var debugPredictReadDelayMs = StorageService.defaultDebugPredictReadDelayMsValue
     @State private var enableMarkup = StorageService.defaultEnableMarkupValue
     @State private var sendButtonOnLeft = StorageService.defaultSendButtonOnLeftValue
     @State private var loadLastChat = StorageService.defaultLoadLastChatValue
     @State private var largeControls = StorageService.defaultLargeControlsValue
     @State private var showMicrophone = StorageService.defaultShowMicrophoneValue
     @State private var showingResetConfirmation = false
+    private let debugPredictReadDelayPresetMs: [Double] = [0.0, 0.3, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 10.0]
 
     var body: some View {
         Form {
@@ -60,9 +63,11 @@ struct SettingsView: View {
             // Logs
             logsSection
 
-            // Debug inference (debug builds only)
+            // Debug inference controls
             if DebugInferenceOptions.isEnabled {
                 debugInferenceSection
+            } else {
+                predictReadDelaySection
             }
 
             // About
@@ -276,10 +281,32 @@ struct SettingsView: View {
             }
 
             Toggle("Only Log Divergence", isOn: $debugRepeatOnlyDivergence)
+
+            Toggle("Compare KV State Every Token", isOn: $debugCompareKVStateEveryToken)
+
+            Picker("Predict Output Read Delay", selection: $debugPredictReadDelayMs) {
+                ForEach(debugPredictReadDelayPresetMs, id: \.self) { delay in
+                    Text(predictReadDelayLabel(delay)).tag(delay)
+                }
+            }
         } header: {
             Text("Debug Inference")
         } footer: {
             Text("Disables prefill, CoreML I/O backings, caps the input context, and optionally repeats token inference for divergence testing (heavy). Requires model reload. Debug builds only.")
+        }
+    }
+
+    private var predictReadDelaySection: some View {
+        Section {
+            Picker("Predict Output Read Delay", selection: $debugPredictReadDelayMs) {
+                ForEach(debugPredictReadDelayPresetMs, id: \.self) { delay in
+                    Text(predictReadDelayLabel(delay)).tag(delay)
+                }
+            }
+        } header: {
+            Text("Inference Diagnostics")
+        } footer: {
+            Text("Adds a delay before reading CoreML outputs to probe ANE non-determinism.")
         }
     }
 
@@ -341,6 +368,22 @@ struct SettingsView: View {
 
     // MARK: - Actions
 
+    private func normalizedPredictReadDelayMs(_ value: Double) -> Double {
+        let clamped = max(0.0, min(value, 500.0))
+        guard clamped > 0 else { return 0.0 }
+        return debugPredictReadDelayPresetMs.min(by: { abs($0 - clamped) < abs($1 - clamped) }) ?? 0.0
+    }
+
+    private func predictReadDelayLabel(_ value: Double) -> String {
+        if value == 0 {
+            return "Off"
+        }
+        if value.rounded(.towardZero) == value {
+            return "\(Int(value))ms"
+        }
+        return "\(value)ms"
+    }
+
     private func loadSettings() {
         temperature = chatVM.temperature
         maxTokens = chatVM.maxTokens
@@ -372,6 +415,8 @@ struct SettingsView: View {
             debugDisableIOBackings = await StorageService.shared.debugDisableIOBackings
             debugRepeatInferCount = await StorageService.shared.debugRepeatInferCount
             debugRepeatOnlyDivergence = await StorageService.shared.debugRepeatOnlyDivergence
+            debugCompareKVStateEveryToken = await StorageService.shared.debugCompareKVStateEveryToken
+            debugPredictReadDelayMs = normalizedPredictReadDelayMs(await StorageService.shared.debugPredictReadDelayMs)
             enableMarkup = await StorageService.shared.enableMarkup
             sendButtonOnLeft = await StorageService.shared.sendButtonOnLeft
             loadLastChat = await StorageService.shared.loadLastChat
@@ -381,6 +426,9 @@ struct SettingsView: View {
     }
 
     private func saveSettings() {
+        let normalizedDelay = normalizedPredictReadDelayMs(debugPredictReadDelayMs)
+        debugPredictReadDelayMs = normalizedDelay
+
         chatVM.temperature = temperature
         chatVM.maxTokens = maxTokens
 
@@ -408,6 +456,8 @@ struct SettingsView: View {
             await StorageService.shared.saveDebugDisableIOBackings(debugDisableIOBackings)
             await StorageService.shared.saveDebugRepeatInferCount(debugRepeatInferCount)
             await StorageService.shared.saveDebugRepeatOnlyDivergence(debugRepeatOnlyDivergence)
+            await StorageService.shared.saveDebugCompareKVStateEveryToken(debugCompareKVStateEveryToken)
+            await StorageService.shared.saveDebugPredictReadDelayMs(normalizedDelay)
             await StorageService.shared.saveEnableMarkup(enableMarkup)
             await StorageService.shared.saveSendButtonOnLeft(sendButtonOnLeft)
             await StorageService.shared.saveLoadLastChat(loadLastChat)
@@ -423,13 +473,16 @@ struct SettingsView: View {
                     InferenceService.shared.debugDisableIOBackings = debugDisableIOBackings
                     InferenceService.shared.debugRepeatInferCount = debugRepeatInferCount
                     InferenceService.shared.debugRepeatOnlyDivergence = debugRepeatOnlyDivergence
+                    InferenceService.shared.debugCompareKVStateEveryToken = debugCompareKVStateEveryToken
                 } else {
                     InferenceService.shared.debugDisablePrefill = false
                     InferenceService.shared.debugContextCap = 0
                     InferenceService.shared.debugDisableIOBackings = false
                     InferenceService.shared.debugRepeatInferCount = 0
                     InferenceService.shared.debugRepeatOnlyDivergence = false
+                    InferenceService.shared.debugCompareKVStateEveryToken = true
                 }
+                InferenceService.shared.debugPredictReadDelayMs = normalizedDelay
             }
         }
     }
@@ -447,6 +500,9 @@ struct SettingsView: View {
         debugContextCap = StorageService.defaultDebugContextCapValue
         debugDisableIOBackings = StorageService.defaultDebugDisableIOBackingsValue
         debugRepeatInferCount = StorageService.defaultDebugRepeatInferCountValue
+        debugRepeatOnlyDivergence = StorageService.defaultDebugRepeatOnlyDivergenceValue
+        debugCompareKVStateEveryToken = StorageService.defaultDebugCompareKVStateEveryTokenValue
+        debugPredictReadDelayMs = StorageService.defaultDebugPredictReadDelayMsValue
         enableMarkup = StorageService.defaultEnableMarkupValue
         sendButtonOnLeft = StorageService.defaultSendButtonOnLeftValue
         loadLastChat = StorageService.defaultLoadLastChatValue
@@ -470,12 +526,17 @@ struct SettingsView: View {
                     InferenceService.shared.debugContextCap = debugContextCap
                     InferenceService.shared.debugDisableIOBackings = debugDisableIOBackings
                     InferenceService.shared.debugRepeatInferCount = debugRepeatInferCount
+                    InferenceService.shared.debugRepeatOnlyDivergence = debugRepeatOnlyDivergence
+                    InferenceService.shared.debugCompareKVStateEveryToken = debugCompareKVStateEveryToken
                 } else {
                     InferenceService.shared.debugDisablePrefill = false
                     InferenceService.shared.debugContextCap = 0
                     InferenceService.shared.debugDisableIOBackings = false
                     InferenceService.shared.debugRepeatInferCount = 0
+                    InferenceService.shared.debugRepeatOnlyDivergence = false
+                    InferenceService.shared.debugCompareKVStateEveryToken = true
                 }
+                InferenceService.shared.debugPredictReadDelayMs = debugPredictReadDelayMs
             }
         }
     }

@@ -268,6 +268,8 @@ actor StorageService {
     static let defaultDebugDisableIOBackingsValue: Bool = false
     static let defaultDebugRepeatInferCountValue: Int = 0
     static let defaultDebugRepeatOnlyDivergenceValue: Bool = false
+    static let defaultDebugCompareKVStateEveryTokenValue: Bool = true
+    static let defaultDebugPredictReadDelayMsValue: Double = 0.0
     static let defaultAutoLoadLastModelValue: Bool = true
     static let defaultEnableMarkupValue: Bool = true
     static let defaultSendButtonOnLeftValue: Bool = false
@@ -356,6 +358,31 @@ actor StorageService {
         UserDefaults.standard.set(value, forKey: "debugRepeatOnlyDivergence")
     }
 
+    var debugCompareKVStateEveryToken: Bool {
+        UserDefaults.standard.object(forKey: "debugCompareKVStateEveryToken") as? Bool ?? Self.defaultDebugCompareKVStateEveryTokenValue
+    }
+
+    func saveDebugCompareKVStateEveryToken(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "debugCompareKVStateEveryToken")
+    }
+
+    var debugPredictReadDelayMs: Double {
+        if let value = UserDefaults.standard.object(forKey: "debugPredictReadDelayMs") as? Double {
+            return max(0.0, min(value, 500.0))
+        }
+
+        // Backward compatibility with older int-based setting values.
+        if let value = UserDefaults.standard.object(forKey: "debugPredictReadDelayMs") as? Int {
+            return max(0.0, min(Double(value), 500.0))
+        }
+
+        return Self.defaultDebugPredictReadDelayMsValue
+    }
+
+    func saveDebugPredictReadDelayMs(_ value: Double) {
+        UserDefaults.standard.set(max(0.0, min(value, 500.0)), forKey: "debugPredictReadDelayMs")
+    }
+
     var enableMarkup: Bool {
         UserDefaults.standard.object(forKey: "enableMarkup") as? Bool ?? Self.defaultEnableMarkupValue
     }
@@ -428,6 +455,8 @@ actor StorageService {
         UserDefaults.standard.set(Self.defaultDebugDisableIOBackingsValue, forKey: "debugDisableIOBackings")
         UserDefaults.standard.set(Self.defaultDebugRepeatInferCountValue, forKey: "debugRepeatInferCount")
         UserDefaults.standard.set(Self.defaultDebugRepeatOnlyDivergenceValue, forKey: "debugRepeatOnlyDivergence")
+        UserDefaults.standard.set(Self.defaultDebugCompareKVStateEveryTokenValue, forKey: "debugCompareKVStateEveryToken")
+        UserDefaults.standard.set(Self.defaultDebugPredictReadDelayMsValue, forKey: "debugPredictReadDelayMs")
         UserDefaults.standard.set(Self.defaultAutoLoadLastModelValue, forKey: "autoLoadLastModel")
         UserDefaults.standard.set(Self.defaultEnableMarkupValue, forKey: "enableMarkup")
         UserDefaults.standard.set(Self.defaultSendButtonOnLeftValue, forKey: "sendButtonOnLeft")

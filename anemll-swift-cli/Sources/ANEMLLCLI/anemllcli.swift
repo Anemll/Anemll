@@ -171,6 +171,24 @@ struct AnemllCLI: AsyncParsableCommand {
     // Add flag for detailed loading progress
     @Flag(name: .long, help: "Show detailed model loading progress")
     var showLoadingProgress = false
+
+    @Option(name: .long, help: "Repeat infer N times per position for divergence detection (0=off, 2-4 supported)")
+    var debugRepeatInferCount: Int = 0
+
+    @Flag(name: .long, help: "Only log repeat divergences")
+    var debugRepeatOnlyDivergence = false
+
+    @Option(name: .long, help: "Print KV state similarity for every repeated token (true/false)")
+    var debugCompareKVStateEveryToken: Bool = true
+
+    @Option(name: .long, help: "Delay before reading prediction outputs, in milliseconds (0-500, fractional allowed)")
+    var debugPredictReadDelayMs: Double = 0
+
+    @Flag(name: .long, help: "Use infer-only single-token prefill (disable batch prefill)")
+    var debugSingleTokenPrefill = false
+
+    @Flag(name: .long, help: "Disable CoreML I/O backings (CVPixelBuffer output backings)")
+    var debugDisableIOBackings = false
     
     // Update thinking prompt to use actual tokens
     private static let THINKING_PROMPT = """
@@ -276,8 +294,16 @@ struct AnemllCLI: AsyncParsableCommand {
             .OBJC_ASSOCIATION_RETAIN
         )
     }
+
+    private func clampedPredictReadDelayMs() -> Double {
+        min(max(debugPredictReadDelayMs, 0.0), 500.0)
+    }
     
     mutating func run() async throws {
+        print("\n=== ANEMLL CLI: starting ===")
+        print("Meta config: \(meta)")
+        fflush(stdout)
+
         // Load config
         let config = try YAMLConfig.load(from: meta)
         
@@ -309,6 +335,10 @@ struct AnemllCLI: AsyncParsableCommand {
             }
             print("Auto-detected template: \(effectiveTemplate) (from model prefix: \(config.modelPrefix))")
         }
+
+        print("Params: prompt=\(prompt != nil ? "yes" : "no"), max_tokens=\(effectiveMaxTokens), temperature=\(temperature), template=\(effectiveTemplate), debug_level=\(debugLevel)")
+        print("Debug params: single_token_prefill=\(debugSingleTokenPrefill), disable_io_backings=\(debugDisableIOBackings), repeat_infer_count=\(debugRepeatInferCount < 2 ? 0 : min(debugRepeatInferCount, 4)), only_divergence=\(debugRepeatOnlyDivergence), compare_kv_every_token=\(debugCompareKVStateEveryToken), predict_read_delay_ms=\(String(format: "%.3f", clampedPredictReadDelayMs()))")
+        fflush(stdout)
 
         // Initialize tokenizer with debug level and template
         print("\nInitializing tokenizer...")
@@ -356,8 +386,26 @@ struct AnemllCLI: AsyncParsableCommand {
             argmaxInModel: config.argmaxInModel,
             slidingWindow: config.slidingWindow,  // Gemma3 rotation support
             updateMaskPrefill: config.updateMaskPrefill,  // Multi-turn KV cache support
-            prefillDynamicSlice: config.prefillDynamicSlice  // Alternative batch prefill support
+            prefillDynamicSlice: config.prefillDynamicSlice,  // Alternative batch prefill support
+            disableIOBackings: debugDisableIOBackings
         )
+
+        // Optional divergence diagnostics
+        inferenceManager.setDisablePrefill(debugSingleTokenPrefill)
+        inferenceManager.setDebugRepeatInferCount(debugRepeatInferCount)
+        inferenceManager.setDebugRepeatOnlyDivergence(debugRepeatOnlyDivergence)
+        inferenceManager.setDebugCompareKVStateEveryToken(debugCompareKVStateEveryToken)
+        inferenceManager.setDebugPredictReadDelayMs(debugPredictReadDelayMs)
+
+        if debugRepeatInferCount >= 2 || clampedPredictReadDelayMs() > 0 || debugSingleTokenPrefill || debugDisableIOBackings || debugLevel >= 1 {
+            print("\nDivergence debug options:")
+            print("  single_token_prefill: \(debugSingleTokenPrefill)")
+            print("  disable_io_backings: \(debugDisableIOBackings)")
+            print("  repeat_infer_count: \(debugRepeatInferCount < 2 ? 0 : min(debugRepeatInferCount, 4))")
+            print("  only_divergence: \(debugRepeatOnlyDivergence)")
+            print("  compare_kv_every_token: \(debugCompareKVStateEveryToken)")
+            print("  predict_read_delay_ms: \(String(format: "%.3f", clampedPredictReadDelayMs()))")
+        }
         
         if let prompt = prompt {
             // Initialize token printer

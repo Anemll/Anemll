@@ -137,6 +137,8 @@ final class InferenceService: ObservableObject {
     var debugDisableIOBackings: Bool = false
     var debugRepeatInferCount: Int = 0
     var debugRepeatOnlyDivergence: Bool = false
+    var debugCompareKVStateEveryToken: Bool = true
+    var debugPredictReadDelayMs: Double = 0.0
 
     private init() {
         // Load settings from storage
@@ -151,6 +153,8 @@ final class InferenceService: ObservableObject {
             debugDisableIOBackings = await StorageService.shared.debugDisableIOBackings
             debugRepeatInferCount = await StorageService.shared.debugRepeatInferCount
             debugRepeatOnlyDivergence = await StorageService.shared.debugRepeatOnlyDivergence
+            debugCompareKVStateEveryToken = await StorageService.shared.debugCompareKVStateEveryToken
+            debugPredictReadDelayMs = await StorageService.shared.debugPredictReadDelayMs
         }
     }
 
@@ -409,6 +413,8 @@ final class InferenceService: ObservableObject {
         let capturedDebugDisablePrefill = debugDisablePrefill
         let capturedDebugRepeatInferCount = debugRepeatInferCount
         let capturedDebugRepeatOnlyDivergence = debugRepeatOnlyDivergence
+        let capturedDebugCompareKVStateEveryToken = debugCompareKVStateEveryToken
+        let capturedDebugPredictReadDelayMs = debugPredictReadDelayMs
         let inputTokenCount = inputTokens.count  // Capture for history calculation
 
         do {
@@ -447,11 +453,14 @@ final class InferenceService: ObservableObject {
                     capturedInferenceManager.setDisablePrefill(capturedDebugDisablePrefill)
                     capturedInferenceManager.setDebugRepeatInferCount(capturedDebugRepeatInferCount)
                     capturedInferenceManager.setDebugRepeatOnlyDivergence(capturedDebugRepeatOnlyDivergence)
+                    capturedInferenceManager.setDebugCompareKVStateEveryToken(capturedDebugCompareKVStateEveryToken)
                 } else {
                     capturedInferenceManager.setDisablePrefill(false)
                     capturedInferenceManager.setDebugRepeatInferCount(0)
                     capturedInferenceManager.setDebugRepeatOnlyDivergence(false)
+                    capturedInferenceManager.setDebugCompareKVStateEveryToken(true)
                 }
+                capturedInferenceManager.setDebugPredictReadDelayMs(capturedDebugPredictReadDelayMs)
 
                 let (_, prefillTime, stopReason) = try await capturedInferenceManager.generateResponse(
                     initialTokens: inputTokens,
