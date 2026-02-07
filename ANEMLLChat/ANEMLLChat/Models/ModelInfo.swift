@@ -7,6 +7,13 @@
 
 import Foundation
 
+/// Model source type for lifecycle handling (download/import/link)
+enum ModelSourceKind: String, Codable, Sendable {
+    case huggingFace
+    case localImported
+    case localLinked
+}
+
 /// Information about an available LLM model
 struct ModelInfo: Identifiable, Codable, Sendable, Equatable {
     let id: String                    // HuggingFace repo ID (e.g., "anemll/llama-3.2-1B")
@@ -29,6 +36,9 @@ struct ModelInfo: Identifiable, Codable, Sendable, Equatable {
     // Local paths (set after download)
     var localPath: String?
     var metaYamlPath: String?
+    var sourceKind: ModelSourceKind
+    var linkedPath: String?
+    var bookmarkDataBase64: String?
 
     init(
         id: String,
@@ -44,7 +54,10 @@ struct ModelInfo: Identifiable, Codable, Sendable, Equatable {
         downloadError: String? = nil,
         isDownloading: Bool = false,
         localPath: String? = nil,
-        metaYamlPath: String? = nil
+        metaYamlPath: String? = nil,
+        sourceKind: ModelSourceKind = .huggingFace,
+        linkedPath: String? = nil,
+        bookmarkDataBase64: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -60,6 +73,50 @@ struct ModelInfo: Identifiable, Codable, Sendable, Equatable {
         self.isDownloading = isDownloading
         self.localPath = localPath
         self.metaYamlPath = metaYamlPath
+        self.sourceKind = sourceKind
+        self.linkedPath = linkedPath
+        self.bookmarkDataBase64 = bookmarkDataBase64
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case description
+        case size
+        case sizeBytes
+        case contextLength
+        case architecture
+        case isDownloaded
+        case downloadProgress
+        case downloadedBytes
+        case downloadError
+        case isDownloading
+        case localPath
+        case metaYamlPath
+        case sourceKind
+        case linkedPath
+        case bookmarkDataBase64
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.name = try container.decode(String.self, forKey: .name)
+        self.description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
+        self.size = try container.decodeIfPresent(String.self, forKey: .size) ?? "Unknown"
+        self.sizeBytes = try container.decodeIfPresent(Int64.self, forKey: .sizeBytes)
+        self.contextLength = try container.decodeIfPresent(Int.self, forKey: .contextLength)
+        self.architecture = try container.decodeIfPresent(String.self, forKey: .architecture)
+        self.isDownloaded = try container.decodeIfPresent(Bool.self, forKey: .isDownloaded) ?? false
+        self.downloadProgress = try container.decodeIfPresent(Double.self, forKey: .downloadProgress)
+        self.downloadedBytes = try container.decodeIfPresent(Int64.self, forKey: .downloadedBytes)
+        self.downloadError = try container.decodeIfPresent(String.self, forKey: .downloadError)
+        self.isDownloading = try container.decodeIfPresent(Bool.self, forKey: .isDownloading) ?? false
+        self.localPath = try container.decodeIfPresent(String.self, forKey: .localPath)
+        self.metaYamlPath = try container.decodeIfPresent(String.self, forKey: .metaYamlPath)
+        self.sourceKind = try container.decodeIfPresent(ModelSourceKind.self, forKey: .sourceKind) ?? .huggingFace
+        self.linkedPath = try container.decodeIfPresent(String.self, forKey: .linkedPath)
+        self.bookmarkDataBase64 = try container.decodeIfPresent(String.self, forKey: .bookmarkDataBase64)
     }
 }
 

@@ -24,6 +24,11 @@ struct ANEMLLChatApp: App {
             ContentView()
                 .environment(chatViewModel)
                 .environment(modelManager)
+                .onOpenURL { url in
+                    Task {
+                        await modelManager.handleIncomingTransferURL(url)
+                    }
+                }
                 #if os(iOS)
                 // Force dark mode on iOS/iPadOS/visionOS to match hardcoded dark backgrounds
                 .preferredColorScheme(.dark)

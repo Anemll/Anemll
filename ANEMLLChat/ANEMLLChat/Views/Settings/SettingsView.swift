@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import UniformTypeIdentifiers
 
 // System prompt options
 enum SystemPromptOption: String, CaseIterable, Identifiable {
@@ -20,6 +21,9 @@ enum SystemPromptOption: String, CaseIterable, Identifiable {
 
 struct SettingsView: View {
     @Environment(ChatViewModel.self) private var chatVM
+    #if os(macOS)
+    @Environment(ModelManagerViewModel.self) private var modelManager
+    #endif
     @Environment(\.dismiss) private var dismiss
 
     @State private var temperature: Float = 0.0
@@ -37,6 +41,17 @@ struct SettingsView: View {
     @State private var largeControls = StorageService.defaultLargeControlsValue
     @State private var showMicrophone = StorageService.defaultShowMicrophoneValue
     @State private var showingResetConfirmation = false
+    #if os(macOS)
+    @State private var macOSStorageFolderPath = ""
+    @State private var showingStorageFolderPicker = false
+    @State private var pendingStorageMigration: (oldURL: URL, newURL: URL)?
+    @State private var showingStorageMigrationPrompt = false
+    @State private var showingStorageMigrationOptions = false
+    @State private var storageFolderStatusMessage: String?
+    @State private var isStorageMigrationInProgress = false
+    @State private var storageMigrationProgressValue: Double = 0
+    @State private var storageMigrationProgressMessage = ""
+    #endif
 
     var body: some View {
         Form {
@@ -81,6 +96,48 @@ struct SettingsView: View {
         .sheet(isPresented: $showingLogs) {
             LogsView()
         }
+        #if os(macOS)
+        .fileImporter(
+            isPresented: $showingStorageFolderPicker,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let selected = urls.first else { return }
+                handleStorageFolderSelection(selected)
+            case .failure(let error):
+                storageFolderStatusMessage = "Failed to select folder: \(error.localizedDescription)"
+            }
+        }
+        .alert("Migrate Existing Data?", isPresented: $showingStorageMigrationPrompt) {
+            Button("Not Now", role: .cancel) {
+                pendingStorageMigration = nil
+            }
+            Button("Yes") {
+                showingStorageMigrationOptions = true
+            }
+        } message: {
+            if let migration = pendingStorageMigration {
+                Text("Storage changed from \(migration.oldURL.path) to \(migration.newURL.path). Migrate existing chats and models to the new folder?")
+            } else {
+                Text("Migrate existing chats and models to the new folder?")
+            }
+        }
+        .confirmationDialog("Migrate Storage Data", isPresented: $showingStorageMigrationOptions, titleVisibility: .visible) {
+            Button("Copy Files") {
+                performStorageMigration(.copy)
+            }
+            Button("Move Files") {
+                performStorageMigration(.move)
+            }
+            Button("Cancel", role: .cancel) {
+                pendingStorageMigration = nil
+            }
+        } message: {
+            Text("Choose how to migrate existing data. Only app data under this folder is migrated; the source root folder itself is never moved.")
+        }
+        #endif
     }
 
     // MARK: - Model Section
@@ -97,10 +154,52 @@ struct SettingsView: View {
             } label: {
                 Label("Clear remembered model", systemImage: "xmark.circle")
             }
+
+            #if os(macOS)
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Storage Folder")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+
+                Text(macOSStorageFolderPath)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+
+                Button {
+                    showingStorageFolderPicker = true
+                } label: {
+                    Label("Change Storage Folder", systemImage: "folder")
+                }
+                .disabled(isStorageMigrationInProgress)
+            }
+
+            if let storageFolderStatusMessage {
+                Text(storageFolderStatusMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if isStorageMigrationInProgress {
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: storageMigrationProgressValue)
+                    Text(storageMigrationProgressMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            #endif
         } header: {
             Text("Model")
         } footer: {
+            #if os(macOS)
+            Text(loadLastChat ? "App will restore your last conversation on startup. Storage folder applies to macOS only." : "App will start with a new chat on startup. Storage folder applies to macOS only.")
+            #else
             Text(loadLastChat ? "App will restore your last conversation on startup" : "App will start with a new chat on startup")
+            #endif
         }
     }
 
@@ -326,6 +425,9 @@ struct SettingsView: View {
             loadLastChat = await StorageService.shared.loadLastChat
             largeControls = await StorageService.shared.largeControls
             showMicrophone = await StorageService.shared.showMicrophone
+            #if os(macOS)
+            macOSStorageFolderPath = await StorageService.shared.currentMacOSStorageFolderURL().path
+            #endif
         }
     }
 
@@ -395,6 +497,87 @@ struct SettingsView: View {
             }
         }
     }
+
+    #if os(macOS)
+    private func handleStorageFolderSelection(_ selectedURL: URL) {
+        Task {
+            do {
+                let update = try await StorageService.shared.updateMacOSStorageFolder(to: selectedURL)
+
+                await MainActor.run {
+                    macOSStorageFolderPath = update.newURL.path
+                }
+
+                guard update.changed else {
+                    await MainActor.run {
+                        storageFolderStatusMessage = "Storage folder is unchanged."
+                    }
+                    return
+                }
+
+                await refreshStorageBackedData()
+
+                await MainActor.run {
+                    pendingStorageMigration = (oldURL: update.oldURL, newURL: update.newURL)
+                    storageFolderStatusMessage = "Storage folder changed. Choose whether to migrate existing data."
+                    showingStorageMigrationPrompt = true
+                }
+
+            } catch {
+                await MainActor.run {
+                    storageFolderStatusMessage = "Failed to change storage folder: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func performStorageMigration(_ mode: StorageMigrationMode) {
+        guard let migration = pendingStorageMigration else { return }
+
+        Task {
+            await MainActor.run {
+                isStorageMigrationInProgress = true
+                storageMigrationProgressValue = 0
+                storageMigrationProgressMessage = mode == .copy ? "Preparing copy..." : "Preparing move..."
+                storageFolderStatusMessage = nil
+            }
+
+            do {
+                try await StorageService.shared.migrateMacOSStorage(
+                    from: migration.oldURL,
+                    to: migration.newURL,
+                    mode: mode,
+                    progress: { progress in
+                        Task { @MainActor in
+                            storageMigrationProgressValue = progress.fractionCompleted
+                            storageMigrationProgressMessage = progress.message
+                        }
+                    }
+                )
+                await refreshStorageBackedData()
+                await MainActor.run {
+                    isStorageMigrationInProgress = false
+                    storageMigrationProgressValue = 1.0
+                    storageMigrationProgressMessage = mode == .copy ? "Copy complete." : "Move complete."
+                    storageFolderStatusMessage = mode == .copy
+                        ? "Copied existing data to the new storage folder. Source root folder was left unchanged."
+                        : "Moved app data to the new storage folder. Source root folder was left unchanged."
+                    pendingStorageMigration = nil
+                }
+            } catch {
+                await MainActor.run {
+                    isStorageMigrationInProgress = false
+                    storageFolderStatusMessage = "Migration failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func refreshStorageBackedData() async {
+        await chatVM.loadConversations()
+        await modelManager.loadModels()
+    }
+    #endif
 }
 
 // MARK: - Logs View

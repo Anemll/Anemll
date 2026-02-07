@@ -7,6 +7,24 @@
 
 import Foundation
 
+#if os(macOS)
+enum StorageMigrationMode: String, Sendable {
+    case copy
+    case move
+}
+
+struct StorageMigrationProgress: Sendable {
+    let completedUnits: Int
+    let totalUnits: Int
+    let message: String
+
+    var fractionCompleted: Double {
+        guard totalUnits > 0 else { return 0 }
+        return Double(completedUnits) / Double(totalUnits)
+    }
+}
+#endif
+
 /// Errors that can occur during storage operations
 enum StorageError: LocalizedError {
     case encodingFailed
@@ -33,11 +51,21 @@ actor StorageService {
     private let fileManager = FileManager.default
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    #if os(macOS)
+    private static let macOSStorageFolderPathKey = "macOSStorageFolderPath"
+    private static let macOSLegacyMigrationStatePrefix = "macOSLegacyStorageMigratedTo"
+    #endif
 
     private init() {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         decoder.dateDecodingStrategy = .iso8601
+
+        #if os(macOS)
+        Task { [weak self] in
+            await self?.migrateLegacyMacOSStorageIfNeeded()
+        }
+        #endif
     }
 
     // MARK: - Directories
@@ -47,18 +75,45 @@ actor StorageService {
         fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
 
+    /// App data root directory
+    /// - macOS: ~/.cache/anemll
+    /// - iOS: app Documents directory
+    private var appDataRootDirectory: URL {
+        #if os(macOS)
+        return configuredMacOSStorageRootDirectory
+        #else
+        return documentsDirectory
+        #endif
+    }
+
+    #if os(macOS)
+    private var defaultMacOSStorageRootDirectory: URL {
+        fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache", isDirectory: true)
+            .appendingPathComponent("anemll", isDirectory: true)
+            .standardizedFileURL
+    }
+
+    private var configuredMacOSStorageRootDirectory: URL {
+        if let storedPath = UserDefaults.standard.string(forKey: Self.macOSStorageFolderPathKey),
+           !storedPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return URL(fileURLWithPath: storedPath, isDirectory: true).standardizedFileURL
+        }
+        return defaultMacOSStorageRootDirectory
+    }
+    #endif
+
     /// Conversations directory
     private var conversationsDirectory: URL {
-        documentsDirectory.appendingPathComponent("Conversations", isDirectory: true)
+        appDataRootDirectory.appendingPathComponent("Conversations", isDirectory: true)
     }
 
     /// Models directory (for downloaded models)
-    /// - macOS: ~/Documents/ (directly in user's Documents for easy access)
+    /// - macOS: ~/.cache/anemll/Models
     /// - iOS: Documents/Models/ (in app's sandboxed Documents)
     var modelsDirectory: URL {
         #if os(macOS)
-        // Store directly in ~/Documents for easy Finder access (matches anemll-chatbot)
-        return fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Documents", isDirectory: true)
+        return appDataRootDirectory.appendingPathComponent("Models", isDirectory: true)
         #else
         // iOS: Store in app's Documents/Models (visible in Files app with UIFileSharingEnabled)
         return documentsDirectory.appendingPathComponent("Models", isDirectory: true)
@@ -76,6 +131,282 @@ actor StorageService {
             }
         }
     }
+
+    #if os(macOS)
+    func currentMacOSStorageFolderURL() -> URL {
+        configuredMacOSStorageRootDirectory
+    }
+
+    /// Set macOS storage root folder.
+    /// Returns old/new URLs and whether the folder actually changed.
+    @discardableResult
+    func updateMacOSStorageFolder(to newFolderURL: URL) throws -> (oldURL: URL, newURL: URL, changed: Bool) {
+        let oldURL = configuredMacOSStorageRootDirectory
+        let normalizedNewURL = newFolderURL.standardizedFileURL
+
+        try ensureDirectoryExists(normalizedNewURL)
+
+        if normalizedNewURL.path == oldURL.path {
+            return (oldURL, normalizedNewURL, false)
+        }
+
+        UserDefaults.standard.set(normalizedNewURL.path, forKey: Self.macOSStorageFolderPathKey)
+        logInfo("Updated macOS storage folder to \(normalizedNewURL.path)", category: .storage)
+        return (oldURL, normalizedNewURL, true)
+    }
+
+    /// Migrate app data between macOS storage roots.
+    /// `copy` leaves original data; `move` removes source items after transfer.
+    func migrateMacOSStorage(
+        from oldRoot: URL,
+        to newRoot: URL,
+        mode: StorageMigrationMode,
+        progress: (@Sendable (StorageMigrationProgress) -> Void)? = nil
+    ) throws {
+        let source = oldRoot.standardizedFileURL
+        let destination = newRoot.standardizedFileURL
+        guard source.path != destination.path else { return }
+
+        let sourceModelsRoot = source.appendingPathComponent("Models", isDirectory: true)
+        let modelDirectories = try listTopLevelDirectories(at: sourceModelsRoot)
+        let modelWorkUnits = max(modelDirectories.count, 1)
+        let totalUnits = 2 + modelWorkUnits
+        var completedUnits = 0
+
+        emitMigrationProgress(progress, completedUnits: completedUnits, totalUnits: totalUnits, message: "Preparing migration...")
+
+        try ensureDirectoryExists(destination)
+
+        try migrateDirectoryContents(
+            source: source.appendingPathComponent("Conversations", isDirectory: true),
+            destination: destination.appendingPathComponent("Conversations", isDirectory: true),
+            mode: mode,
+            protectedRoot: source
+        )
+        completedUnits += 1
+        emitMigrationProgress(progress, completedUnits: completedUnits, totalUnits: totalUnits, message: "Migrated conversations")
+
+        try migrateModelsRegistryFile(
+            source: source.appendingPathComponent("models.json"),
+            destination: destination.appendingPathComponent("models.json"),
+            mode: mode
+        )
+        completedUnits += 1
+        emitMigrationProgress(progress, completedUnits: completedUnits, totalUnits: totalUnits, message: "Migrated model registry")
+
+        let destinationModelsRoot = destination.appendingPathComponent("Models", isDirectory: true)
+        try ensureDirectoryExists(destinationModelsRoot)
+
+        if modelDirectories.isEmpty {
+            completedUnits += 1
+            emitMigrationProgress(progress, completedUnits: completedUnits, totalUnits: totalUnits, message: "No model folders to migrate")
+        } else {
+            for (index, sourceModelDir) in modelDirectories.enumerated() {
+                let destinationModelDir = destinationModelsRoot.appendingPathComponent(sourceModelDir.lastPathComponent, isDirectory: true)
+                try migrateDirectoryContents(source: sourceModelDir, destination: destinationModelDir, mode: mode, protectedRoot: source)
+                completedUnits += 1
+                emitMigrationProgress(
+                    progress,
+                    completedUnits: completedUnits,
+                    totalUnits: totalUnits,
+                    message: "Migrated model folder \(index + 1)/\(modelDirectories.count): \(sourceModelDir.lastPathComponent)"
+                )
+            }
+        }
+    }
+
+    private func migrateLegacyMacOSStorageIfNeeded() {
+        let targetRoot = configuredMacOSStorageRootDirectory
+        let migrationStateKey = "\(Self.macOSLegacyMigrationStatePrefix)::\(targetRoot.path)"
+        if UserDefaults.standard.bool(forKey: migrationStateKey) {
+            return
+        }
+
+        let legacyDocuments = fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Documents", isDirectory: true)
+
+        do {
+            try ensureDirectoryExists(targetRoot)
+
+            // Legacy chats and registry lived directly under ~/Documents.
+            try migrateDirectoryContents(
+                source: legacyDocuments.appendingPathComponent("Conversations", isDirectory: true),
+                destination: targetRoot.appendingPathComponent("Conversations", isDirectory: true),
+                mode: .copy
+            )
+            try migrateModelsRegistryFile(
+                source: legacyDocuments.appendingPathComponent("models.json"),
+                destination: targetRoot.appendingPathComponent("models.json"),
+                mode: .copy
+            )
+
+            // Legacy downloaded models were top-level folders in ~/Documents.
+            try ensureDirectoryExists(targetRoot.appendingPathComponent("Models", isDirectory: true))
+            if let entries = try? fileManager.contentsOfDirectory(
+                at: legacyDocuments,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for entry in entries {
+                    guard isLegacyModelDirectory(entry) else { continue }
+                    let destination = targetRoot
+                        .appendingPathComponent("Models", isDirectory: true)
+                        .appendingPathComponent(entry.lastPathComponent, isDirectory: true)
+                    try migrateDirectoryContents(source: entry, destination: destination, mode: .copy)
+                }
+            }
+
+            UserDefaults.standard.set(true, forKey: migrationStateKey)
+            logInfo("Completed macOS legacy storage migration to \(targetRoot.path)", category: .storage)
+        } catch {
+            logWarning("Legacy macOS storage migration failed: \(error)", category: .storage)
+        }
+    }
+
+    private func isLegacyModelDirectory(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return false
+        }
+
+        let hasMeta = fileManager.fileExists(atPath: url.appendingPathComponent("meta.yaml").path)
+        guard hasMeta else { return false }
+
+        let children = (try? fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)) ?? []
+        let hasCompiledModel = children.contains { $0.pathExtension.lowercased() == "mlmodelc" }
+        return hasCompiledModel
+    }
+
+    private func migrateDirectoryContents(
+        source: URL,
+        destination: URL,
+        mode: StorageMigrationMode,
+        protectedRoot: URL? = nil
+    ) throws {
+        var sourceIsDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: source.path, isDirectory: &sourceIsDirectory), sourceIsDirectory.boolValue else {
+            return
+        }
+
+        if !fileManager.fileExists(atPath: destination.path) {
+            try ensureDirectoryExists(destination.deletingLastPathComponent())
+            switch mode {
+            case .copy:
+                try fileManager.copyItem(at: source, to: destination)
+            case .move:
+                try fileManager.moveItem(at: source, to: destination)
+            }
+            return
+        }
+
+        try ensureDirectoryExists(destination)
+        let sourceChildren = try fileManager.contentsOfDirectory(
+            at: source,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+
+        for child in sourceChildren {
+            let target = destination.appendingPathComponent(child.lastPathComponent, isDirectory: true)
+            var childIsDirectory: ObjCBool = false
+            let childExists = fileManager.fileExists(atPath: child.path, isDirectory: &childIsDirectory)
+            guard childExists else { continue }
+
+            var targetIsDirectory: ObjCBool = false
+            let targetExists = fileManager.fileExists(atPath: target.path, isDirectory: &targetIsDirectory)
+
+            if targetExists {
+                if childIsDirectory.boolValue && targetIsDirectory.boolValue {
+                    try migrateDirectoryContents(source: child, destination: target, mode: mode, protectedRoot: protectedRoot)
+                    if mode == .move {
+                        try? fileManager.removeItem(at: child)
+                    }
+                } else {
+                    // Destination takes precedence; on move, drop duplicate source entry.
+                    if mode == .move {
+                        try? fileManager.removeItem(at: child)
+                    }
+                }
+                continue
+            }
+
+            switch mode {
+            case .copy:
+                try fileManager.copyItem(at: child, to: target)
+            case .move:
+                try fileManager.moveItem(at: child, to: target)
+            }
+        }
+
+        if mode == .move {
+            let normalizedSource = source.standardizedFileURL.path
+            let normalizedProtected = protectedRoot?.standardizedFileURL.path
+            if normalizedSource == normalizedProtected {
+                // Safety guard: never remove the selected source root folder itself.
+                return
+            }
+            try? fileManager.removeItem(at: source)
+        }
+    }
+
+    private func migrateModelsRegistryFile(source: URL, destination: URL, mode: StorageMigrationMode) throws {
+        guard fileManager.fileExists(atPath: source.path) else { return }
+
+        if !fileManager.fileExists(atPath: destination.path) {
+            try ensureDirectoryExists(destination.deletingLastPathComponent())
+            switch mode {
+            case .copy:
+                try fileManager.copyItem(at: source, to: destination)
+            case .move:
+                try fileManager.moveItem(at: source, to: destination)
+            }
+            return
+        }
+
+        // Merge by model id when both registry files exist.
+        let sourceData = try Data(contentsOf: source)
+        let destinationData = try Data(contentsOf: destination)
+        let sourceModels = (try? decoder.decode([ModelInfo].self, from: sourceData)) ?? []
+        var destinationModels = (try? decoder.decode([ModelInfo].self, from: destinationData)) ?? []
+
+        for sourceModel in sourceModels where !destinationModels.contains(where: { $0.id == sourceModel.id }) {
+            destinationModels.append(sourceModel)
+        }
+
+        let merged = try encoder.encode(destinationModels)
+        try merged.write(to: destination, options: .atomic)
+
+        if mode == .move {
+            try? fileManager.removeItem(at: source)
+        }
+    }
+
+    private func emitMigrationProgress(
+        _ callback: (@Sendable (StorageMigrationProgress) -> Void)?,
+        completedUnits: Int,
+        totalUnits: Int,
+        message: String
+    ) {
+        callback?(StorageMigrationProgress(completedUnits: completedUnits, totalUnits: totalUnits, message: message))
+    }
+
+    private func listTopLevelDirectories(at root: URL) throws -> [URL] {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return []
+        }
+
+        let entries = try fileManager.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+        return entries
+            .filter {
+                (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            }
+            .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+    }
+    #endif
 
     // MARK: - Conversations
 
@@ -148,11 +479,13 @@ actor StorageService {
 
     /// File for custom model registry
     private var modelsRegistryFile: URL {
-        documentsDirectory.appendingPathComponent("models.json")
+        appDataRootDirectory.appendingPathComponent("models.json")
     }
 
     /// Save custom models to registry
     func saveModelsRegistry(_ models: [ModelInfo]) async throws {
+        try ensureDirectoryExists(appDataRootDirectory)
+
         // Only save custom models (not defaults)
         let customModels = models.filter { model in
             !ModelInfo.defaultModels.contains(where: { $0.id == model.id })
@@ -198,6 +531,36 @@ actor StorageService {
         let modelDir = modelPath(for: modelId)
         let metaYaml = modelDir.appendingPathComponent("meta.yaml")
         return fileManager.fileExists(atPath: metaYaml.path)
+    }
+
+    /// Import a local model directory into app-managed storage using staged atomic finalize.
+    /// This guarantees we never leave a partially imported model at the final destination.
+    func importModelDirectory(from sourceURL: URL, toModelId modelId: String) async throws -> URL {
+        try ensureDirectoryExists(modelsDirectory)
+
+        let destinationURL = modelPath(for: modelId)
+        let stagingURL = modelsDirectory.appendingPathComponent(".import-\(UUID().uuidString)", isDirectory: true)
+
+        do {
+            if fileManager.fileExists(atPath: stagingURL.path) {
+                try fileManager.removeItem(at: stagingURL)
+            }
+            if fileManager.fileExists(atPath: destinationURL.path) {
+                try fileManager.removeItem(at: destinationURL)
+            }
+
+            try fileManager.copyItem(at: sourceURL, to: stagingURL)
+            try fileManager.moveItem(at: stagingURL, to: destinationURL)
+            logInfo("Imported local model into app storage: \(destinationURL.path)", category: .storage)
+            return destinationURL
+
+        } catch {
+            if fileManager.fileExists(atPath: stagingURL.path) {
+                try? fileManager.removeItem(at: stagingURL)
+            }
+            logError("Import model directory failed: \(error)", category: .storage)
+            throw StorageError.fileWriteFailed(error)
+        }
     }
 
     /// Delete a downloaded model

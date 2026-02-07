@@ -6,6 +6,9 @@
 //
 
 import SwiftUI
+#if os(macOS)
+import AppKit
+#endif
 
 struct ContentView: View {
     @Environment(ChatViewModel.self) private var chatVM
@@ -50,6 +53,15 @@ struct ContentView: View {
                     .environment(chatVM)
             }
         }
+        .onChange(of: modelManager.lastImportedPackageModelId) { importedModelId in
+            guard importedModelId != nil else { return }
+            showingModelSheet = true
+            modelManager.lastImportedPackageModelId = nil
+        }
+        .toast(Binding(
+            get: { modelManager.incomingTransferStatusMessage },
+            set: { modelManager.incomingTransferStatusMessage = $0 }
+        ), type: .info, duration: 4)
         // Auto-show model list ONLY on true fresh start (never used before)
         .task {
             guard !hasCheckedInitialState else { return }
@@ -83,6 +95,11 @@ struct ContentView: View {
             ModelListView()
                 .environment(modelManager)
                 .environment(chatVM)
+                .frame(minWidth: 720, maxWidth: .infinity, minHeight: 560, maxHeight: .infinity)
+                .onResolveWindow { window in
+                    window.styleMask.insert(.resizable)
+                    window.minSize = NSSize(width: 720, height: 560)
+                }
         }
         // Auto-show model list ONLY on true fresh start (never used before)
         .task {
@@ -403,6 +420,29 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
+
+#if os(macOS)
+private struct WindowResolver: NSViewRepresentable {
+    let onResolve: (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        NSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            guard let window = nsView.window else { return }
+            onResolve(window)
+        }
+    }
+}
+
+private extension View {
+    func onResolveWindow(_ onResolve: @escaping (NSWindow) -> Void) -> some View {
+        background(WindowResolver(onResolve: onResolve).frame(width: 0, height: 0))
+    }
+}
+#endif
 
 // MARK: - Conversation Row
 

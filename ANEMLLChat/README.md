@@ -88,6 +88,61 @@ swift build
 2. Tap "+" to add a custom model
 3. Enter HuggingFace repo ID (e.g., `anemll/my-custom-model`)
 
+### Local Models (Mac → iOS, no Hugging Face)
+
+If your CoreML/ANE models live on your Mac, you can avoid Hugging Face entirely by either
+copying them directly to the iOS app sandbox or serving them over your local network.
+
+#### Option A: macOS local import (drag & drop) + AirDrop to iOS
+
+If you want a “local model” workflow similar to the macOS app:
+
+1. **macOS app**: allow dropping a compiled model folder into the app.
+   - The app should prompt to **Import** (copy into app storage) or **Link** (reference the
+     original folder for quick local testing).
+2. **macOS app**: add a **Share** action in the Models view to AirDrop the model folder
+   (or a zipped package) to iOS.
+3. **iOS app**: handle incoming AirDrop files by unzipping (if needed) and moving the
+   model into:
+   - `Documents/Models/<model-id>/`
+   - Update `Documents/models.json` so it appears in the list.
+
+This flow is useful even without network transfer and matches a “local first” workflow.
+
+#### Option B: Copy directly to iOS (USB / Files app)
+
+1. Convert + compile your model for iOS.
+2. Copy the entire model folder into the app's Documents directory:
+   - iOS path: `Documents/Models/<model-id>/`
+3. Ensure the folder contains `meta.yaml`, tokenizer files, and compiled `.mlmodelc` directories.
+4. Add the model to the registry:
+   - iOS path: `Documents/models.json`
+
+This mirrors the existing on-device model discovery and avoids any network transfer.
+
+#### Option C: Serve from macOS and pull over Wi-Fi (VHTTP-style, requires app support)
+
+1. Put the compiled model directory in a single folder on your Mac.
+2. Start a simple HTTP server in that folder (example):
+
+   ```bash
+   cd /path/to/Models
+   python3 -m http.server 8080
+   ```
+
+3. Note your Mac’s IP address (e.g., `192.168.1.50`).
+4. **Important:** the current iOS “Add Model” flow only accepts a Hugging Face repo ID.
+   To use a LAN-served model, you’ll need to extend the app to accept a base URL.
+   Suggested code touchpoints:
+   - `AddModelView`: allow URL input alongside HF repo IDs.
+   - `ModelManagerViewModel.addCustomModel`: store a `baseURL` or `sourceType`.
+   - `DownloadService`: resolve file URLs from either Hugging Face or your local server.
+5. Once that support exists, the iOS app can download directly from:
+   - Example: `http://192.168.1.50:8080/<model-id>/`
+
+If you want zero code changes today, use **Option A** (copy directly into
+`Documents/Models/<model-id>/` and update `Documents/models.json`).
+
 ## Performance Metrics
 
 The app displays real-time metrics during generation:

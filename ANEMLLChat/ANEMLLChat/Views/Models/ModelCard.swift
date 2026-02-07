@@ -22,6 +22,10 @@ struct ModelCard: View {
         modelManager.loadedModelId == model.id
     }
 
+    private var isJustAdded: Bool {
+        modelManager.justAddedModelId == model.id
+    }
+
     /// Check if model has oversized weights that WILL cause issues on THIS device
     private var hasWeightWarning: Bool {
         guard model.isDownloaded else { return false }
@@ -32,6 +36,15 @@ struct ModelCard: View {
     private var hasLargeWeights: Bool {
         guard model.isDownloaded else { return false }
         return modelManager.hasOversizedWeights(for: model)
+    }
+
+    private var deleteMessage: String {
+        switch model.sourceKind {
+        case .localLinked:
+            return "Are you sure you want to remove \(model.name)? This only removes the app reference. The original linked folder is not deleted."
+        case .localImported, .huggingFace:
+            return "Are you sure you want to delete \(model.name)? This will remove local model files from app storage."
+        }
     }
 
     var body: some View {
@@ -72,8 +85,18 @@ struct ModelCard: View {
                             .foregroundStyle(.orange)
                             .help("Model has weight files >1GB - won't load on iPhone or non-M-series iPad")
                     }
+
+                    if isJustAdded {
+                        Label("Just Added", systemImage: "sparkles")
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.blue)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.blue.opacity(0.15), in: Capsule())
+                    }
                 }
-                .frame(height: 20)
+                .frame(minHeight: 20, alignment: .leading)
 
                 // Row 2: Description + Action buttons (buttons moved down)
                 HStack(spacing: 6) {
@@ -133,6 +156,15 @@ struct ModelCard: View {
 
                 #if os(macOS)
                 Button {
+                    Task {
+                        await modelManager.shareModelToIOS(model)
+                    }
+                } label: {
+                    Label("Share to iOS", systemImage: "square.and.arrow.up")
+                }
+                .tint(.blue)
+
+                Button {
                     showInFinder()
                 } label: {
                     Label("Finder", systemImage: "folder")
@@ -149,7 +181,7 @@ struct ModelCard: View {
                 }
             }
         } message: {
-            Text("Are you sure you want to delete \(model.name)? This will remove all downloaded files.")
+            Text(deleteMessage)
         }
         .sheet(isPresented: $showingModelDetail) {
             ModelDetailView(model: model)
@@ -176,7 +208,7 @@ struct ModelCard: View {
                     .foregroundStyle(hasWeightWarning ? .red : .orange)
                     .background(
                         Circle()
-                            .fill(Color(.systemBackground))
+                            .fill(backgroundCircleColor)
                             .frame(width: 18, height: 18)
                     )
                     .offset(x: 14, y: 14)
@@ -202,22 +234,36 @@ struct ModelCard: View {
         }
     }
 
+    private var backgroundCircleColor: Color {
+        #if os(macOS)
+        return Color(NSColor.windowBackgroundColor)
+        #else
+        return Color(uiColor: .systemBackground)
+        #endif
+    }
+
     // MARK: - Action Button
 
     @ViewBuilder
     private var actionButton: some View {
         switch model.status {
         case .available:
-            Button {
-                Task {
-                    await modelManager.downloadModel(model)
+            if model.sourceKind == .huggingFace {
+                Button {
+                    Task {
+                        await modelManager.downloadModel(model)
+                    }
+                } label: {
+                    Image(systemName: "arrow.down.circle")
+                        .font(.title2)
                 }
-            } label: {
-                Image(systemName: "arrow.down.circle")
-                    .font(.title2)
+                .buttonStyle(.plain)
+                .foregroundStyle(.orange)
+            } else {
+                Label("Missing", systemImage: "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.orange)
 
         case .downloading:
             ProgressView()
@@ -240,6 +286,20 @@ struct ModelCard: View {
                     .tint(.red)
                     .controlSize(.small)
 
+                    #if os(macOS)
+                    Button {
+                        Task {
+                            await modelManager.shareModelToIOS(model)
+                        }
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.blue)
+                    .controlSize(.small)
+                    #endif
+
                     // Load button
                     Button {
                         Task {
@@ -259,17 +319,23 @@ struct ModelCard: View {
             }
 
         case .error(let message):
-            Button {
-                Task {
-                    await modelManager.downloadModel(model)
+            if model.sourceKind == .huggingFace {
+                Button {
+                    Task {
+                        await modelManager.downloadModel(model)
+                    }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.title2)
                 }
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.title2)
+                .buttonStyle(.plain)
+                .foregroundStyle(.orange)
+                .help(message)
+            } else {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                    .help(message)
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.orange)
-            .help(message)
         }
     }
 
@@ -291,6 +357,16 @@ struct ModelCard: View {
 
             #if os(macOS)
             Button {
+                Task {
+                    await modelManager.shareModelToIOS(model)
+                }
+            } label: {
+                Label("Share to iOS", systemImage: "square.and.arrow.up")
+            }
+
+            Divider()
+
+            Button {
                 showInFinder()
             } label: {
                 Label("Show in Finder", systemImage: "folder")
@@ -305,12 +381,14 @@ struct ModelCard: View {
                 Label("Delete", systemImage: "trash")
             }
         } else {
-            Button {
-                Task {
-                    await modelManager.downloadModel(model)
+            if model.sourceKind == .huggingFace {
+                Button {
+                    Task {
+                        await modelManager.downloadModel(model)
+                    }
+                } label: {
+                    Label("Download", systemImage: "arrow.down.circle")
                 }
-            } label: {
-                Label("Download", systemImage: "arrow.down.circle")
             }
         }
     }
@@ -336,8 +414,10 @@ struct ModelCard: View {
                 }
             }
         case .available:
-            Task {
-                await modelManager.downloadModel(model)
+            if model.sourceKind == .huggingFace {
+                Task {
+                    await modelManager.downloadModel(model)
+                }
             }
         default:
             break
