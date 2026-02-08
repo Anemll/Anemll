@@ -133,6 +133,16 @@ final class InferenceService: ObservableObject {
     var debugLevel: Int = 0  // Debug verbosity: 0=off, 1=basic, 2=verbose
     var repetitionDetectionEnabled: Bool = false  // Default: off (matches CLI behavior)
 
+    // Sampling settings
+    var doSample: Bool = false  // If false, use greedy (temperature=0)
+    var topP: Float = 0.95
+    var topK: Int = 0  // 0 = disabled
+    var useRecommendedSampling: Bool = true  // Use model's recommended sampling if available
+
+    // Model's recommended sampling (set after model load)
+    private(set) var modelRecommendedSampling: (doSample: Bool, temperature: Float, topP: Float, topK: Int)?
+    private(set) var isArgmaxModel: Bool = false  // If true, sampling is unavailable
+
     private init() {
         // Load settings from storage
         Task {
@@ -141,6 +151,10 @@ final class InferenceService: ObservableObject {
             systemPrompt = await StorageService.shared.defaultSystemPrompt
             debugLevel = await StorageService.shared.debugLevel
             repetitionDetectionEnabled = await StorageService.shared.repetitionDetectionEnabled
+            doSample = await StorageService.shared.doSample
+            topP = await StorageService.shared.topP
+            topK = await StorageService.shared.topK
+            useRecommendedSampling = await StorageService.shared.useRecommendedSampling
         }
     }
 
@@ -218,6 +232,9 @@ final class InferenceService: ObservableObject {
             currentModelId = modelPath.lastPathComponent
             isModelLoaded = true
             loadingProgress = ModelLoadingProgress(percentage: 1.0, stage: "Ready", detail: nil)
+
+            // Apply recommended sampling from model config
+            applySamplingConfig(from: config)
 
             logInfo("Model loaded successfully", category: .model)
             print("===== [MODEL LOADED] Successfully loaded: \(modelPath.lastPathComponent) =====")
@@ -526,6 +543,63 @@ final class InferenceService: ObservableObject {
         inferenceManager?.AbortGeneration(Code: 1)
         generationTask?.cancel()
         generationTask = nil
+    }
+
+    // MARK: - Sampling Configuration
+
+    /// Apply recommended sampling settings from model config
+    private func applySamplingConfig(from config: YAMLConfig) {
+        // Check for argmax model
+        isArgmaxModel = config.argmaxInModel
+        if isArgmaxModel {
+            logWarning("Model uses argmax output - sampling is unavailable, using greedy decoding", category: .model)
+            print("===== [SAMPLING] Argmax model detected - sampling unavailable, using greedy =====")
+            modelRecommendedSampling = nil
+            return
+        }
+
+        // Extract recommended sampling from config
+        if let rec = config.recommendedSampling {
+            modelRecommendedSampling = (
+                doSample: rec.doSample,
+                temperature: Float(rec.temperature),
+                topP: Float(rec.topP),
+                topK: rec.topK
+            )
+
+            print("===== [SAMPLING] Model recommends: doSample=\(rec.doSample), temp=\(rec.temperature), topP=\(rec.topP), topK=\(rec.topK) =====")
+            logInfo("Model recommended sampling: temp=\(rec.temperature), topP=\(rec.topP), topK=\(rec.topK)", category: .model)
+
+            // Apply if user enabled "use recommended sampling"
+            if useRecommendedSampling {
+                doSample = rec.doSample
+                temperature = Float(rec.temperature)
+                topP = Float(rec.topP)
+                topK = rec.topK
+                logInfo("Applied model-recommended sampling settings", category: .model)
+                print("===== [SAMPLING] Applied recommended settings =====")
+            }
+        } else {
+            modelRecommendedSampling = nil
+            logDebug("No recommended sampling in model config", category: .model)
+        }
+    }
+
+    /// Get effective sampling parameters (respects argmax, recommended, and user settings)
+    var effectiveSamplingDescription: String {
+        if isArgmaxModel {
+            return "Greedy (argmax model)"
+        }
+
+        if useRecommendedSampling, let rec = modelRecommendedSampling {
+            return "Model recommended: \(String(format: "%.2f", rec.temperature)) / \(String(format: "%.2f", rec.topP)) / \(rec.topK)"
+        }
+
+        if doSample && temperature > 0 {
+            return "Custom: \(String(format: "%.2f", temperature)) / \(String(format: "%.2f", topP)) / \(topK)"
+        }
+
+        return "Greedy"
     }
 
     // MARK: - Helpers

@@ -118,7 +118,7 @@ struct ChatView: View {
                         .ignoresSafeArea()
 
                     // Centered loading gauge
-                    ModelLoadingGauge(progress: progress)
+                    ModelLoadingGauge(progress: progress, modelName: modelManager.loadingModelName)
                         .fixedSize()  // Prevent gauge from expanding to fill space
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -984,6 +984,7 @@ private struct FlameDots: View {
 
 struct ModelLoadingGauge: View {
     let progress: ModelLoadingProgress
+    var modelName: String? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var startTime: Date?
@@ -1166,6 +1167,14 @@ struct ModelLoadingGauge: View {
                                 .foregroundStyle(.tertiary)
                         }
                     }
+                }
+
+                // Model name display
+                if let name = modelName, !name.isEmpty {
+                    Text(name)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
                 }
             }
         }

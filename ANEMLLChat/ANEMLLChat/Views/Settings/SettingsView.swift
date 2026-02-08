@@ -31,6 +31,12 @@ struct SettingsView: View {
     @State private var systemPromptOption: SystemPromptOption = .defaultPrompt
     @State private var customPrompt: String = ""
 
+    // Sampling settings
+    @State private var doSample: Bool = false
+    @State private var topP: Float = 0.95
+    @State private var topK: Int = 0
+    @State private var useRecommendedSampling: Bool = true
+
     @State private var showingLogs = false
     @State private var autoLoadLastModel = true
     @State private var debugLevel: Int = 0
@@ -207,6 +213,9 @@ struct SettingsView: View {
 
     private var generationSection: some View {
         Section {
+            // Sampling toggle and recommended sampling
+            samplingControls
+
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Temperature")
@@ -217,10 +226,55 @@ struct SettingsView: View {
                 }
 
                 Slider(value: $temperature, in: 0...2, step: 0.05)
+                    .disabled(useRecommendedSampling && hasRecommendedSampling)
 
                 Text("Lower = more focused, Higher = more creative")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            // Top-P and Top-K controls (only when sampling is enabled)
+            if doSample || (useRecommendedSampling && hasRecommendedSampling) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Top-P")
+                        Spacer()
+                        Text(String(format: "%.2f", topP))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+
+                    Slider(value: $topP, in: 0...1, step: 0.05)
+                        .disabled(useRecommendedSampling && hasRecommendedSampling)
+
+                    Text("Nucleus sampling threshold")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Top-K")
+                        Spacer()
+                        Text(topK == 0 ? "Off" : "\(topK)")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+
+                    Slider(
+                        value: Binding(
+                            get: { Double(topK) },
+                            set: { topK = Int($0) }
+                        ),
+                        in: 0...100,
+                        step: 5
+                    )
+                    .disabled(useRecommendedSampling && hasRecommendedSampling)
+
+                    Text("Top-K sampling (0 = disabled)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -251,6 +305,77 @@ struct SettingsView: View {
             Text("Generation")
         } footer: {
             Text(repetitionDetectionEnabled ? "Stops generation if repetitive patterns are detected" : "Generation continues until EOS or max tokens (CLI behavior)")
+        }
+    }
+
+    // MARK: - Sampling Controls
+
+    private var hasRecommendedSampling: Bool {
+        InferenceService.shared.modelRecommendedSampling != nil
+    }
+
+    private var isArgmaxModel: Bool {
+        InferenceService.shared.isArgmaxModel
+    }
+
+    @ViewBuilder
+    private var samplingControls: some View {
+        // Always show this toggle - it's a global preference
+        Toggle("Use Model Sampling (if available)", isOn: $useRecommendedSampling)
+            .onChange(of: useRecommendedSampling) { _, newValue in
+                if newValue, let rec = InferenceService.shared.modelRecommendedSampling {
+                    // Apply recommended values
+                    doSample = rec.doSample
+                    temperature = rec.temperature
+                    topP = rec.topP
+                    topK = rec.topK
+                }
+            }
+
+        // Show status based on current model
+        if isArgmaxModel {
+            // Argmax model - sampling unavailable
+            HStack {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                Text("Sampling unavailable (argmax model)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } else if useRecommendedSampling && hasRecommendedSampling {
+            // Model has recommendations and user wants to use them
+            if let rec = InferenceService.shared.modelRecommendedSampling {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Using: \(String(format: "%.2f", rec.temperature)) / \(String(format: "%.2f", rec.topP)) / \(rec.topK)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } else if useRecommendedSampling && !hasRecommendedSampling {
+            // User wants recommendations but model doesn't have any
+            HStack {
+                Image(systemName: "info.circle")
+                    .foregroundStyle(.secondary)
+                Text("Model has no sampling recommendations")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+
+        // Enable sampling toggle (only when not using recommended or model has no recommendations)
+        if !useRecommendedSampling || !hasRecommendedSampling {
+            Toggle("Enable Sampling", isOn: $doSample)
+                .onChange(of: doSample) { _, newValue in
+                    if !newValue {
+                        // Switching to greedy - set temperature to 0
+                        temperature = 0.0
+                    } else if temperature == 0 {
+                        // Switching to sampling - set reasonable default
+                        temperature = 0.7
+                    }
+                }
         }
     }
 
@@ -416,6 +541,12 @@ struct SettingsView: View {
             customPrompt = storedPrompt
         }
 
+        // Load sampling settings from InferenceService (which already loaded from storage)
+        doSample = InferenceService.shared.doSample
+        topP = InferenceService.shared.topP
+        topK = InferenceService.shared.topK
+        useRecommendedSampling = InferenceService.shared.useRecommendedSampling
+
         Task {
             autoLoadLastModel = await StorageService.shared.autoLoadLastModel
             debugLevel = await StorageService.shared.debugLevel
@@ -459,10 +590,19 @@ struct SettingsView: View {
             await StorageService.shared.saveLoadLastChat(loadLastChat)
             await StorageService.shared.saveLargeControls(largeControls)
             await StorageService.shared.saveShowMicrophone(showMicrophone)
+            // Save sampling settings
+            await StorageService.shared.saveDoSample(doSample)
+            await StorageService.shared.saveTopP(topP)
+            await StorageService.shared.saveTopK(topK)
+            await StorageService.shared.saveUseRecommendedSampling(useRecommendedSampling)
             // Update InferenceService settings
             await MainActor.run {
                 InferenceService.shared.debugLevel = debugLevel
                 InferenceService.shared.repetitionDetectionEnabled = repetitionDetectionEnabled
+                InferenceService.shared.doSample = doSample
+                InferenceService.shared.topP = topP
+                InferenceService.shared.topK = topK
+                InferenceService.shared.useRecommendedSampling = useRecommendedSampling
             }
         }
     }
@@ -481,6 +621,10 @@ struct SettingsView: View {
         loadLastChat = StorageService.defaultLoadLastChatValue
         largeControls = StorageService.defaultLargeControlsValue
         showMicrophone = StorageService.defaultShowMicrophoneValue
+        doSample = StorageService.defaultDoSampleValue
+        topP = StorageService.defaultTopPValue
+        topK = StorageService.defaultTopKValue
+        useRecommendedSampling = StorageService.defaultUseRecommendedSamplingValue
 
         // Save to storage
         Task {
@@ -494,6 +638,10 @@ struct SettingsView: View {
             await MainActor.run {
                 InferenceService.shared.debugLevel = debugLevel
                 InferenceService.shared.repetitionDetectionEnabled = repetitionDetectionEnabled
+                InferenceService.shared.doSample = doSample
+                InferenceService.shared.topP = topP
+                InferenceService.shared.topK = topK
+                InferenceService.shared.useRecommendedSampling = useRecommendedSampling
             }
         }
     }

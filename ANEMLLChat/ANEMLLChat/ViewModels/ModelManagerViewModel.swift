@@ -243,6 +243,12 @@ final class ModelManagerViewModel {
         return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
     }
 
+    /// Display name of model currently being loaded
+    var loadingModelName: String? {
+        guard let loadingId = loadingModelId else { return nil }
+        return availableModels.first { $0.id == loadingId }?.name
+    }
+
     // MARK: - Initialization
 
     init() {

@@ -17,6 +17,7 @@ struct ModelCard: View {
 
     @State private var showingDeleteAlert = false
     @State private var showingModelDetail = false
+    @State private var recommendedSampling: RecommendedSampling?
 
     private var isLoaded: Bool {
         modelManager.loadedModelId == model.id
@@ -132,6 +133,21 @@ struct ModelCard: View {
                             .background(Color.secondary.opacity(0.2), in: Capsule())
                     }
 
+                    // Recommended sampling indicator
+                    if let sampling = recommendedSampling {
+                        HStack(spacing: 2) {
+                            Image(systemName: "dice.fill")
+                                .font(.system(size: 8))
+                            Text(String(format: "%.1f", sampling.temperature))
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(.green)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.green.opacity(0.15), in: Capsule())
+                        .help("Recommended: temp=\(String(format: "%.2f", sampling.temperature)), top_p=\(String(format: "%.2f", sampling.topP)), top_k=\(sampling.topK)")
+                    }
+
                     Spacer(minLength: 0)
                 }
                 .frame(height: 18)
@@ -185,6 +201,17 @@ struct ModelCard: View {
         }
         .sheet(isPresented: $showingModelDetail) {
             ModelDetailView(model: model)
+        }
+        .task {
+            // Load recommended sampling for downloaded models
+            if model.isDownloaded, let localPath = model.localPath {
+                let metaPath = URL(fileURLWithPath: localPath)
+                    .appendingPathComponent("meta.yaml")
+                    .path
+                if let metadata = ModelMetadata.load(from: metaPath) {
+                    recommendedSampling = metadata.recommendedSampling
+                }
+            }
         }
     }
 
@@ -454,6 +481,14 @@ struct ModelCard: View {
 
 import Yams
 
+/// Recommended sampling parameters from meta.yaml
+struct RecommendedSampling: Sendable {
+    let doSample: Bool
+    let temperature: Double
+    let topP: Double
+    let topK: Int
+}
+
 /// Parsed model configuration from meta.yaml
 struct ModelMetadata: Sendable {
     let version: String
@@ -468,6 +503,7 @@ struct ModelMetadata: Sendable {
     let splitLMHead: Int
     let argmaxInModel: Bool
     let slidingWindow: Int?
+    let recommendedSampling: RecommendedSampling?
 
     static func load(from path: String) -> ModelMetadata? {
         guard FileManager.default.fileExists(atPath: path),
@@ -476,6 +512,21 @@ struct ModelMetadata: Sendable {
               let modelInfo = yaml["model_info"] as? [String: Any],
               let params = modelInfo["parameters"] as? [String: Any] else {
             return nil
+        }
+
+        // Parse recommended sampling if present
+        var recommendedSampling: RecommendedSampling? = nil
+        if let sampling = params["recommended_sampling"] as? [String: Any],
+           let temperature = toDouble(sampling["temperature"]),
+           let topP = toDouble(sampling["top_p"] ?? sampling["topP"]),
+           let topK = toInt(sampling["top_k"] ?? sampling["topK"]) {
+            let doSample = sampling["do_sample"] as? Bool ?? true
+            recommendedSampling = RecommendedSampling(
+                doSample: doSample,
+                temperature: temperature,
+                topP: topP,
+                topK: topK
+            )
         }
 
         return ModelMetadata(
@@ -490,8 +541,26 @@ struct ModelMetadata: Sendable {
             numChunks: params["num_chunks"] as? Int ?? 1,
             splitLMHead: params["split_lm_head"] as? Int ?? 8,
             argmaxInModel: params["argmax_in_model"] as? Bool ?? false,
-            slidingWindow: params["sliding_window"] as? Int
+            slidingWindow: params["sliding_window"] as? Int,
+            recommendedSampling: recommendedSampling
         )
+    }
+
+    private static func toDouble(_ value: Any?) -> Double? {
+        if let v = value as? Double { return v }
+        if let v = value as? Float { return Double(v) }
+        if let v = value as? Int { return Double(v) }
+        if let v = value as? NSNumber { return v.doubleValue }
+        if let v = value as? String { return Double(v) }
+        return nil
+    }
+
+    private static func toInt(_ value: Any?) -> Int? {
+        if let v = value as? Int { return v }
+        if let v = value as? NSNumber { return v.intValue }
+        if let v = value as? Double { return Int(v) }
+        if let v = value as? String { return Int(v) }
+        return nil
     }
 }
 
@@ -532,6 +601,10 @@ struct ModelDetailView: View {
                         configurationCard(meta: meta)
                         parametersCard(meta: meta)
                         quantizationCard(meta: meta)
+                        // Sampling Card (if model has recommendations)
+                        if let sampling = meta.recommendedSampling {
+                            samplingCard(sampling: sampling, isArgmax: meta.argmaxInModel)
+                        }
                     } else if model.isDownloaded && !isLoading {
                         noMetadataCard
                     } else if !model.isDownloaded {
@@ -777,6 +850,56 @@ struct ModelDetailView: View {
         case 7...8: return Color(red: 0.9, green: 0.4, blue: 0.1)
         default: return Color(red: 0.8, green: 0.3, blue: 0.1)
         }
+    }
+
+    // MARK: - Sampling Card
+
+    private func samplingCard(sampling: RecommendedSampling, isArgmax: Bool) -> some View {
+        DetailCard(title: "Recommended Sampling", icon: "dice.fill", iconColor: .green) {
+            if isArgmax {
+                // Argmax model - sampling not available
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("Sampling unavailable (argmax model)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                HStack(spacing: 12) {
+                    samplingBadge(label: "Temp", value: String(format: "%.2f", sampling.temperature))
+                    samplingBadge(label: "Top-P", value: String(format: "%.2f", sampling.topP))
+                    samplingBadge(label: "Top-K", value: sampling.topK == 0 ? "Off" : "\(sampling.topK)")
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+
+                HStack(spacing: 4) {
+                    Image(systemName: sampling.doSample ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .foregroundStyle(sampling.doSample ? .green : .secondary)
+                    Text(sampling.doSample ? "Sampling enabled" : "Greedy decoding")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func samplingBadge(label: String, value: String) -> some View {
+        VStack(spacing: 4) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Text(value)
+                .font(.system(.caption, design: .rounded))
+                .fontWeight(.bold)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Color.green, in: Capsule())
+        }
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - Weight Files Card

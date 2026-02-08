@@ -38,13 +38,18 @@ struct MarkdownView: View {
         case bulletList([String])
         case numberedList([String])
         case heading(String, level: Int)
+        case thinkBlock(String)  // <think>...</think> collapsible block
     }
 
     // MARK: - Parsing
 
     private func parseBlocks(from content: String) -> [MarkdownBlock] {
         var blocks: [MarkdownBlock] = []
-        let lines = content.components(separatedBy: "\n")
+
+        // First, extract <think>...</think> blocks
+        let processedContent = extractThinkBlocks(from: content, into: &blocks)
+
+        let lines = processedContent.components(separatedBy: "\n")
         var i = 0
 
         while i < lines.count {
@@ -151,6 +156,46 @@ struct MarkdownView: View {
         return blocks
     }
 
+    /// Extract <think>...</think> blocks and return content with placeholders replaced
+    private func extractThinkBlocks(from content: String, into blocks: inout [MarkdownBlock]) -> String {
+        var result = content
+
+        // First, handle complete <think>...</think> blocks
+        let completePattern = #"<think>([\s\S]*?)</think>"#
+        if let regex = try? NSRegularExpression(pattern: completePattern, options: []) {
+            let range = NSRange(content.startIndex..., in: content)
+            let matches = regex.matches(in: content, options: [], range: range)
+
+            // Process matches in reverse order to preserve indices
+            for match in matches.reversed() {
+                guard let thinkRange = Range(match.range(at: 1), in: content) else { continue }
+                let thinkContent = String(content[thinkRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+                // Add think block
+                blocks.insert(.thinkBlock(thinkContent), at: 0)
+
+                // Remove the <think>...</think> from result
+                if let fullRange = Range(match.range, in: result) {
+                    result.replaceSubrange(fullRange, with: "")
+                }
+            }
+        }
+
+        // Handle incomplete <think> without closing </think> (streaming response)
+        if let openRange = result.range(of: "<think>") {
+            // There's an unclosed <think> tag - extract content and show as in-progress thinking
+            let thinkContent = String(result[openRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !thinkContent.isEmpty {
+                blocks.append(.thinkBlock(thinkContent + " ..."))
+            } else {
+                blocks.append(.thinkBlock("..."))  // Just started thinking
+            }
+            result = String(result[..<openRange.lowerBound])
+        }
+
+        return result
+    }
+
     private func refreshCacheIfNeeded() {
         guard content != cachedContent else { return }
         cachedContent = content
@@ -233,6 +278,9 @@ struct MarkdownView: View {
             renderInlineMarkdown(text)
                 .font(headingFont(level: level))
                 .fontWeight(.bold)
+
+        case .thinkBlock(let thinkContent):
+            ThinkBlockView(content: thinkContent, allowSelection: allowSelection)
         }
     }
 
@@ -338,6 +386,187 @@ private struct InlineMarkdownText: View {
     }
 }
 
+// MARK: - Think Block View (Collapsible)
+
+/// Collapsible view for <think>...</think> content
+struct ThinkBlockView: View {
+    let content: String
+    let allowSelection: Bool
+
+    @State private var isExpanded: Bool = false
+    @State private var dotScale: [CGFloat] = [1.0, 1.0, 1.0]
+    @State private var thinkingStartTime: Date?
+    @State private var thinkingDuration: TimeInterval = 0
+
+    // Orange shade - similar to LLM accent but slightly different
+    private var thinkAccent: Color {
+        Color(red: 0.95, green: 0.55, blue: 0.2)  // Warm orange thinking color
+    }
+
+    /// Check if thinking is still in progress (content ends with "...")
+    private var isThinking: Bool {
+        content.hasSuffix("...")
+    }
+
+    /// Format duration for display
+    private var durationText: String {
+        let seconds = Int(thinkingDuration)
+        if seconds < 60 {
+            return "\(seconds)s"
+        } else {
+            let mins = seconds / 60
+            let secs = seconds % 60
+            return "\(mins):\(String(format: "%02d", secs))"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header - always visible, tappable
+            Button {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    // Think icon
+                    Image(systemName: "brain")
+                        .font(.caption)
+                        .foregroundStyle(thinkAccent)
+
+                    if isThinking {
+                        // Still thinking - show "Thinking" with animated dots
+                        Text("Thinking")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundStyle(thinkAccent)
+
+                        // Animated dots when collapsed and still thinking
+                        if !isExpanded {
+                            HStack(spacing: 3) {
+                                ForEach(0..<3, id: \.self) { index in
+                                    Circle()
+                                        .fill(thinkAccent)
+                                        .frame(width: 5, height: 5)
+                                        .scaleEffect(dotScale[index])
+                                }
+                            }
+                        }
+                    } else {
+                        // Done thinking - show "Thought for X"
+                        Text("Thought for \(durationText)")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundStyle(thinkAccent)
+                    }
+
+                    Spacer()
+
+                    // Expand/collapse chevron
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(thinkAccent.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+            }
+            .buttonStyle(.plain)
+
+            // Content - shown when expanded
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 4) {
+                    Divider()
+                        .background(thinkAccent.opacity(0.3))
+
+                    // Remove trailing "..." from display content if present
+                    let displayContent = content.hasSuffix(" ...")
+                        ? String(content.dropLast(4))
+                        : (content.hasSuffix("...") ? String(content.dropLast(3)) : content)
+
+                    Text(displayContent)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .selectable(allowSelection)
+                        .lineSpacing(3)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                }
+                .background(thinkAccent.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(thinkAccent.opacity(0.2), lineWidth: 1)
+        )
+        .onAppear {
+            // Start tracking thinking time
+            if isThinking {
+                thinkingStartTime = Date()
+                startDotAnimation()
+            } else {
+                // Already completed - estimate duration based on content length
+                // Rough estimate: ~20 tokens per second, ~4 chars per token
+                let estimatedTokens = content.count / 4
+                thinkingDuration = max(1, Double(estimatedTokens) / 20.0)
+            }
+        }
+        .onChange(of: content) { _, newContent in
+            // When content changes and thinking completes, record duration
+            if !newContent.hasSuffix("...") && thinkingStartTime != nil {
+                thinkingDuration = Date().timeIntervalSince(thinkingStartTime!)
+            }
+        }
+        .onChange(of: isExpanded) { _, expanded in
+            if !expanded && isThinking {
+                startDotAnimation()
+            }
+        }
+        .onChange(of: isThinking) { wasThinking, nowThinking in
+            // Thinking just finished
+            if wasThinking && !nowThinking {
+                if let start = thinkingStartTime {
+                    thinkingDuration = Date().timeIntervalSince(start)
+                }
+            }
+        }
+    }
+
+    /// Animate dots with staggered bounce effect (similar to typing indicator)
+    private func startDotAnimation() {
+        // Staggered animation for each dot
+        for i in 0..<3 {
+            let delay = Double(i) * 0.15
+            withAnimation(
+                .easeInOut(duration: 0.4)
+                .repeatForever(autoreverses: true)
+                .delay(delay)
+            ) {
+                dotScale[i] = 1.4
+            }
+        }
+    }
+}
+
+#Preview("Think Block") {
+    VStack(spacing: 20) {
+        // In-progress thinking (ends with "...")
+        ThinkBlockView(
+            content: "Let me think about this step by step ...",
+            allowSelection: true
+        )
+
+        // Completed thinking (no "...")
+        ThinkBlockView(
+            content: "I analyzed the problem and determined the solution involves three steps:\n1. First step\n2. Second step\n3. Third step",
+            allowSelection: true
+        )
+    }
+    .padding()
+}
+
 #Preview {
     ScrollView {
         VStack(alignment: .leading, spacing: 20) {
@@ -346,6 +575,11 @@ private struct InlineMarkdownText: View {
             ## Heading 2
 
             This is a paragraph with **bold** and *italic* text.
+
+            <think>
+            Let me think about this...
+            I need to consider multiple factors.
+            </think>
 
             - First item
             - Second item

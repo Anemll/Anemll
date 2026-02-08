@@ -633,6 +633,12 @@ actor StorageService {
     static let defaultLargeControlsValue: Bool = false  // Large controls for accessibility
     static let defaultShowMicrophoneValue: Bool = true  // Show microphone button by default
 
+    // Sampling defaults
+    static let defaultDoSampleValue: Bool = false  // Default: greedy (temperature=0)
+    static let defaultTopPValue: Float = 0.95
+    static let defaultTopKValue: Int = 0  // 0 = disabled
+    static let defaultUseRecommendedSamplingValue: Bool = true  // Use model's recommended sampling if available
+
     /// Current settings (with defaults)
     var defaultTemperature: Float {
         UserDefaults.standard.object(forKey: "temperature") as? Float ?? Self.defaultTemperatureValue
@@ -714,6 +720,40 @@ actor StorageService {
         UserDefaults.standard.set(value, forKey: "showMicrophone")
     }
 
+    // MARK: - Sampling Settings
+
+    var doSample: Bool {
+        UserDefaults.standard.object(forKey: "doSample") as? Bool ?? Self.defaultDoSampleValue
+    }
+
+    func saveDoSample(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "doSample")
+    }
+
+    var topP: Float {
+        UserDefaults.standard.object(forKey: "topP") as? Float ?? Self.defaultTopPValue
+    }
+
+    func saveTopP(_ value: Float) {
+        UserDefaults.standard.set(value, forKey: "topP")
+    }
+
+    var topK: Int {
+        UserDefaults.standard.object(forKey: "topK") as? Int ?? Self.defaultTopKValue
+    }
+
+    func saveTopK(_ value: Int) {
+        UserDefaults.standard.set(value, forKey: "topK")
+    }
+
+    var useRecommendedSampling: Bool {
+        UserDefaults.standard.object(forKey: "useRecommendedSampling") as? Bool ?? Self.defaultUseRecommendedSamplingValue
+    }
+
+    func saveUseRecommendedSampling(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "useRecommendedSampling")
+    }
+
     func clearLastModel() {
         UserDefaults.standard.removeObject(forKey: "selectedModelId")
     }
@@ -747,6 +787,10 @@ actor StorageService {
         UserDefaults.standard.set(Self.defaultLoadLastChatValue, forKey: "loadLastChat")
         UserDefaults.standard.set(Self.defaultLargeControlsValue, forKey: "largeControls")
         UserDefaults.standard.set(Self.defaultShowMicrophoneValue, forKey: "showMicrophone")
+        UserDefaults.standard.set(Self.defaultDoSampleValue, forKey: "doSample")
+        UserDefaults.standard.set(Self.defaultTopPValue, forKey: "topP")
+        UserDefaults.standard.set(Self.defaultTopKValue, forKey: "topK")
+        UserDefaults.standard.set(Self.defaultUseRecommendedSamplingValue, forKey: "useRecommendedSampling")
         logInfo("Settings reset to defaults", category: .storage)
     }
 }
