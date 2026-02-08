@@ -51,6 +51,7 @@ class QwenConverter(BaseConverter):
         lut_bits: int | None = 4,
         per_channel: int = 8,
         num_chunks: int = 1,
+        argmax_in_model: bool = False,
     ) -> None:
         super().__init__(model)
         self.context_length = context_length
@@ -62,6 +63,7 @@ class QwenConverter(BaseConverter):
         )
         self.converted_model = None
         self.num_chunks = num_chunks
+        self.argmax_in_model = argmax_in_model
 
     @staticmethod
     def GetTransformerStates(model, part=None, prefix="model.model."):
@@ -184,10 +186,19 @@ class QwenConverter(BaseConverter):
             mlmodel = self.convert_to_coreml(self.model)
         elif part == "monolithic":
             print("Converting monolithic model (embeddings + FFN + LM head)...")
-            mlmodel = self.convert_monolithic(self.model, is_prefill=False)
+            mlmodel = self.convert_monolithic(
+                self.model,
+                is_prefill=False,
+                argmax_in_model=self.argmax_in_model,
+            )
         elif part == "monolithic_prefill":
             print("Converting monolithic prefill model...")
-            mlmodel = self.convert_monolithic(self.model, is_prefill=True)
+            # Prefill is cache-building only; keep logits path for compatibility.
+            mlmodel = self.convert_monolithic(
+                self.model,
+                is_prefill=True,
+                argmax_in_model=False,
+            )
         elif part in ("embeddings", "1"):
             print("Converting embeddings...")
             mlmodel = self.convert_part_1(self.model)
@@ -211,7 +222,10 @@ class QwenConverter(BaseConverter):
                 mlmodel = self.convert_part_2(self.model)
         elif part == "3":
             print("Converting LM head...")
-            mlmodel = self.convert_part_3(self.model)
+            mlmodel = self.convert_part_3(
+                self.model,
+                argmax_in_model=self.argmax_in_model,
+            )
         else:
             raise ValueError(f"Unsupported part: {part}")
 
@@ -352,13 +366,18 @@ class QwenConverter(BaseConverter):
         require_coreml()
         return self.convert_embeddings(model)
 
-    def convert_part_3(self, model: QwenForCausalLM) -> ct.models.MLModel:
+    def convert_part_3(
+        self, model: QwenForCausalLM, argmax_in_model: bool = False
+    ) -> ct.models.MLModel:
         """Convert LM head only."""
         require_coreml()
 
         class LMHeadWrapper(torch.nn.Module):
-            def __init__(self, model: QwenForCausalLM) -> None:
+            def __init__(
+                self, model: QwenForCausalLM, argmax_mode: bool = False
+            ) -> None:
                 super().__init__()
+                self.argmax_mode = argmax_mode
                 if hasattr(model, "lm_head16_1"):
                     self.heads = [
                         getattr(model, f"lm_head16_{i}") for i in range(1, 17)
@@ -381,25 +400,38 @@ class QwenConverter(BaseConverter):
                 if self.mode != "linear":
                     hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
 
-                if self.mode == "16":
-                    return tuple(
+                if self.mode in ("16", "8", "2"):
+                    logits_list = [
                         h(hidden_states).squeeze(2).transpose(1, 2) for h in self.heads
-                    )
-                if self.mode == "8":
-                    return tuple(
-                        h(hidden_states).squeeze(2).transpose(1, 2) for h in self.heads
-                    )
-                if self.mode == "2":
-                    logits1 = self.heads[0](hidden_states).squeeze(2).transpose(1, 2)
-                    logits2 = self.heads[1](hidden_states).squeeze(2).transpose(1, 2)
-                    return logits1, logits2
-                if self.mode == "1":
-                    return self.head(hidden_states).squeeze(2).transpose(1, 2)
-                return self.head(hidden_states)
+                    ]
+                elif self.mode == "1":
+                    logits_list = [self.head(hidden_states).squeeze(2).transpose(1, 2)]
+                else:
+                    logits_list = [self.head(hidden_states)]
 
-        wrapper = LMHeadWrapper(model)
+                if self.argmax_mode:
+                    all_idx = []
+                    all_val = []
+                    for logits in logits_list:
+                        chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)
+                        chunk_max_val = torch.gather(logits, -1, chunk_argmax)
+                        all_idx.append(chunk_argmax.to(torch.int32))
+                        all_val.append(chunk_max_val)
+                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)
+                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)
+                    return (argmax_idx, argmax_val)
+
+                if self.mode == "16":
+                    return tuple(logits_list)
+                if self.mode == "8":
+                    return tuple(logits_list)
+                if self.mode == "2":
+                    return logits_list[0], logits_list[1]
+                return logits_list[0]
+
+        wrapper = LMHeadWrapper(model, argmax_mode=argmax_in_model)
         wrapper.eval()
-        
+
         # Ensure no gradients
         for param in wrapper.parameters():
             param.requires_grad = False
@@ -412,7 +444,12 @@ class QwenConverter(BaseConverter):
         with torch.no_grad():
             traced = torch.jit.trace(wrapper, sample_input)
 
-        if getattr(wrapper, "mode") == "16":
+        if argmax_in_model:
+            outputs = [
+                ct.TensorType(name="argmax_idx", dtype=np.int32),
+                ct.TensorType(name="argmax_val", dtype=np.float16),
+            ]
+        elif getattr(wrapper, "mode") == "16":
             outputs = [
                 ct.TensorType(name=f"logits{i}", dtype=np.float16) for i in range(1, 17)
             ]
@@ -464,9 +501,11 @@ class QwenConverter(BaseConverter):
             end_layer = None
 
         class FFNWrapper(torch.nn.Module):
-            def __init__(self, model: QwenForCausalLM) -> None:
+            def __init__(self, model: QwenForCausalLM, start_layer: int, end_layer: int) -> None:
                 super().__init__()
                 self.model = model  # Use QwenForCausalLM as root
+                self.start_layer = start_layer
+                self.end_layer = end_layer
                 self.states = QwenConverter.GetTransformerStates(
                     model, part="2", prefix="model.model."
                 )
@@ -479,14 +518,17 @@ class QwenConverter(BaseConverter):
                     causal_mask,
                     current_pos,
                     rotary,
-                    start_layer=start_layer,
-                    end_layer=end_layer,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
                     IN_PREFILL=False,
                 )
-                out = self.model.model.norm(out)
+                # Apply final norm only once on the last chunk.
+                # Applying it on every chunk causes severe divergence for chunked exports.
+                if self.end_layer is None or self.end_layer == len(self.model.model.layers):
+                    out = self.model.model.norm(out)
                 return out
 
-        wrapper = FFNWrapper(model)
+        wrapper = FFNWrapper(model, start_layer, end_layer)
         wrapper.eval()
 
         hidden_states = torch.zeros(
@@ -835,7 +877,10 @@ class QwenConverter(BaseConverter):
         return mlmodel
 
     def convert_monolithic(
-        self, model: QwenForCausalLM, is_prefill: bool = False
+        self,
+        model: QwenForCausalLM,
+        is_prefill: bool = False,
+        argmax_in_model: bool = False,
     ) -> ct.models.MLModel:
         """Convert full model (embeddings + FFN + LM head) to single CoreML model.
 
@@ -858,12 +903,17 @@ class QwenConverter(BaseConverter):
             """Wrapper combining embeddings + transformer + LM head."""
 
             def __init__(
-                self, model: QwenForCausalLM, context_length: int, is_prefill: bool
+                self,
+                model: QwenForCausalLM,
+                context_length: int,
+                is_prefill: bool,
+                argmax_in_model: bool = False,
             ) -> None:
                 super().__init__()
                 self.model = model
                 self.context_length = context_length
                 self.is_prefill = is_prefill
+                self.argmax_in_model = argmax_in_model
 
                 # Determine LM head mode
                 if hasattr(model, "lm_head16_1"):
@@ -921,33 +971,44 @@ class QwenConverter(BaseConverter):
                 if self.lm_head_mode != "linear":
                     hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
 
-                if self.lm_head_mode == "16":
-                    return tuple(
+                if self.lm_head_mode in ("16", "8", "2"):
+                    logits_list = [
                         h(hidden_states).squeeze(2).transpose(1, 2)
                         for h in self.lm_heads
-                    )
-                elif self.lm_head_mode == "8":
-                    return tuple(
-                        h(hidden_states).squeeze(2).transpose(1, 2)
-                        for h in self.lm_heads
-                    )
-                elif self.lm_head_mode == "2":
-                    logits1 = self.lm_heads[0](hidden_states).squeeze(2).transpose(1, 2)
-                    logits2 = self.lm_heads[1](hidden_states).squeeze(2).transpose(1, 2)
-                    return logits1, logits2
+                    ]
                 elif self.lm_head_mode == "1":
-                    return (self.lm_head(hidden_states).squeeze(2).transpose(1, 2),)
+                    logits_list = [self.lm_head(hidden_states).squeeze(2).transpose(1, 2)]
                 else:
-                    return (self.lm_head(hidden_states),)
+                    logits_list = [self.lm_head(hidden_states)]
 
-        wrapper = MonolithicWrapper(model, self.context_length, is_prefill)
+                if self.argmax_in_model and not self.is_prefill:
+                    all_idx = []
+                    all_val = []
+                    for logits in logits_list:
+                        chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)
+                        chunk_max_val = torch.gather(logits, -1, chunk_argmax)
+                        all_idx.append(chunk_argmax.to(torch.int32))
+                        all_val.append(chunk_max_val)
+                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)
+                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)
+                    return (argmax_idx, argmax_val)
+
+                return tuple(logits_list)
+
+        wrapper = MonolithicWrapper(
+            model,
+            self.context_length,
+            is_prefill,
+            argmax_in_model=argmax_in_model,
+        )
         wrapper.eval()
 
         # Ensure no gradients
         for param in wrapper.parameters():
             param.requires_grad = False
 
-        print(f"Monolithic wrapper created (LM head mode: {wrapper.lm_head_mode})")
+        argmax_str = ", argmax_in_model=True" if (argmax_in_model and not is_prefill) else ""
+        print(f"Monolithic wrapper created (LM head mode: {wrapper.lm_head_mode}{argmax_str})")
 
         # Prepare inputs based on mode
         if is_prefill:
@@ -1000,7 +1061,12 @@ class QwenConverter(BaseConverter):
         print("Tracing completed!")
 
         # Define outputs based on LM head mode
-        if wrapper.lm_head_mode == "16":
+        if argmax_in_model and not is_prefill:
+            outputs = [
+                ct.TensorType(name="argmax_idx", dtype=np.int32),
+                ct.TensorType(name="argmax_val", dtype=np.float16),
+            ]
+        elif wrapper.lm_head_mode == "16":
             outputs = [
                 ct.TensorType(name=f"logits{i}", dtype=np.float16)
                 for i in range(1, 17)
@@ -1070,10 +1136,19 @@ def parse_lut_arg(lut_value):
     if lut_value is None:
         return None, 8
 
-    if ',' in lut_value:
-        parts = lut_value.split(',')
+    if isinstance(lut_value, int):
+        return lut_value, 8  # Default per_channel value
+
+    lut_str = str(lut_value).strip().lower()
+
+    # Handle "none" as no LUT quantization
+    if lut_str in ('none', 'no', 'false', ''):
+        return None, 8
+
+    if ',' in lut_str:
+        parts = lut_str.split(',')
         if len(parts) != 2:
-            raise ValueError(f"Invalid LUT format: {lut_value}. Expected format: 'bits' or 'bits,per_channel'")
+            raise ValueError(f"Invalid LUT format: {lut_value}. Expected 'bits' or 'bits,per_channel'")
         try:
             lut_bits = int(parts[0])
             per_channel_str = parts[1].strip().lower()
@@ -1087,7 +1162,7 @@ def parse_lut_arg(lut_value):
             raise ValueError(f"Invalid LUT format: {lut_value}. Expected 'bits' or 'bits,per_channel'")
     else:
         try:
-            lut_bits = int(lut_value)
+            lut_bits = int(lut_str)
             return lut_bits, 8  # Default per_channel value
         except ValueError:
             raise ValueError(f"Invalid LUT bits value: {lut_value}")
@@ -1156,6 +1231,11 @@ def parse_args() -> argparse.Namespace:
         default=".",
         help="Output directory for converted models",
     )
+    parser.add_argument(
+        "--argmax",
+        action="store_true",
+        help="Compute argmax inside LM head for part 3 / monolithic inference.",
+    )
 
     return parser.parse_args()
 
@@ -1171,6 +1251,7 @@ def test_conversion(
     part: str = "full",
     num_chunks: int = 1,
     per_channel: int = 8,
+    argmax_in_model: bool = False,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
     """Convert a Qwen model and save the result.
 
@@ -1184,6 +1265,7 @@ def test_conversion(
         output_dir: Output directory
         part: Part to convert ("full" or "prefill")
         per_channel: Group size for per_grouped_channel quantization
+        argmax_in_model: If True, emit argmax_idx/argmax_val for LM head inference models
     """
     print(
         f"test_conversion called with model_path={model_path}, prefix={prefix}, part={part}"
@@ -1233,6 +1315,7 @@ def test_conversion(
         lut_bits=lut_bits,
         num_chunks=num_chunks,
         per_channel=per_channel,
+        argmax_in_model=argmax_in_model,
     )
 
     print("Starting conversion...")
@@ -1259,6 +1342,7 @@ def test_conversion(
                 "split_part": (
                     ModelPart.FULL.value if part in ["full", "all", "123"] else part
                 ),
+                "argmax_in_model": argmax_in_model if part in ["3", "monolithic"] else None,
             },
         )
         fname = f"{prefix}"
@@ -1309,6 +1393,8 @@ def main() -> None:
         print(f"LUT quantization: {lut_bits} bits, per_channel group size: {per_channel}")
     if args.chunk:
         print(f"Splitting into {args.chunk} chunks")
+    if args.argmax:
+        print("Argmax in model: enabled")
     print(f"Converting part(s): {args.part}")
 
     # Map legacy part names to numeric equivalents
@@ -1327,6 +1413,7 @@ def main() -> None:
             part=part,
             num_chunks=args.chunk or 1,
             per_channel=per_channel,
+            argmax_in_model=args.argmax,
         )
         print(f"Conversion completed successfully! Result: {type(result)}")
     except Exception as e:  # pragma: no cover - CLI tool

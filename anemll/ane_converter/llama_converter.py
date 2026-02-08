@@ -38,7 +38,17 @@ import sys
 class LlamaConverter(BaseConverter):
     """Handles LLAMA model conversion to Apple Neural Engine format."""
 
-    def __init__(self, model, context_length=512, state_length=None, lut_bits=4, per_channel=8, batch_size=64, num_chunks=1):
+    def __init__(
+        self,
+        model,
+        context_length=512,
+        state_length=None,
+        lut_bits=4,
+        per_channel=8,
+        batch_size=64,
+        num_chunks=1,
+        argmax_in_model=False,
+    ):
         super().__init__(model)
         self.context_length = context_length
         self.state_length = state_length or context_length
@@ -48,6 +58,7 @@ class LlamaConverter(BaseConverter):
         self.converted_model = None
         self.batch_size = batch_size
         self.num_chunks = num_chunks
+        self.argmax_in_model = argmax_in_model
 
     def convert(self, split_part=None):
         """Convert model to CoreML format with optional splitting.
@@ -78,17 +89,34 @@ class LlamaConverter(BaseConverter):
         elif split_part == '2_prefill':
             return self.convert_prefill(self.model)
         elif split_part == '3':
-            return self.convert_lm_head(self.model, lut_bits=self.lut_bits)
+            return self.convert_lm_head(
+                self.model,
+                lut_bits=self.lut_bits,
+                argmax_in_model=self.argmax_in_model,
+            )
         elif split_part == 'monolithic':
-            return self.convert_monolithic(self.model, is_prefill=False)
+            return self.convert_monolithic(
+                self.model,
+                is_prefill=False,
+                argmax_in_model=self.argmax_in_model,
+            )
         elif split_part == 'monolithic_prefill':
-            return self.convert_monolithic(self.model, is_prefill=True)
+            # Prefill is cache-building only; keep logits path for compatibility.
+            return self.convert_monolithic(
+                self.model,
+                is_prefill=True,
+                argmax_in_model=False,
+            )
 
         # Handle full model conversion
         elif split_part == '123':
             embeddings_model = self.convert_embeddings(self.model)
             transformer_model = self.convert_FFN(self.model)
-            lm_head_model = self.convert_lm_head(self.model, lut_bits=self.lut_bits)
+            lm_head_model = self.convert_lm_head(
+                self.model,
+                lut_bits=self.lut_bits,
+                argmax_in_model=self.argmax_in_model,
+            )
             return [embeddings_model, transformer_model, lm_head_model]
 
         self.postprocess(num_workers=None)
@@ -524,13 +552,16 @@ class LlamaConverter(BaseConverter):
         
         return mlmodel
 
-    def convert_lm_head(self, model, lut_bits=None, output_dir="."):
+    def convert_lm_head(
+        self, model, lut_bits=None, output_dir=".", argmax_in_model: bool = False
+    ):
         """Convert LM head layer to CoreML."""
         print("\nConverting LM head layer...")
         
         class LMHeadWrapper(torch.nn.Module):
-            def __init__(self, model):
+            def __init__(self, model, argmax_mode: bool = False):
                 super().__init__()
+                self.argmax_mode = argmax_mode
                 if hasattr(model, 'lm_head8_1'):  # 8-way split
                     self.heads = [
                         getattr(model, f'lm_head8_{i}')
@@ -553,20 +584,37 @@ class LlamaConverter(BaseConverter):
                     hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
                 
                 if self.split_mode == '8way':
-                    logits = [head(hidden_states).squeeze(2).transpose(1, 2) 
-                             for head in self.heads]
-                    return tuple(logits)
+                    logits = [head(hidden_states).squeeze(2).transpose(1, 2) for head in self.heads]
                 elif self.split_mode == '2way':
-                    logits1 = self.heads[0](hidden_states).squeeze(2).transpose(1, 2)
-                    logits2 = self.heads[1](hidden_states).squeeze(2).transpose(1, 2)
-                    return logits1, logits2
+                    logits = [
+                        self.heads[0](hidden_states).squeeze(2).transpose(1, 2),
+                        self.heads[1](hidden_states).squeeze(2).transpose(1, 2),
+                    ]
                 elif self.split_mode == 'single':
-                    return self.head(hidden_states).squeeze(2).transpose(1, 2)
+                    logits = [self.head(hidden_states).squeeze(2).transpose(1, 2)]
                 else:  # linear
-                    return self.head(hidden_states)
+                    logits = [self.head(hidden_states)]
+
+                if self.argmax_mode:
+                    all_idx = []
+                    all_val = []
+                    for chunk_logits in logits:
+                        chunk_argmax = torch.argmax(chunk_logits, dim=-1, keepdim=True)
+                        chunk_max_val = torch.gather(chunk_logits, -1, chunk_argmax)
+                        all_idx.append(chunk_argmax.to(torch.int32))
+                        all_val.append(chunk_max_val)
+                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)
+                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)
+                    return (argmax_idx, argmax_val)
+
+                if self.split_mode == '8way':
+                    return tuple(logits)
+                if self.split_mode == '2way':
+                    return logits[0], logits[1]
+                return logits[0]
         
         # Create wrapper and ensure eval mode
-        wrapper = LMHeadWrapper(model)
+        wrapper = LMHeadWrapper(model, argmax_mode=argmax_in_model)
         wrapper.eval()
         
         # Create sample input
@@ -578,7 +626,12 @@ class LlamaConverter(BaseConverter):
         traced_model = torch.jit.trace(wrapper, sample_input)
         
         # Define outputs based on head type
-        if wrapper.split_mode == '8way':
+        if argmax_in_model:
+            outputs = [
+                ct.TensorType(name="argmax_idx", dtype=np.int32),
+                ct.TensorType(name="argmax_val", dtype=np.float16),
+            ]
+        elif wrapper.split_mode == '8way':
             outputs = [
                 ct.TensorType(name=f"logits{i}", dtype=np.float16)
                 for i in range(1, 9)
@@ -849,7 +902,9 @@ class LlamaConverter(BaseConverter):
             print(f"Error during prefill conversion: {str(e)}")
             raise
 
-    def convert_monolithic(self, model, is_prefill: bool = False):
+    def convert_monolithic(
+        self, model, is_prefill: bool = False, argmax_in_model: bool = False
+    ):
         """Convert full model (embeddings + FFN + LM head) to single CoreML model.
 
         This creates a monolithic model that takes input_ids and returns logits,
@@ -869,11 +924,18 @@ class LlamaConverter(BaseConverter):
         class MonolithicWrapper(torch.nn.Module):
             """Wrapper combining embeddings + transformer + LM head."""
 
-            def __init__(self, model, context_length: int, is_prefill: bool) -> None:
+            def __init__(
+                self,
+                model,
+                context_length: int,
+                is_prefill: bool,
+                argmax_in_model: bool = False,
+            ) -> None:
                 super().__init__()
                 self.model = model
                 self.context_length = context_length
                 self.is_prefill = is_prefill
+                self.argmax_in_model = argmax_in_model
 
                 # Determine LM head mode
                 if hasattr(model, "lm_head8_1"):
@@ -917,28 +979,44 @@ class LlamaConverter(BaseConverter):
                 if self.lm_head_mode != "linear":
                     hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
 
-                if self.lm_head_mode == "8":
-                    return tuple(
+                if self.lm_head_mode in ("8", "2"):
+                    logits_list = [
                         h(hidden_states).squeeze(2).transpose(1, 2)
                         for h in self.lm_heads
-                    )
-                elif self.lm_head_mode == "2":
-                    logits1 = self.lm_heads[0](hidden_states).squeeze(2).transpose(1, 2)
-                    logits2 = self.lm_heads[1](hidden_states).squeeze(2).transpose(1, 2)
-                    return logits1, logits2
+                    ]
                 elif self.lm_head_mode == "1":
-                    return (self.lm_head(hidden_states).squeeze(2).transpose(1, 2),)
+                    logits_list = [self.lm_head(hidden_states).squeeze(2).transpose(1, 2)]
                 else:
-                    return (self.lm_head(hidden_states),)
+                    logits_list = [self.lm_head(hidden_states)]
 
-        wrapper = MonolithicWrapper(model, self.context_length, is_prefill)
+                if self.argmax_in_model and not self.is_prefill:
+                    all_idx = []
+                    all_val = []
+                    for logits in logits_list:
+                        chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)
+                        chunk_max_val = torch.gather(logits, -1, chunk_argmax)
+                        all_idx.append(chunk_argmax.to(torch.int32))
+                        all_val.append(chunk_max_val)
+                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)
+                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)
+                    return (argmax_idx, argmax_val)
+
+                return tuple(logits_list)
+
+        wrapper = MonolithicWrapper(
+            model,
+            self.context_length,
+            is_prefill,
+            argmax_in_model=argmax_in_model,
+        )
         wrapper.eval()
 
         # Ensure no gradients
         for param in wrapper.parameters():
             param.requires_grad = False
 
-        print(f"Monolithic wrapper created (LM head mode: {wrapper.lm_head_mode})")
+        argmax_str = ", argmax_in_model=True" if (argmax_in_model and not is_prefill) else ""
+        print(f"Monolithic wrapper created (LM head mode: {wrapper.lm_head_mode}{argmax_str})")
 
         # Prepare inputs based on mode
         if is_prefill:
@@ -991,7 +1069,12 @@ class LlamaConverter(BaseConverter):
         print("Tracing completed!")
 
         # Define outputs based on LM head mode
-        if wrapper.lm_head_mode == "8":
+        if argmax_in_model and not is_prefill:
+            outputs = [
+                ct.TensorType(name="argmax_idx", dtype=np.int32),
+                ct.TensorType(name="argmax_val", dtype=np.float16),
+            ]
+        elif wrapper.lm_head_mode == "8":
             outputs = [
                 ct.TensorType(name=f"logits{i}", dtype=np.float16)
                 for i in range(1, 9)
@@ -1056,10 +1139,19 @@ def parse_lut_arg(lut_value):
     if lut_value is None:
         return None, 8
 
-    if ',' in lut_value:
-        parts = lut_value.split(',')
+    if isinstance(lut_value, int):
+        return lut_value, 8  # Default per_channel value
+
+    lut_str = str(lut_value).strip().lower()
+
+    # Handle "none" as no LUT quantization
+    if lut_str in ('none', 'no', 'false', ''):
+        return None, 8
+
+    if ',' in lut_str:
+        parts = lut_str.split(',')
         if len(parts) != 2:
-            raise ValueError(f"Invalid LUT format: {lut_value}. Expected format: 'bits' or 'bits,per_channel'")
+            raise ValueError(f"Invalid LUT format: {lut_value}. Expected 'bits' or 'bits,per_channel'")
         try:
             lut_bits = int(parts[0])
             per_channel_str = parts[1].strip().lower()
@@ -1073,7 +1165,7 @@ def parse_lut_arg(lut_value):
             raise ValueError(f"Invalid LUT format: {lut_value}. Expected 'bits' or 'bits,per_channel'")
     else:
         try:
-            lut_bits = int(lut_value)
+            lut_bits = int(lut_str)
             return lut_bits, 8  # Default per_channel value
         except ValueError:
             raise ValueError(f"Invalid LUT bits value: {lut_value}")
@@ -1100,12 +1192,18 @@ def parse_args():
                        help='Convert specific part (1=embeddings, 2=FFN, 2_prefill=FFN prefill mode, 3=lm_head, monolithic=single file with embed+FFN+lmhead)')
     parser.add_argument('--output', type=str, default='.',
                       help='Output directory for converted models (default: current directory)')
+    parser.add_argument(
+        '--argmax',
+        action='store_true',
+        help='Compute argmax inside LM head for part 3 / monolithic inference',
+    )
 
     return parser.parse_args()
 
 def test_conversion(model_path=None, output_path=None, context_length=512, lut_bits=4,
                    model=None, skip_load_weights=False, split_part='123',
-                   batch_size=64, num_chunks=1, prefix='llama', output_dir='.', per_channel=8):
+                   batch_size=64, num_chunks=1, prefix='llama', output_dir='.',
+                   per_channel=8, argmax_in_model: bool = False):
     """Test conversion of a LLAMA model to ANE format."""
     if model is None:
         print(f"Testing conversion with model from {model_path}")
@@ -1137,7 +1235,8 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
         lut_bits=lut_bits,
         batch_size=batch_size,
         num_chunks=num_chunks,
-        per_channel=per_channel
+        per_channel=per_channel,
+        argmax_in_model=argmax_in_model,
     )
     
     # Initialize converted_model as None
@@ -1176,7 +1275,8 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
                     'chunk_no': i+1,
                     'batch_size': batch_size if split_part in ['2_prefill'] else None,
                     'lut_bits': lut_bits,
-                    'split_part': split_part
+                    'split_part': split_part,
+                    'argmax_in_model': argmax_in_model if split_part in ['3', 'monolithic'] else None
                 })
                 print(f"Saving chunk to {chunk_output_path}")
                 chunk_output_path = os.path.join(output_dir, chunk_output_path)
@@ -1210,7 +1310,8 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
             'context_length': context_length,
             'batch_size': batch_size if split_part == 'monolithic_prefill' else None,
             'lut_bits': lut_bits,
-            'split_part': split_part
+            'split_part': split_part,
+            'argmax_in_model': argmax_in_model if split_part in ['monolithic'] else None
         })
         print(f"Saving monolithic model to {output_path}")
         output_path = os.path.join(output_dir, output_path)
@@ -1245,7 +1346,8 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
                         'chunk_no': i+1,
                         'batch_size': batch_size if split_part in ['2_prefill'] else None,
                         'lut_bits': lut_bits,
-                        'split_part': split_part
+                        'split_part': split_part,
+                        'argmax_in_model': argmax_in_model if split_part in ['3', 'monolithic'] else None
                     })
                     chunk_output_path = output_path.replace('.mlpackage', f'_{i+1}.mlpackage')
                     print(f"Saving chunk to {chunk_output_path}")
@@ -1257,7 +1359,8 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
                     'context_length': context_length,
                     'batch_size': batch_size if split_part in ['2_prefill'] else None,
                     'lut_bits': lut_bits,
-                    'split_part': split_part
+                    'split_part': split_part,
+                    'argmax_in_model': argmax_in_model if split_part in ['3', 'monolithic'] else None
                 })
                 print(f"Saving model to {output_path}")
                 output_path = os.path.join(output_dir, output_path)
@@ -1302,6 +1405,8 @@ def main():
         print(f"LUT quantization: {lut_bits} bits, per_channel group size: {per_channel}")
     if args.chunk:
         print(f"Splitting into {args.chunk} chunks")
+    if args.argmax:
+        print("Argmax in model: enabled")
     print(f"Converting part(s): {args.part}")
     
     # Initialize and convert model
@@ -1342,7 +1447,8 @@ def main():
             batch_size=args.batch_size,
             num_chunks=args.chunk,
             output_dir=args.output,
-            per_channel=per_channel
+            per_channel=per_channel,
+            argmax_in_model=args.argmax,
         )
             
     except Exception as e:

@@ -118,6 +118,9 @@ def AddMetadata(model, params=None):
             
         if 'lut_bits' in params and params['lut_bits'] is not None:
             model.user_defined_metadata["com.anemll.lut_bits"] = str(params['lut_bits'])
+
+        if 'argmax_in_model' in params and params['argmax_in_model']:
+            model.user_defined_metadata["com.anemll.argmax_in_model"] = "true"
             
         if 'function_names' in params and params['function_names'] is not None:
             model.short_description = f"Combined model with functions: {', '.join(params['function_names'])}"
@@ -255,4 +258,3 @@ def AddCombinedMetadata(target_model, source_models):
         print("\nFull traceback:")
         traceback.print_exc()
         raise
-
