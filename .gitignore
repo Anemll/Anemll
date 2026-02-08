@@ -45,3 +45,4 @@ xcuserdata/
 ane_*.log
 tests/dev/segmented_results/*
 tests/dev/segment_analysis/*
+tests/dev/_runs/
