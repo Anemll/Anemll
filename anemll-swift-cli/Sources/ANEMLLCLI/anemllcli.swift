@@ -356,7 +356,10 @@ struct AnemllCLI: AsyncParsableCommand {
             argmaxInModel: config.argmaxInModel,
             slidingWindow: config.slidingWindow,  // Gemma3 rotation support
             updateMaskPrefill: config.updateMaskPrefill,  // Multi-turn KV cache support
-            prefillDynamicSlice: config.prefillDynamicSlice  // Alternative batch prefill support
+            prefillDynamicSlice: config.prefillDynamicSlice,  // Alternative batch prefill support
+            modelPrefix: config.modelPrefix,
+            vocabSize: config.vocabSize,
+            lmHeadChunkSizes: config.lmHeadChunkSizes
         )
         
         if let prompt = prompt {

@@ -121,6 +121,8 @@ def generate_monolithic_meta(
     update_mask_prefill=False,
     prefill_dynamic_slice=False,
     single_cache=False,
+    vocab_size=None,
+    lm_head_chunk_sizes=None,
 ):
     """Generate meta.yaml for monolithic model format.
 
@@ -180,10 +182,11 @@ def generate_monolithic_meta(
         meta_parts.append(f'    lut_per_channel: {lut_per_channel}')
 
     argmax_line = f'\n    argmax_in_model: true' if argmax_in_model else ''
+    vocab_line = f'\n    vocab_size: {vocab_size}' if vocab_size is not None else ''
+    chunk_sizes_line = f'\n    lm_head_chunk_sizes: [{", ".join(str(x) for x in lm_head_chunk_sizes)}]' if lm_head_chunk_sizes else ''
     sliding_window_line = f'\n    sliding_window: {sliding_window}' if sliding_window is not None else ''
     update_mask_line = '\n    update_mask_prefill: true' if update_mask_prefill else ''
     prefill_dynamic_slice_line = '\n    prefill_dynamic_slice: true' if prefill_dynamic_slice else ''
-    single_cache_line = '\n    single_cache: true' if single_cache else ''
     single_cache_line = '\n    single_cache: true' if single_cache else ''
 
     # Build functions list based on rotate flag
@@ -200,7 +203,7 @@ def generate_monolithic_meta(
 
     meta_parts.append(f'''    model_prefix: {prefix}
     monolithic_model: {model_name_file}
-    split_lm_head: {split_lm_head}{argmax_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}
+    split_lm_head: {split_lm_head}{argmax_line}{vocab_line}{chunk_sizes_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}
 {functions_yaml}
 ''')
 
@@ -244,7 +247,7 @@ def generate_conversion_comments(conversion_info_json):
 
     # Add each parameter as a comment
     param_order = [
-        'model_path', 'output_dir', 'context_length', 'batch_size',
+        'model_path', 'output_dir', 'command_line', 'context_length', 'batch_size',
         'num_chunks', 'lut_part1', 'lut_part2', 'lut_part3',
         'prefix', 'architecture', 'argmax_in_model', 'split_rotate',
         'sliding_window', 'fp16_scale', 'clamp', 'single_cache',
@@ -281,6 +284,14 @@ def generate_conversion_comments(conversion_info_json):
 
 
 def main():
+    conversion_info = os.environ.get('ANEMLL_CONVERSION_INFO')
+    conversion_info_dict = None
+    if conversion_info:
+        try:
+            conversion_info_dict = json.loads(conversion_info)
+        except json.JSONDecodeError:
+            conversion_info_dict = None
+
     # Check for --monolithic flag
     is_monolithic = '--monolithic' in sys.argv
     if is_monolithic:
@@ -345,6 +356,9 @@ def main():
             prefix=sys.argv[8],
             arch=sys.argv[9],
             output_dir=sys.argv[10],
+            # Optional metadata from conversion info (if provided)
+            vocab_size=conversion_info_dict.get('vocab_size') if conversion_info_dict else None,
+            lm_head_chunk_sizes=conversion_info_dict.get('lm_head_chunk_sizes') if conversion_info_dict else None,
             argmax_in_model=argmax_in_model,
             rotate=rotate,
             sliding_window=sliding_window,
@@ -441,6 +455,18 @@ def main():
     # Add argmax_in_model if requested
     argmax_line = '\n    argmax_in_model: true' if argmax_in_model else ''
 
+    vocab_size = None
+    lm_head_chunk_sizes = None
+    if conversion_info_dict:
+        vocab_size = conversion_info_dict.get('vocab_size')
+        lm_head_chunk_sizes = conversion_info_dict.get('lm_head_chunk_sizes')
+
+    vocab_line = f'\n    vocab_size: {vocab_size}' if vocab_size is not None else ''
+    chunk_sizes_line = (
+        f'\n    lm_head_chunk_sizes: [{", ".join(str(x) for x in lm_head_chunk_sizes)}]'
+        if isinstance(lm_head_chunk_sizes, list) and lm_head_chunk_sizes else ''
+    )
+
     # Add split_rotate field if in split-rotate mode
     split_rotate_line = '\n    split_rotate: true' if split_rotate else ''
     pf_line = f'\n    pf: {pf_path}' if split_rotate else ''
@@ -456,13 +482,12 @@ def main():
     embeddings: {embeddings_path}
     lm_head: {lmhead_path}
     ffn: {ffn_path}{pf_line}
-    split_lm_head: {split_lm_head}{argmax_line}{split_rotate_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}
+    split_lm_head: {split_lm_head}{argmax_line}{vocab_line}{chunk_sizes_line}{split_rotate_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}
 ''')
 
     meta = '\n'.join(meta_parts)
 
     # Add conversion info as comments if provided
-    conversion_info = os.environ.get('ANEMLL_CONVERSION_INFO')
     if conversion_info:
         meta += generate_conversion_comments(conversion_info)
 

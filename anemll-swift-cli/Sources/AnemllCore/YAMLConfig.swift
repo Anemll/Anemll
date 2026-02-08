@@ -12,6 +12,8 @@ public struct YAMLConfig: Sendable {
     public let lutBits: Int
     public let numChunks: Int
     public let splitLMHead: Int
+    public let vocabSize: Int?
+    public let lmHeadChunkSizes: [Int]?
 
     // Model paths
     public let embedPath: String
@@ -62,6 +64,8 @@ public struct YAMLConfig: Sendable {
         self.lutBits = yaml["lut_bits"] as? Int ?? 4
         self.numChunks = yaml["num_chunks"] as? Int ?? 1
         self.splitLMHead = yaml["split_lm_head"] as? Int ?? 8
+        self.vocabSize = yaml["vocab_size"] as? Int
+        self.lmHeadChunkSizes = yaml["lm_head_chunk_sizes"] as? [Int]
         
         // Extract paths from yaml
         self.embedPath = yaml["embed_path"] as? String ?? ""
@@ -164,6 +168,8 @@ public struct YAMLConfig: Sendable {
             let lutEmbeddings = String(params["lut_embeddings"] as? Int ?? -1)
             let numChunks = params["num_chunks"] as? Int ?? 1
             let splitLMHead = params["split_lm_head"] as? Int ?? 8
+            let vocabSize = params["vocab_size"] as? Int
+            let lmHeadChunkSizes = params["lm_head_chunk_sizes"] as? [Int]
             
             // Check for predefined paths in parameters
             let predefinedEmbedPath = params["embeddings"] as? String
@@ -312,6 +318,8 @@ public struct YAMLConfig: Sendable {
                 "ffn_path": ffnPath,
                 "lmhead_path": lmheadPath,
                 "split_lm_head": splitLMHead,
+                "vocab_size": vocabSize as Any,
+                "lm_head_chunk_sizes": lmHeadChunkSizes as Any,
                 "is_monolithic": isMonolithic,
                 "argmax_in_model": argmaxInModel,
                 "update_mask_prefill": updateMaskPrefill,
@@ -372,6 +380,8 @@ public struct YAMLConfig: Sendable {
             "ffn_path": ffnPath,
             "lmhead_path": lmheadPath,
             "split_lm_head": splitLMHead,
+            "vocab_size": params["vocab_size"] as? Int as Any,
+            "lm_head_chunk_sizes": params["lm_head_chunk_sizes"] as? [Int] as Any,
             "is_monolithic": isMonolithic,
             "argmax_in_model": argmaxInModel
         ]

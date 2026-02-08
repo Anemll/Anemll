@@ -204,8 +204,14 @@ final class InferenceService: ObservableObject {
                 batchSize: config.batchSize,
                 splitLMHead: config.splitLMHead,
                 debugLevel: debugLevel,
+                v110: config.configVersion == "0.1.1",
                 argmaxInModel: config.argmaxInModel,
-                slidingWindow: config.slidingWindow
+                slidingWindow: config.slidingWindow,
+                updateMaskPrefill: config.updateMaskPrefill,
+                prefillDynamicSlice: config.prefillDynamicSlice,
+                modelPrefix: config.modelPrefix,
+                vocabSize: config.vocabSize,
+                lmHeadChunkSizes: config.lmHeadChunkSizes
             )
             print("===== [MODEL CONFIG] splitLMHead=\(config.splitLMHead), context=\(config.contextLength), batch=\(config.batchSize), argmax=\(config.argmaxInModel) =====")
 
@@ -526,9 +532,16 @@ final class InferenceService: ObservableObject {
 
     /// Resolve system prompt marker to actual prompt based on model template
     nonisolated private static func resolveSystemPrompt(_ prompt: String, template: String) -> String {
-        // If empty or doesn't start with marker, return as-is
-        guard prompt.hasPrefix("[MODEL_") else {
-            return prompt
+        let normalizedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Default / no-template markers map to "no extra system prompt".
+        if normalizedPrompt.isEmpty || normalizedPrompt == "[DEFAULT_PROMPT]" || normalizedPrompt == "[NO_TEMPLATE]" {
+            return ""
+        }
+
+        // If this is not a model marker, treat it as a custom prompt.
+        guard normalizedPrompt.hasPrefix("[MODEL_") else {
+            return normalizedPrompt
         }
 
         // Define default prompts for each model type
@@ -563,7 +576,7 @@ final class InferenceService: ObservableObject {
 
         let template = template.lowercased()
 
-        switch prompt {
+        switch normalizedPrompt {
         case "[MODEL_DEFAULT]":
             return defaultPrompts[template] ?? defaultPrompts["default"]!
         case "[MODEL_THINKING]":

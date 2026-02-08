@@ -353,7 +353,11 @@ struct AnemllCLIAdv: AsyncParsableCommand {
             v110: config.configVersion == "0.1.1",  // Set v110 flag based on version
             argmaxInModel: config.argmaxInModel,
             slidingWindow: config.slidingWindow,  // Gemma3 rotation support
-            updateMaskPrefill: config.updateMaskPrefill  // Multi-turn KV cache support
+            updateMaskPrefill: config.updateMaskPrefill,  // Multi-turn KV cache support
+            prefillDynamicSlice: config.prefillDynamicSlice,  // Alternative batch prefill support
+            modelPrefix: config.modelPrefix,
+            vocabSize: config.vocabSize,
+            lmHeadChunkSizes: config.lmHeadChunkSizes
         )
         
         // *** SET SAMPLING CONFIGURATION ***

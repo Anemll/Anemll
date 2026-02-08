@@ -33,6 +33,11 @@ SINGLE_CACHE=false
 # Default converter; may be overridden after parsing config.json
 CONVERTER="python3 -m anemll.ane_converter.llama_converter"
 
+# Capture exact invocation for troubleshooting metadata.
+ORIGINAL_ARGS=("$@")
+CONVERSION_COMMAND="$(printf '%q ' "$0" "${ORIGINAL_ARGS[@]}")"
+CONVERSION_COMMAND="${CONVERSION_COMMAND% }"
+
 # Function to print usage
 print_usage() {
     echo "Usage: $0 --model <path_to_model> --output <output_directory> [options]"
@@ -228,6 +233,8 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)" || {
 # Detect architecture from config.json
 CONFIG_FILE="$MODEL_PATH/config.json"
 ARCH="llama"
+SLIDING_WINDOW=""
+HAS_SWA=false
 if [ -f "$CONFIG_FILE" ]; then
     ARCH=$(jq -r '.model_type // (.architectures[0] // "")' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
     # Check for Qwen2 (which is Qwen 2.5) or Qwen2ForCausalLM architecture
@@ -253,11 +260,58 @@ if [ -f "$CONFIG_FILE" ]; then
         fi
     fi
 
-    # Extract sliding_window from config.json (used for Gemma3 rotation checks)
-    # Gemma3 models have it nested in .text_config.sliding_window
-    # Default: 512 for 1B models, 1024 for 4B models
-    SLIDING_WINDOW=$(jq -r '.text_config.sliding_window // .sliding_window // 512' "$CONFIG_FILE")
-    echo "Detected sliding_window: $SLIDING_WINDOW"
+    # Detect whether this architecture actually uses sliding-window attention.
+    # Qwen2.5 carries sliding_window in config but sets use_sliding_window=false.
+    USE_SLIDING_WINDOW=$(jq -r '.text_config.use_sliding_window // .use_sliding_window // empty' "$CONFIG_FILE")
+    SLIDING_WINDOW_RAW=$(jq -r '.text_config.sliding_window // .sliding_window // empty' "$CONFIG_FILE")
+    if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
+        HAS_SWA=true
+        if [[ "$SLIDING_WINDOW_RAW" =~ ^[0-9]+$ ]] && [ "$SLIDING_WINDOW_RAW" -gt 0 ]; then
+            SLIDING_WINDOW="$SLIDING_WINDOW_RAW"
+        else
+            SLIDING_WINDOW=512
+        fi
+    elif [[ "$USE_SLIDING_WINDOW" == "true" ]] && [[ "$SLIDING_WINDOW_RAW" =~ ^[0-9]+$ ]] && [ "$SLIDING_WINDOW_RAW" -gt 0 ]; then
+        HAS_SWA=true
+        SLIDING_WINDOW="$SLIDING_WINDOW_RAW"
+    fi
+
+    if [ "$HAS_SWA" = true ]; then
+        echo "Detected sliding_window: $SLIDING_WINDOW (SWA enabled)"
+    else
+        echo "Detected SWA: disabled"
+    fi
+fi
+
+# Optional argmax layout metadata for runtimes that need exact local->global mapping.
+VOCAB_SIZE_JSON="null"
+LM_HEAD_CHUNK_SIZES_JSON="null"
+SPLIT_LM_HEAD=8
+if [[ "$ARCH" == qwen* ]] || [[ "$ARCH" == gemma* ]]; then
+    SPLIT_LM_HEAD=16
+fi
+if [ -f "$CONFIG_FILE" ]; then
+    VOCAB_SIZE_RAW=$(jq -r '.vocab_size // .text_config.vocab_size // empty' "$CONFIG_FILE")
+    if [[ "$VOCAB_SIZE_RAW" =~ ^[0-9]+$ ]] && [ "$VOCAB_SIZE_RAW" -gt 0 ]; then
+        VOCAB_SIZE_JSON="$VOCAB_SIZE_RAW"
+        base=$((VOCAB_SIZE_RAW / SPLIT_LM_HEAD))
+        rem=$((VOCAB_SIZE_RAW % SPLIT_LM_HEAD))
+        sizes="["
+        for ((i=0; i<SPLIT_LM_HEAD; i++)); do
+            size=$base
+            if [ $i -lt $rem ]; then
+                size=$((size + 1))
+            fi
+            if [ $i -gt 0 ]; then
+                sizes+=","
+            fi
+            sizes+="$size"
+        done
+        sizes+="]"
+        LM_HEAD_CHUNK_SIZES_JSON="$sizes"
+        echo "Detected vocab_size: $VOCAB_SIZE_RAW, split_lm_head: $SPLIT_LM_HEAD"
+        echo "Derived lm_head_chunk_sizes: $LM_HEAD_CHUNK_SIZES_JSON"
+    fi
 fi
 
 echo ""
@@ -377,8 +431,8 @@ run_step 2 "Converting Monolithic Prefill Model" "$CONVERTER \
     --model \"$MODEL_PATH\" \
     --output \"$OUTPUT_DIR\""
 
-# For context > sliding_window, also convert rotation functions (4-function model for Gemma3)
-if [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
+# For context > sliding_window, also convert rotation functions (4-function model for SWA models)
+if [ "$HAS_SWA" = true ] && [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
     if [ "$SINGLE_CACHE" = true ]; then
         echo "Skipping rotate conversions: --single-cache disables rotate/prefill_rotate."
     else
@@ -414,7 +468,7 @@ fi
 # Step 3: Combine into Multi-Function Model
 # Includes rotation functions if context > sliding_window
 ROTATE_FLAG=""
-if [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
+if [ "$HAS_SWA" = true ] && [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
     ROTATE_FLAG="--rotate"
 fi
 run_step 3 "Combining Monolithic Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
@@ -448,6 +502,66 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
     else
         MODEL_NAME=$(basename "$MODEL_PATH")
     fi
+
+    ROTATION_ENABLED=false
+    if [ "$HAS_SWA" = true ] && [ -n "$SLIDING_WINDOW" ] && [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ] && [ "$SINGLE_CACHE" != true ]; then
+        ROTATION_ENABLED=true
+    fi
+
+    ARGMAX_JSON=false
+    [ "$ARGMAX_IN_MODEL" = true ] && ARGMAX_JSON=true
+    ROTATION_JSON=false
+    [ "$ROTATION_ENABLED" = true ] && ROTATION_JSON=true
+    SINGLE_CACHE_JSON=false
+    [ "$SINGLE_CACHE" = true ] && SINGLE_CACHE_JSON=true
+    DYNAMIC_PREFILL_JSON=false
+    [ "$DYNAMIC_PREFILL_SLICE" = true ] && DYNAMIC_PREFILL_JSON=true
+
+    SLIDING_WINDOW_JSON="null"
+    if [ "$HAS_SWA" = true ] && [ -n "$SLIDING_WINDOW" ]; then
+        SLIDING_WINDOW_JSON="$SLIDING_WINDOW"
+    fi
+
+    CONVERSION_INFO=$(jq -nc \
+        --arg model_path "$MODEL_PATH" \
+        --arg output_dir "$OUTPUT_DIR" \
+        --arg lut_bits "${LUT_BITS:-none}" \
+        --arg prefix "$PREFIX" \
+        --arg architecture "$ARCH" \
+        --arg fp16_scale "${FP16_SCALE:-}" \
+        --arg clamp "${CLAMP:-}" \
+        --arg command_line "$CONVERSION_COMMAND" \
+        --argjson context_length "$CONTEXT_LENGTH" \
+        --argjson batch_size "$BATCH_SIZE" \
+        --argjson argmax_in_model "$ARGMAX_JSON" \
+        --argjson rotate "$ROTATION_JSON" \
+        --argjson sliding_window "$SLIDING_WINDOW_JSON" \
+        --argjson single_cache "$SINGLE_CACHE_JSON" \
+        --argjson dynamic_prefill_slice "$DYNAMIC_PREFILL_JSON" \
+        --argjson vocab_size "$VOCAB_SIZE_JSON" \
+        --argjson lm_head_chunk_sizes "$LM_HEAD_CHUNK_SIZES_JSON" \
+        '{
+            model_path: $model_path,
+            output_dir: $output_dir,
+            context_length: $context_length,
+            batch_size: $batch_size,
+            lut_bits: $lut_bits,
+            prefix: $prefix,
+            architecture: $architecture,
+            argmax_in_model: $argmax_in_model,
+            rotate: $rotate,
+            sliding_window: $sliding_window,
+            fp16_scale: (if $fp16_scale == "" then null else $fp16_scale end),
+            clamp: (if $clamp == "" then null else $clamp end),
+            single_cache: $single_cache,
+            dynamic_prefill_slice: $dynamic_prefill_slice,
+            vocab_size: $vocab_size,
+            lm_head_chunk_sizes: $lm_head_chunk_sizes,
+            command_line: $command_line,
+            monolithic: true,
+            anemll_version: "0.3.5"
+        }')
+    export CONVERSION_INFO
 
     run_step 5 "Copying tokenizer files and creating meta.yaml" "
         # Copy tokenizer files if they exist
@@ -483,12 +597,12 @@ EOF_CONFIG
         # Create meta.yaml for monolithic model
         # Add --rotate flag if context > sliding_window (4-function model)
         ROTATE_META_FLAG=\"\"
-        if [ \"$CONTEXT_LENGTH\" -gt \"$SLIDING_WINDOW\" ] && [ \"$SINGLE_CACHE\" != true ]; then
+        if [ \"$HAS_SWA\" = true ] && [ \"$CONTEXT_LENGTH\" -gt \"$SLIDING_WINDOW\" ] && [ \"$SINGLE_CACHE\" != true ]; then
             ROTATE_META_FLAG=\"--rotate\"
         fi
-        # Add sliding_window flag for Gemma3 models
+        # Add sliding_window flag only when SWA is enabled.
         SLIDING_WINDOW_FLAG=\"\"
-        if [[ \"$ARCH\" == \"gemma3\"* ]] && [ -n \"$SLIDING_WINDOW\" ]; then
+        if [ \"$HAS_SWA\" = true ] && [ -n \"$SLIDING_WINDOW\" ]; then
             SLIDING_WINDOW_FLAG=\"--sliding-window $SLIDING_WINDOW\"
         fi
         UPDATE_MASK_PREFILL_FLAG=\"\"
@@ -505,9 +619,6 @@ EOF_CONFIG
         if [ \"$SINGLE_CACHE\" = true ]; then
             SINGLE_CACHE_META_FLAG=\"--single-cache\"
         fi
-
-        # Build conversion info JSON for troubleshooting comments in meta.yaml
-        CONVERSION_INFO='{\"model_path\":\"$MODEL_PATH\",\"output_dir\":\"$OUTPUT_DIR\",\"context_length\":$CONTEXT_LENGTH,\"batch_size\":$BATCH_SIZE,\"lut_bits\":\"${LUT_BITS:-none}\",\"prefix\":\"$PREFIX\",\"architecture\":\"$ARCH\",\"argmax_in_model\":$( [ \"$ARGMAX_IN_MODEL\" = true ] && echo true || echo false ),\"rotate\":$( [ \"$ROTATE\" = true ] && echo true || echo false ),\"sliding_window\":${SLIDING_WINDOW:-null},\"fp16_scale\":\"${FP16_SCALE:-null}\",\"clamp\":\"${CLAMP:-null}\",\"single_cache\":$( [ \"$SINGLE_CACHE\" = true ] && echo true || echo false ),\"dynamic_prefill_slice\":$( [ \"$DYNAMIC_PREFILL_SLICE\" = true ] && echo true || echo false ),\"monolithic\":true,\"anemll_version\":\"0.3.5\"}'
 
         ANEMLL_CONVERSION_INFO=\"\$CONVERSION_INFO\" python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \

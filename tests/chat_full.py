@@ -230,6 +230,91 @@ def build_stop_token_ids(tokenizer):
 
     return stop_ids
 
+
+def _parse_lm_head_chunk_sizes(raw_sizes):
+    """Parse lm_head_chunk_sizes from metadata (list or comma-separated string)."""
+    if raw_sizes is None:
+        return None
+    if isinstance(raw_sizes, (list, tuple)):
+        sizes = []
+        for x in raw_sizes:
+            try:
+                v = int(x)
+                if v > 0:
+                    sizes.append(v)
+            except Exception:
+                return None
+        return sizes if sizes else None
+    if isinstance(raw_sizes, str):
+        raw_sizes = raw_sizes.strip()
+        if not raw_sizes:
+            return None
+        # Accept either "1,2,3" or "[1, 2, 3]"
+        raw_sizes = raw_sizes.strip("[]")
+        parts = [p.strip() for p in raw_sizes.split(",") if p.strip()]
+        if not parts:
+            return None
+        try:
+            sizes = [int(p) for p in parts]
+        except Exception:
+            return None
+        return sizes if all(v > 0 for v in sizes) else None
+    return None
+
+
+def _resolve_argmax_chunk_layout(metadata, num_chunks, argmax_idx_flat=None):
+    """Resolve per-chunk sizes and offsets for argmax local->global index mapping."""
+    # Preferred: exact chunk sizes from metadata.
+    chunk_sizes = _parse_lm_head_chunk_sizes(metadata.get("lm_head_chunk_sizes"))
+    if chunk_sizes and len(chunk_sizes) == num_chunks and all(v > 0 for v in chunk_sizes):
+        offsets = [0]
+        for size in chunk_sizes[:-1]:
+            offsets.append(offsets[-1] + size)
+        return chunk_sizes, offsets
+
+    # Next-best: derive from vocab_size + split distribution used by converters.
+    vocab_size = metadata.get("vocab_size")
+    try:
+        vocab_size = int(vocab_size) if vocab_size is not None else None
+    except Exception:
+        vocab_size = None
+    if vocab_size and vocab_size > 0 and num_chunks > 0:
+        base, rem = divmod(vocab_size, num_chunks)
+        chunk_sizes = [base + (1 if i < rem else 0) for i in range(num_chunks)]
+        offsets = [0]
+        for size in chunk_sizes[:-1]:
+            offsets.append(offsets[-1] + size)
+        return chunk_sizes, offsets
+
+    # Fallback defaults by architecture.
+    arch = str(metadata.get("architecture", "")).lower()
+    if arch.startswith("gemma"):
+        fallback_vocab = 262144
+    elif arch.startswith("qwen"):
+        fallback_vocab = 151936
+    elif arch.startswith("llama"):
+        fallback_vocab = 128257
+    else:
+        fallback_vocab = None
+    if fallback_vocab and num_chunks > 0:
+        base, rem = divmod(fallback_vocab, num_chunks)
+        chunk_sizes = [base + (1 if i < rem else 0) for i in range(num_chunks)]
+        offsets = [0]
+        for size in chunk_sizes[:-1]:
+            offsets.append(offsets[-1] + size)
+        return chunk_sizes, offsets
+
+    # Last resort: infer a minimum width from observed local indices.
+    inferred = 1
+    if argmax_idx_flat is not None and len(argmax_idx_flat) > 0:
+        try:
+            inferred = max(int(np.max(argmax_idx_flat)) + 1, 1)
+        except Exception:
+            inferred = 1
+    chunk_sizes = [inferred] * max(num_chunks, 1)
+    offsets = [i * inferred for i in range(max(num_chunks, 1))]
+    return chunk_sizes, offsets
+
 def format_manual_prompt(messages):
     """Format a plain text prompt when no chat template is available."""
     system = None
@@ -396,9 +481,19 @@ def parse_args():
 
                 # Check for argmax_in_model flag (model outputs argmax instead of logits)
                 args.argmax_in_model = params.get('argmax_in_model', False)
+                args.vocab_size = params.get('vocab_size', None)
+                args.lm_head_chunk_sizes = params.get('lm_head_chunk_sizes', None)
                 # Prefill behavior flags
                 args.update_mask_prefill = params.get('update_mask_prefill', False)
                 args.prefill_dynamic_slice = params.get('prefill_dynamic_slice', False)
+                # Sliding window (cache rotation) is optional; keep None when model does not use SWA.
+                if getattr(args, 'sliding_window', None) is None:
+                    if 'sliding_window' in params:
+                        args.sliding_window = int(params['sliding_window'])
+                    elif prefix.lower().startswith('gemma3'):
+                        args.sliding_window = 512
+                    else:
+                        args.sliding_window = None
 
                 # Set split_lm_head, but allow CLI override
                 if args.split_lm_head is None:
@@ -458,6 +553,8 @@ def parse_args():
 
                 # Check for argmax_in_model flag (for chunked models)
                 args.argmax_in_model = params.get('argmax_in_model', False)
+                args.vocab_size = params.get('vocab_size', None)
+                args.lm_head_chunk_sizes = params.get('lm_head_chunk_sizes', None)
                 # Prefill behavior flags
                 args.update_mask_prefill = params.get('update_mask_prefill', False)
                 args.prefill_dynamic_slice = params.get('prefill_dynamic_slice', False)
@@ -503,12 +600,30 @@ def load_metadata(model,args):
         metadata['batch_size'] = int(meta.get('com.anemll.batch_size', 64))
         metadata['lut_bits'] = int(meta.get('com.anemll.lut_bits', 0))
         metadata['num_chunks'] = int(meta.get('com.anemll.num_chunks', 1))
+        if 'com.anemll.vocab_size' in meta:
+            try:
+                metadata['vocab_size'] = int(meta.get('com.anemll.vocab_size', 0))
+            except Exception:
+                pass
+        if 'com.anemll.lm_head_chunk_sizes' in meta:
+            metadata['lm_head_chunk_sizes'] = _parse_lm_head_chunk_sizes(
+                meta.get('com.anemll.lm_head_chunk_sizes')
+            )
 
         # If meta.yaml/args provide overrides, prefer those for reporting/usage
         if getattr(args, 'context_length', None) is not None:
             metadata['context_length'] = int(args.context_length)
         if getattr(args, 'state_length', None) is not None:
             metadata['state_length'] = int(args.state_length)
+        if getattr(args, 'vocab_size', None) is not None:
+            try:
+                metadata['vocab_size'] = int(args.vocab_size)
+            except Exception:
+                pass
+        if getattr(args, 'lm_head_chunk_sizes', None) is not None:
+            parsed_sizes = _parse_lm_head_chunk_sizes(args.lm_head_chunk_sizes)
+            if parsed_sizes:
+                metadata['lm_head_chunk_sizes'] = parsed_sizes
         if getattr(args, 'update_mask_prefill', None) is not None:
             metadata['update_mask_prefill'] = bool(args.update_mask_prefill)
         if getattr(args, 'prefill_dynamic_slice', None) is not None:
@@ -937,8 +1052,9 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
 
     if argmax_in_model and 'argmax_idx' in lm_output:
         # Model outputs argmax_idx and argmax_val (split across num_chunks chunks)
-        argmax_idx = lm_output['argmax_idx']  # shape: [num_chunks], LOCAL indices within chunk
-        argmax_val = lm_output['argmax_val']  # shape: [num_chunks], max logit values
+        # argmax_idx values are LOCAL indices within each chunk.
+        argmax_idx = lm_output['argmax_idx']
+        argmax_val = lm_output['argmax_val']
 
         # Flatten in case of extra dimensions
         argmax_idx_flat = argmax_idx.flatten()
@@ -948,11 +1064,19 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
         best_chunk = int(np.argmax(argmax_val_flat))
         local_idx = int(argmax_idx_flat[best_chunk])
 
-        # Calculate global token index: local_idx + chunk_offset
         num_chunks = len(argmax_idx_flat)
-        vocab_size = 262144  # Standard for Gemma3
-        chunk_size = vocab_size // num_chunks
-        next_token = local_idx + (best_chunk * chunk_size)
+        chunk_sizes, chunk_offsets = _resolve_argmax_chunk_layout(
+            metadata or {},
+            num_chunks,
+            argmax_idx_flat=argmax_idx_flat,
+        )
+        if best_chunk < len(chunk_sizes):
+            max_local = chunk_sizes[best_chunk] - 1
+            if local_idx < 0:
+                local_idx = 0
+            elif local_idx > max_local:
+                local_idx = max_local
+        next_token = local_idx + chunk_offsets[min(best_chunk, len(chunk_offsets) - 1)]
 
         return next_token
 
@@ -1026,23 +1150,31 @@ def load_monolithic_model(args, metadata):
 
     print(f"Loading from: {model_path}")
 
-    # Load all functions
+    # Load base functions
     infer_model = load_model(model_path, function_name='infer', compute_unit=compute_unit)
     prefill_model = load_model(model_path, function_name='prefill', compute_unit=compute_unit)
 
-    # Try to load infer_rotate (optional, for models with split cache rotation)
     infer_rotate_model = None
-    try:
-        infer_rotate_model = load_model(model_path, function_name='infer_rotate', compute_unit=compute_unit)
-    except Exception as e:
-        print(f"  Note: infer_rotate not available - using infer for all positions")
-
-    # Try to load prefill_rotate (optional, for long context prefill with rotation)
     prefill_rotate_model = None
-    try:
-        prefill_rotate_model = load_model(model_path, function_name='prefill_rotate', compute_unit=compute_unit)
-    except Exception as e:
-        pass  # prefill_rotate is optional
+    # Try rotation functions only when SWA is enabled and context exceeds the window.
+    attempt_rotate = False
+    context_length = getattr(args, "context_length", None)
+    sliding_window = getattr(args, "sliding_window", None)
+    if context_length is not None and sliding_window is not None:
+        attempt_rotate = context_length > sliding_window
+
+    if attempt_rotate:
+        try:
+            infer_rotate_model = load_model(model_path, function_name='infer_rotate', compute_unit=compute_unit)
+        except Exception:
+            if not getattr(args, 'nw', False):
+                print("  Note: infer_rotate not available - using infer for all positions")
+        try:
+            prefill_rotate_model = load_model(model_path, function_name='prefill_rotate', compute_unit=compute_unit)
+        except Exception:
+            pass
+    elif sliding_window is not None:
+        print(f"  Skipping rotation functions (context {context_length} <= sliding_window {sliding_window})")
 
     # Report loaded functions
     functions = ["infer", "prefill"]
@@ -1143,8 +1275,8 @@ def run_monolithic_prefill_with_rotation(prefill_model, prefill_rotate_model, in
         infer_model: Used for single-token processing of partial batches (avoids padding issues)
         single_token_mode: If True, use only infer (single-token) for all prefill (slower but more accurate)
     """
-    # If no rotation model or short context, use standard prefill
-    if prefill_rotate_model is None or context_pos <= sliding_window:
+    # If no rotation model, no sliding window, or short context, use standard prefill
+    if prefill_rotate_model is None or sliding_window is None or context_pos <= sliding_window:
         return run_monolithic_prefill(prefill_model, input_ids, context_pos, context_length,
                                       batch_size, state, causal_mask, infer_model=infer_model,
                                       single_token_mode=single_token_mode, mask_len=mask_len,
@@ -1256,9 +1388,9 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
 
     if argmax_in_model and 'argmax_idx' in output:
         # Model outputs argmax_idx and argmax_val (split across num_chunks chunks)
-        # Each chunk covers vocab_size / num_chunks tokens
-        argmax_idx = output['argmax_idx']  # shape: [num_chunks], LOCAL indices within chunk
-        argmax_val = output['argmax_val']  # shape: [num_chunks], max logit values
+        # argmax_idx values are LOCAL indices within each chunk.
+        argmax_idx = output['argmax_idx']
+        argmax_val = output['argmax_val']
 
         # Flatten in case of extra dimensions
         argmax_idx_flat = argmax_idx.flatten()
@@ -1268,12 +1400,19 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
         best_chunk = int(np.argmax(argmax_val_flat))
         local_idx = int(argmax_idx_flat[best_chunk])
 
-        # Calculate global token index: local_idx + chunk_offset
-        # Each chunk covers vocab_size / num_chunks tokens (e.g., 16384 for 262k vocab / 16 chunks)
         num_chunks = len(argmax_idx_flat)
-        vocab_size = 262144  # Standard for Gemma3
-        chunk_size = vocab_size // num_chunks
-        next_token = local_idx + (best_chunk * chunk_size)
+        chunk_sizes, chunk_offsets = _resolve_argmax_chunk_layout(
+            metadata or {},
+            num_chunks,
+            argmax_idx_flat=argmax_idx_flat,
+        )
+        if best_chunk < len(chunk_sizes):
+            max_local = chunk_sizes[best_chunk] - 1
+            if local_idx < 0:
+                local_idx = 0
+            elif local_idx > max_local:
+                local_idx = max_local
+        next_token = local_idx + chunk_offsets[min(best_chunk, len(chunk_offsets) - 1)]
 
         return next_token
 
@@ -1339,8 +1478,8 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
     global DEBUG_LEVEL
     context_length = metadata.get('context_length')
     state_length = metadata.get('state_length', context_length)
-    sliding_window = metadata.get('sliding_window', 512)  # For switching between infer modes
-    mask_len = max(state_length, sliding_window)
+    sliding_window = metadata.get('sliding_window', None)  # Optional SWA window
+    mask_len = max(state_length, sliding_window or 0)
     batch_size = metadata.get('batch_size', 64)
     update_mask_prefill = metadata.get('update_mask_prefill', False)
     prefill_dynamic_slice = metadata.get('prefill_dynamic_slice', False)
@@ -1363,8 +1502,11 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
     if not warmup:
         print(f"\nUsing context length: {context_length}")
         print(f"State length (global attention): {state_length}")
-        print(f"Sliding window (local attention): {sliding_window}")
-        if infer_rotate_model is not None:
+        if sliding_window is not None:
+            print(f"Sliding window (local attention): {sliding_window}")
+        else:
+            print("Sliding window: DISABLED")
+        if infer_rotate_model is not None and sliding_window is not None:
             print(f"Cache rotation: ENABLED (infer_rotate function available)")
             print(f"  - pos < {sliding_window}: infer (fill mode)")
             print(f"  - pos >= {sliding_window}: infer_rotate (rotation mode)")
@@ -1622,7 +1764,7 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                     # Select the appropriate model based on position:
                     # - pos < sliding_window: use infer_model (fill mode)
                     # - pos >= sliding_window: use infer_rotate_model (rotation mode) if available
-                    if pos >= sliding_window and infer_rotate_model is not None:
+                    if sliding_window is not None and pos >= sliding_window and infer_rotate_model is not None:
                         current_infer_model = infer_rotate_model
                     else:
                         current_infer_model = infer_model
@@ -1677,11 +1819,16 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                     # Show context status for split cache debugging
                     # Final position after generation
                     final_pos = context_pos + len(response_tokens)
-                    rotation_mode = "ROTATE" if (final_pos >= sliding_window and infer_rotate_model is not None) else "FILL"
-                    if total_tokens_in_memory > sliding_window:
+                    rotation_mode = (
+                        "ROTATE"
+                        if (sliding_window is not None and final_pos >= sliding_window and infer_rotate_model is not None)
+                        else "FILL"
+                    )
+                    effective_window = sliding_window if sliding_window is not None else state_length
+                    if total_tokens_in_memory > effective_window:
                         context_status = f"[Turn {turn_number} | GLOBAL+{rotation_mode}: {total_tokens_in_memory}/{state_length} ctx, {len(conversation)} msgs]"
                     else:
-                        context_status = f"[Turn {turn_number} | LOCAL+{rotation_mode}: {total_tokens_in_memory}/{sliding_window} ctx, {len(conversation)} msgs]"
+                        context_status = f"[Turn {turn_number} | LOCAL+{rotation_mode}: {total_tokens_in_memory}/{effective_window} ctx, {len(conversation)} msgs]"
 
                     print(f"{DARK_BLUE}{inference_tokens_per_sec:.1f} t/s, "
                           f"TTFT: {prefill_ms:.1f}ms ({prefill_tokens_per_sec:.1f} t/s, {context_pos} tokens), "
@@ -2084,7 +2231,11 @@ def main():
             metadata['batch_size'] = getattr(args, 'batch_size', 64)
             metadata['split_lm_head'] = getattr(args, 'split_lm_head', 16)
             metadata['argmax_in_model'] = getattr(args, 'argmax_in_model', False)
-            metadata['sliding_window'] = 512  # Local attention window for Gemma3
+            metadata['sliding_window'] = getattr(args, 'sliding_window', None)
+            metadata['vocab_size'] = getattr(args, 'vocab_size', None)
+            metadata['lm_head_chunk_sizes'] = _parse_lm_head_chunk_sizes(
+                getattr(args, 'lm_head_chunk_sizes', None)
+            )
 
             print(f"\nMonolithic metadata: {metadata}")
 
@@ -2161,6 +2312,10 @@ def main():
 
             # Add argmax_in_model flag for chunked models
             metadata['argmax_in_model'] = getattr(args, 'argmax_in_model', False)
+            metadata['vocab_size'] = getattr(args, 'vocab_size', None)
+            metadata['lm_head_chunk_sizes'] = _parse_lm_head_chunk_sizes(
+                getattr(args, 'lm_head_chunk_sizes', None)
+            )
 
             # Add sliding_window for Gemma3 rotation support
             sliding_window = getattr(args, 'sliding_window', None)

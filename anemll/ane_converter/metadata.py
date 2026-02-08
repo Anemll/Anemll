@@ -121,6 +121,15 @@ def AddMetadata(model, params=None):
 
         if 'argmax_in_model' in params and params['argmax_in_model']:
             model.user_defined_metadata["com.anemll.argmax_in_model"] = "true"
+
+        if 'vocab_size' in params and params['vocab_size'] is not None:
+            model.user_defined_metadata["com.anemll.vocab_size"] = str(params['vocab_size'])
+
+        if 'lm_head_chunk_sizes' in params and params['lm_head_chunk_sizes'] is not None:
+            chunk_sizes = params['lm_head_chunk_sizes']
+            if isinstance(chunk_sizes, (list, tuple)):
+                chunk_sizes = ",".join(str(int(x)) for x in chunk_sizes)
+            model.user_defined_metadata["com.anemll.lm_head_chunk_sizes"] = str(chunk_sizes)
             
         if 'function_names' in params and params['function_names'] is not None:
             model.short_description = f"Combined model with functions: {', '.join(params['function_names'])}"

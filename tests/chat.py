@@ -87,7 +87,19 @@ class TokenPrinter:
             return
 
         # Decode all tokens at once in the main thread
-        token_str = self.tokenizer.decode(self.decoding_buffer)
+        try:
+            token_str = self.tokenizer.decode(self.decoding_buffer)
+        except Exception:
+            # Fallback for occasional tokenizer decode failures (e.g. unknown token id -> None)
+            decoded_pieces = []
+            for token_id in self.decoding_buffer:
+                try:
+                    piece = self.tokenizer.decode([token_id])
+                    if piece is not None:
+                        decoded_pieces.append(piece)
+                except Exception:
+                    continue
+            token_str = "".join(decoded_pieces)
         self.decoding_buffer.clear()
         
         # Store the text in buffer for later saving to file
@@ -246,6 +258,91 @@ def build_stop_token_ids(tokenizer):
 
     return stop_ids
 
+
+def _parse_lm_head_chunk_sizes(raw_sizes):
+    """Parse lm_head_chunk_sizes from metadata (list or comma-separated string)."""
+    if raw_sizes is None:
+        return None
+    if isinstance(raw_sizes, (list, tuple)):
+        sizes = []
+        for x in raw_sizes:
+            try:
+                v = int(x)
+                if v > 0:
+                    sizes.append(v)
+            except Exception:
+                return None
+        return sizes if sizes else None
+    if isinstance(raw_sizes, str):
+        raw_sizes = raw_sizes.strip()
+        if not raw_sizes:
+            return None
+        # Accept either "1,2,3" or "[1, 2, 3]"
+        raw_sizes = raw_sizes.strip("[]")
+        parts = [p.strip() for p in raw_sizes.split(",") if p.strip()]
+        if not parts:
+            return None
+        try:
+            sizes = [int(p) for p in parts]
+        except Exception:
+            return None
+        return sizes if all(v > 0 for v in sizes) else None
+    return None
+
+
+def _resolve_argmax_chunk_layout(metadata, num_chunks, argmax_idx_flat=None):
+    """Resolve per-chunk sizes and offsets for argmax local->global index mapping."""
+    # Preferred: exact chunk sizes from metadata.
+    chunk_sizes = _parse_lm_head_chunk_sizes(metadata.get("lm_head_chunk_sizes"))
+    if chunk_sizes and len(chunk_sizes) == num_chunks and all(v > 0 for v in chunk_sizes):
+        offsets = [0]
+        for size in chunk_sizes[:-1]:
+            offsets.append(offsets[-1] + size)
+        return chunk_sizes, offsets
+
+    # Next-best: derive from vocab_size + split distribution used by converters.
+    vocab_size = metadata.get("vocab_size")
+    try:
+        vocab_size = int(vocab_size) if vocab_size is not None else None
+    except Exception:
+        vocab_size = None
+    if vocab_size and vocab_size > 0 and num_chunks > 0:
+        base, rem = divmod(vocab_size, num_chunks)
+        chunk_sizes = [base + (1 if i < rem else 0) for i in range(num_chunks)]
+        offsets = [0]
+        for size in chunk_sizes[:-1]:
+            offsets.append(offsets[-1] + size)
+        return chunk_sizes, offsets
+
+    # Fallback defaults by architecture.
+    arch = str(metadata.get("architecture", "")).lower()
+    if arch.startswith("gemma"):
+        fallback_vocab = 262144
+    elif arch.startswith("qwen"):
+        fallback_vocab = 151936
+    elif arch.startswith("llama"):
+        fallback_vocab = 128257
+    else:
+        fallback_vocab = None
+    if fallback_vocab and num_chunks > 0:
+        base, rem = divmod(fallback_vocab, num_chunks)
+        chunk_sizes = [base + (1 if i < rem else 0) for i in range(num_chunks)]
+        offsets = [0]
+        for size in chunk_sizes[:-1]:
+            offsets.append(offsets[-1] + size)
+        return chunk_sizes, offsets
+
+    # Last resort: infer a minimum width from observed local indices.
+    inferred = 1
+    if argmax_idx_flat is not None and len(argmax_idx_flat) > 0:
+        try:
+            inferred = max(int(np.max(argmax_idx_flat)) + 1, 1)
+        except Exception:
+            inferred = 1
+    chunk_sizes = [inferred] * max(num_chunks, 1)
+    offsets = [i * inferred for i in range(max(num_chunks, 1))]
+    return chunk_sizes, offsets
+
 def parse_ffn_filename(path):
     """Parse FFN model filename to extract chunk information."""
     path = Path(path)
@@ -324,11 +421,24 @@ def load_model(path, function_name=None, compute_unit=None):
             # For compiled models (.mlmodelc), use CompiledMLModel
             if function_name:
                 _check_function_exists(path, function_name, compute_unit)
-                return ct.models.CompiledMLModel(str(path), compute_unit, function_name=function_name)
+                try:
+                    return ct.models.CompiledMLModel(str(path), compute_unit, function_name=function_name)
+                except RuntimeError as e:
+                    # Multi-function compiled models don't support function_name parameter
+                    # Fall back to .mlpackage if available
+                    if "functionName" in str(e) or "function_name" in str(e):
+                        mlpackage_path = path.with_suffix('.mlpackage')
+                        if mlpackage_path.exists():
+                            print(f"  Note: Using .mlpackage for multi-function model: {mlpackage_path.name}")
+                            _check_function_exists(mlpackage_path, function_name, compute_unit)
+                            # Don't specify compute_units to allow make_state() to work
+                            return ct.models.MLModel(str(mlpackage_path), function_name=function_name)
+                    raise
             else:
                 return ct.models.CompiledMLModel(str(path), compute_unit)
         else:
             # For packages (.mlpackage)
+            # Don't specify compute_units to allow make_state() to work
             if function_name:
                 _check_function_exists(path, function_name, compute_unit)
                 return ct.models.MLModel(str(path), function_name=function_name)
@@ -357,6 +467,15 @@ def load_metadata(model,args):
         metadata['batch_size'] = int(meta.get('com.anemll.batch_size', 64))
         metadata['lut_bits'] = int(meta.get('com.anemll.lut_bits', 0))
         metadata['num_chunks'] = int(meta.get('com.anemll.num_chunks', 1))
+        if 'com.anemll.vocab_size' in meta:
+            try:
+                metadata['vocab_size'] = int(meta.get('com.anemll.vocab_size', 0))
+            except Exception:
+                pass
+        if 'com.anemll.lm_head_chunk_sizes' in meta:
+            metadata['lm_head_chunk_sizes'] = _parse_lm_head_chunk_sizes(
+                meta.get('com.anemll.lm_head_chunk_sizes')
+            )
         if getattr(args, 'update_mask_prefill', None) is not None:
             metadata['update_mask_prefill'] = bool(args.update_mask_prefill)
         if getattr(args, 'prefill_dynamic_slice', None) is not None:
@@ -480,8 +599,19 @@ def detect_cache_type(ffn_model, eval_mode=False):
         # Method 1: Try get_spec() for .mlpackage
         try:
             spec = model.get_spec()
+            # Check top-level stateInput (older format)
             if hasattr(spec, 'description') and hasattr(spec.description, 'stateInput'):
                 state_names = [s.name for s in spec.description.stateInput]
+            # Check top-level state (newer format)
+            if not state_names and hasattr(spec, 'description') and hasattr(spec.description, 'state'):
+                state_names = [s.name for s in spec.description.state if s.name]
+            # Method 1b: For multi-function ML Programs, check functions[].state
+            if not state_names and hasattr(spec, 'description') and hasattr(spec.description, 'functions'):
+                for func in spec.description.functions:
+                    if hasattr(func, 'state'):
+                        for s in func.state:
+                            if s.name and s.name not in state_names:
+                                state_names.append(s.name)
         except (AttributeError, Exception):
             pass
 
@@ -566,8 +696,9 @@ def detect_cache_type(ffn_model, eval_mode=False):
                     state_repr = repr(state)
                     has_global = 'kv_cache_global' in state_repr
                     has_local = 'kv_cache_local' in state_repr
+                    has_unified = 'kv_cache_0' in state_repr or 'kv_cache' in state_repr
                     if not eval_mode:
-                        print(f"    Chunk {idx}: global={has_global}, local={has_local}")
+                        print(f"    Chunk {idx}: global={has_global}, local={has_local}, unified={has_unified}")
                     if has_global:
                         result['global_cache_chunk_idx'] = idx
                         result['has_global_cache'] = True
@@ -575,6 +706,9 @@ def detect_cache_type(ffn_model, eval_mode=False):
                             result['has_local_cache'] = True
                             result['cache_type'] = 'split'
                         break
+                    elif has_unified and not result['has_unified_cache']:
+                        result['has_unified_cache'] = True
+                        result['cache_type'] = 'unified'
                     elif has_local and not result['has_local_cache']:
                         result['has_local_cache'] = True
                         result['cache_type'] = 'local_only'
@@ -1078,16 +1212,20 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
         best_chunk = int(np.argmax(argmax_val_flat))
         local_idx = int(argmax_idx_flat[best_chunk])
 
-        # Compute global index: local_idx + (best_chunk * chunk_size)
         num_chunks = len(argmax_idx_flat)
-        chunk_size = 262144 // num_chunks  # Gemma3 vocab = 262144
-        global_idx = local_idx + (best_chunk * chunk_size)
+        chunk_sizes, chunk_offsets = _resolve_argmax_chunk_layout(
+            metadata,
+            num_chunks,
+            argmax_idx_flat=argmax_idx_flat,
+        )
+        global_idx = local_idx + chunk_offsets[best_chunk]
 
         if metadata.get('debug_argmax', False):
             print(f"\nLM head argmax mode (chunked):")
             print(f"  argmax_idx shape: {argmax_idx.shape}, dtype: {argmax_idx.dtype}")
             print(f"  argmax_val shape: {argmax_val.shape}, dtype: {argmax_val.dtype}")
             print(f"  best_chunk={best_chunk}, local_idx={local_idx}, global_idx={global_idx}")
+            print(f"  chunk_size={chunk_sizes[best_chunk]}, chunk_offset={chunk_offsets[best_chunk]}")
             print(f"  best_val={argmax_val_flat[best_chunk]:.4f}")
 
         return global_idx
@@ -1479,6 +1617,8 @@ def parse_args():
     # Model configuration
     parser.add_argument('--context-length', type=int,
                        help='Context length for the model (default: 512), if not provided, it will be detected from the model directory name ctxNUMBER')
+    parser.add_argument('--sliding-window', type=int,
+                       help='Sliding-window size for models with cache rotation support (e.g., Gemma3)')
     parser.add_argument('--batch-size', type=int,
                        help='Batch size for prefill (default: 64)')
     parser.add_argument('--num-logits', type=int, default=8,
@@ -1541,9 +1681,19 @@ def parse_args():
 
                 # Check for argmax_in_model flag
                 args.argmax_in_model = params.get('argmax_in_model', False)
+                args.vocab_size = params.get('vocab_size', None)
+                args.lm_head_chunk_sizes = params.get('lm_head_chunk_sizes', None)
                 # Prefill behavior flags
                 args.update_mask_prefill = params.get('update_mask_prefill', False)
                 args.prefill_dynamic_slice = params.get('prefill_dynamic_slice', False)
+                # Sliding window (cache rotation) is optional; keep None when model does not use SWA.
+                if getattr(args, 'sliding_window', None) is None:
+                    if 'sliding_window' in params:
+                        args.sliding_window = int(params['sliding_window'])
+                    elif prefix.lower().startswith('gemma3'):
+                        args.sliding_window = 512
+                    else:
+                        args.sliding_window = None
 
                 # Set tokenizer path
                 if not args.tokenizer:
@@ -1645,6 +1795,8 @@ def parse_args():
 
                 # Check for argmax_in_model flag (for chunked models)
                 args.argmax_in_model = params.get('argmax_in_model', False)
+                args.vocab_size = params.get('vocab_size', None)
+                args.lm_head_chunk_sizes = params.get('lm_head_chunk_sizes', None)
                 # Prefill behavior flags
                 args.update_mask_prefill = params.get('update_mask_prefill', False)
                 args.prefill_dynamic_slice = params.get('prefill_dynamic_slice', False)
@@ -1705,13 +1857,11 @@ def load_monolithic_model(args, metadata):
             sys.stdout.write("\n")
 
     # Decide whether to attempt rotate functions
-    attempt_rotate = True
+    attempt_rotate = False
     context_length = getattr(args, "context_length", None)
     sliding_window = getattr(args, "sliding_window", None)
     if context_length is not None and sliding_window is not None:
         attempt_rotate = context_length > sliding_window
-    elif context_length is not None and context_length <= 512:
-        attempt_rotate = False
 
     functions_to_load = [("infer", True), ("prefill", True)]
     if attempt_rotate:
@@ -1820,7 +1970,7 @@ def run_monolithic_prefill_with_rotation(prefill_model, prefill_rotate_model, in
     If prefill_rotate_model is None or context_pos <= sliding_window, falls back to standard prefill.
     """
     # If no rotation model or short context, use standard prefill
-    if prefill_rotate_model is None or context_pos <= sliding_window:
+    if prefill_rotate_model is None or sliding_window is None or context_pos <= sliding_window:
         return run_monolithic_prefill(prefill_model, input_ids, context_pos, context_length,
                                       batch_size, state, causal_mask,
                                       infer_model=infer_model,
@@ -1945,30 +2095,39 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
         best_chunk = int(np.argmax(argmax_val_flat))
         local_idx = int(argmax_idx_flat[best_chunk])
 
-        # Compute global token ID: local_idx + (chunk * chunk_size)
-        chunk_size = 16384  # 262144 / 16
-        global_idx = local_idx + (best_chunk * chunk_size)
+        num_chunks = len(argmax_idx_flat)
+        chunk_sizes, chunk_offsets = _resolve_argmax_chunk_layout(
+            metadata,
+            num_chunks,
+            argmax_idx_flat=argmax_idx_flat,
+        )
+        global_idx = local_idx + chunk_offsets[best_chunk]
 
         # Debug: print shapes and values
         if metadata.get('debug_argmax', False):
             print(f"\n=== Argmax Debug (pos={pos}) ===")
             print(f"argmax_idx shape: {argmax_idx.shape}, dtype: {argmax_idx.dtype}")
             print(f"argmax_val shape: {argmax_val.shape}, dtype: {argmax_val.dtype}")
-            print(f"Per-chunk results (LOCAL indices, chunk_size={chunk_size}):")
+            print("Per-chunk results (LOCAL indices):")
 
             # Find top 3 chunks by value for comparison
             sorted_indices = np.argsort(argmax_val_flat)[::-1][:3]
 
-            for i in range(min(16, len(argmax_idx_flat))):
+            for i in range(len(argmax_idx_flat)):
                 local = int(argmax_idx_flat[i])
                 val = float(argmax_val_flat[i])
-                computed_global = local + (i * chunk_size)
+                chunk_size = chunk_sizes[i]
+                chunk_offset = chunk_offsets[i]
+                computed_global = local + chunk_offset
                 in_range = 0 <= local < chunk_size
                 marker = " <-- SELECTED" if i == best_chunk else ""
                 if i in sorted_indices and i != best_chunk:
                     marker += f" (top-{list(sorted_indices).index(i)+1})"
                 range_ok = "✓" if in_range else f"✗ (expected 0-{chunk_size-1})"
-                print(f"  Chunk {i:2d}: local={local:5d}, global={computed_global:6d}, val={val:8.4f}, range={range_ok}{marker}")
+                print(
+                    f"  Chunk {i:2d}: local={local:5d}, global={computed_global:6d}, "
+                    f"offset={chunk_offset:6d}, size={chunk_size:5d}, val={val:8.4f}, range={range_ok}{marker}"
+                )
 
             print(f"Result: best_chunk={best_chunk}, local_idx={local_idx}, global_idx={global_idx}, best_val={argmax_val_flat[best_chunk]:.4f}")
 
@@ -2040,8 +2199,8 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
     """
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
-    sliding_window = metadata.get('sliding_window', 512)  # For switching between infer modes
-    mask_len = max(metadata.get('state_length', context_length), sliding_window)
+    sliding_window = metadata.get('sliding_window', None)  # For switching between infer modes
+    mask_len = max(metadata.get('state_length', context_length), sliding_window or 0)
     update_mask_prefill = metadata.get('update_mask_prefill', False)
     single_token_mode = False
     if not update_mask_prefill:
@@ -2137,7 +2296,7 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                     # Select the appropriate model based on position:
                     # - pos < sliding_window: use infer_model (fill mode)
                     # - pos >= sliding_window: use infer_rotate_model (rotation mode) if available
-                    if pos >= sliding_window and infer_rotate_model is not None:
+                    if sliding_window is not None and pos >= sliding_window and infer_rotate_model is not None:
                         current_infer_model = infer_rotate_model
                     else:
                         current_infer_model = infer_model
@@ -2269,7 +2428,11 @@ def main():
             metadata['argmax_in_model'] = getattr(args, 'argmax_in_model', False)
             metadata['debug_argmax'] = getattr(args, 'debug_argmax', False)
             metadata['debug'] = getattr(args, 'debug', False)
-            metadata['sliding_window'] = getattr(args, 'sliding_window', 512)
+            metadata['sliding_window'] = getattr(args, 'sliding_window', None)
+            metadata['vocab_size'] = getattr(args, 'vocab_size', None)
+            metadata['lm_head_chunk_sizes'] = _parse_lm_head_chunk_sizes(
+                getattr(args, 'lm_head_chunk_sizes', None)
+            )
 
             if not args.eval:
                 print(f"\nMonolithic metadata: {metadata}")
@@ -2353,6 +2516,10 @@ def main():
             # Add argmax_in_model flag for chunked models
             metadata['argmax_in_model'] = getattr(args, 'argmax_in_model', False)
             metadata['debug_argmax'] = getattr(args, 'debug_argmax', False)
+            metadata['vocab_size'] = getattr(args, 'vocab_size', None)
+            metadata['lm_head_chunk_sizes'] = _parse_lm_head_chunk_sizes(
+                getattr(args, 'lm_head_chunk_sizes', None)
+            )
 
             if not args.eval:
                 print(f"\nMetadata after load_models: {metadata}")

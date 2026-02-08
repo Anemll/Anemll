@@ -1330,6 +1330,27 @@ def test_conversion(
     else:
         models = [mlmodel]
 
+    vocab_size = int(getattr(model.config, "vocab_size", 0)) if model is not None else None
+    lm_head_chunk_sizes = None
+    if part in ["3", "monolithic"]:
+        if hasattr(model, "lm_head16_1"):
+            lm_head_chunk_sizes = [
+                int(getattr(model, f"lm_head16_{i}").out_channels) for i in range(1, 17)
+            ]
+        elif hasattr(model, "lm_head8_1"):
+            lm_head_chunk_sizes = [
+                int(getattr(model, f"lm_head8_{i}").out_channels) for i in range(1, 9)
+            ]
+        elif hasattr(model, "lm_head2_1"):
+            lm_head_chunk_sizes = [
+                int(model.lm_head2_1.out_channels),
+                int(model.lm_head2_2.out_channels),
+            ]
+        elif hasattr(model, "lm_head1"):
+            lm_head_chunk_sizes = [int(model.lm_head1.out_channels)]
+        elif hasattr(model, "lm_head"):
+            lm_head_chunk_sizes = [int(model.lm_head.out_channels)]
+
     for i, m in enumerate(models):
         AddMetadata(
             m,
@@ -1343,6 +1364,8 @@ def test_conversion(
                     ModelPart.FULL.value if part in ["full", "all", "123"] else part
                 ),
                 "argmax_in_model": argmax_in_model if part in ["3", "monolithic"] else None,
+                "vocab_size": vocab_size if part in ["3", "monolithic"] else None,
+                "lm_head_chunk_sizes": lm_head_chunk_sizes if part in ["3", "monolithic"] else None,
             },
         )
         fname = f"{prefix}"

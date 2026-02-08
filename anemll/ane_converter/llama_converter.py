@@ -1238,6 +1238,22 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
         per_channel=per_channel,
         argmax_in_model=argmax_in_model,
     )
+
+    vocab_size_meta = int(getattr(model.config, "vocab_size", 0)) if model is not None else None
+    lm_head_chunk_sizes_meta = None
+    if hasattr(model, "lm_head8_1"):
+        lm_head_chunk_sizes_meta = [
+            int(getattr(model, f"lm_head8_{i}").out_channels) for i in range(1, 9)
+        ]
+    elif hasattr(model, "lm_head2_1"):
+        lm_head_chunk_sizes_meta = [
+            int(model.lm_head2_1.out_channels),
+            int(model.lm_head2_2.out_channels),
+        ]
+    elif hasattr(model, "lm_head1"):
+        lm_head_chunk_sizes_meta = [int(model.lm_head1.out_channels)]
+    elif hasattr(model, "lm_head"):
+        lm_head_chunk_sizes_meta = [int(model.lm_head.out_features)]
     
     # Initialize converted_model as None
     converted_model = None
@@ -1276,7 +1292,9 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
                     'batch_size': batch_size if split_part in ['2_prefill'] else None,
                     'lut_bits': lut_bits,
                     'split_part': split_part,
-                    'argmax_in_model': argmax_in_model if split_part in ['3', 'monolithic'] else None
+                    'argmax_in_model': argmax_in_model if split_part in ['3', 'monolithic'] else None,
+                    'vocab_size': vocab_size_meta if split_part in ['3', 'monolithic'] else None,
+                    'lm_head_chunk_sizes': lm_head_chunk_sizes_meta if split_part in ['3', 'monolithic'] else None,
                 })
                 print(f"Saving chunk to {chunk_output_path}")
                 chunk_output_path = os.path.join(output_dir, chunk_output_path)
@@ -1311,7 +1329,9 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
             'batch_size': batch_size if split_part == 'monolithic_prefill' else None,
             'lut_bits': lut_bits,
             'split_part': split_part,
-            'argmax_in_model': argmax_in_model if split_part in ['monolithic'] else None
+            'argmax_in_model': argmax_in_model if split_part in ['monolithic'] else None,
+            'vocab_size': vocab_size_meta if split_part in ['3', 'monolithic'] else None,
+            'lm_head_chunk_sizes': lm_head_chunk_sizes_meta if split_part in ['3', 'monolithic'] else None,
         })
         print(f"Saving monolithic model to {output_path}")
         output_path = os.path.join(output_dir, output_path)
@@ -1347,7 +1367,9 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
                         'batch_size': batch_size if split_part in ['2_prefill'] else None,
                         'lut_bits': lut_bits,
                         'split_part': split_part,
-                        'argmax_in_model': argmax_in_model if split_part in ['3', 'monolithic'] else None
+                        'argmax_in_model': argmax_in_model if split_part in ['3', 'monolithic'] else None,
+                        'vocab_size': vocab_size_meta if split_part in ['3', 'monolithic'] else None,
+                        'lm_head_chunk_sizes': lm_head_chunk_sizes_meta if split_part in ['3', 'monolithic'] else None,
                     })
                     chunk_output_path = output_path.replace('.mlpackage', f'_{i+1}.mlpackage')
                     print(f"Saving chunk to {chunk_output_path}")
@@ -1360,7 +1382,9 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
                     'batch_size': batch_size if split_part in ['2_prefill'] else None,
                     'lut_bits': lut_bits,
                     'split_part': split_part,
-                    'argmax_in_model': argmax_in_model if split_part in ['3', 'monolithic'] else None
+                    'argmax_in_model': argmax_in_model if split_part in ['3', 'monolithic'] else None,
+                    'vocab_size': vocab_size_meta if split_part in ['3', 'monolithic'] else None,
+                    'lm_head_chunk_sizes': lm_head_chunk_sizes_meta if split_part in ['3', 'monolithic'] else None,
                 })
                 print(f"Saving model to {output_path}")
                 output_path = os.path.join(output_dir, output_path)

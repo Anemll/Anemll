@@ -28,6 +28,9 @@ private typealias Float16 = Float
     private var prefillEndTime: CFAbsoluteTime?
     private var FilterLLAMA01: Bool = false
     private let splitLMHead: Int
+    private let modelPrefix: String
+    private let vocabSize: Int?
+    private let lmHeadChunkSizes: [Int]?
     private let isMonolithic: Bool  // Monolithic model support
     private let argmaxInModel: Bool  // If true, model outputs argmax_idx/val pairs instead of logits
     private let slidingWindow: Int?  // Gemma3 sliding window - if set, use rotation functions when position >= slidingWindow
@@ -109,6 +112,7 @@ private typealias Float16 = Float
     private var lastArgmaxPosition: Int = -1
     private var argmaxInferOptions: MLPredictionOptions?
     private var argmaxInferInput: MLDictionaryFeatureProvider?
+    private var cachedArgmaxLayoutByChunks: [Int: (sizes: [Int], offsets: [Int])] = [:]
     
     // Move struct definition to class scope, before the methods
     private struct PartialMax {
@@ -156,6 +160,106 @@ private typealias Float16 = Float
         default:
             throw InferenceError.inferenceError("Unsupported logits data type: \(array.dataType)")
         }
+    }
+
+    private func resolveArgmaxChunkLayout(
+        numChunks: Int,
+        idxArray: MLMultiArray? = nil
+    ) -> (sizes: [Int], offsets: [Int]) {
+        let safeNumChunks = max(numChunks, 1)
+
+        if let cached = cachedArgmaxLayoutByChunks[safeNumChunks] {
+            return cached
+        }
+
+        if let configured = lmHeadChunkSizes,
+           configured.count == safeNumChunks,
+           configured.allSatisfy({ $0 > 0 }) {
+            var offsets: [Int] = []
+            offsets.reserveCapacity(safeNumChunks)
+            var running = 0
+            for size in configured {
+                offsets.append(running)
+                running += size
+            }
+            let resolved = (configured, offsets)
+            cachedArgmaxLayoutByChunks[safeNumChunks] = resolved
+            return resolved
+        }
+
+        if let vocabSize, vocabSize > 0 {
+            let base = vocabSize / safeNumChunks
+            let rem = vocabSize % safeNumChunks
+            var sizes: [Int] = []
+            var offsets: [Int] = []
+            sizes.reserveCapacity(safeNumChunks)
+            offsets.reserveCapacity(safeNumChunks)
+            var running = 0
+            for i in 0..<safeNumChunks {
+                let size = base + (i < rem ? 1 : 0)
+                sizes.append(max(size, 1))
+                offsets.append(running)
+                running += max(size, 1)
+            }
+            let resolved = (sizes, offsets)
+            cachedArgmaxLayoutByChunks[safeNumChunks] = resolved
+            return resolved
+        }
+
+        let prefix = modelPrefix.lowercased()
+        if safeNumChunks > 0 {
+            let fallbackVocab: Int?
+            if prefix.hasPrefix("gemma") {
+                fallbackVocab = 262144
+            } else if prefix.hasPrefix("qwen") {
+                fallbackVocab = 151936
+            } else if prefix.hasPrefix("llama") {
+                fallbackVocab = 128257
+            } else {
+                fallbackVocab = nil
+            }
+            if let fallbackVocab {
+                let base = fallbackVocab / safeNumChunks
+                let rem = fallbackVocab % safeNumChunks
+                var sizes: [Int] = []
+                var offsets: [Int] = []
+                sizes.reserveCapacity(safeNumChunks)
+                offsets.reserveCapacity(safeNumChunks)
+                var running = 0
+                for i in 0..<safeNumChunks {
+                    let size = base + (i < rem ? 1 : 0)
+                    sizes.append(max(size, 1))
+                    offsets.append(running)
+                    running += max(size, 1)
+                }
+                let resolved = (sizes, offsets)
+                cachedArgmaxLayoutByChunks[safeNumChunks] = resolved
+                return resolved
+            }
+        }
+
+        var inferredSize = 1
+        if let idxArray {
+            let n = min(safeNumChunks, idxArray.count)
+            for i in 0..<n {
+                inferredSize = max(inferredSize, idxArray[i].intValue + 1)
+            }
+        }
+
+        if inferredSize <= 1 {
+            // Legacy fallback (Gemma-style split) if we couldn't infer anything.
+            if safeNumChunks == 16 {
+                inferredSize = 16384
+            } else if safeNumChunks == 8 {
+                inferredSize = 32768
+            }
+        }
+
+        let sizes = Array(repeating: inferredSize, count: safeNumChunks)
+        let offsets = (0..<safeNumChunks).map { $0 * inferredSize }
+        let resolved = (sizes, offsets)
+        cachedArgmaxLayoutByChunks[safeNumChunks] = resolved
+        return resolved
     }
     
     public func AbortGeneration( Code : Int)
@@ -647,7 +751,7 @@ private typealias Float16 = Float
     }
 
 
-    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil, updateMaskPrefill: Bool = false, prefillDynamicSlice: Bool = false, disableIOBackings: Bool = false) throws {  // Make init throwing
+    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil, updateMaskPrefill: Bool = false, prefillDynamicSlice: Bool = false, disableIOBackings: Bool = false, modelPrefix: String = "llama", vocabSize: Int? = nil, lmHeadChunkSizes: [Int]? = nil) throws {  // Make init throwing
 #if arch(x86_64)
         throw InferenceError.inferenceError("x86_64 has no Apple Neural Engine and is unsupported by this application.")
 #endif
@@ -662,8 +766,11 @@ private typealias Float16 = Float
         self.contextLength = contextLength
         self.batchSize = batchSize
         self.splitLMHead = splitLMHead
+        self.modelPrefix = modelPrefix
         self.v110 = v110 // Set the v110 flag based on the parameter
         self.disableIOBackings = disableIOBackings
+        self.vocabSize = vocabSize
+        self.lmHeadChunkSizes = lmHeadChunkSizes
 
         // Check if rotation functions are available
         let hasRotation = ffnChunks.first?.hasRotationSupport ?? false
@@ -679,10 +786,10 @@ private typealias Float16 = Float
         // Set prefill dynamic slice flag
         self.prefillDynamicSlice = prefillDynamicSlice
 
-        // Match Python tests/chat.py monolithic behavior:
-        // - Monolithic: batch prefill partials only when update_mask is available
-        // - Non-monolithic: allow dynamic-slice path as an alternative
-        let allowBatchPrefill = isMonolithic ? hasUpdateMask : (hasUpdateMask || prefillDynamicSlice)
+        // Match Python tests/chat.py behavior:
+        // allow partial-batch prefill if either update_mask_prefill or
+        // prefill_dynamic_slice is available.
+        let allowBatchPrefill = hasUpdateMask || prefillDynamicSlice
 
         print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation), hasUpdateMask=\(hasUpdateMask), prefillDynamicSlice=\(prefillDynamicSlice), allowBatchPrefill=\(allowBatchPrefill), disableIOBackings=\(disableIOBackings)")
 
@@ -2229,8 +2336,10 @@ private typealias Float16 = Float
                 throw InferenceError.inferenceError("Missing argmax_idx or argmax_val in LM head output backings")
             }
 
-            let numChunks = splitLMHead
-            let chunkSize = 16384  // 262144 / 16 for Gemma3
+            let numChunks = idxArray.count
+            let layout = resolveArgmaxChunkLayout(numChunks: numChunks, idxArray: idxArray)
+            let chunkSizes = layout.sizes
+            let chunkOffsets = layout.offsets
 
             // Collect ALL chunk data for debugging
             var allChunkData: [(chunk: Int, localIdx: Int, val: Float)] = []
@@ -2253,7 +2362,7 @@ private typealias Float16 = Float
             }
 
             // Get the global index
-            let globalIdx = bestLocalIdx + (bestChunk * chunkSize)
+            let globalIdx = bestLocalIdx + chunkOffsets[bestChunk]
 
             if debugLevel >= 1 {
                 // Sort by value to see top candidates
@@ -2264,9 +2373,9 @@ private typealias Float16 = Float
                 print("Top 5 chunks:")
                 for i in 0..<min(5, sorted.count) {
                     let c = sorted[i]
-                    let gIdx = c.localIdx + (c.chunk * chunkSize)
+                    let gIdx = c.localIdx + chunkOffsets[c.chunk]
                     let marker = (c.chunk == bestChunk) ? " <-- SELECTED" : ""
-                    print("  #\(i+1): chunk=\(String(format: "%2d", c.chunk)), localIdx=\(String(format: "%5d", c.localIdx)), globalIdx=\(String(format: "%6d", gIdx)), val=\(String(format: "%.8f", c.val))\(marker)")
+                    print("  #\(i+1): chunk=\(String(format: "%2d", c.chunk)), localIdx=\(String(format: "%5d", c.localIdx)), globalIdx=\(String(format: "%6d", gIdx)), offset=\(String(format: "%6d", chunkOffsets[c.chunk])), size=\(String(format: "%5d", chunkSizes[c.chunk])), val=\(String(format: "%.8f", c.val))\(marker)")
                     
                     // Decode token if we have tokenizer
                     if let tokenizer = tokenizer {
@@ -2623,7 +2732,9 @@ private typealias Float16 = Float
             var bestLocalIdx = 0
             var bestVal: Float = -Float.infinity
             let numChunks = idxArray.count
-            let chunkSize = 16384  // 262144 / 16
+            let layout = resolveArgmaxChunkLayout(numChunks: numChunks, idxArray: idxArray)
+            let chunkSizes = layout.sizes
+            let chunkOffsets = layout.offsets
 
             // Collect all values for debug output
             var chunkData: [(chunk: Int, localIdx: Int, val: Float)] = []
@@ -2641,13 +2752,13 @@ private typealias Float16 = Float
             }
 
             // Compute global token ID: local_idx + (chunk * chunk_size)
-            let globalIdx = bestLocalIdx + (bestChunk * chunkSize)
+            let globalIdx = bestLocalIdx + chunkOffsets[bestChunk]
 
             // Debug output (similar to Python's --debug-argmax)
             if debugLevel >= 1 {
                 print("\n=== Argmax Debug (Swift) ===")
                 print("argmax_idx count: \(numChunks), argmax_val count: \(numChunks)")
-                print("Per-chunk results (LOCAL indices, chunk_size=\(chunkSize)):")
+                print("Per-chunk results (LOCAL indices):")
 
                 // Sort by value to find top-3
                 let sortedByVal = chunkData.sorted { $0.val > $1.val }
@@ -2657,8 +2768,8 @@ private typealias Float16 = Float
                 for i in 0..<numChunks {
                     let local = chunkData[i].localIdx
                     let val = chunkData[i].val
-                    let computedGlobal = local + (i * chunkSize)
-                    let inRange = local >= 0 && local < chunkSize
+                    let computedGlobal = local + chunkOffsets[i]
+                    let inRange = local >= 0 && local < chunkSizes[i]
                     if !inRange { anyOutOfRange = true }
 
                     var marker = ""
@@ -2668,8 +2779,8 @@ private typealias Float16 = Float
                             marker += " (top-\(rank + 1))"
                         }
                     }
-                    let rangeOk = inRange ? "✓" : "✗ (expected 0-\(chunkSize-1))"
-                    print("  Chunk \(String(format: "%2d", i)): local=\(String(format: "%5d", local)), global=\(String(format: "%6d", computedGlobal)), val=\(String(format: "%8.4f", val)), range=\(rangeOk)\(marker)")
+                    let rangeOk = inRange ? "✓" : "✗ (expected 0-\(chunkSizes[i]-1))"
+                    print("  Chunk \(String(format: "%2d", i)): local=\(String(format: "%5d", local)), global=\(String(format: "%6d", computedGlobal)), offset=\(String(format: "%6d", chunkOffsets[i])), size=\(String(format: "%5d", chunkSizes[i])), val=\(String(format: "%8.4f", val)), range=\(rangeOk)\(marker)")
                 }
 
                 print("Result: best_chunk=\(bestChunk), local_idx=\(bestLocalIdx), global_idx=\(globalIdx), best_val=\(String(format: "%.4f", bestVal))")
@@ -2684,7 +2795,7 @@ private typealias Float16 = Float
                 }
 
                 if anyOutOfRange {
-                    print("⚠️ WARNING: Some local indices are outside expected range (0 to \(chunkSize-1))!")
+                    print("⚠️ WARNING: Some local indices are outside expected per-chunk ranges.")
                 }
             }
 
@@ -2961,8 +3072,9 @@ private typealias Float16 = Float
         }
 
         // Find the chunk with highest value using direct pointer access
-        let chunkSize = 16384  // 262144 / 16
-        let numChunks = splitLMHead
+        let numChunks = idxArray.count
+        let layout = resolveArgmaxChunkLayout(numChunks: numChunks, idxArray: idxArray)
+        let chunkOffsets = layout.offsets
 
         var bestChunk = 0
         var bestLocalIdx = 0
@@ -2982,7 +3094,7 @@ private typealias Float16 = Float
         }
 
         // Compute global token ID: local_idx + (chunk * chunk_size)
-        let globalIdx = bestLocalIdx + (bestChunk * chunkSize)
+        let globalIdx = bestLocalIdx + chunkOffsets[bestChunk]
 
         return (globalIdx, bestVal)
     }
