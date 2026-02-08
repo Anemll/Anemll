@@ -360,26 +360,50 @@ struct AnemllCLIAdv: AsyncParsableCommand {
             lmHeadChunkSizes: config.lmHeadChunkSizes
         )
         
+        // Resolve sampling parameters (CLI defaults can be overridden by meta recommendation)
+        var effectiveSamplingTemperature = temperature
+        var effectiveTopK = topK
+        var effectiveTopP = topP
+        let effectiveDoSample: Bool
+
+        if doSample, let recommended = config.recommendedSampling {
+            if recommended.doSample {
+                effectiveDoSample = true
+                effectiveSamplingTemperature = Float(recommended.temperature)
+                effectiveTopK = recommended.topK
+                effectiveTopP = recommended.topP
+                print("\nUsing recommended sampling from meta.yaml (recommended_sampling):")
+                print("  temperature: \(effectiveSamplingTemperature)")
+                print("  top_k: \(effectiveTopK)")
+                print("  top_p: \(effectiveTopP)")
+            } else {
+                effectiveDoSample = doSample
+                print("\nrecommended_sampling.do_sample=false in meta.yaml; using CLI sampling values.")
+            }
+        } else {
+            effectiveDoSample = doSample
+        }
+
         // *** SET SAMPLING CONFIGURATION ***
         let samplingConfig = SamplingConfig(
-            doSample: doSample,
-            temperature: Double(temperature),
-            topK: topK,
-            topP: topP,
+            doSample: effectiveDoSample,
+            temperature: Double(effectiveSamplingTemperature),
+            topK: effectiveTopK,
+            topP: effectiveTopP,
             repetitionPenalty: repetitionPenalty
         )
         inferenceManager.setSamplingConfig(samplingConfig)
-        
+
         // Override temperature with effective temperature
-        let effectiveTemperature = doSample ? temperature : 0.0
-        
+        let effectiveTemperature = effectiveDoSample ? effectiveSamplingTemperature : 0.0
+
         // Print sampling configuration
         print("\nSampling parameters:")
-        print("  do_sample: \(doSample)")
-        if doSample {
-            print("  temperature: \(temperature)")
-            print("  top_k: \(topK)")
-            print("  top_p: \(topP)")
+        print("  do_sample: \(effectiveDoSample)")
+        if effectiveDoSample {
+            print("  temperature: \(effectiveSamplingTemperature)")
+            print("  top_k: \(effectiveTopK)")
+            print("  top_p: \(effectiveTopP)")
             print("  repetition_penalty: \(repetitionPenalty)")
         }
         

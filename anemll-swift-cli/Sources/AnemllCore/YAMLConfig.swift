@@ -2,6 +2,13 @@ import Foundation
 import Yams
 
 public struct YAMLConfig: Sendable {
+    public struct RecommendedSampling: Sendable {
+        public let doSample: Bool
+        public let temperature: Double
+        public let topK: Int
+        public let topP: Double
+    }
+
     public let modelPath: String
     public let configVersion: String
     public let functionName: String?
@@ -36,6 +43,9 @@ public struct YAMLConfig: Sendable {
 
     // Model prefix for template auto-detection
     public let modelPrefix: String
+
+    // Optional model-level sampling recommendation (from meta.yaml)
+    public let recommendedSampling: RecommendedSampling?
     
     public init(from yamlString: String) throws {
         // Load YAML
@@ -87,6 +97,22 @@ public struct YAMLConfig: Sendable {
 
         // Model prefix for template auto-detection
         self.modelPrefix = yaml["model_prefix"] as? String ?? "llama"
+
+        // Optional recommended sampling block
+        if let sampling = yaml["recommended_sampling"] as? [String: Any],
+           let temperature = YAMLConfig.toDouble(sampling["temperature"]),
+           let topP = YAMLConfig.toDouble(sampling["top_p"] ?? sampling["topP"]),
+           let topK = YAMLConfig.toInt(sampling["top_k"] ?? sampling["topK"]) {
+            let doSample = sampling["do_sample"] as? Bool ?? true
+            self.recommendedSampling = RecommendedSampling(
+                doSample: doSample,
+                temperature: temperature,
+                topK: topK,
+                topP: topP
+            )
+        } else {
+            self.recommendedSampling = nil
+        }
 
         // Get the ffn_path
         let rawFFNPath = yaml["ffn_path"] as? String ?? ""
@@ -170,6 +196,7 @@ public struct YAMLConfig: Sendable {
             let splitLMHead = params["split_lm_head"] as? Int ?? 8
             let vocabSize = params["vocab_size"] as? Int
             let lmHeadChunkSizes = params["lm_head_chunk_sizes"] as? [Int]
+            let recommendedSampling = params["recommended_sampling"] as? [String: Any]
             
             // Check for predefined paths in parameters
             let predefinedEmbedPath = params["embeddings"] as? String
@@ -271,6 +298,14 @@ public struct YAMLConfig: Sendable {
                 print("Prefill dynamic slice enabled")
             }
 
+            if let rec = recommendedSampling,
+               let recTemp = YAMLConfig.toDouble(rec["temperature"]),
+               let recTopP = YAMLConfig.toDouble(rec["top_p"] ?? rec["topP"]),
+               let recTopK = YAMLConfig.toInt(rec["top_k"] ?? rec["topK"]) {
+                let recDoSample = rec["do_sample"] as? Bool ?? true
+                print("Recommended sampling from meta.yaml: do_sample=\(recDoSample), temperature=\(recTemp), top_p=\(recTopP), top_k=\(recTopK)")
+            }
+
             // Build monolithic model path if applicable
             let monolithicModelPath: String?
             if isMonolithic {
@@ -325,6 +360,9 @@ public struct YAMLConfig: Sendable {
                 "update_mask_prefill": updateMaskPrefill,
                 "prefill_dynamic_slice": prefillDynamicSlice
             ]
+            if let rec = recommendedSampling {
+                configDict["recommended_sampling"] = rec
+            }
             if let monolithicPath = monolithicModelPath {
                 configDict["monolithic_model_path"] = monolithicPath
             }
@@ -360,7 +398,8 @@ public struct YAMLConfig: Sendable {
         isMonolithic: Bool = false,
         monolithicModelPath: String? = nil,
         argmaxInModel: Bool = false,
-        slidingWindow: Int? = nil
+        slidingWindow: Int? = nil,
+        recommendedSampling: [String: Any]? = nil
     ) throws -> YAMLConfig {
         // Create YAML string for init(from:)
         var configDict: [String: Any] = [
@@ -385,6 +424,9 @@ public struct YAMLConfig: Sendable {
             "is_monolithic": isMonolithic,
             "argmax_in_model": argmaxInModel
         ]
+        if let rec = recommendedSampling {
+            configDict["recommended_sampling"] = rec
+        }
         if let monolithicPath = monolithicModelPath {
             configDict["monolithic_model_path"] = monolithicPath
         }
@@ -394,6 +436,41 @@ public struct YAMLConfig: Sendable {
 
         let yamlString = try Yams.dump(object: configDict)
         return try YAMLConfig(from: yamlString)
+    }
+
+    private static func toDouble(_ value: Any?) -> Double? {
+        if let v = value as? Double {
+            return v
+        }
+        if let v = value as? Float {
+            return Double(v)
+        }
+        if let v = value as? Int {
+            return Double(v)
+        }
+        if let v = value as? NSNumber {
+            return v.doubleValue
+        }
+        if let v = value as? String {
+            return Double(v)
+        }
+        return nil
+    }
+
+    private static func toInt(_ value: Any?) -> Int? {
+        if let v = value as? Int {
+            return v
+        }
+        if let v = value as? NSNumber {
+            return v.intValue
+        }
+        if let v = value as? Double {
+            return Int(v)
+        }
+        if let v = value as? String {
+            return Int(v)
+        }
+        return nil
     }
 }
 
