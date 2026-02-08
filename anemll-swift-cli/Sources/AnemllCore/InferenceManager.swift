@@ -679,8 +679,10 @@ private typealias Float16 = Float
         // Set prefill dynamic slice flag
         self.prefillDynamicSlice = prefillDynamicSlice
 
-        // allowBatchPrefill = hasUpdateMask || prefillDynamicSlice (matching Python chat_full.py)
-        let allowBatchPrefill = hasUpdateMask || prefillDynamicSlice
+        // Match Python tests/chat.py monolithic behavior:
+        // - Monolithic: batch prefill partials only when update_mask is available
+        // - Non-monolithic: allow dynamic-slice path as an alternative
+        let allowBatchPrefill = isMonolithic ? hasUpdateMask : (hasUpdateMask || prefillDynamicSlice)
 
         print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation), hasUpdateMask=\(hasUpdateMask), prefillDynamicSlice=\(prefillDynamicSlice), allowBatchPrefill=\(allowBatchPrefill), disableIOBackings=\(disableIOBackings)")
 
@@ -1700,9 +1702,10 @@ private typealias Float16 = Float
 
         var batchPos = 0
 
-        // With update_mask OR prefill_dynamic_slice, we can process ALL tokens in batches (including partial batches)
-        // Without either, we can only process FULL batches, then remaining one-at-a-time
-        let processPartialWithPrefill = hasUpdateMask || prefillDynamicSlice
+        // Match Python tests/chat.py monolithic behavior:
+        // only update_mask enables partial-batch prefill.
+        // Otherwise we use full batches + single-token fallback for remaining tokens.
+        let processPartialWithPrefill = hasUpdateMask
 
         // Process batches with prefill model
         while batchPos < contextPos {
@@ -2712,15 +2715,37 @@ private typealias Float16 = Float
         }
         maybeDelayBeforeReadingPredictionOutputsSync()
 
+        // Build per-logit split sizes/offsets from actual model outputs.
+        // Qwen/Gemma splits are not guaranteed to be 16384-wide.
+        var chunkSizes: [Int] = []
+        chunkSizes.reserveCapacity(splitLMHead)
+        var chunkOffsets: [Int] = []
+        chunkOffsets.reserveCapacity(splitLMHead)
+        var runningOffset = 0
+        for i in 1...splitLMHead {
+            let logitsKey = "logits\(i)"
+            guard let logitsPart = currentBackings[logitsKey] else {
+                throw InferenceError.inferenceError("Missing \(logitsKey)")
+            }
+            chunkOffsets.append(runningOffset)
+            let size = logitsPart.count
+            chunkSizes.append(size)
+            runningOffset += size
+        }
+        let totalVocabSize = runningOffset
+        let chunkOffsetsConst = chunkOffsets
+
         // Process logits - try Metal GPU argmax first, fallback to CPU
         if GreedySearch {
-            // Try Metal argmax (processes all 16 chunks on GPU)
-            if let metal = metalArgmax {
+            // Try Metal argmax only for the fixed-layout case it currently supports.
+            // MetalArgmax assumes 16 chunks x 16384 each.
+            let metalCompatible = (splitLMHead == 16) && chunkSizes.allSatisfy { $0 == 16384 }
+            if metalCompatible, let metal = metalArgmax {
                 do {
                     let tokenId = try metal.findArgmax(
                         backings: currentBackings,
                         splitCount: splitLMHead,
-                        vocabSize: splitLMHead * 16384,
+                        vocabSize: totalVocabSize,
                         filterFirst: FilterLLAMA01
                     )
                     if debugLevel >= 1 {
@@ -2743,7 +2768,7 @@ private typealias Float16 = Float
                 let chunkIdx = taskIdx / parallelFactor
                 let subIdx = taskIdx % parallelFactor
                 let logitsKey = "logits\(chunkIdx + 1)"
-                let chunkOffset = chunkIdx * 16384
+                let chunkOffset = chunkOffsetsConst[chunkIdx]
 
                 guard let logitsPart = currentBackings[logitsKey],
                       let buffer = try? self.getFloatBuffer(from: logitsPart) else {
@@ -2811,7 +2836,7 @@ private typealias Float16 = Float
         } else {
             // Sampling branch
             var allLogits: [Float] = []
-            allLogits.reserveCapacity(splitLMHead * 16384)
+            allLogits.reserveCapacity(totalVocabSize)
 
             for i in 1...splitLMHead {
                 let logitsKey = "logits\(i)"
