@@ -159,6 +159,14 @@ class QwenConverter(BaseConverter):
                 print(f"❌ LUT quantization failed: {str(e)}")
                 print("Continuing without quantization...")
 
+    @staticmethod
+    def _reset_kv_cache_buffers(module: torch.nn.Module | torch.jit.ScriptModule) -> None:
+        """Clear mutable KV-cache buffers to avoid trace side-effects in state dict checks."""
+        with torch.no_grad():
+            for name, buffer in module.named_buffers():
+                if "kv_cache_" in name:
+                    buffer.zero_()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -291,6 +299,7 @@ class QwenConverter(BaseConverter):
         print(f"sample_current_pos shape: {sample_current_pos.shape}")
         print(f"sample_update_mask shape: {sample_update_mask.shape}")
 
+        self._reset_kv_cache_buffers(wrapper)
         print("Starting torch.jit.trace...")
         traced = torch.jit.trace(
             wrapper,
@@ -302,6 +311,8 @@ class QwenConverter(BaseConverter):
                 sample_update_mask,
             ),
         )
+        self._reset_kv_cache_buffers(wrapper)
+        self._reset_kv_cache_buffers(traced)
         print("torch.jit.trace completed!")
 
         print("Starting CoreML conversion...")
@@ -540,9 +551,12 @@ class QwenConverter(BaseConverter):
         )
         current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
 
+        self._reset_kv_cache_buffers(wrapper)
         traced = torch.jit.trace(
             wrapper, (hidden_states, position_ids, causal_mask, current_pos)
         )
+        self._reset_kv_cache_buffers(wrapper)
+        self._reset_kv_cache_buffers(traced)
 
         mlmodel = ct.convert(
             traced,
@@ -647,9 +661,12 @@ class QwenConverter(BaseConverter):
         )
         current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
 
+        self._reset_kv_cache_buffers(wrapper)
         traced = torch.jit.trace(
             wrapper, (hidden_states, position_ids, causal_mask, current_pos)
         )
+        self._reset_kv_cache_buffers(wrapper)
+        self._reset_kv_cache_buffers(traced)
 
         mlmodel = ct.convert(
             traced,
@@ -754,6 +771,7 @@ class QwenConverter(BaseConverter):
         print(f"sample_causal_mask shape: {sample_causal_mask.shape}")
         print(f"sample_current_pos shape: {sample_current_pos.shape}")
 
+        self._reset_kv_cache_buffers(wrapper)
         print("Starting torch.jit.trace for prefill...")
         traced = torch.jit.trace(
             wrapper,
@@ -764,6 +782,8 @@ class QwenConverter(BaseConverter):
                 sample_current_pos,
             ),
         )
+        self._reset_kv_cache_buffers(wrapper)
+        self._reset_kv_cache_buffers(traced)
         print("torch.jit.trace for prefill completed!")
 
         print("Starting CoreML conversion for prefill...")
@@ -1048,6 +1068,7 @@ class QwenConverter(BaseConverter):
 
         # Trace model
         print("Tracing monolithic model...")
+        self._reset_kv_cache_buffers(wrapper)
         with torch.no_grad():
             traced = torch.jit.trace(
                 wrapper,
@@ -1058,6 +1079,8 @@ class QwenConverter(BaseConverter):
                     sample_current_pos,
                 ),
             )
+        self._reset_kv_cache_buffers(wrapper)
+        self._reset_kv_cache_buffers(traced)
         print("Tracing completed!")
 
         # Define outputs based on LM head mode

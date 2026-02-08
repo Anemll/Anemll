@@ -263,6 +263,7 @@ class LlamaConverter(BaseConverter):
                 
                 # Now trace the model
                 print("Starting model trace...")
+                self._reset_kv_cache_buffers(wrapper)
                 traced_model = torch.jit.trace(
                     wrapper,
                     (
@@ -272,6 +273,8 @@ class LlamaConverter(BaseConverter):
                         sample_current_pos
                     )
                 )
+                self._reset_kv_cache_buffers(wrapper)
+                self._reset_kv_cache_buffers(traced_model)
                 print("Model traced successfully...converting")
                 
                 if ENABLE_DEBUG:
@@ -485,6 +488,14 @@ class LlamaConverter(BaseConverter):
             except Exception as e:
                 print(f"Warning: LUT quantization failed: {str(e)}")
                 print("Continuing with unquantized model...")
+
+    @staticmethod
+    def _reset_kv_cache_buffers(module):
+        """Clear mutable KV-cache buffers to avoid trace side-effects in state dict checks."""
+        with torch.no_grad():
+            for name, buffer in module.named_buffers():
+                if "kv_cache_" in name:
+                    buffer.zero_()
 
     def convert_embeddings(self, model):
         """Convert embeddings layer to CoreML format.
@@ -751,10 +762,13 @@ class LlamaConverter(BaseConverter):
             
             # Trace model
             print("Tracing FFN model...")
+            self._reset_kv_cache_buffers(wrapper)
             traced_model = torch.jit.trace(
                 wrapper, 
                 (hidden_states, position_ids, causal_mask, current_pos)
             )
+            self._reset_kv_cache_buffers(wrapper)
+            self._reset_kv_cache_buffers(traced_model)
             
             # Prepare inputs/outputs for conversion
             inputs = [
@@ -859,10 +873,13 @@ class LlamaConverter(BaseConverter):
             
             # Trace model
             print("Tracing prefill model...")
+            self._reset_kv_cache_buffers(wrapper)
             traced_model = torch.jit.trace(
                 wrapper, 
                 (hidden_states, position_ids, causal_mask, current_pos)
             )
+            self._reset_kv_cache_buffers(wrapper)
+            self._reset_kv_cache_buffers(traced_model)
             
             # Prepare inputs/outputs for conversion
             inputs = [
@@ -1056,6 +1073,7 @@ class LlamaConverter(BaseConverter):
 
         # Trace model
         print("Tracing monolithic model...")
+        self._reset_kv_cache_buffers(wrapper)
         with torch.no_grad():
             traced = torch.jit.trace(
                 wrapper,
@@ -1066,6 +1084,8 @@ class LlamaConverter(BaseConverter):
                     sample_current_pos,
                 ),
             )
+        self._reset_kv_cache_buffers(wrapper)
+        self._reset_kv_cache_buffers(traced)
         print("Tracing completed!")
 
         # Define outputs based on LM head mode
