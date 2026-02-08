@@ -705,7 +705,11 @@ EOF_CONFIG
         if [ \"$SINGLE_CACHE\" = true ]; then
             SINGLE_CACHE_META_FLAG=\"--single-cache\"
         fi
-        python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
+
+        # Build conversion info JSON for troubleshooting comments in meta.yaml
+        CONVERSION_INFO='{\"model_path\":\"$MODEL_PATH\",\"output_dir\":\"$OUTPUT_DIR\",\"context_length\":$CONTEXT_LENGTH,\"batch_size\":$BATCH_SIZE,\"num_chunks\":$NUM_CHUNKS,\"lut_part1\":\"${LUT_PART1:-none}\",\"lut_part2\":\"${LUT_PART2:-none}\",\"lut_part3\":\"${LUT_PART3:-none}\",\"prefix\":\"$PREFIX\",\"architecture\":\"$ARCH\",\"argmax_in_model\":$( [ \"$ARGMAX_IN_MODEL\" = true ] && echo true || echo false ),\"split_rotate\":$( [ \"$SPLIT_ROTATE\" = true ] && echo true || echo false ),\"sliding_window\":${SLIDING_WINDOW:-null},\"fp16_scale\":\"${FP16_SCALE:-null}\",\"clamp\":\"${CLAMP:-null}\",\"single_cache\":$( [ \"$SINGLE_CACHE\" = true ] && echo true || echo false ),\"dynamic_prefill_slice\":$( [ \"$DYNAMIC_PREFILL_SLICE\" = true ] && echo true || echo false ),\"monolithic\":false,\"anemll_version\":\"0.3.5\"}'
+
+        ANEMLL_CONVERSION_INFO=\"\$CONVERSION_INFO\" python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
             $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \$ARGMAX_META_FLAG \$SPLIT_ROTATE_META_FLAG \$SLIDING_WINDOW_FLAG \$UPDATE_MASK_PREFILL_FLAG \$PREFILL_DYNAMIC_SLICE_FLAG \$SINGLE_CACHE_META_FLAG

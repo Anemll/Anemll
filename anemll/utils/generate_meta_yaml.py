@@ -5,6 +5,58 @@ Generate meta.yaml with correct LUT values based on actual file existence
 
 import sys
 import os
+import json
+import re
+from datetime import datetime
+
+
+def escape_yaml_value(value):
+    """Escape a value for safe inclusion in YAML.
+
+    Handles special characters that could break YAML parsing:
+    - Quotes (single and double)
+    - Colons, hashes, and other YAML special chars
+    - Newlines and control characters
+
+    Args:
+        value: The value to escape (will be converted to string)
+
+    Returns:
+        str: Safely escaped string for YAML
+    """
+    if value is None:
+        return 'null'
+
+    s = str(value)
+
+    # Check if the string needs quoting
+    # YAML special characters and patterns that need quoting
+    needs_quoting = (
+        s == '' or
+        s.startswith((' ', '\t')) or
+        s.endswith((' ', '\t')) or
+        re.search(r'[\n\r\t\x00-\x1f]', s) or  # Control characters
+        re.search(r'^[#!&*?|>\[\]{}@`]', s) or  # YAML indicators at start
+        ':' in s or
+        '#' in s or
+        '"' in s or
+        "'" in s or
+        '\\' in s or
+        s.lower() in ('true', 'false', 'null', 'yes', 'no', 'on', 'off')
+    )
+
+    if not needs_quoting:
+        return s
+
+    # Use double quotes and escape special characters
+    escaped = s.replace('\\', '\\\\')  # Escape backslashes first
+    escaped = escaped.replace('"', '\\"')  # Escape double quotes
+    escaped = escaped.replace('\n', '\\n')  # Escape newlines
+    escaped = escaped.replace('\r', '\\r')  # Escape carriage returns
+    escaped = escaped.replace('\t', '\\t')  # Escape tabs
+
+    return f'"{escaped}"'
+
 
 def parse_lut_value(lut_str):
     """Parse LUT string to extract bits and per_channel values.
@@ -154,6 +206,11 @@ def generate_monolithic_meta(
 
     meta = '\n'.join(meta_parts)
 
+    # Add conversion info as comments if provided
+    conversion_info = os.environ.get('ANEMLL_CONVERSION_INFO')
+    if conversion_info:
+        meta += generate_conversion_comments(conversion_info)
+
     output_file = os.path.join(output_dir, 'meta.yaml')
     with open(output_file, 'w') as f:
         f.write(meta)
@@ -161,6 +218,66 @@ def generate_monolithic_meta(
     print(f"Generated monolithic meta.yaml at: {output_file}")
     print(f"  model: {model_name_file}")
     print(f"  lut_bits: {lut_value}" + (f" (per_channel: {lut_per_channel})" if lut_per_channel else ""))
+
+
+def generate_conversion_comments(conversion_info_json):
+    """Generate YAML comments with conversion parameters for troubleshooting.
+
+    Args:
+        conversion_info_json: JSON string with conversion parameters
+
+    Returns:
+        str: YAML comment block with conversion info
+    """
+    try:
+        info = json.loads(conversion_info_json)
+    except json.JSONDecodeError:
+        return ""
+
+    lines = [
+        "",
+        "# =============================================================================",
+        "# Conversion Parameters (for troubleshooting)",
+        "# =============================================================================",
+        f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+
+    # Add each parameter as a comment
+    param_order = [
+        'model_path', 'output_dir', 'context_length', 'batch_size',
+        'num_chunks', 'lut_part1', 'lut_part2', 'lut_part3',
+        'prefix', 'architecture', 'argmax_in_model', 'split_rotate',
+        'sliding_window', 'fp16_scale', 'clamp', 'single_cache',
+        'dynamic_prefill_slice', 'update_mask_prefill', 'converter',
+        'monolithic', 'anemll_version'
+    ]
+
+    lines.append("#")
+    for key in param_order:
+        if key in info and info[key] is not None:
+            value = info[key]
+            # Format boolean values
+            if isinstance(value, bool):
+                value = 'true' if value else 'false'
+            else:
+                # Escape special characters for YAML safety
+                value = escape_yaml_value(value)
+            lines.append(f"# {key}: {value}")
+
+    # Add any extra keys not in param_order
+    for key, value in info.items():
+        if key not in param_order and value is not None:
+            if isinstance(value, bool):
+                value = 'true' if value else 'false'
+            else:
+                # Escape special characters for YAML safety
+                value = escape_yaml_value(value)
+            lines.append(f"# {key}: {value}")
+
+    lines.append("# =============================================================================")
+    lines.append("")
+
+    return '\n'.join(lines)
 
 
 def main():
@@ -343,6 +460,11 @@ def main():
 ''')
 
     meta = '\n'.join(meta_parts)
+
+    # Add conversion info as comments if provided
+    conversion_info = os.environ.get('ANEMLL_CONVERSION_INFO')
+    if conversion_info:
+        meta += generate_conversion_comments(conversion_info)
 
     output_file = os.path.join(OUTPUT_DIR, 'meta.yaml')
     with open(output_file, 'w') as f:

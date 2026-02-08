@@ -505,7 +505,11 @@ EOF_CONFIG
         if [ \"$SINGLE_CACHE\" = true ]; then
             SINGLE_CACHE_META_FLAG=\"--single-cache\"
         fi
-        python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
+
+        # Build conversion info JSON for troubleshooting comments in meta.yaml
+        CONVERSION_INFO='{\"model_path\":\"$MODEL_PATH\",\"output_dir\":\"$OUTPUT_DIR\",\"context_length\":$CONTEXT_LENGTH,\"batch_size\":$BATCH_SIZE,\"lut_bits\":\"${LUT_BITS:-none}\",\"prefix\":\"$PREFIX\",\"architecture\":\"$ARCH\",\"argmax_in_model\":$( [ \"$ARGMAX_IN_MODEL\" = true ] && echo true || echo false ),\"rotate\":$( [ \"$ROTATE\" = true ] && echo true || echo false ),\"sliding_window\":${SLIDING_WINDOW:-null},\"fp16_scale\":\"${FP16_SCALE:-null}\",\"clamp\":\"${CLAMP:-null}\",\"single_cache\":$( [ \"$SINGLE_CACHE\" = true ] && echo true || echo false ),\"dynamic_prefill_slice\":$( [ \"$DYNAMIC_PREFILL_SLICE\" = true ] && echo true || echo false ),\"monolithic\":true,\"anemll_version\":\"0.3.5\"}'
+
+        ANEMLL_CONVERSION_INFO=\"\$CONVERSION_INFO\" python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \
             1 \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \
