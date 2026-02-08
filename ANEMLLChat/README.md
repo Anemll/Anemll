@@ -151,6 +151,10 @@ The app displays real-time metrics during generation:
 - **Token count**: Total tokens generated
 - **Window shifts**: Context window rotations (for long conversations)
 
+## Release Notes
+
+- Fixed Qwen3 multi-chunk inference divergence caused by applying final normalization on every FFN chunk. Final normalization is now applied only on the last chunk, restoring stable Qwen3 chunked generation quality.
+
 ## License
 
 MIT License - See LICENSE file for details
