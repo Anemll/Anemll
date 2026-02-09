@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+set -eEuo pipefail
+
+# Step-driven wrapper for state-transition context builds.
+#
+# Step 1:
+#   Build max-context folder with full hybrid export (rebuild script).
+# Step 2:
+#   Build remaining contexts using --reuse-static-from max-context output.
+# Step 3:
+#   Combine all contexts into one state-transition output folder
+#   and write multi-context meta.yaml.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REBUILD_SCRIPT="${SCRIPT_DIR}/rebuild_vibethinker_hybrid.sh"
+COMBINE_SCRIPT="${SCRIPT_DIR}/combine_vibethinker_infer_contexts.sh"
+
+STEP_RAW=""
+CONTEXTS_RAW="512 1024 2048 3072 4096"
+MAX_CONTEXT=4096
+STATE_ROOT="/Volumes/Models/ANE/vibethinker_1.5b_state_transition"
+CONTEXT_ROOT=""
+OUTPUT_DIR=""
+CONTEXT_NAME_TEMPLATE="vibethinker_1.5b_ctx{context}_fp16_hybrid"
+
+FORCE_CLEAN=true
+SKIP_SMOKE=true
+FORCE_COMBINE=true
+STEP2_REUSE_INFER_ONLY=false
+REBUILD_EXTRA_ARGS=""
+COMBINE_EXTRA_ARGS=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/build_ctx_model --step <1|2|3|all> [options]
+
+Steps:
+  --step 1   Equivalent to:
+               bash scripts/rebuild_vibethinker_hybrid.sh \
+                 --context 4096 \
+                 --output <context-root>/vibethinker_1.5b_ctx4096_fp16_hybrid \
+                 --force-clean \
+                 --skip-smoke
+
+  --step 2   Equivalent to:
+               for C in 512 1024 2048 3072; do
+                 bash scripts/rebuild_vibethinker_hybrid.sh \
+                   --context "$C" \
+                   --output "<context-root>/vibethinker_1.5b_ctx${C}_fp16_hybrid" \
+                   --reuse-static-from <context-root>/vibethinker_1.5b_ctx4096_fp16_hybrid \
+                   --force-clean \
+                   --skip-smoke
+               done
+
+  --step 3   Equivalent to:
+               bash scripts/combine_vibethinker_infer_contexts.sh \
+                 --contexts "512 1024 2048 3072 4096" \
+                 --max-context 4096 \
+                 --context-root <context-root> \
+                 --output <output> \
+                 --infer-kind FFN_PF \
+                 --infer-chunk1-kind auto \
+                 --prefill-kind FFN_PF \
+                 # pass --combine-extra-args "--infer-chunk1-kind FFN_attn_fp32" \
+                 # only when explicitly testing standalone FP32 infer chunk_01
+                 --clean-output \
+                 --force
+               # Writes <output>/meta.yaml for multi-context state transition
+
+Options:
+  --contexts "LIST"            Context list (comma/space separated)
+                               Default: "512 1024 2048 3072 4096"
+  --max-context N              Max/prefill context (default: 4096)
+  --state-root DIR             Root for transition build
+                               Default: /Volumes/Models/ANE/vibethinker_1.5b_state_transition
+  --context-root DIR           Per-context folder root
+                               Default: <state-root>/_contexts
+  --output DIR                 Combined output folder (step 3)
+                               Default: <state-root>
+  --context-name-template STR  Per-context folder template with {context}
+                               Default: vibethinker_1.5b_ctx{context}_fp16_hybrid
+
+  --no-force-clean             Do not pass --force-clean to rebuild script
+  --clean                      Explicitly pass --force-clean (default behavior)
+  --no-skip-smoke              Do not pass --skip-smoke to rebuild script
+  --no-force-combine           Do not pass --force to combine script
+  --step2-reuse-infer-only     Step 2 uses converter infer-only reuse mode
+                               (faster but uses regular converter chunk contract)
+  --rebuild-extra-args "ARGS"  Extra args appended to rebuild calls
+  --combine-extra-args "ARGS"  Extra args appended to combine call
+
+  -h, --help                   Show this help
+EOF
+}
+
+ctx_dir_for() {
+  local ctx="$1"
+  local name="${CONTEXT_NAME_TEMPLATE//\{context\}/${ctx}}"
+  echo "${CONTEXT_ROOT}/${name}"
+}
+
+has_infer_chunk_file() {
+  local dir="$1"
+  local idx="$2"
+  local ext
+  for ext in mlpackage mlmodelc; do
+    if [[ -d "${dir}/qwen25_FFN_chunk_${idx}of03.${ext}" ]]; then
+      return 0
+    fi
+    if [[ -d "${dir}/qwen25_FFN_PF_chunk_${idx}of03.${ext}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+assert_context_has_infer_chunks() {
+  local ctx="$1"
+  local dir="$2"
+  local idx
+  for idx in 01 02 03; do
+    if ! has_infer_chunk_file "${dir}" "${idx}"; then
+      echo "[check] Context ${ctx} is missing infer chunk ${idx}of03 in ${dir}" >&2
+      echo "        Expected qwen25_FFN_chunk_* or qwen25_FFN_PF_chunk_* artifacts." >&2
+      return 1
+    fi
+  done
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --step) STEP_RAW="$2"; shift 2 ;;
+    --contexts) CONTEXTS_RAW="$2"; shift 2 ;;
+    --max-context) MAX_CONTEXT="$2"; shift 2 ;;
+    --state-root) STATE_ROOT="$2"; shift 2 ;;
+    --context-root) CONTEXT_ROOT="$2"; shift 2 ;;
+    --output) OUTPUT_DIR="$2"; shift 2 ;;
+    --context-name-template) CONTEXT_NAME_TEMPLATE="$2"; shift 2 ;;
+    --clean) FORCE_CLEAN=true; shift 1 ;;
+    --no-force-clean) FORCE_CLEAN=false; shift 1 ;;
+    --no-skip-smoke) SKIP_SMOKE=false; shift 1 ;;
+    --no-force-combine) FORCE_COMBINE=false; shift 1 ;;
+    --step2-reuse-infer-only) STEP2_REUSE_INFER_ONLY=true; shift 1 ;;
+    --rebuild-extra-args) REBUILD_EXTRA_ARGS="$2"; shift 2 ;;
+    --combine-extra-args) COMBINE_EXTRA_ARGS="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+if [[ -z "${STEP_RAW}" ]]; then
+  echo "--step is required" >&2
+  usage
+  exit 1
+fi
+
+if [[ ! -f "${REBUILD_SCRIPT}" ]]; then
+  echo "Missing script: ${REBUILD_SCRIPT}" >&2
+  exit 1
+fi
+if [[ ! -f "${COMBINE_SCRIPT}" ]]; then
+  echo "Missing script: ${COMBINE_SCRIPT}" >&2
+  exit 1
+fi
+if [[ ! "${MAX_CONTEXT}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid --max-context: ${MAX_CONTEXT}" >&2
+  exit 1
+fi
+
+if [[ -z "${CONTEXT_ROOT}" ]]; then
+  CONTEXT_ROOT="${STATE_ROOT}/_contexts"
+fi
+if [[ -z "${OUTPUT_DIR}" ]]; then
+  OUTPUT_DIR="${STATE_ROOT}"
+fi
+mkdir -p "${CONTEXT_ROOT}"
+
+# shellcheck disable=SC2206
+CONTEXTS=( $(echo "${CONTEXTS_RAW}" | tr ',' ' ') )
+if [[ ${#CONTEXTS[@]} -eq 0 ]]; then
+  echo "No contexts provided" >&2
+  exit 1
+fi
+for c in "${CONTEXTS[@]}"; do
+  if [[ ! "${c}" =~ ^[0-9]+$ ]]; then
+    echo "Invalid context value: ${c}" >&2
+    exit 1
+  fi
+done
+
+has_max=false
+for c in "${CONTEXTS[@]}"; do
+  if [[ "${c}" == "${MAX_CONTEXT}" ]]; then
+    has_max=true
+    break
+  fi
+done
+if [[ "${has_max}" != "true" ]]; then
+  echo "--max-context (${MAX_CONTEXT}) must be included in --contexts" >&2
+  exit 1
+fi
+
+if [[ "${STEP_RAW}" == "all" ]]; then
+  STEPS=(1 2 3)
+else
+  # shellcheck disable=SC2206
+  STEPS=( $(echo "${STEP_RAW}" | tr ',' ' ') )
+  if [[ ${#STEPS[@]} -eq 0 ]]; then
+    echo "Invalid --step value: ${STEP_RAW}" >&2
+    exit 1
+  fi
+  for s in "${STEPS[@]}"; do
+    case "${s}" in
+      1|2|3) ;;
+      *) echo "Invalid step token: ${s} (allowed: 1,2,3,all)" >&2; exit 1 ;;
+    esac
+  done
+fi
+
+run_step_1() {
+  local max_dir
+  max_dir="$(ctx_dir_for "${MAX_CONTEXT}")"
+
+  local cmd=(
+    bash "${REBUILD_SCRIPT}"
+    --context "${MAX_CONTEXT}"
+    --output "${max_dir}"
+  )
+  if [[ "${FORCE_CLEAN}" == "true" ]]; then
+    cmd+=(--force-clean)
+  fi
+  if [[ "${SKIP_SMOKE}" == "true" ]]; then
+    cmd+=(--skip-smoke)
+  fi
+  if [[ -n "${REBUILD_EXTRA_ARGS}" ]]; then
+    # shellcheck disable=SC2206
+    local extra=( ${REBUILD_EXTRA_ARGS} )
+    cmd+=("${extra[@]}")
+  fi
+
+  echo "[step 1] max context export"
+  echo "         ${cmd[*]}"
+  "${cmd[@]}"
+}
+
+run_step_2() {
+  local max_dir
+  max_dir="$(ctx_dir_for "${MAX_CONTEXT}")"
+  if [[ ! -d "${max_dir}" ]]; then
+    echo "[step 2] Missing max context dir: ${max_dir}" >&2
+    echo "Run --step 1 first, or set --context-root/--context-name-template correctly." >&2
+    exit 1
+  fi
+
+  local ran=false
+  local ctx out_dir
+  for ctx in "${CONTEXTS[@]}"; do
+    if [[ "${ctx}" == "${MAX_CONTEXT}" ]]; then
+      continue
+    fi
+    out_dir="$(ctx_dir_for "${ctx}")"
+    local cmd=(
+      bash "${REBUILD_SCRIPT}"
+      --context "${ctx}"
+      --output "${out_dir}"
+      --reuse-static-from "${max_dir}"
+    )
+    if [[ "${STEP2_REUSE_INFER_ONLY}" == "true" ]]; then
+      cmd+=(--reuse-infer-only)
+    fi
+    if [[ "${FORCE_CLEAN}" == "true" ]]; then
+      cmd+=(--force-clean)
+    fi
+    if [[ "${SKIP_SMOKE}" == "true" ]]; then
+      cmd+=(--skip-smoke)
+    fi
+    if [[ -n "${REBUILD_EXTRA_ARGS}" ]]; then
+      # shellcheck disable=SC2206
+      local extra=( ${REBUILD_EXTRA_ARGS} )
+      cmd+=("${extra[@]}")
+    fi
+
+    echo "[step 2] context ${ctx}"
+    echo "         ${cmd[*]}"
+    "${cmd[@]}"
+    assert_context_has_infer_chunks "${ctx}" "${out_dir}"
+    ran=true
+  done
+
+  if [[ "${ran}" != "true" ]]; then
+    echo "[step 2] No non-max contexts to build (contexts: ${CONTEXTS[*]})." >&2
+  fi
+}
+
+run_step_3() {
+  local cmd=(
+    bash "${COMBINE_SCRIPT}"
+    --contexts "${CONTEXTS[*]}"
+    --max-context "${MAX_CONTEXT}"
+    --context-root "${CONTEXT_ROOT}"
+    --context-name-template "${CONTEXT_NAME_TEMPLATE}"
+    --output "${OUTPUT_DIR}"
+    --infer-kind "FFN_PF"
+    --infer-chunk1-kind "auto"
+    --prefill-kind "FFN_PF"
+    --clean-output
+  )
+
+  local ctx pre_dir
+  for ctx in "${CONTEXTS[@]}"; do
+    pre_dir="$(ctx_dir_for "${ctx}")"
+    if [[ ! -d "${pre_dir}" ]]; then
+      echo "[step 3] Missing context directory: ${pre_dir}" >&2
+      exit 1
+    fi
+    if ! assert_context_has_infer_chunks "${ctx}" "${pre_dir}"; then
+      echo "[step 3] Run step 2 (or rebuild missing context) before combine." >&2
+      exit 1
+    fi
+  done
+
+  if [[ "${FORCE_COMBINE}" == "true" ]]; then
+    cmd+=(--force)
+  fi
+  if [[ -n "${COMBINE_EXTRA_ARGS}" ]]; then
+    # shellcheck disable=SC2206
+    local extra=( ${COMBINE_EXTRA_ARGS} )
+    cmd+=("${extra[@]}")
+  fi
+
+  echo "[step 3] combine contexts"
+  echo "         ${cmd[*]}"
+  "${cmd[@]}"
+
+  local meta_path="${OUTPUT_DIR}/meta.yaml"
+  if [[ ! -f "${meta_path}" ]]; then
+    echo "[step 3] ERROR: expected multi-context meta.yaml was not created: ${meta_path}" >&2
+    exit 1
+  fi
+  if ! grep -q "state_transition_infer_contexts:" "${meta_path}"; then
+    echo "[step 3] ERROR: meta.yaml missing state transition contexts: ${meta_path}" >&2
+    exit 1
+  fi
+  if ! grep -q "state_transition_prefill_context:" "${meta_path}"; then
+    echo "[step 3] ERROR: meta.yaml missing prefill transition context: ${meta_path}" >&2
+    exit 1
+  fi
+  echo "[step 3] Verified multi-context meta.yaml: ${meta_path}"
+}
+
+echo "Build plan:"
+echo "  Steps: ${STEPS[*]}"
+echo "  Contexts: ${CONTEXTS[*]}"
+echo "  Max context: ${MAX_CONTEXT}"
+echo "  Context root: ${CONTEXT_ROOT}"
+echo "  Output: ${OUTPUT_DIR}"
+echo "  Step2 infer-only reuse: ${STEP2_REUSE_INFER_ONLY}"
+
+for step in "${STEPS[@]}"; do
+  case "${step}" in
+    1) run_step_1 ;;
+    2) run_step_2 ;;
+    3) run_step_3 ;;
+  esac
+done
+
+echo "Done."

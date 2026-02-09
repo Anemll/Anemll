@@ -517,5 +517,97 @@ This would give:
 - ANEMLL Project: https://github.com/anemll/anemll
 
 ---
+## Post-LUT Multi-Context Chunk Export (Inference-Only)
 
-*Last updated: 2026-01-24*
+When you already have context-specific exports (and LUT/palettization already done),
+use the exporter below to avoid re-running LUT for every state size.
+
+What it creates per chunk:
+- `infer_ctx512`, `infer_ctx1024`, `infer_ctx2048`, `infer_ctx3072`, `infer_ctx4096`
+- `infer` alias (points to max context infer)
+- `prefill` from max context only (single prefill state size)
+
+Script:
+- `tests/dev/export_state_transition_chunks.py`
+
+Example:
+
+```bash
+python tests/dev/export_state_transition_chunks.py \
+  --contexts \
+    512=/Volumes/Models/ANE/vibethinker_1.5b_ctx0512_fp16_hybrid \
+    1024=/Volumes/Models/ANE/vibethinker_1.5b_ctx1024_fp16_hybrid \
+    2048=/Volumes/Models/ANE/vibethinker_1.5b_ctx2048_fp16_hybrid \
+    3072=/Volumes/Models/ANE/vibethinker_1.5b_ctx3072_fp16_hybrid \
+    4096=/Volumes/Models/ANE/vibethinker_1.5b_ctx4096_fp16_hybrid \
+  --output-dir /Volumes/Models/ANE/vibethinker_1.5b_state_transition \
+  --compile \
+  --force
+```
+
+Notes:
+- This is an export/combine step only; it does not re-convert weights.
+- Current scope is inference state transitions. Prefill remains max-context only.
+- Output writes `state_transition_manifest.yaml` to the output folder.
+
+One-command builder (creates context subfolders, verifies inference for each context, then combines):
+
+```bash
+bash scripts/build_vibethinker_state_transition.sh \
+  --output /Volumes/Models/ANE/vibethinker_1.5b_state_transition \
+  --contexts "512 1024 2048 3072 4096" \
+  --force-output
+```
+
+Export-first flow (no combine/compile), with max context first:
+
+```bash
+bash scripts/export_vibethinker_infer_contexts.sh \
+  --contexts "512 1024 2048 3072 4096" \
+  --max-context 4096 \
+  --context-root /Volumes/Models/ANE/vibethinker_1.5b_state_transition/_contexts
+```
+
+This export-first script does exactly:
+- Context `4096`: steps `1,2,3,4` only (embeddings + lm_head + FFN infer chunks + prefill chunks)
+- Other contexts: step `3` only (FFN infer chunks only)
+- Never runs combine/compile/test steps (`5/6/8`)
+
+After that, combine into state-transition chunk packages (no compile):
+
+```bash
+bash scripts/combine_vibethinker_infer_contexts.sh \
+  --contexts "512 1024 2048 3072 4096" \
+  --max-context 4096 \
+  --context-root /Volumes/Models/ANE/vibethinker_1.5b_state_transition/_contexts \
+  --output /Volumes/Models/ANE/vibethinker_1.5b_state_transition \
+  --force
+```
+
+This combine script creates per chunk:
+- `infer_ctx512`, `infer_ctx1024`, `infer_ctx2048`, `infer_ctx3072`, `infer_ctx4096`
+- `infer` alias (from 4096 infer)
+- `prefill` (from 4096 prefill)
+
+Default intermediate context folders are created under:
+- `<output>/_contexts/`
+for example:
+- `/Volumes/Models/ANE/vibethinker_1.5b_state_transition/_contexts/vibethinker_1.5b_ctx512_fp16_hybrid`
+
+Final combined chunks are written directly in:
+- `/Volumes/Models/ANE/vibethinker_1.5b_state_transition`
+
+Per-context inference verification (before combine):
+- Builder runs a smoke inference (`tests/chat.py --meta ... --prompt ...`) for each context.
+- A PASS marker is written at `<context_dir>/.infer_smoke_ok`.
+- On later runs, verification is skipped automatically for contexts that already have the marker.
+- Use `--verify-always` to force re-test, or `--no-verify-infer` to skip checks.
+
+Quantization behavior:
+- `--context-lut2` controls per-context rebuild quantization (slow if enabled for many contexts)
+- `--post-lut2` / `--lut2` quantizes once per **combined chunk package**
+- Recommended for multi-context export: `--context-lut2 none --lut2 <bits[,per_channel]>`
+
+---
+
+*Last updated: 2026-02-08*

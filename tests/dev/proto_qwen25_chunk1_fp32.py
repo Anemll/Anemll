@@ -243,6 +243,72 @@ class Chunk1AttnPrefillWrapper(torch.nn.Module):
         return hidden_states + attn_out
 
 
+class Chunk1Fp32FirstAttnInferWrapper(torch.nn.Module):
+    """Full chunk-1 contract with FP32 first-layer attention path.
+
+    This wrapper is intended for infer-only standalone export used by
+    state-transition combine. It preserves default converter chunk semantics:
+    - chunk_01 must output the same hidden state contract as regular FFN chunk_01
+      for the given num_chunks partition.
+    """
+
+    def __init__(self, model: Qwen25ForCausalLM, end_layer: int | None):
+        super().__init__()
+        self.model = model
+        self.end_layer = end_layer
+
+    def forward(self, hidden_states, position_ids, causal_mask, current_pos):
+        layer0 = self.model.model.layers[0]
+        normalized_states = layer0.input_layernorm(hidden_states)
+        rotary = self.model.model.get_rotary_embeddings_s(current_pos)
+        query_states, key_states, value_states = layer0.self_attn.get_new_kv_cache(
+            normalized_states,
+            current_pos,
+            rotary,
+        )
+
+        kv_cache = self.model.model.kv_cache_0
+        layers_per_group = self.model.config.num_hidden_layers
+        key_idx = 0
+        value_idx = layers_per_group
+        pos = current_pos
+        kv_cache[key_idx : key_idx + 1, :, pos : pos + 1, :] = key_states
+        kv_cache[value_idx : value_idx + 1, :, pos : pos + 1, :] = value_states
+
+        key_cache = kv_cache[key_idx : key_idx + 1].squeeze(0)
+        value_cache = kv_cache[value_idx : value_idx + 1].squeeze(0)
+        attn_out = layer0.self_attn.forward_regular(
+            hidden_states=normalized_states,
+            query_states=query_states,
+            kv_cache_layer=(key_cache, value_cache),
+            causal_mask=causal_mask,
+            current_pos=current_pos,
+        )
+        hidden_states = hidden_states + attn_out
+
+        # Complete layer0 MLP path so chunk output matches default converter chunk_01.
+        post = layer0.post_attention_layernorm(hidden_states)
+        hidden_states = hidden_states + layer0.mlp(post)
+
+        if self.end_layer is None or self.end_layer > 1:
+            hidden_states = self.model.model.process_layers(
+                hidden_states,
+                position_ids,
+                causal_mask,
+                current_pos,
+                rotary,
+                start_layer=1,
+                end_layer=self.end_layer,
+                IN_PREFILL=False,
+            )
+
+        # Mirror converter behavior: only last chunk applies final norm.
+        if self.end_layer is None or self.end_layer == len(self.model.model.layers):
+            hidden_states = self.model.model.norm(hidden_states)
+
+        return hidden_states
+
+
 class Chunk2AfterAttnInferWrapper(torch.nn.Module):
     """layer0 MLP + middle layers for infer."""
 
@@ -432,13 +498,17 @@ def _build_lm_head(
     return converter.convert_part_3(model, argmax_in_model=argmax_in_model)
 
 
-def _load_meta_params(source_dir: Path) -> dict[str, Any]:
+def _load_meta_params(source_dir: Path, allow_missing: bool = False) -> dict[str, Any]:
     meta_path = source_dir / "meta.yaml"
     if not meta_path.exists():
+        if allow_missing:
+            return {}
         raise FileNotFoundError(meta_path)
     meta = yaml.safe_load(meta_path.read_text())
     params = meta.get("model_info", {}).get("parameters", {})
     if not params:
+        if allow_missing:
+            return {}
         raise ValueError("meta.yaml missing model_info.parameters")
     return params
 
@@ -461,6 +531,11 @@ def _copy_tail_chunk_from_source(source_dir: Path, out_dir: Path, source_base: s
 
 def _lut_to_meta_value(bits: int | None) -> str | int:
     return "none" if bits is None else int(bits)
+
+
+def _has_chunk_artifact(out_dir: Path, base: str, idx: int, num_chunks: int) -> bool:
+    stem = f"{base}_chunk_{idx:02d}of{num_chunks:02d}"
+    return (out_dir / f"{stem}.mlpackage").exists() or (out_dir / f"{stem}.mlmodelc").exists()
 
 
 def _update_meta_for_3chunks(
@@ -534,13 +609,37 @@ def main() -> int:
     )
     ap.add_argument("--context-length", type=int, default=2048)
     ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--num-chunks", type=int, default=3, help="Chunk count for infer-only patch naming (default: 3).")
     ap.add_argument("--reuse-out-dir", action="store_true", help="Do not recopy source dir if out dir exists.")
+    ap.add_argument(
+        "--infer-only",
+        action="store_true",
+        help="Only rebuild FFN chunk_01 infer in FP32 and keep existing FFN chunk_02/03 artifacts.",
+    )
+    ap.add_argument(
+        "--infer-only-out-base",
+        default=None,
+        help=(
+            "Optional output base stem for infer-only FP32 chunk export "
+            "(e.g. qwen25_FFN_attn_fp32). If omitted, overwrites the regular FFN chunk_01 base."
+        ),
+    )
+    ap.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Do not compile newly produced .mlpackage outputs to .mlmodelc.",
+    )
     ap.add_argument("--no-quantize-chunk2", action="store_true", help="Skip LUT quantization for chunk2 (legacy flag).")
     ap.add_argument("--no-quantize-ffn", action="store_true", help="Skip LUT quantization for FFN chunks 2 and 3.")
     ap.add_argument("--copy-tail-from-source", action="store_true", help="Reuse source tail chunk (may stay quantized).")
     ap.add_argument("--lut1", type=str, default=None, help="LUT for embeddings, e.g. 'none' or '6,4'")
     ap.add_argument("--lut2", type=str, default=None, help="LUT for FFN chunks, e.g. 'none' or '6,4'")
     ap.add_argument("--lut3", type=str, default=None, help="LUT for lm_head, e.g. 'none' or '6,4'")
+    ap.add_argument(
+        "--reuse-lm-head",
+        action="store_true",
+        help="Reuse existing lm_head artifact in out dir instead of rebuilding it.",
+    )
     ap.add_argument(
         "--argmax-in-model",
         choices=["auto", "true", "false"],
@@ -571,7 +670,7 @@ def main() -> int:
         print(f"Cloning source directory to: {out_dir}")
         shutil.copytree(source_dir, out_dir)
 
-    meta_params = _load_meta_params(source_dir)
+    meta_params = _load_meta_params(source_dir, allow_missing=args.infer_only)
     model_prefix = str(meta_params.get("model_prefix", "qwen25"))
     src_lut1_bits, src_lut1_per = _meta_lut_to_tuple(
         meta_params.get("lut_embeddings"),
@@ -592,8 +691,12 @@ def main() -> int:
     if lut1_bits is not None:
         print("Warning: this prototype keeps chunk_01of03 FP32 unquantized; --lut1 is metadata-only here.")
 
-    source_base = f"{model_prefix}_FFN_PF{_lut_suffix(src_lut2_bits)}"
-    target_base = f"{model_prefix}_FFN_PF{_lut_suffix(lut2_bits)}"
+    if args.infer_only:
+        source_base = f"{model_prefix}_FFN{_lut_suffix(src_lut2_bits)}"
+        target_base = f"{model_prefix}_FFN{_lut_suffix(lut2_bits)}"
+    else:
+        source_base = f"{model_prefix}_FFN_PF{_lut_suffix(src_lut2_bits)}"
+        target_base = f"{model_prefix}_FFN_PF{_lut_suffix(lut2_bits)}"
 
     print(f"Source chunk base: {source_base}")
     print(f"Target chunk base: {target_base}")
@@ -622,6 +725,71 @@ def main() -> int:
     chunk2_prefill = Chunk2AfterAttnPrefillWrapper(model, end_layer=split_layer).eval()
     chunk3_infer = Chunk3TailInferWrapper(model, start_layer=split_layer).eval()
     chunk3_prefill = Chunk3TailPrefillWrapper(model, start_layer=split_layer).eval()
+
+    if args.infer_only:
+        if args.num_chunks <= 0:
+            raise ValueError("--num-chunks must be > 0")
+
+        chunk1_start, chunk1_end = _chunk_bounds(cfg.num_hidden_layers, args.num_chunks, 0)
+        if chunk1_start != 0:
+            raise RuntimeError(
+                f"Unexpected chunk partition for chunk_01: start={chunk1_start}, end={chunk1_end}"
+            )
+        chunk1_infer_compatible = Chunk1Fp32FirstAttnInferWrapper(
+            model,
+            end_layer=chunk1_end,
+        ).eval()
+
+        infer_only_base = args.infer_only_out_base.strip() if args.infer_only_out_base else target_base
+        overwrite_mode = infer_only_base == target_base
+        print(
+            "Infer-only mode: exporting "
+            f"{infer_only_base}_chunk_01of{args.num_chunks:02d} in FP32-first-attn mode "
+            f"(chunk_01 end_layer={chunk1_end})"
+            + (" (overwrite mode)" if overwrite_mode else " (standalone mode)")
+        )
+        c1_infer_ml = _convert_infer_wrapper(
+            chunk1_infer_compatible,
+            model,
+            args.context_length,
+            cfg.hidden_size,
+            precision=ct.precision.FLOAT32,
+            compute_units=ct.ComputeUnit.CPU_ONLY,
+        )
+
+        c1_pkg = out_dir / f"{infer_only_base}_chunk_01of{args.num_chunks:02d}.mlpackage"
+        _save_model(c1_infer_ml, c1_pkg)
+        if not args.no_compile:
+            _compile_mlpackage(c1_pkg, out_dir)
+
+        if overwrite_mode:
+            for idx in range(2, args.num_chunks + 1):
+                if not _has_chunk_artifact(out_dir, target_base, idx, args.num_chunks):
+                    raise FileNotFoundError(
+                        f"Missing existing infer chunk {idx:02d}of{args.num_chunks:02d} in {out_dir} "
+                        f"(expected {target_base}_chunk_{idx:02d}of{args.num_chunks:02d}.mlpackage/.mlmodelc)."
+                    )
+
+        # Update meta only when present; infer-only context folders may skip meta.yaml.
+        if overwrite_mode and meta_params and (out_dir / "meta.yaml").exists():
+            meta_path = out_dir / "meta.yaml"
+            meta = yaml.safe_load(meta_path.read_text())
+            params = meta.setdefault("model_info", {}).setdefault("parameters", {})
+            params["num_chunks"] = int(args.num_chunks)
+            params["lut_ffn"] = _lut_to_meta_value(lut2_bits)
+            params["ffn"] = (
+                f"{target_base}_chunk_01of{args.num_chunks:02d}.mlpackage"
+                if args.no_compile
+                else f"{target_base}_chunk_01of{args.num_chunks:02d}.mlmodelc"
+            )
+            meta_path.write_text(yaml.safe_dump(meta, sort_keys=False))
+
+        print("\nDone (infer-only).")
+        print(f"FP32 attention artifact: {c1_pkg.name}")
+        if not overwrite_mode:
+            print(f"Original FFN chunks preserved under base: {target_base}")
+        print(f"Compile: {'disabled' if args.no_compile else 'enabled'}")
+        return 0
 
     # Build lm_head according to --lut3 so metadata can point to a matching artifact.
     source_argmax_in_model = bool(meta_params.get("argmax_in_model", False))
@@ -660,19 +828,34 @@ def main() -> int:
         }
 
     lm_head_stem = f"{model_prefix}_lm_head{_lut_suffix(lut3_bits)}"
-    lm_head_pkg = out_dir / f"{lm_head_stem}.mlpackage"
-    lm_head_mlmodelc = out_dir / f"{lm_head_stem}.mlmodelc"
-    print(f"Building LM head: {lm_head_pkg.name} (argmax={argmax_in_model})")
-    lm_head_ml = _build_lm_head(
-        model=model,
-        context_length=args.context_length,
-        batch_size=args.batch_size,
-        lut3_bits=lut3_bits,
-        lut3_per=lut3_per,
-        argmax_in_model=argmax_in_model,
-    )
-    _save_model(lm_head_ml, lm_head_pkg)
-    _compile_mlpackage(lm_head_pkg, out_dir)
+    if args.reuse_lm_head:
+        existing_lm_head = str(meta_params.get("lm_head", "")).strip()
+        if existing_lm_head:
+            lm_head_stem = Path(existing_lm_head).stem
+        lm_head_pkg = out_dir / f"{lm_head_stem}.mlpackage"
+        lm_head_mlmodelc = out_dir / f"{lm_head_stem}.mlmodelc"
+        print(f"Reusing LM head: {lm_head_stem} (argmax meta override={argmax_in_model})")
+        if not lm_head_mlmodelc.exists():
+            if lm_head_pkg.exists():
+                _compile_mlpackage(lm_head_pkg, out_dir)
+            else:
+                raise FileNotFoundError(
+                    f"--reuse-lm-head requested but neither {lm_head_pkg} nor {lm_head_mlmodelc} exists"
+                )
+    else:
+        lm_head_pkg = out_dir / f"{lm_head_stem}.mlpackage"
+        lm_head_mlmodelc = out_dir / f"{lm_head_stem}.mlmodelc"
+        print(f"Building LM head: {lm_head_pkg.name} (argmax={argmax_in_model})")
+        lm_head_ml = _build_lm_head(
+            model=model,
+            context_length=args.context_length,
+            batch_size=args.batch_size,
+            lut3_bits=lut3_bits,
+            lut3_per=lut3_per,
+            argmax_in_model=argmax_in_model,
+        )
+        _save_model(lm_head_ml, lm_head_pkg)
+        _compile_mlpackage(lm_head_pkg, out_dir)
 
     # Build chunk 01of03 (FP32 attention-only)
     print("Converting chunk_01of03 infer (FP32, CPU_ONLY)...")
