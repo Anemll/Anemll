@@ -291,11 +291,11 @@ struct SettingsView: View {
                         get: { Double(maxTokens) },
                         set: { maxTokens = Int($0) }
                     ),
-                    in: 64...2048,
+                    in: 64...Double(maxTokensLimit),
                     step: 64
                 )
 
-                Text("Maximum number of tokens to generate")
+                Text("Maximum number of tokens to generate (model max: \(maxTokensLimit))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -316,6 +316,11 @@ struct SettingsView: View {
 
     private var isArgmaxModel: Bool {
         InferenceService.shared.isArgmaxModel
+    }
+
+    /// Maximum tokens limit based on current model's context size
+    private var maxTokensLimit: Int {
+        InferenceService.shared.modelMaxContextSize
     }
 
     @ViewBuilder
@@ -521,7 +526,8 @@ struct SettingsView: View {
 
     private func loadSettings() {
         temperature = chatVM.temperature
-        maxTokens = chatVM.maxTokens
+        // Clamp maxTokens to current model's context size
+        maxTokens = min(chatVM.maxTokens, maxTokensLimit)
 
         // Parse the stored system prompt to determine option
         let storedPrompt = chatVM.systemPrompt

@@ -72,12 +72,42 @@ struct MessageBubble: View, Equatable {
     }
 
     private func copyToClipboard() {
+        copyText(message.content)
+    }
+
+    /// Copy text excluding <think>...</think> blocks
+    private func copyWithoutThinking() {
+        let cleaned = stripThinkBlocks(from: message.content)
+        copyText(cleaned)
+    }
+
+    private func copyText(_ text: String) {
         #if os(macOS)
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(message.content, forType: .string)
+        NSPasteboard.general.setString(text, forType: .string)
         #else
-        UIPasteboard.general.string = message.content
+        UIPasteboard.general.string = text
         #endif
+    }
+
+    /// Remove <think>...</think> blocks from content
+    private func stripThinkBlocks(from content: String) -> String {
+        var result = content
+
+        // Remove complete <think>...</think> blocks
+        let completePattern = #"<think>[\s\S]*?</think>"#
+        if let regex = try? NSRegularExpression(pattern: completePattern, options: []) {
+            let range = NSRange(result.startIndex..., in: result)
+            result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
+        }
+
+        // Remove incomplete <think>... (streaming case)
+        if let openRange = result.range(of: "<think>") {
+            result = String(result[..<openRange.lowerBound])
+        }
+
+        // Clean up extra whitespace
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Message Content
@@ -104,7 +134,7 @@ struct MessageBubble: View, Equatable {
                     } else {
                         // Assistant messages
                         if enableMarkup {
-                            MarkdownView(content: message.content, isUserMessage: false, allowSelection: allowSelection)
+                            MarkdownView(content: message.content, isUserMessage: false, allowSelection: allowSelection, isMessageComplete: message.isComplete)
                         } else {
                             Text(message.content)
                                 .selectable(allowSelection)
@@ -145,8 +175,19 @@ private let llmAccent = Color(red: 1.0, green: 0.62, blue: 0.2)
 extension MessageBubble {
     @ViewBuilder
     fileprivate var statsView: some View {
-        // Always show key stats: tok/s, prefill speed, context tokens
+        // Always show key stats: copy button, tok/s, prefill speed, context tokens
         HStack(spacing: 8) {
+            // Copy button (always visible in stats row) - excludes thinking
+            Button {
+                copyWithoutThinking()
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Copy message (excludes thinking)")
+
             // Generation speed
             if let tps = message.tokensPerSecond {
                 HStack(spacing: 2) {

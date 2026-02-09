@@ -387,35 +387,56 @@ struct ContentView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "bubble.left.and.bubble.right")
-                .font(.system(size: 60))
-                .foregroundStyle(.secondary)
+        VStack(spacing: 16) {
+            Spacer()
 
-            Text("No Conversation Selected")
-                .font(.title2)
-                .foregroundStyle(.secondary)
+            // App icon
+            #if os(macOS)
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 96, height: 96)
+            #else
+            Image("AppIcon")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 96, height: 96)
+                .clipShape(RoundedRectangle(cornerRadius: 22))
+            #endif
 
+            Text("ANEMLL Chat")
+                .font(.title)
+                .fontWeight(.semibold)
+                .foregroundStyle(.primary)
+
+            // Action area
             if modelManager.loadedModelId == nil {
-                VStack(spacing: 12) {
-                    Text("Load a model to start chatting")
-                        .foregroundStyle(.secondary)
+                Text("Load a model to get started")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
 
-                    Button {
-                        showingModelSheet = true
-                    } label: {
-                        Label("Select Model", systemImage: "cpu")
-                    }
-                    .buttonStyle(.borderedProminent)
+                Button {
+                    showingModelSheet = true
+                } label: {
+                    Label("Select Model", systemImage: "cpu")
                 }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
             } else {
+                Text("Start a new conversation")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+
                 Button {
                     chatVM.newConversation()
                 } label: {
                     Label("New Conversation", systemImage: "plus")
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.large)
             }
+
+            Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

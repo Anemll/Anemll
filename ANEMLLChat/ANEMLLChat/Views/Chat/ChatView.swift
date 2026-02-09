@@ -845,7 +845,7 @@ struct StreamingMessageView: View {
                     // Show streaming text with markdown rendering
                     HStack(alignment: .bottom, spacing: 0) {
                         if enableMarkup {
-                            MarkdownView(content: content, isUserMessage: false, allowSelection: allowSelection)
+                            MarkdownView(content: content, isUserMessage: false, allowSelection: allowSelection, isMessageComplete: false)
                         } else {
                             Text(content)
                                 .selectable(allowSelection)

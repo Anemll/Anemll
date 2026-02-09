@@ -6,11 +6,17 @@
 //
 
 import SwiftUI
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 
 struct MarkdownView: View {
     let content: String
     let isUserMessage: Bool
     let allowSelection: Bool
+    var isMessageComplete: Bool = true  // Whether the parent message is complete
 
     @State private var cachedContent: String = ""
     @State private var cachedBlocks: [MarkdownBlock] = []
@@ -186,9 +192,10 @@ struct MarkdownView: View {
             // There's an unclosed <think> tag - extract content and show as in-progress thinking
             let thinkContent = String(result[openRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
             if !thinkContent.isEmpty {
-                blocks.append(.thinkBlock(thinkContent + " ..."))
+                // Use special marker that won't appear in natural text
+                blocks.append(.thinkBlock(thinkContent + " \u{2026}"))  // Unicode ellipsis character
             } else {
-                blocks.append(.thinkBlock("..."))  // Just started thinking
+                blocks.append(.thinkBlock("\u{2026}"))  // Just started thinking
             }
             result = String(result[..<openRange.lowerBound])
         }
@@ -236,19 +243,7 @@ struct MarkdownView: View {
             renderInlineMarkdown(text)
 
         case .codeBlock(let code, let language):
-            VStack(alignment: .leading, spacing: 4) {
-                if let lang = language, !lang.isEmpty {
-                    Text(lang)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                Text(code)
-                    .font(.system(.body, design: .monospaced))
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.black.opacity(0.3))
-                    .cornerRadius(8)
-            }
+            CodeBlockView(code: code, language: language)
 
         case .table(let headers, let rows):
             renderTable(headers: headers, rows: rows)
@@ -280,7 +275,7 @@ struct MarkdownView: View {
                 .fontWeight(.bold)
 
         case .thinkBlock(let thinkContent):
-            ThinkBlockView(content: thinkContent, allowSelection: allowSelection)
+            ThinkBlockView(content: thinkContent, allowSelection: allowSelection, isMessageComplete: isMessageComplete)
         }
     }
 
@@ -392,9 +387,9 @@ private struct InlineMarkdownText: View {
 struct ThinkBlockView: View {
     let content: String
     let allowSelection: Bool
+    var isMessageComplete: Bool = false  // Whether the parent message generation is complete
 
     @State private var isExpanded: Bool = false
-    @State private var dotScale: [CGFloat] = [1.0, 1.0, 1.0]
     @State private var thinkingStartTime: Date?
     @State private var thinkingDuration: TimeInterval = 0
 
@@ -403,14 +398,33 @@ struct ThinkBlockView: View {
         Color(red: 0.95, green: 0.55, blue: 0.2)  // Warm orange thinking color
     }
 
-    /// Check if thinking is still in progress (content ends with "...")
+    /// Check if thinking is still in progress
+    /// Thinking is complete if:
+    /// 1. The parent message is complete (generation finished), OR
+    /// 2. The content doesn't have the ellipsis marker (proper </think> was found)
     private var isThinking: Bool {
-        content.hasSuffix("...")
+        // If message is complete, thinking is definitely done
+        if isMessageComplete {
+            return false
+        }
+        // Otherwise check for the streaming marker
+        return content.hasSuffix("\u{2026}")  // Unicode ellipsis character
+    }
+
+    /// Computed duration - uses recorded duration or estimates if needed
+    private var displayDuration: TimeInterval {
+        if thinkingDuration > 0 {
+            return thinkingDuration
+        }
+        // Fallback: estimate based on content length
+        // ~20 tokens per second, ~4 chars per token
+        let estimatedTokens = max(1, content.count / 4)
+        return max(1, Double(estimatedTokens) / 20.0)
     }
 
     /// Format duration for display
     private var durationText: String {
-        let seconds = Int(thinkingDuration)
+        let seconds = Int(displayDuration)
         if seconds < 60 {
             return "\(seconds)s"
         } else {
@@ -443,14 +457,7 @@ struct ThinkBlockView: View {
 
                         // Animated dots when collapsed and still thinking
                         if !isExpanded {
-                            HStack(spacing: 3) {
-                                ForEach(0..<3, id: \.self) { index in
-                                    Circle()
-                                        .fill(thinkAccent)
-                                        .frame(width: 5, height: 5)
-                                        .scaleEffect(dotScale[index])
-                                }
-                            }
+                            ThinkingDotsView(color: thinkAccent)
                         }
                     } else {
                         // Done thinking - show "Thought for X"
@@ -479,10 +486,10 @@ struct ThinkBlockView: View {
                     Divider()
                         .background(thinkAccent.opacity(0.3))
 
-                    // Remove trailing "..." from display content if present
-                    let displayContent = content.hasSuffix(" ...")
-                        ? String(content.dropLast(4))
-                        : (content.hasSuffix("...") ? String(content.dropLast(3)) : content)
+                    // Remove trailing ellipsis marker from display content if present
+                    let displayContent = content.hasSuffix(" \u{2026}")
+                        ? String(content.dropLast(2))  // Remove " …"
+                        : (content.hasSuffix("\u{2026}") ? String(content.dropLast(1)) : content)
 
                     Text(displayContent)
                         .font(.callout)
@@ -502,49 +509,146 @@ struct ThinkBlockView: View {
                 .stroke(thinkAccent.opacity(0.2), lineWidth: 1)
         )
         .onAppear {
-            // Start tracking thinking time
-            if isThinking {
-                thinkingStartTime = Date()
-                startDotAnimation()
-            } else {
-                // Already completed - estimate duration based on content length
-                // Rough estimate: ~20 tokens per second, ~4 chars per token
-                let estimatedTokens = content.count / 4
-                thinkingDuration = max(1, Double(estimatedTokens) / 20.0)
-            }
+            initializeThinkingState()
         }
         .onChange(of: content) { _, newContent in
             // When content changes and thinking completes, record duration
-            if !newContent.hasSuffix("...") && thinkingStartTime != nil {
+            if !newContent.hasSuffix("\u{2026}") && thinkingStartTime != nil && thinkingDuration == 0 {
                 thinkingDuration = Date().timeIntervalSince(thinkingStartTime!)
-            }
-        }
-        .onChange(of: isExpanded) { _, expanded in
-            if !expanded && isThinking {
-                startDotAnimation()
             }
         }
         .onChange(of: isThinking) { wasThinking, nowThinking in
             // Thinking just finished
             if wasThinking && !nowThinking {
-                if let start = thinkingStartTime {
+                if let start = thinkingStartTime, thinkingDuration == 0 {
                     thinkingDuration = Date().timeIntervalSince(start)
                 }
             }
         }
     }
 
-    /// Animate dots with staggered bounce effect (similar to typing indicator)
-    private func startDotAnimation() {
-        // Staggered animation for each dot
-        for i in 0..<3 {
-            let delay = Double(i) * 0.15
-            withAnimation(
-                .easeInOut(duration: 0.4)
-                .repeatForever(autoreverses: true)
-                .delay(delay)
-            ) {
-                dotScale[i] = 1.4
+    /// Initialize thinking state on appear
+    private func initializeThinkingState() {
+        if isThinking {
+            // Start tracking thinking time
+            if thinkingStartTime == nil {
+                thinkingStartTime = Date()
+            }
+        }
+        // Note: displayDuration computed property handles fallback estimation
+    }
+}
+
+/// Self-contained animated dots view that manages its own animation state
+private struct ThinkingDotsView: View {
+    let color: Color
+
+    @State private var isAnimating = false
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(0..<3, id: \.self) { index in
+                Circle()
+                    .fill(color)
+                    .frame(width: 5, height: 5)
+                    .scaleEffect(isAnimating ? 1.4 : 1.0)
+                    .animation(
+                        .easeInOut(duration: 0.4)
+                        .repeatForever(autoreverses: true)
+                        .delay(Double(index) * 0.15),
+                        value: isAnimating
+                    )
+            }
+        }
+        .onAppear {
+            // Small delay to ensure view is fully rendered before animating
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                isAnimating = true
+            }
+        }
+    }
+}
+
+// MARK: - Code Block View (with Copy Button)
+
+/// Code block with hover-to-copy functionality
+private struct CodeBlockView: View {
+    let code: String
+    let language: String?
+
+    @State private var isHovering = false
+    @State private var showCopied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            // Language label and copy button row
+            HStack {
+                if let lang = language, !lang.isEmpty {
+                    Text(lang)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                // Copy button (visible on hover)
+                Button {
+                    copyCode()
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: showCopied ? "checkmark" : "doc.on.doc")
+                            .font(.caption2)
+                        if showCopied {
+                            Text("Copied")
+                                .font(.caption2)
+                        }
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 4))
+                }
+                .buttonStyle(.plain)
+                .opacity(isHovering || showCopied ? 1 : 0)
+            }
+
+            // Code content
+            Text(code)
+                .font(.system(.body, design: .monospaced))
+                .textSelection(.enabled)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.black.opacity(0.3))
+                .cornerRadius(8)
+        }
+        #if os(macOS)
+        .onHover { hovering in
+            isHovering = hovering
+            if !hovering {
+                // Reset copied state when mouse leaves
+                showCopied = false
+            }
+        }
+        #endif
+    }
+
+    private func copyCode() {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        #else
+        UIPasteboard.general.string = code
+        #endif
+
+        // Show "Copied" feedback
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showCopied = true
+        }
+
+        // Reset after delay
+        Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            await MainActor.run {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showCopied = false
+                }
             }
         }
     }
@@ -552,16 +656,18 @@ struct ThinkBlockView: View {
 
 #Preview("Think Block") {
     VStack(spacing: 20) {
-        // In-progress thinking (ends with "...")
+        // In-progress thinking (streaming - uses ellipsis marker)
         ThinkBlockView(
-            content: "Let me think about this step by step ...",
-            allowSelection: true
+            content: "Let me think about this step by step \u{2026}",
+            allowSelection: true,
+            isMessageComplete: false
         )
 
-        // Completed thinking (no "...")
+        // Completed thinking (message complete, even with ellipsis)
         ThinkBlockView(
-            content: "I analyzed the problem and determined the solution involves three steps:\n1. First step\n2. Second step\n3. Third step",
-            allowSelection: true
+            content: "I analyzed the problem and determined the solution...\n1. First step\n2. Second step\n3. Third step",
+            allowSelection: true,
+            isMessageComplete: true
         )
     }
     .padding()

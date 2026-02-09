@@ -143,6 +143,14 @@ final class InferenceService: ObservableObject {
     private(set) var modelRecommendedSampling: (doSample: Bool, temperature: Float, topP: Float, topK: Int)?
     private(set) var isArgmaxModel: Bool = false  // If true, sampling is unavailable
 
+    /// Current model's maximum context size (stateLength or contextLength)
+    /// Returns 2048 as default when no model is loaded
+    var modelMaxContextSize: Int {
+        guard let config = config else { return 2048 }
+        // Use stateLength if available, otherwise contextLength
+        return config.stateLength > 0 ? config.stateLength : config.contextLength
+    }
+
     private init() {
         // Load settings from storage
         Task {
