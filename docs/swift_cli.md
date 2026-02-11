@@ -112,6 +112,18 @@ OPTIONS:
   --temperature <float>   Temperature for sampling (0 for deterministic)
   --template <style>      Template style (default, deephermes)
   --debug-level <number>  Debug level (0=disabled, 1=basic, 2=hidden states)
+  --debug-single-token-prefill
+                           Use infer-only single-token prefill (disable batch prefill)
+  --debug-disable-io-backings
+                           Disable CoreML I/O backings (CVPixelBuffer output backings)
+  --debug-repeat-infer-count <n>
+                           Repeat infer N times per position for divergence (0=off, 2-4 supported)
+  --debug-repeat-only-divergence
+                           Only log repeat divergences
+  --debug-compare-kv-state-every-token <true|false>
+                           Print KV state similarity every repeated token
+  --debug-predict-read-delay-ms <ms>
+                           Delay before reading prediction outputs (0..500 ms, fractional allowed; debug race probing)
   --thinking-mode         Enable thinking mode with detailed reasoning
   --show-special-tokens   Show special tokens in output
   --show-loading-progress Show detailed model loading progress
@@ -128,3 +140,31 @@ Interactive chat mode:
 ```bash
 anemllcli --meta /path/to/model/meta.yaml
 ```
+
+### Divergence Repro (KV/State)
+
+Use greedy decoding and repeated infer runs:
+
+```bash
+swift run -c release anemllcli \
+  --meta /path/to/model/meta.yaml \
+  --prompt "what is apple neural engine?" \
+  --temperature 0 \
+  --debug-level 1 \
+  --debug-single-token-prefill \
+  --debug-disable-io-backings \
+  --debug-repeat-infer-count 2 \
+  --debug-compare-kv-state-every-token true \
+  --debug-predict-read-delay-ms 0
+```
+
+You can probe delay sensitivity with values like:
+`0`, `0.3`, `0.5`, `1`, `2`, `3`, `5`, `8`, `10`.
+
+Optional:
+
+```bash
+--debug-repeat-only-divergence
+```
+
+The same flags are supported by `anemllcli_adv`.
