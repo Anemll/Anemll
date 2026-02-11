@@ -187,10 +187,151 @@ extension ModelInfo {
     }
 }
 
+// MARK: - HuggingFace Collection Factory
+
+extension ModelInfo {
+    /// Create a ModelInfo from a HuggingFace repo ID and fetched metadata
+    static func fromHuggingFaceRepo(id: String, sizeBytes: Int64?, modelType: String?) -> ModelInfo {
+        // Strip "anemll/anemll-" prefix to get the model descriptor
+        let repoName = id.components(separatedBy: "/").last ?? id
+        let descriptor = repoName.hasPrefix("anemll-") ? String(repoName.dropFirst(7)) : repoName
+
+        // Parse context length from "ctx\d+" pattern
+        let contextLength: Int? = {
+            guard let range = descriptor.range(of: #"ctx(\d+)"#, options: .regularExpression) else { return nil }
+            let match = descriptor[range]
+            let digits = match.dropFirst(3) // drop "ctx"
+            return Int(digits)
+        }()
+
+        // Detect architecture from modelType or repo name
+        let arch = modelType ?? detectArchitecture(from: descriptor)
+
+        // Build friendly display name
+        let name = buildDisplayName(from: descriptor)
+
+        // Format size
+        let sizeString: String
+        if let bytes = sizeBytes {
+            sizeString = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        } else {
+            sizeString = "Unknown"
+        }
+
+        // Build description
+        let desc = buildDescription(from: descriptor, architecture: arch, contextLength: contextLength)
+
+        return ModelInfo(
+            id: id,
+            name: name,
+            description: desc,
+            size: sizeString,
+            sizeBytes: sizeBytes,
+            contextLength: contextLength,
+            architecture: arch,
+            sourceKind: .huggingFace
+        )
+    }
+
+    private static func detectArchitecture(from descriptor: String) -> String? {
+        let lower = descriptor.lowercased()
+        if lower.contains("gemma") { return "gemma" }
+        if lower.contains("qwen") { return "qwen" }
+        if lower.contains("llama") { return "llama" }
+        if lower.contains("deepseek") { return "deepseek" }
+        if lower.contains("deephermes") { return "deephermes" }
+        return nil
+    }
+
+    private static func buildDisplayName(from descriptor: String) -> String {
+        let lower = descriptor.lowercased()
+
+        // Extract parameter size (e.g., "270m", "1b", "1.7B", "0.5B", "4B", "8B")
+        let paramSize: String? = {
+            // Match patterns like "3-270m", "3-1b", "1.7B", "0.5B" etc.
+            if let range = descriptor.range(of: #"[\d.]+-?(\d+\.?\d*[BbMm])"#, options: .regularExpression) {
+                // Extract just the size part
+                let match = String(descriptor[range])
+                // Find the actual size at the end
+                if let sizeRange = match.range(of: #"\d+\.?\d*[BbMm]$"#, options: .regularExpression) {
+                    return String(match[sizeRange]).uppercased()
+                }
+            }
+            // Try standalone size like "1.7B" or "0.5B"
+            if let range = descriptor.range(of: #"(\d+\.?\d*[BbMm])\b"#, options: .regularExpression) {
+                return String(descriptor[range]).uppercased()
+            }
+            return nil
+        }()
+
+        // Determine model family
+        if lower.contains("gemma") {
+            let version = lower.contains("gemma-3") || lower.contains("gemma3") ? "3" : ""
+            return "Gemma \(version) \(paramSize ?? "")".trimmingCharacters(in: .whitespaces)
+        }
+        if lower.contains("qwen3") {
+            return "Qwen3 \(paramSize ?? "")".trimmingCharacters(in: .whitespaces)
+        }
+        if lower.contains("qwen2.5") || lower.contains("qwen-2.5") {
+            return "Qwen 2.5 \(paramSize ?? "")".trimmingCharacters(in: .whitespaces)
+        }
+        if lower.contains("qwen") {
+            return "Qwen \(paramSize ?? "")".trimmingCharacters(in: .whitespaces)
+        }
+        if lower.contains("llama") {
+            let version = lower.contains("3.2") ? "3.2" : lower.contains("3.1") ? "3.1" : ""
+            return "LLaMA \(version) \(paramSize ?? "")".trimmingCharacters(in: .whitespaces)
+        }
+        if lower.contains("deephermes") {
+            return "DeepHermes \(paramSize ?? "")".trimmingCharacters(in: .whitespaces)
+        }
+        if lower.contains("deepseek") {
+            return "DeepSeek \(paramSize ?? "")".trimmingCharacters(in: .whitespaces)
+        }
+
+        // Fallback: use descriptor cleaned up
+        return descriptor
+            .replacingOccurrences(of: #"_\d+\.\d+\.\d+$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: "-", with: " ")
+    }
+
+    private static func buildDescription(from descriptor: String, architecture: String?, contextLength: Int?) -> String {
+        var parts: [String] = []
+
+        if let arch = architecture {
+            let source: String
+            switch arch.lowercased() {
+            case "gemma": source = "Google"
+            case "qwen": source = "Alibaba"
+            case "llama": source = "Meta"
+            case "deepseek": source = "DeepSeek"
+            case "deephermes": source = "Nous Research"
+            default: source = ""
+            }
+            if !source.isEmpty { parts.append(source) }
+        }
+
+        if descriptor.lowercased().contains("monolithic") {
+            parts.append("monolithic")
+        }
+
+        if let ctx = contextLength {
+            if ctx >= 1024 {
+                parts.append("\(ctx / 1024)K context")
+            } else {
+                parts.append("\(ctx) context")
+            }
+        }
+
+        if parts.isEmpty { return "ANEMLL optimized model" }
+        return parts.joined(separator: " · ")
+    }
+}
+
 // MARK: - Default Models
 
 extension ModelInfo {
-    /// Default available models from HuggingFace
+    /// Default available models from HuggingFace (fallback when collection fetch fails)
     /// Gemma 3 270M first (smallest/fastest), then 1B, then others
     static let defaultModels: [ModelInfo] = [
         ModelInfo(
@@ -203,40 +344,13 @@ extension ModelInfo {
             architecture: "gemma"
         ),
         ModelInfo(
-            id: "anemll/anemll-google-gemma-3-1b-it-ctx4096_0.3.4",
+            id: "anemll/anemll-google-gemma-3-270m-it-ctx4096_0.3.5",
             name: "Gemma 3 1B",
             description: "Google's Gemma 3 1B with 4K context",
             size: "1.5 GB",
             sizeBytes: 1_600_000_000,
             contextLength: 4096,
             architecture: "gemma"
-        ),
-        ModelInfo(
-            id: "anemll/anemll-llama-3.2-1B-iOSv2.0",
-            name: "LLaMA 3.2 1B",
-            description: "Meta's LLaMA 3.2 1B optimized for iOS/macOS",
-            size: "1.6 GB",
-            sizeBytes: 1_740_000_000,
-            contextLength: 512,
-            architecture: "llama"
-        ),
-        ModelInfo(
-            id: "anemll/anemll-Qwen3-4B-ctx1024_0.3.0",
-            name: "Qwen 3 4B",
-            description: "Alibaba's Qwen 3 4B model",
-            size: "4.0 GB",
-            sizeBytes: 4_300_000_000,
-            contextLength: 1024,
-            architecture: "qwen"
-        ),
-        ModelInfo(
-            id: "anemll/anemll-Llama-3.2-1B-FAST-iOS_0.3.0",
-            name: "LLaMA 3.2 1B FAST",
-            description: "Fast optimized LLaMA 3.2 1B",
-            size: "1.2 GB",
-            sizeBytes: 1_200_000_000,
-            contextLength: 512,
-            architecture: "llama"
         )
     ]
 }

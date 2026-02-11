@@ -20,6 +20,9 @@ struct ModelListView: View {
 
     @State private var showingAddModel = false
     @State private var scrollProxy: ScrollViewProxy?
+    @State private var isRefreshing = false
+    @State private var showRefreshConfirmation = false
+    @State private var refreshResultText = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -247,9 +250,53 @@ struct ModelListView: View {
                     .id(model.id)
             }
         } header: {
-            Text("Available")
+            HStack {
+                Text("Available")
+                Spacer()
+                Button {
+                    Task {
+                        isRefreshing = true
+                        await modelManager.refreshModelStatus()
+                        // Brief delay so the spinner is visible
+                        try? await Task.sleep(for: .milliseconds(300))
+                        isRefreshing = false
+                        refreshResultText = modelManager.lastRefreshDiscoveredCount > 0
+                            ? "+\(modelManager.lastRefreshDiscoveredCount) new"
+                            : "Up to date"
+                        showRefreshConfirmation = true
+                        // Auto-hide confirmation
+                        try? await Task.sleep(for: .seconds(2.5))
+                        showRefreshConfirmation = false
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        if isRefreshing {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text("Checking...")
+                                .font(.caption)
+                        } else if showRefreshConfirmation {
+                            Image(systemName: modelManager.lastRefreshDiscoveredCount > 0
+                                  ? "plus.circle.fill" : "checkmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(modelManager.lastRefreshDiscoveredCount > 0 ? .blue : .green)
+                            Text(refreshResultText)
+                                .font(.caption)
+                                .foregroundStyle(modelManager.lastRefreshDiscoveredCount > 0 ? .blue : .green)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.caption)
+                            Text("Refresh")
+                                .font(.caption)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.orange)
+                .disabled(isRefreshing)
+            }
         } footer: {
-            Text("Download models from HuggingFace.")
+            Text("Download models from HuggingFace. Tap \(Image(systemName: "arrow.clockwise")) to refresh list.")
         }
     }
 
@@ -356,6 +403,26 @@ struct ModelListView: View {
                 Text(modelManager.downloadedModelsSize)
                     .foregroundStyle(.secondary)
             }
+
+            // Device info
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(DeviceType.chipName)
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    Spacer()
+                    Text(DeviceType.physicalMemoryString)
+                        .font(.caption)
+                }
+                HStack {
+                    Text(DeviceType.osVersionString)
+                        .font(.caption)
+                    Spacer()
+                    Text("\(DeviceType.processorCount) cores")
+                        .font(.caption)
+                }
+            }
+            .foregroundStyle(.secondary)
 
             // Debug info - always show model counts
             HStack {

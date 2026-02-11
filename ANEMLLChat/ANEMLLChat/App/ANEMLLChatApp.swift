@@ -13,6 +13,11 @@ struct ANEMLLChatApp: App {
     @State private var modelManager = ModelManagerViewModel()
 
     init() {
+        // Log device info at startup
+        logInfo("=== ANEMLL Chat Starting ===", category: .app)
+        logInfo("Device: \(DeviceType.deviceSummary)", category: .app)
+        logInfo("App version: \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"))", category: .app)
+
         // Start UI freeze watchdog in debug builds
         #if DEBUG
         UIFreezeWatchdog.shared.start()

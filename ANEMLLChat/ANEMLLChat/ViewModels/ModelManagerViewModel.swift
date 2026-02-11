@@ -96,6 +96,126 @@ enum DeviceType {
 
     /// Maximum weight file size in bytes (1GB for limited devices)
     static let maxWeightFileSize: Int64 = 1_073_741_824  // 1 GB
+
+    // MARK: - Device Info
+
+    /// Machine identifier (e.g., "arm64", "iPad14,5", "iPhone16,1")
+    static var machineIdentifier: String {
+        var sysinfo = utsname()
+        uname(&sysinfo)
+        return withUnsafePointer(to: &sysinfo.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+                String(validatingUTF8: $0)
+            }
+        } ?? "unknown"
+    }
+
+    /// CPU/chip brand string (e.g., "Apple M1", "Apple M4 Pro")
+    /// On macOS uses sysctl; on iOS infers from device identifier
+    static var chipName: String {
+        #if os(macOS)
+        var size: size_t = 0
+        sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
+        if size > 0 {
+            var buffer = [CChar](repeating: 0, count: size)
+            sysctlbyname("machdep.cpu.brand_string", &buffer, &size, nil, 0)
+            let brand = String(cString: buffer).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !brand.isEmpty { return brand }
+        }
+        return hasMSeriesChip ? "Apple Silicon" : "Intel"
+        #else
+        return chipNameFromIdentifier(machineIdentifier)
+        #endif
+    }
+
+    /// Physical memory in bytes
+    static var physicalMemory: UInt64 {
+        ProcessInfo.processInfo.physicalMemory
+    }
+
+    /// Physical memory formatted (e.g., "8 GB")
+    static var physicalMemoryString: String {
+        ByteCountFormatter.string(fromByteCount: Int64(physicalMemory), countStyle: .memory)
+    }
+
+    /// Number of active processor cores
+    static var processorCount: Int {
+        ProcessInfo.processInfo.activeProcessorCount
+    }
+
+    /// OS version string
+    static var osVersionString: String {
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        #if os(macOS)
+        return "macOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
+        #elseif os(visionOS)
+        return "visionOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
+        #else
+        let device = UIDevice.current
+        return "\(device.systemName) \(device.systemVersion)"
+        #endif
+    }
+
+    /// Full device summary for logging
+    static var deviceSummary: String {
+        let chip = chipName
+        let mem = physicalMemoryString
+        let cores = processorCount
+        let os = osVersionString
+        let machine = machineIdentifier
+        let mSeries = hasMSeriesChip ? "M-series" : "non-M-series"
+        return "\(os) | \(chip) (\(mSeries)) | \(cores) cores | \(mem) RAM | \(machine)"
+    }
+
+    /// Infer Apple chip name from iOS/iPadOS device identifier
+    private static func chipNameFromIdentifier(_ id: String) -> String {
+        if id.hasPrefix("iPhone") {
+            let parts = id.replacingOccurrences(of: "iPhone", with: "").split(separator: ",")
+            if let major = parts.first, let num = Int(major) {
+                switch num {
+                case 17: return "Apple A18 Pro"
+                case 16: return "Apple A17 Pro"
+                case 15: return "Apple A16"
+                case 14: return "Apple A15"
+                case 13: return "Apple A14"
+                case 12: return "Apple A13"
+                case 11: return "Apple A12"
+                case 10: return "Apple A11"
+                default: return "Apple A-series"
+                }
+            }
+        }
+
+        if id.hasPrefix("iPad") {
+            let parts = id.replacingOccurrences(of: "iPad", with: "").split(separator: ",")
+            if let major = parts.first, let num = Int(major) {
+                switch num {
+                case 16: return "Apple M4"
+                case 14:
+                    if let minor = parts.last, let m = Int(minor), m >= 8 {
+                        return "Apple M2"
+                    }
+                    return "Apple M2"
+                case 13:
+                    if let minor = parts.last, let m = Int(minor), m >= 16 {
+                        return "Apple M1"
+                    }
+                    if let minor = parts.last, let m = Int(minor), m >= 4 {
+                        return "Apple M1"
+                    }
+                    return "Apple A14"
+                case 12: return "Apple A14"
+                case 11: return "Apple A12/A12X"
+                case 8: return "Apple A12X/A12Z"
+                case 7: return "Apple A10"
+                default: return "Apple A-series"
+                }
+            }
+        }
+
+        if id.contains("arm64") { return "Apple Silicon" }
+        return "Unknown (\(id))"
+    }
 }
 
 enum LocalModelImportMode: String, CaseIterable, Sendable {
@@ -264,15 +384,36 @@ final class ModelManagerViewModel {
 
     // MARK: - Model Loading
 
-    /// Load model list (defaults + custom)
+    /// HuggingFace collection URL for dynamic model list
+    private static let collectionURL = URL(string: "https://huggingface.co/api/collections/anemll/anemll-chat")!
+
+    /// Load model list: try HF collection → cache → hardcoded defaults, then merge custom models
     func loadModels() async {
         logInfo("Loading models...", category: .model)
 
-        // Start with defaults - these should ALWAYS be available
-        var models = ModelInfo.defaultModels
-        logDebug("Starting with \(models.count) default models", category: .model)
+        // Step 1: Get base model list (collection → cache → defaults)
+        var models: [ModelInfo]
 
-        // Add custom models (if any)
+        do {
+            let fetched = try await fetchCollectionModels()
+            models = fetched
+            logInfo("Fetched \(fetched.count) models from HuggingFace collection", category: .model)
+            // Cache for offline use
+            await StorageService.shared.saveCollectionCache(fetched)
+        } catch {
+            print("[Collection] ERROR: \(error)")
+            logWarning("Failed to fetch collection: \(error)", category: .model)
+            // Try cache
+            if let cached = await StorageService.shared.loadCollectionCache() {
+                models = cached
+                logInfo("Using \(cached.count) cached collection models", category: .model)
+            } else {
+                models = ModelInfo.defaultModels
+                logInfo("Using \(models.count) hardcoded default models", category: .model)
+            }
+        }
+
+        // Step 2: Add custom models (if any)
         do {
             let customModels = try await StorageService.shared.loadModelsRegistry()
             for custom in customModels {
@@ -283,10 +424,9 @@ final class ModelManagerViewModel {
             }
         } catch {
             logWarning("Failed to load custom models: \(error)", category: .model)
-            // Continue with defaults only
         }
 
-        // Check model availability and reset stale download state
+        // Step 3: Check model availability and reset stale download state
         for i in models.indices {
             models[i] = await refreshedModelStatus(for: models[i])
         }
@@ -301,16 +441,133 @@ final class ModelManagerViewModel {
         }
     }
 
-    /// Refresh download status for all models
-    func refreshModelStatus() async {
-        var refreshedModels: [ModelInfo] = []
-        refreshedModels.reserveCapacity(availableModels.count)
+    // MARK: - HuggingFace Collection Fetch
 
-        for model in availableModels {
+    /// Fetch model list from HuggingFace collection API
+    private func fetchCollectionModels() async throws -> [ModelInfo] {
+        let collectionURL = Self.collectionURL
+        print("[Collection] Fetching from: \(collectionURL)")
+
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 10
+        let session = URLSession(configuration: config)
+
+        let (collectionData, response) = try await session.data(from: collectionURL)
+        if let httpResponse = response as? HTTPURLResponse {
+            print("[Collection] HTTP \(httpResponse.statusCode), \(collectionData.count) bytes")
+        }
+
+        // Decode collection response
+        struct CollectionItem: Decodable {
+            let id: String
+            let type: String?
+            let position: Int?
+        }
+        struct CollectionResponse: Decodable {
+            let items: [CollectionItem]
+        }
+
+        let collection = try JSONDecoder().decode(CollectionResponse.self, from: collectionData)
+        let modelItems = collection.items
+            .filter { ($0.type ?? "model") == "model" }
+            .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
+
+        print("[Collection] Found \(modelItems.count) models in collection")
+
+        // Fetch per-model details concurrently
+        let models = await withTaskGroup(of: (Int, ModelInfo?).self) { group in
+            for (index, item) in modelItems.enumerated() {
+                group.addTask {
+                    do {
+                        let modelInfo = try await Self.fetchModelDetail(id: item.id, session: session)
+                        print("[Collection] Fetched detail for: \(item.id)")
+                        return (index, modelInfo)
+                    } catch {
+                        print("[Collection] Failed detail for \(item.id): \(error)")
+                        // Fall back to parsing from repo ID only
+                        return (index, ModelInfo.fromHuggingFaceRepo(id: item.id, sizeBytes: nil, modelType: nil))
+                    }
+                }
+            }
+
+            var results: [(Int, ModelInfo)] = []
+            for await result in group {
+                if let model = result.1 {
+                    results.append((result.0, model))
+                }
+            }
+            return results.sorted { $0.0 < $1.0 }.map(\.1)
+        }
+
+        print("[Collection] Returning \(models.count) models")
+        return models
+    }
+
+    /// Fetch individual model details from HuggingFace API
+    private static func fetchModelDetail(id: String, session: URLSession) async throws -> ModelInfo {
+        struct ModelDetailConfig: Decodable {
+            let model_type: String?
+        }
+        struct ModelDetailResponse: Decodable {
+            let usedStorage: Int64?
+            let config: ModelDetailConfig?
+        }
+
+        let url = URL(string: "https://huggingface.co/api/models/\(id)")!
+        let (data, _) = try await session.data(from: url)
+        let detail = try JSONDecoder().decode(ModelDetailResponse.self, from: data)
+
+        return ModelInfo.fromHuggingFaceRepo(
+            id: id,
+            sizeBytes: detail.usedStorage,
+            modelType: detail.config?.model_type
+        )
+    }
+
+    /// Refresh model list from HuggingFace collection (user-triggered)
+    func refreshFromCollection() async {
+        print("[Collection] Manual refresh triggered")
+        await loadModels()
+    }
+
+    /// Refresh download status for all models and discover new ones from HuggingFace
+    func refreshModelStatus() async {
+        // First, try to discover new models from HuggingFace
+        let discovered = await fetchAnemllModelsFromHF()
+        var models = availableModels
+
+        // Merge newly discovered models
+        var addedCount = 0
+        for newModel in discovered {
+            if !models.contains(where: { $0.id == newModel.id }) {
+                models.append(newModel)
+                addedCount += 1
+                logInfo("Discovered new model: \(newModel.id)", category: .model)
+            }
+        }
+        if addedCount > 0 {
+            logInfo("Discovered \(addedCount) new model(s) from HuggingFace", category: .model)
+        }
+
+        // Refresh download status for all models
+        var refreshedModels: [ModelInfo] = []
+        refreshedModels.reserveCapacity(models.count)
+
+        for model in models {
             refreshedModels.append(await refreshedModelStatus(for: model))
         }
         availableModels = refreshedModels
+
+        // Save registry so newly discovered models persist
+        if addedCount > 0 {
+            try? await StorageService.shared.saveModelsRegistry(availableModels)
+        }
+
+        lastRefreshDiscoveredCount = addedCount
     }
+
+    /// Number of models discovered in last refresh (for UI feedback)
+    var lastRefreshDiscoveredCount: Int = 0
 
     // MARK: - Download
 
@@ -1148,6 +1405,146 @@ final class ModelManagerViewModel {
                 }
             }
         )
+    }
+
+    // MARK: - HuggingFace Discovery
+
+    /// Fetch list of ANEMLL models from HuggingFace API
+    /// Returns ModelInfo entries for newly discovered models (not already in availableModels)
+    private func fetchAnemllModelsFromHF() async -> [ModelInfo] {
+        let apiURL = URL(string: "https://huggingface.co/api/models?author=anemll&limit=100")!
+        logInfo("Fetching ANEMLL models from HuggingFace...", category: .model)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(from: apiURL)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                logWarning("HuggingFace API returned non-200 status", category: .model)
+                return []
+            }
+
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                logWarning("Failed to parse HuggingFace API response", category: .model)
+                return []
+            }
+
+            var discovered: [ModelInfo] = []
+
+            for item in json {
+                guard let modelId = item["modelId"] as? String ?? item["id"] as? String else { continue }
+
+                // Only include models that look like ANEMLL converted models
+                let repoName = modelId.components(separatedBy: "/").last ?? modelId
+                guard repoName.hasPrefix("anemll-") else { continue }
+
+                // Skip if already known
+                if availableModels.contains(where: { $0.id == modelId }) { continue }
+
+                // Parse model info from the repo metadata
+                let name = suggestHFDisplayName(from: repoName)
+                let architecture = detectHFArchitecture(from: repoName)
+                let contextLength = detectHFContextLength(from: repoName)
+
+                // Build a descriptive string
+                var desc = "ANEMLL model"
+                let lower = repoName.lowercased()
+                if lower.contains("monolithic") { desc += " (monolithic)" }
+                if lower.range(of: #"-m\d+-"#, options: .regularExpression) != nil {
+                    desc += " - optimized for older Apple Silicon"
+                }
+
+                let model = ModelInfo(
+                    id: modelId,
+                    name: name,
+                    description: desc,
+                    size: "Unknown",
+                    contextLength: contextLength,
+                    architecture: architecture
+                )
+
+                discovered.append(model)
+            }
+
+            lastRefreshDiscoveredCount = discovered.count
+            logInfo("HuggingFace discovery: found \(json.count) repos, \(discovered.count) new", category: .model)
+            return discovered
+
+        } catch {
+            logWarning("Failed to fetch from HuggingFace: \(error)", category: .model)
+            lastRefreshDiscoveredCount = 0
+            return []
+        }
+    }
+
+    /// Generate a display name from a HuggingFace repo name
+    private func suggestHFDisplayName(from repoName: String) -> String {
+        var name = repoName
+            .replacingOccurrences(of: "anemll-", with: "")
+            .replacingOccurrences(of: "google-", with: "")
+            .replacingOccurrences(of: "Qwen-", with: "")
+            .replacingOccurrences(of: "meta-llama-", with: "")
+            .replacingOccurrences(of: "-it-", with: "-")
+            .replacingOccurrences(of: "-qat-", with: "-QAT-")
+            .replacingOccurrences(of: "-int4", with: "")
+            .replacingOccurrences(of: "-unquantized", with: "")
+
+        // Remove version suffix like _0.3.5
+        if let range = name.range(of: #"_\d+\.\d+(\.\d+)?$"#, options: .regularExpression) {
+            name = String(name[..<range.lowerBound])
+        }
+
+        // Extract chip designator (e.g., M1, M2, M4) before replacing dashes
+        var chipTag: String? = nil
+        if let chipRange = name.range(of: #"-M\d+-"#, options: .regularExpression) {
+            chipTag = String(name[chipRange]).replacingOccurrences(of: "-", with: "")
+            name.removeSubrange(chipRange)
+            name.insert("-", at: chipRange.lowerBound)
+        }
+
+        // Remove context length and monolithic from display name
+        name = name.replacingOccurrences(of: "-monolithic", with: "")
+        if let ctxRange = name.range(of: #"-ctx\d+"#, options: .regularExpression) {
+            name.removeSubrange(ctxRange)
+        }
+
+        name = name.replacingOccurrences(of: "-", with: " ")
+
+        // Capitalize each word
+        name = name.split(separator: " ").map { word in
+            let w = String(word)
+            if w.uppercased() == w { return w }
+            if w.lowercased() == "gemma" { return "Gemma" }
+            if w.lowercased() == "qwen" { return "Qwen" }
+            if w.lowercased() == "llama" { return "LLaMA" }
+            if w.lowercased() == "deepseek" { return "DeepSeek" }
+            if w.contains(where: { $0.isNumber }) { return w.uppercased() }
+            return w.capitalized
+        }.joined(separator: " ")
+
+        if let chip = chipTag {
+            name += " (\(chip))"
+        }
+
+        return name
+    }
+
+    /// Detect model architecture from repo name
+    private func detectHFArchitecture(from repoName: String) -> String? {
+        let lower = repoName.lowercased()
+        if lower.contains("gemma") { return "gemma" }
+        if lower.contains("llama") { return "llama" }
+        if lower.contains("qwen") { return "qwen" }
+        if lower.contains("deepseek") { return "deepseek" }
+        return nil
+    }
+
+    /// Detect context length from repo name (e.g., "ctx512", "ctx4096")
+    private func detectHFContextLength(from repoName: String) -> Int? {
+        if let range = repoName.range(of: #"ctx(\d+)"#, options: .regularExpression) {
+            let match = repoName[range]
+            let digits = match.dropFirst(3)
+            return Int(digits)
+        }
+        return nil
     }
 
     // MARK: - Helpers
