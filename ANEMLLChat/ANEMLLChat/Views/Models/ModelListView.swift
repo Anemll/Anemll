@@ -149,6 +149,38 @@ struct ModelListView: View {
         } message: {
             Text(modelManager.weightWarningMessage ?? "This model has weight files that may not load correctly on this device.")
         }
+        // [ANE-COMPAT:M1-A14] Compatibility warning alert for Gemma global attention (load-time)
+        .alert("Device Compatibility", isPresented: Binding(
+            get: { modelManager.showCompatibilityWarningAlert },
+            set: { modelManager.showCompatibilityWarningAlert = $0 }
+        )) {
+            Button("Cancel", role: .cancel) {
+                modelManager.cancelLoadModel()
+            }
+            Button("Load Anyway") {
+                Task {
+                    await modelManager.confirmLoadModel()
+                }
+            }
+        } message: {
+            Text(modelManager.compatibilityWarningMessage ?? "This model may not work correctly on this device.")
+        }
+        // [ANE-COMPAT:M1-A14] Pre-download compatibility warning alert for Gemma global attention
+        .alert("Device Compatibility", isPresented: Binding(
+            get: { modelManager.showDownloadCompatibilityWarningAlert },
+            set: { modelManager.showDownloadCompatibilityWarningAlert = $0 }
+        )) {
+            Button("Cancel", role: .cancel) {
+                modelManager.cancelDownloadModel()
+            }
+            Button("Download Anyway") {
+                Task {
+                    await modelManager.confirmDownloadModel()
+                }
+            }
+        } message: {
+            Text(modelManager.downloadCompatibilityWarningMessage ?? "This model may not work correctly on this device.")
+        }
     }
 
     // MARK: - Computed Properties

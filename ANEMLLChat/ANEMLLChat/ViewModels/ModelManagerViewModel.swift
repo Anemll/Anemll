@@ -97,6 +97,27 @@ enum DeviceType {
     /// Maximum weight file size in bytes (1GB for limited devices)
     static let maxWeightFileSize: Int64 = 1_073_741_824  // 1 GB
 
+    // [ANE-COMPAT:M1-A14] Global attention compatibility check
+    /// Whether this device supports Gemma3 global attention (KV-cache rotation).
+    /// M1 Macs and A14 (and earlier) iOS devices cannot handle the global attention
+    /// KV-cache implementation. Both M1 and A14 are first-gen Apple Silicon families
+    /// and share this limitation.
+    static var supportsGlobalAttention: Bool {
+        let chip = chipName.lowercased()
+        // M1 (including M1 Pro, M1 Max, M1 Ultra) does NOT support it
+        if chip.range(of: #"\bm1\b"#, options: .regularExpression) != nil { return false }
+        if chip.range(of: #"\bm1 "#, options: .regularExpression) != nil { return false }
+        // A14 and earlier don't support it
+        if chip.range(of: #"\ba1[0-4]\b"#, options: .regularExpression) != nil { return false }
+        if chip.range(of: #"\ba[1-9]\b"#, options: .regularExpression) != nil { return false }
+        // Intel Macs
+        if chip.contains("intel") { return false }
+        // Unknown chips — be conservative
+        if chip.contains("unknown") { return false }
+        // Everything else (M2+, A15+) supports it
+        return true
+    }
+
     // MARK: - Device Info
 
     /// Machine identifier (e.g., "arm64", "iPad14,5", "iPhone16,1")
@@ -433,6 +454,7 @@ final class ModelManagerViewModel {
 
         // Update the published property - this triggers UI update
         availableModels = models
+        refreshGlobalAttentionCompatibilityCache()
         logInfo("Loaded \(models.count) models (\(downloadedModels.count) downloaded)", category: .model)
 
         // Auto-load last model after models are loaded (if setting enabled)
@@ -557,6 +579,7 @@ final class ModelManagerViewModel {
             refreshedModels.append(await refreshedModelStatus(for: model))
         }
         availableModels = refreshedModels
+        refreshGlobalAttentionCompatibilityCache()
 
         // Save registry so newly discovered models persist
         if addedCount > 0 {
@@ -571,7 +594,15 @@ final class ModelManagerViewModel {
 
     // MARK: - Download
 
-    /// Download a model (public API - sets state and starts download)
+    // [ANE-COMPAT:M1-A14] Pre-download compatibility warning state
+    /// Warning message shown before downloading an incompatible model
+    var downloadCompatibilityWarningMessage: String?
+    /// Whether to show the pre-download compatibility warning alert
+    var showDownloadCompatibilityWarningAlert: Bool = false
+    /// Model pending download (waiting for user confirmation after compatibility check)
+    private var pendingDownloadModel: ModelInfo?
+
+    /// Download a model (public API - checks compatibility then starts download)
     func downloadModel(_ model: ModelInfo) async {
         guard model.sourceKind == .huggingFace else {
             errorMessage = "Only HuggingFace models support download."
@@ -579,12 +610,88 @@ final class ModelManagerViewModel {
         }
         guard !model.isDownloaded, !model.isDownloading else { return }
 
-        // Set state immediately so UI updates
+        // [ANE-COMPAT:M1-A14] On M1/A14, fetch meta.yaml first to check compatibility
+        if !DeviceType.supportsGlobalAttention {
+            if let warning = await fetchAndCheckPreDownloadCompatibility(for: model) {
+                downloadCompatibilityWarningMessage = warning
+                pendingDownloadModel = model
+                showDownloadCompatibilityWarningAlert = true
+                logWarning("Pre-download compatibility warning for \(model.id): \(warning)", category: .download)
+                return
+            }
+        }
+
+        // No compatibility issue — start download immediately
+        await startDownload(model)
+    }
+
+    /// Continue downloading after user confirmed pre-download compatibility warning
+    func confirmDownloadModel() async {
+        guard let model = pendingDownloadModel else {
+            clearPendingDownloadState()
+            return
+        }
+        clearPendingDownloadState()
+        await startDownload(model)
+    }
+
+    /// Cancel download after pre-download compatibility warning
+    func cancelDownloadModel() {
+        clearPendingDownloadState()
+    }
+
+    private func clearPendingDownloadState() {
+        pendingDownloadModel = nil
+        showDownloadCompatibilityWarningAlert = false
+        downloadCompatibilityWarningMessage = nil
+    }
+
+    /// Internal: set UI state and kick off performDownload
+    private func startDownload(_ model: ModelInfo) async {
         downloadingModelId = model.id
         updateModelDownloading(model.id, isDownloading: true)
-
-        // Perform the actual download
         await performDownload(model)
+    }
+
+    // [ANE-COMPAT:M1-A14] Fetch meta.yaml from HuggingFace and check for global attention incompatibility
+    /// Returns a warning message if the model is incompatible, or nil if OK / unknown.
+    /// Caches the result so ModelCard can display "Not Compatible" even before download.
+    private func fetchAndCheckPreDownloadCompatibility(for model: ModelInfo) async -> String? {
+        logInfo("Fetching meta.yaml for pre-download compatibility check: \(model.id)", category: .download)
+
+        guard let yamlContent = await DownloadService.shared.fetchMetaYaml(for: model.id) else {
+            logDebug("No meta.yaml available for pre-download check — proceeding with download", category: .download)
+            return nil
+        }
+
+        logInfo("Pre-download meta.yaml fetched for \(model.id), checking compatibility...", category: .download)
+
+        // Parse the YAML content using ModelMetadata's parsing logic
+        guard let metadata = ModelMetadata.loadFromString(yamlContent) else {
+            logDebug("Failed to parse meta.yaml for pre-download check — proceeding with download", category: .download)
+            return nil
+        }
+
+        // Only Gemma architecture is affected
+        let isGemma = metadata.isGemmaFamily
+            || model.architecture?.lowercased() == "gemma"
+            || model.id.lowercased().contains("gemma")
+        guard isGemma else {
+            // Cache as "checked, no warning" so we don't re-fetch
+            cacheGlobalAttentionWarning(nil, for: model.id)
+            return nil
+        }
+
+        // When contextLength > slidingWindow, global attention layers are needed
+        guard let sw = metadata.slidingWindow, metadata.contextLength > sw else {
+            cacheGlobalAttentionWarning(nil, for: model.id)
+            return nil
+        }
+
+        let warning = "This Gemma model uses global attention (context \(metadata.contextLength) > SWA \(sw)) which is not compatible with \(DeviceType.chipName). Requires Apple M2+ (Mac) or A15+ (iPhone/iPad). You can still download it, but it may not load correctly."
+        // Cache so ModelCard shows "Not Compatible" tag immediately
+        cacheGlobalAttentionWarning(warning, for: model.id)
+        return warning
     }
 
     /// Cancel ongoing download
@@ -617,6 +724,7 @@ final class ModelManagerViewModel {
                     availableModels[index].metaYamlPath = nil
                 }
             }
+            clearCachedGlobalAttentionWarning(for: model.id)
 
             try? await StorageService.shared.saveModelsRegistry(availableModels)
 
@@ -641,8 +749,27 @@ final class ModelManagerViewModel {
     /// Whether to show the weight warning alert
     var showWeightWarningAlert: Bool = false
 
+    // [ANE-COMPAT:M1-A14] Compatibility warning state
+    /// Warning message shown before loading an incompatible model
+    var compatibilityWarningMessage: String?
+
+    /// Whether to show the compatibility warning alert
+    var showCompatibilityWarningAlert: Bool = false
+
     /// Model pending load (waiting for user confirmation)
     private var pendingLoadModel: ModelInfo?
+
+    /// Which warning gate the user is currently confirming before load.
+    private enum PendingLoadWarning {
+        case none
+        case weightSize
+        case compatibility
+    }
+    private var pendingLoadWarning: PendingLoadWarning = .none
+
+    // [ANE-COMPAT:M1-A14] Cache post-download compatibility checks
+    private var globalAttentionWarningByModelId: [String: String] = [:]
+    private var globalAttentionCheckedModelIds: Set<String> = []
 
     /// Load a model for inference
     func loadModelForInference(_ model: ModelInfo) async {
@@ -655,12 +782,26 @@ final class ModelManagerViewModel {
             return
         }
 
+        // Reset stale warning state from a previous load attempt.
+        clearPendingLoadState()
+
         // Check for weight size warning
         if let warning = getWeightSizeWarning(for: model) {
             weightWarningMessage = warning
             pendingLoadModel = model
+            pendingLoadWarning = .weightSize
             showWeightWarningAlert = true
             logWarning("Model has weight size warning: \(warning)", category: .model)
+            return
+        }
+
+        // [ANE-COMPAT:M1-A14] Check for global attention compatibility
+        if let compatWarning = getGlobalAttentionWarning(for: model) {
+            compatibilityWarningMessage = compatWarning
+            pendingLoadModel = model
+            pendingLoadWarning = .compatibility
+            showCompatibilityWarningAlert = true
+            logWarning("Model has compatibility warning: \(compatWarning)", category: .model)
             return
         }
 
@@ -670,23 +811,46 @@ final class ModelManagerViewModel {
     /// Continue loading model after user confirmed weight warning
     func confirmLoadModel() async {
         guard let model = pendingLoadModel, let path = model.localPath else {
-            pendingLoadModel = nil
-            showWeightWarningAlert = false
+            clearPendingLoadState()
             return
         }
 
-        showWeightWarningAlert = false
-        weightWarningMessage = nil
-        pendingLoadModel = nil
+        switch pendingLoadWarning {
+        case .weightSize:
+            showWeightWarningAlert = false
+            weightWarningMessage = nil
 
-        await performModelLoad(model, path: path)
+            // If weights are acknowledged, still enforce Gemma global-attention warning.
+            if let compatWarning = getGlobalAttentionWarning(for: model) {
+                compatibilityWarningMessage = compatWarning
+                showCompatibilityWarningAlert = true
+                pendingLoadWarning = .compatibility
+                logWarning("Model has compatibility warning: \(compatWarning)", category: .model)
+                return
+            }
+
+            pendingLoadModel = nil
+            pendingLoadWarning = .none
+            await performModelLoad(model, path: path)
+
+        case .compatibility, .none:
+            clearPendingLoadState()
+            await performModelLoad(model, path: path)
+        }
     }
 
     /// Cancel model load
     func cancelLoadModel() {
+        clearPendingLoadState()
+    }
+
+    private func clearPendingLoadState() {
         pendingLoadModel = nil
+        pendingLoadWarning = .none
         showWeightWarningAlert = false
+        showCompatibilityWarningAlert = false
         weightWarningMessage = nil
+        compatibilityWarningMessage = nil
     }
 
     /// Internal method to perform model loading
@@ -1980,6 +2144,15 @@ final class ModelManagerViewModel {
             availableModels[index].metaYamlPath = path.appendingPathComponent("meta.yaml").path
             availableModels[index].downloadProgress = nil
             availableModels[index].downloadError = nil
+
+            // Parse meta.yaml immediately after download to evaluate M1/A14 compatibility.
+            let warning = evaluateGlobalAttentionWarning(for: availableModels[index])
+            cacheGlobalAttentionWarning(warning, for: id)
+            if let warning {
+                logWarning("Post-download compatibility warning for \(id): \(warning)", category: .model)
+            } else {
+                logDebug("Post-download compatibility check passed: \(id)", category: .model)
+            }
         }
     }
 
@@ -1988,6 +2161,7 @@ final class ModelManagerViewModel {
             availableModels[index].isDownloading = false
             availableModels[index].downloadError = error
         }
+        clearCachedGlobalAttentionWarning(for: id)
     }
 
     // MARK: - Weight File Size Checking
@@ -2076,5 +2250,72 @@ final class ModelManagerViewModel {
     func hasOversizedWeights(for model: ModelInfo) -> Bool {
         guard let details = getWeightFileDetails(for: model) else { return false }
         return details.largest > DeviceType.maxWeightFileSize
+    }
+
+    // MARK: - ANE Compatibility Checking
+
+    // [ANE-COMPAT:M1-A14] Check model compatibility with device
+    /// Check if a model uses global attention that is incompatible with this device.
+    /// Works for both downloaded models (reads meta.yaml from disk) and pre-checked models
+    /// (returns cached result from pre-download meta.yaml fetch).
+    /// Returns a warning message, or nil if compatible.
+    /// NOTE: Currently only Gemma models are affected. Other architectures (Qwen, LLaMA)
+    /// may report sliding_window but don't have the same KV-cache rotation issue.
+    func getGlobalAttentionWarning(for model: ModelInfo) -> String? {
+        guard !DeviceType.supportsGlobalAttention else { return nil }
+
+        // Return cached result if available (covers both post-download and pre-download checks)
+        if globalAttentionCheckedModelIds.contains(model.id) {
+            return globalAttentionWarningByModelId[model.id]
+        }
+
+        // For downloaded models, evaluate from local meta.yaml
+        guard model.isDownloaded else { return nil }
+
+        let warning = evaluateGlobalAttentionWarning(for: model)
+        cacheGlobalAttentionWarning(warning, for: model.id)
+        return warning
+    }
+
+    private func evaluateGlobalAttentionWarning(for model: ModelInfo) -> String? {
+        guard !DeviceType.supportsGlobalAttention else { return nil }
+        guard let metaPath = model.metaYamlPath else { return nil }
+        guard let metadata = ModelMetadata.load(from: metaPath) else { return nil }
+
+        // Only Gemma architecture is affected by this limitation.
+        let isGemma = metadata.isGemmaFamily
+            || model.architecture?.lowercased() == "gemma"
+            || model.id.lowercased().contains("gemma")
+        guard isGemma else { return nil }
+
+        // When contextLength > slidingWindow, the model uses global attention layers
+        // beyond the SWA range — this requires M2+/A15+ hardware
+        guard let sw = metadata.slidingWindow, metadata.contextLength > sw else { return nil }
+        return "This Gemma model uses global attention (context \(metadata.contextLength) > SWA \(sw)) which is not compatible with \(DeviceType.chipName). Requires Apple M2+ (Mac) or A15+ (iPhone/iPad)."
+    }
+
+    private func cacheGlobalAttentionWarning(_ warning: String?, for modelId: String) {
+        globalAttentionCheckedModelIds.insert(modelId)
+        if let warning {
+            globalAttentionWarningByModelId[modelId] = warning
+        } else {
+            globalAttentionWarningByModelId.removeValue(forKey: modelId)
+        }
+    }
+
+    private func clearCachedGlobalAttentionWarning(for modelId: String) {
+        globalAttentionCheckedModelIds.remove(modelId)
+        globalAttentionWarningByModelId.removeValue(forKey: modelId)
+    }
+
+    private func refreshGlobalAttentionCompatibilityCache() {
+        globalAttentionWarningByModelId.removeAll()
+        globalAttentionCheckedModelIds.removeAll()
+
+        guard !DeviceType.supportsGlobalAttention else { return }
+        for model in availableModels where model.isDownloaded {
+            let warning = evaluateGlobalAttentionWarning(for: model)
+            cacheGlobalAttentionWarning(warning, for: model.id)
+        }
     }
 }

@@ -203,6 +203,29 @@ actor DownloadService: NSObject {
         downloadTasks[modelId] != nil
     }
 
+    // MARK: - Pre-download Meta Fetch
+
+    // [ANE-COMPAT:M1-A14] Fetch just meta.yaml from HuggingFace before starting full download
+    /// Fetches the raw content of meta.yaml for a given model repo without downloading the full model.
+    /// Returns the YAML string, or nil if the file doesn't exist or fetch fails.
+    func fetchMetaYaml(for modelId: String) async -> String? {
+        let urlString = "https://huggingface.co/\(modelId)/resolve/main/meta.yaml"
+        guard let url = URL(string: urlString) else { return nil }
+
+        do {
+            let (data, response) = try await urlSession.data(from: url)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200 else {
+                logDebug("meta.yaml not found for \(modelId) (status: \((response as? HTTPURLResponse)?.statusCode ?? 0))", category: .download)
+                return nil
+            }
+            return String(data: data, encoding: .utf8)
+        } catch {
+            logDebug("Failed to fetch meta.yaml for \(modelId): \(error)", category: .download)
+            return nil
+        }
+    }
+
     // MARK: - HuggingFace API
 
     private struct HFFile: Sendable {

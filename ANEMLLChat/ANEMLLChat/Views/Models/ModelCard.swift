@@ -39,6 +39,12 @@ struct ModelCard: View {
         return modelManager.hasOversizedWeights(for: model)
     }
 
+    // [ANE-COMPAT:M1-A14] Compatibility tag for Gemma global attention
+    // Shows for both downloaded models and pre-download-checked models (cached from meta.yaml fetch)
+    private var hasCompatibilityWarning: Bool {
+        return modelManager.getGlobalAttentionWarning(for: model) != nil
+    }
+
     private var deleteMessage: String {
         switch model.sourceKind {
         case .localLinked:
@@ -85,6 +91,18 @@ struct ModelCard: View {
                             .font(.caption2)
                             .foregroundStyle(.orange)
                             .help("Model has weight files >1GB - won't load on iPhone or non-M-series iPad")
+                    }
+
+                    // [ANE-COMPAT:M1-A14] "Not Compatible" tag for Gemma global attention on M1/A14
+                    if hasCompatibilityWarning {
+                        Label("Not Compatible", systemImage: "xmark.circle.fill")
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.red)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.red.opacity(0.15), in: Capsule())
+                            .help("Gemma global attention not supported on \(DeviceType.chipName) — requires M2+/A15+")
                     }
 
                     if isJustAdded {
@@ -228,8 +246,19 @@ struct ModelCard: View {
                 .font(.title3)
                 .foregroundStyle(statusForeground)
 
-            // Warning badge overlay for models with large weights
-            if hasWeightWarning || hasLargeWeights {
+            // Warning badge overlay for models with large weights or compatibility issues
+            if hasCompatibilityWarning {
+                // [ANE-COMPAT:M1-A14] Badge for incompatible models
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.red)
+                    .background(
+                        Circle()
+                            .fill(backgroundCircleColor)
+                            .frame(width: 18, height: 18)
+                    )
+                    .offset(x: 14, y: 14)
+            } else if hasWeightWarning || hasLargeWeights {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 14))
                     .foregroundStyle(hasWeightWarning ? .red : .orange)
@@ -493,6 +522,8 @@ struct RecommendedSampling: Sendable {
 struct ModelMetadata: Sendable {
     let version: String
     let modelType: String
+    let architecture: String?
+    let modelName: String?
     let modelPrefix: String
     let contextLength: Int
     let batchSize: Int
@@ -505,10 +536,27 @@ struct ModelMetadata: Sendable {
     let slidingWindow: Int?
     let recommendedSampling: RecommendedSampling?
 
+    var isGemmaFamily: Bool {
+        let fields = [
+            modelPrefix.lowercased(),
+            (architecture ?? "").lowercased(),
+            (modelName ?? "").lowercased(),
+            modelType.lowercased()
+        ]
+        return fields.contains { $0.contains("gemma") }
+    }
+
     static func load(from path: String) -> ModelMetadata? {
         guard FileManager.default.fileExists(atPath: path),
-              let content = try? String(contentsOfFile: path, encoding: .utf8),
-              let yaml = try? Yams.load(yaml: content) as? [String: Any],
+              let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return nil
+        }
+        return loadFromString(content)
+    }
+
+    // [ANE-COMPAT:M1-A14] Parse from raw YAML string (used for pre-download compatibility check)
+    static func loadFromString(_ content: String) -> ModelMetadata? {
+        guard let yaml = try? Yams.load(yaml: content) as? [String: Any],
               let modelInfo = yaml["model_info"] as? [String: Any],
               let params = modelInfo["parameters"] as? [String: Any] else {
             return nil
@@ -530,18 +578,20 @@ struct ModelMetadata: Sendable {
         }
 
         return ModelMetadata(
-            version: modelInfo["version"] as? String ?? "Unknown",
-            modelType: modelInfo["model_type"] as? String ?? "chunked",
-            modelPrefix: params["model_prefix"] as? String ?? "unknown",
-            contextLength: params["context_length"] as? Int ?? 2048,
-            batchSize: params["batch_size"] as? Int ?? 32,
-            lutFFN: params["lut_ffn"] as? Int,
-            lutLMHead: params["lut_lmhead"] as? Int,
-            lutEmbeddings: params["lut_embeddings"] as? Int,
-            numChunks: params["num_chunks"] as? Int ?? 1,
-            splitLMHead: params["split_lm_head"] as? Int ?? 8,
-            argmaxInModel: params["argmax_in_model"] as? Bool ?? false,
-            slidingWindow: params["sliding_window"] as? Int,
+            version: toString(modelInfo["version"]) ?? "Unknown",
+            modelType: toString(modelInfo["model_type"]) ?? "chunked",
+            architecture: toString(modelInfo["architecture"]),
+            modelName: toString(modelInfo["name"]),
+            modelPrefix: toString(params["model_prefix"]) ?? "unknown",
+            contextLength: toInt(params["context_length"]) ?? 2048,
+            batchSize: toInt(params["batch_size"]) ?? 32,
+            lutFFN: toInt(params["lut_ffn"]),
+            lutLMHead: toInt(params["lut_lmhead"]),
+            lutEmbeddings: toInt(params["lut_embeddings"]),
+            numChunks: toInt(params["num_chunks"]) ?? 1,
+            splitLMHead: toInt(params["split_lm_head"]) ?? 8,
+            argmaxInModel: toBool(params["argmax_in_model"]) ?? false,
+            slidingWindow: toInt(params["sliding_window"]),
             recommendedSampling: recommendedSampling
         )
     }
@@ -559,7 +609,27 @@ struct ModelMetadata: Sendable {
         if let v = value as? Int { return v }
         if let v = value as? NSNumber { return v.intValue }
         if let v = value as? Double { return Int(v) }
+        if let v = value as? Float { return Int(v) }
         if let v = value as? String { return Int(v) }
+        return nil
+    }
+
+    private static func toBool(_ value: Any?) -> Bool? {
+        if let v = value as? Bool { return v }
+        if let v = value as? NSNumber { return v.boolValue }
+        if let v = value as? String {
+            switch v.lowercased() {
+            case "true", "1", "yes", "y": return true
+            case "false", "0", "no", "n": return false
+            default: return nil
+            }
+        }
+        return nil
+    }
+
+    private static func toString(_ value: Any?) -> String? {
+        if let v = value as? String { return v }
+        if let v = value as? NSNumber { return v.stringValue }
         return nil
     }
 }
