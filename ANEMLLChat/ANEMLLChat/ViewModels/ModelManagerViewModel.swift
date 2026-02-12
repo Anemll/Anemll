@@ -434,13 +434,21 @@ final class ModelManagerViewModel {
             }
         }
 
-        // Step 2: Add custom models (if any)
+        // Step 2: Add custom models from registry (local imports/links and downloaded HF models only)
+        // The collection fetch (Step 1) is the authoritative source for HuggingFace models.
+        // Only merge registry entries that are locally imported/linked or actually downloaded.
+        // This prevents stale HF entries (from old author-search) from polluting the model list.
         do {
-            let customModels = try await StorageService.shared.loadModelsRegistry()
-            for custom in customModels {
-                if !models.contains(where: { $0.id == custom.id }) {
-                    models.append(custom)
-                    logDebug("Added custom model: \(custom.id)", category: .model)
+            let registryModels = try await StorageService.shared.loadModelsRegistry()
+            for entry in registryModels {
+                guard !models.contains(where: { $0.id == entry.id }) else { continue }
+                // Keep: local imports, local links, and downloaded HF models
+                // Skip: non-downloaded HF models (the collection already covers those)
+                if entry.sourceKind == .localImported || entry.sourceKind == .localLinked || entry.isDownloaded {
+                    models.append(entry)
+                    logDebug("Added custom model: \(entry.id)", category: .model)
+                } else {
+                    logDebug("Skipped stale registry entry: \(entry.id)", category: .model)
                 }
             }
         } catch {
@@ -546,16 +554,15 @@ final class ModelManagerViewModel {
         )
     }
 
-    /// Refresh model list from HuggingFace collection (user-triggered)
-    func refreshFromCollection() async {
-        print("[Collection] Manual refresh triggered")
-        await loadModels()
-    }
-
-    /// Refresh download status for all models and discover new ones from HuggingFace
+    /// Refresh download status for all models and discover new ones from HuggingFace collection
     func refreshModelStatus() async {
-        // First, try to discover new models from HuggingFace
-        let discovered = await fetchAnemllModelsFromHF()
+        // Discover new models from HuggingFace curated collection (not author search)
+        var discovered: [ModelInfo] = []
+        do {
+            discovered = try await fetchCollectionModels()
+        } catch {
+            logWarning("Failed to fetch collection during refresh: \(error)", category: .model)
+        }
         var models = availableModels
 
         // Merge newly discovered models
@@ -1571,145 +1578,7 @@ final class ModelManagerViewModel {
         )
     }
 
-    // MARK: - HuggingFace Discovery
-
-    /// Fetch list of ANEMLL models from HuggingFace API
-    /// Returns ModelInfo entries for newly discovered models (not already in availableModels)
-    private func fetchAnemllModelsFromHF() async -> [ModelInfo] {
-        let apiURL = URL(string: "https://huggingface.co/api/models?author=anemll&limit=100")!
-        logInfo("Fetching ANEMLL models from HuggingFace...", category: .model)
-
-        do {
-            let (data, response) = try await URLSession.shared.data(from: apiURL)
-            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                logWarning("HuggingFace API returned non-200 status", category: .model)
-                return []
-            }
-
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-                logWarning("Failed to parse HuggingFace API response", category: .model)
-                return []
-            }
-
-            var discovered: [ModelInfo] = []
-
-            for item in json {
-                guard let modelId = item["modelId"] as? String ?? item["id"] as? String else { continue }
-
-                // Only include models that look like ANEMLL converted models
-                let repoName = modelId.components(separatedBy: "/").last ?? modelId
-                guard repoName.hasPrefix("anemll-") else { continue }
-
-                // Skip if already known
-                if availableModels.contains(where: { $0.id == modelId }) { continue }
-
-                // Parse model info from the repo metadata
-                let name = suggestHFDisplayName(from: repoName)
-                let architecture = detectHFArchitecture(from: repoName)
-                let contextLength = detectHFContextLength(from: repoName)
-
-                // Build a descriptive string
-                var desc = "ANEMLL model"
-                let lower = repoName.lowercased()
-                if lower.contains("monolithic") { desc += " (monolithic)" }
-                if lower.range(of: #"-m\d+-"#, options: .regularExpression) != nil {
-                    desc += " - optimized for older Apple Silicon"
-                }
-
-                let model = ModelInfo(
-                    id: modelId,
-                    name: name,
-                    description: desc,
-                    size: "Unknown",
-                    contextLength: contextLength,
-                    architecture: architecture
-                )
-
-                discovered.append(model)
-            }
-
-            lastRefreshDiscoveredCount = discovered.count
-            logInfo("HuggingFace discovery: found \(json.count) repos, \(discovered.count) new", category: .model)
-            return discovered
-
-        } catch {
-            logWarning("Failed to fetch from HuggingFace: \(error)", category: .model)
-            lastRefreshDiscoveredCount = 0
-            return []
-        }
-    }
-
-    /// Generate a display name from a HuggingFace repo name
-    private func suggestHFDisplayName(from repoName: String) -> String {
-        var name = repoName
-            .replacingOccurrences(of: "anemll-", with: "")
-            .replacingOccurrences(of: "google-", with: "")
-            .replacingOccurrences(of: "Qwen-", with: "")
-            .replacingOccurrences(of: "meta-llama-", with: "")
-            .replacingOccurrences(of: "-it-", with: "-")
-            .replacingOccurrences(of: "-qat-", with: "-QAT-")
-            .replacingOccurrences(of: "-int4", with: "")
-            .replacingOccurrences(of: "-unquantized", with: "")
-
-        // Remove version suffix like _0.3.5
-        if let range = name.range(of: #"_\d+\.\d+(\.\d+)?$"#, options: .regularExpression) {
-            name = String(name[..<range.lowerBound])
-        }
-
-        // Extract chip designator (e.g., M1, M2, M4) before replacing dashes
-        var chipTag: String? = nil
-        if let chipRange = name.range(of: #"-M\d+-"#, options: .regularExpression) {
-            chipTag = String(name[chipRange]).replacingOccurrences(of: "-", with: "")
-            name.removeSubrange(chipRange)
-            name.insert("-", at: chipRange.lowerBound)
-        }
-
-        // Remove context length and monolithic from display name
-        name = name.replacingOccurrences(of: "-monolithic", with: "")
-        if let ctxRange = name.range(of: #"-ctx\d+"#, options: .regularExpression) {
-            name.removeSubrange(ctxRange)
-        }
-
-        name = name.replacingOccurrences(of: "-", with: " ")
-
-        // Capitalize each word
-        name = name.split(separator: " ").map { word in
-            let w = String(word)
-            if w.uppercased() == w { return w }
-            if w.lowercased() == "gemma" { return "Gemma" }
-            if w.lowercased() == "qwen" { return "Qwen" }
-            if w.lowercased() == "llama" { return "LLaMA" }
-            if w.lowercased() == "deepseek" { return "DeepSeek" }
-            if w.contains(where: { $0.isNumber }) { return w.uppercased() }
-            return w.capitalized
-        }.joined(separator: " ")
-
-        if let chip = chipTag {
-            name += " (\(chip))"
-        }
-
-        return name
-    }
-
-    /// Detect model architecture from repo name
-    private func detectHFArchitecture(from repoName: String) -> String? {
-        let lower = repoName.lowercased()
-        if lower.contains("gemma") { return "gemma" }
-        if lower.contains("llama") { return "llama" }
-        if lower.contains("qwen") { return "qwen" }
-        if lower.contains("deepseek") { return "deepseek" }
-        return nil
-    }
-
-    /// Detect context length from repo name (e.g., "ctx512", "ctx4096")
-    private func detectHFContextLength(from repoName: String) -> Int? {
-        if let range = repoName.range(of: #"ctx(\d+)"#, options: .regularExpression) {
-            let match = repoName[range]
-            let digits = match.dropFirst(3)
-            return Int(digits)
-        }
-        return nil
-    }
+    // (HuggingFace author-search discovery removed — refresh now uses the curated collection API)
 
     // MARK: - Helpers
 

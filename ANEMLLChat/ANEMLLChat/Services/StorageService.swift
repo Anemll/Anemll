@@ -483,12 +483,18 @@ actor StorageService {
     }
 
     /// Save custom models to registry
+    /// Only persists models that are locally imported/linked or actually downloaded.
+    /// Non-downloaded HuggingFace models are not saved — the collection fetch is the
+    /// authoritative source for those and saving them would create stale registry entries.
     func saveModelsRegistry(_ models: [ModelInfo]) async throws {
         try ensureDirectoryExists(appDataRootDirectory)
 
-        // Only save custom models (not defaults)
+        // Only save: (a) not a hardcoded default, AND (b) locally imported/linked or downloaded
         let customModels = models.filter { model in
-            !ModelInfo.defaultModels.contains(where: { $0.id == model.id })
+            guard !ModelInfo.defaultModels.contains(where: { $0.id == model.id }) else { return false }
+            return model.sourceKind == .localImported
+                || model.sourceKind == .localLinked
+                || model.isDownloaded
         }
 
         do {
