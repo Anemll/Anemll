@@ -23,6 +23,7 @@ enum DeviceType {
     case macCatalyst
     case iPad
     case iPhone
+    case visionPro
     case other
 
     static var current: DeviceType {
@@ -30,7 +31,13 @@ enum DeviceType {
         return .mac
         #elseif targetEnvironment(macCatalyst)
         return .macCatalyst
+        #elseif os(visionOS)
+        return .visionPro
         #else
+        // Check if running as iPad app on Vision Pro
+        if isRunningOnVisionPro {
+            return .visionPro
+        }
         let device = UIDevice.current
         if device.userInterfaceIdiom == .pad {
             return .iPad
@@ -39,6 +46,23 @@ enum DeviceType {
         } else {
             return .other
         }
+        #endif
+    }
+
+    /// Detect if an iOS/iPadOS app is running on Apple Vision Pro (iPad compatibility mode)
+    private static var isRunningOnVisionPro: Bool {
+        #if os(visionOS)
+        return true
+        #elseif os(iOS)
+        if #available(iOS 19.1, *) {
+            return ProcessInfo.processInfo.isiOSAppOnVision
+        }
+        // Fallback: check if machine identifier indicates a RealityDevice
+        let machine = machineIdentifier
+        if machine.hasPrefix("RealityDevice") { return true }
+        return false
+        #else
+        return false
         #endif
     }
 
@@ -56,27 +80,18 @@ enum DeviceType {
         #elseif targetEnvironment(macCatalyst)
         return true
         #else
-        var sysinfo = utsname()
-        uname(&sysinfo)
-        let machine = withUnsafePointer(to: &sysinfo.machine) {
-            $0.withMemoryRebound(to: CChar.self, capacity: 1) {
-                String(validatingUTF8: $0)
-            }
-        }
-        guard let identifier = machine else { return false }
+        // Vision Pro always has M-series chip
+        if isRunningOnVisionPro { return true }
 
-        // iPads with M-series chips
-        let mSeriesIPads = [
-            "iPad13,4", "iPad13,5", "iPad13,6", "iPad13,7",  // iPad Pro 11" 3rd gen (M1)
-            "iPad13,8", "iPad13,9", "iPad13,10", "iPad13,11", // iPad Pro 12.9" 5th gen (M1)
-            "iPad13,16", "iPad13,17",                         // iPad Air 5th gen (M1)
-            "iPad14,3", "iPad14,4",                           // iPad Pro 11" 4th gen (M2)
-            "iPad14,5", "iPad14,6",                           // iPad Pro 12.9" 6th gen (M2)
-            "iPad14,8", "iPad14,9",                           // iPad Air 6th gen (M2)
-            "iPad16,3", "iPad16,4",                           // iPad Pro 11" 5th gen (M4)
-            "iPad16,5", "iPad16,6",                           // iPad Pro 13" 1st gen (M4)
-        ]
-        return mSeriesIPads.contains(identifier)
+        let identifier = machineIdentifier
+
+        // RealityDevice = Vision Pro (M2 or M5)
+        if identifier.hasPrefix("RealityDevice") { return true }
+
+        // Use chipNameFromIdentifier to check — avoids hardcoded list going stale
+        let chip = chipNameFromIdentifier(identifier).lowercased()
+        return chip.contains(" m1") || chip.contains(" m2") || chip.contains(" m3")
+            || chip.contains(" m4") || chip.contains(" m5") || chip.contains("m-series")
         #endif
     }
 
@@ -87,7 +102,7 @@ enum DeviceType {
             return true
         case .iPad:
             return !hasMSeriesChip
-        case .mac, .macCatalyst:
+        case .mac, .macCatalyst, .visionPro:
             return false
         case .other:
             return true
@@ -132,7 +147,7 @@ enum DeviceType {
     }
 
     /// CPU/chip brand string (e.g., "Apple M1", "Apple M4 Pro")
-    /// On macOS uses sysctl; on iOS infers from device identifier
+    /// On macOS uses sysctl; on iOS/visionOS infers from device identifier
     static var chipName: String {
         #if os(macOS)
         var size: size_t = 0
@@ -145,7 +160,19 @@ enum DeviceType {
         }
         return hasMSeriesChip ? "Apple Silicon" : "Intel"
         #else
-        return chipNameFromIdentifier(machineIdentifier)
+        let machine = machineIdentifier
+        var result = chipNameFromIdentifier(machine)
+
+        if isRunningOnVisionPro {
+            // Vision Pro has at least M2 — if we got "arm64" / "Apple Silicon" or
+            // something below M2 (shouldn't happen, but be safe), floor to M2
+            let lower = result.lowercased()
+            if lower.contains("apple silicon") || lower.contains("unknown")
+                || lower.contains("a-series") || lower.contains(" m1") {
+                result = "Apple M2 (Vision Pro)"
+            }
+        }
+        return result
         #endif
     }
 
@@ -172,8 +199,13 @@ enum DeviceType {
         #elseif os(visionOS)
         return "visionOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
         #else
+        // iPad compat mode on Vision Pro still reports iPadOS — annotate it
         let device = UIDevice.current
-        return "\(device.systemName) \(device.systemVersion)"
+        let base = "\(device.systemName) \(device.systemVersion)"
+        if isRunningOnVisionPro {
+            return "\(base) (on visionOS)"
+        }
+        return base
         #endif
     }
 
@@ -188,49 +220,105 @@ enum DeviceType {
         return "\(os) | \(chip) (\(mSeries)) | \(cores) cores | \(mem) RAM | \(machine)"
     }
 
-    /// Infer Apple chip name from iOS/iPadOS device identifier
+    /// Parse "iPhone17,3" → (major: 17, minor: 3)
+    private static func parseDeviceIdentifier(_ id: String, prefix: String) -> (major: Int, minor: Int)? {
+        let body = id.replacingOccurrences(of: prefix, with: "")
+        let parts = body.split(separator: ",")
+        guard let major = parts.first.flatMap({ Int($0) }) else { return nil }
+        let minor = parts.count > 1 ? (Int(parts[1]) ?? 1) : 1
+        return (major, minor)
+    }
+
+    /// Infer Apple chip name from iOS/iPadOS device identifier.
+    ///
+    /// Mapping sources: appledb.dev, support.apple.com/en-us/108044, support.apple.com/en-us/108043
+    /// iPhone major,minor → SoC:
+    ///   18,1-2 = A19 Pro  |  18,3-4 = A19
+    ///   17,1-2 = A18 Pro  |  17,3-5 = A18
+    ///   16,1-2 = A17 Pro  |  15,x   = A16
+    ///   14,x   = A15      |  13,x   = A14
+    ///   12,x   = A13      |  11,x   = A12
+    ///   10,x   = A11
+    /// iPad major,minor → SoC:
+    ///   16,3-6 = M4       |  16,1-2 = A17 Pro (iPad mini 7)
+    ///   15,3-6 = M3       |  15,7-8 = A16 (iPad 11th gen)
+    ///   14,3-6 = M2       |  14,8-11 = M2 (Air)  |  14,1-2 = A15 (mini 6)
+    ///   13,4-11 = M1      |  13,16-19 = M1/A14 (Air 5/iPad 10)  |  13,1-2 = A14 (Air 4)
+    ///   12,x   = A14      |  11,x = A12/A12X  |  8,x = A12X/A12Z
     private static func chipNameFromIdentifier(_ id: String) -> String {
-        if id.hasPrefix("iPhone") {
-            let parts = id.replacingOccurrences(of: "iPhone", with: "").split(separator: ",")
-            if let major = parts.first, let num = Int(major) {
-                switch num {
-                case 17: return "Apple A18 Pro"
-                case 16: return "Apple A17 Pro"
-                case 15: return "Apple A16"
-                case 14: return "Apple A15"
-                case 13: return "Apple A14"
-                case 12: return "Apple A13"
-                case 11: return "Apple A12"
-                case 10: return "Apple A11"
-                default: return "Apple A-series"
-                }
+        // MARK: iPhone
+        if id.hasPrefix("iPhone"),
+           let parsed = parseDeviceIdentifier(id, prefix: "iPhone") {
+            switch parsed.major {
+            case 18:
+                return parsed.minor <= 2 ? "Apple A19 Pro" : "Apple A19"
+            case 17:
+                return parsed.minor <= 2 ? "Apple A18 Pro" : "Apple A18"
+            case 16:
+                return "Apple A17 Pro"
+            case 15:
+                return "Apple A16"
+            case 14:
+                return "Apple A15"
+            case 13:
+                return "Apple A14"
+            case 12:
+                return "Apple A13"
+            case 11:
+                return "Apple A12"
+            case 10:
+                return "Apple A11"
+            default:
+                // Future-proof: major > 18 → assume newer A-series
+                return parsed.major > 18 ? "Apple A-series (new)" : "Apple A-series"
             }
         }
 
-        if id.hasPrefix("iPad") {
-            let parts = id.replacingOccurrences(of: "iPad", with: "").split(separator: ",")
-            if let major = parts.first, let num = Int(major) {
-                switch num {
-                case 16: return "Apple M4"
-                case 14:
-                    if let minor = parts.last, let m = Int(minor), m >= 8 {
-                        return "Apple M2"
-                    }
-                    return "Apple M2"
-                case 13:
-                    if let minor = parts.last, let m = Int(minor), m >= 16 {
-                        return "Apple M1"
-                    }
-                    if let minor = parts.last, let m = Int(minor), m >= 4 {
-                        return "Apple M1"
-                    }
-                    return "Apple A14"
-                case 12: return "Apple A14"
-                case 11: return "Apple A12/A12X"
-                case 8: return "Apple A12X/A12Z"
-                case 7: return "Apple A10"
-                default: return "Apple A-series"
-                }
+        // MARK: iPad
+        if id.hasPrefix("iPad"),
+           let parsed = parseDeviceIdentifier(id, prefix: "iPad") {
+            switch parsed.major {
+            case 16:
+                // 16,1-2 = iPad mini 7 (A17 Pro), 16,3-6 = iPad Pro M4
+                return parsed.minor <= 2 ? "Apple A17 Pro" : "Apple M4"
+            case 15:
+                // 15,3-6 = iPad Air M3, 15,7-8 = iPad 11th gen (A16)
+                return parsed.minor <= 6 ? "Apple M3" : "Apple A16"
+            case 14:
+                // 14,1-2 = iPad mini 6 (A15), 14,3-6 = iPad Pro M2, 14,8-11 = iPad Air M2
+                if parsed.minor <= 2 { return "Apple A15" }
+                return "Apple M2"
+            case 13:
+                // 13,1-2 = iPad Air 4 (A14), 13,4-11 = iPad Pro M1
+                // 13,16-17 = iPad Air 5 (M1), 13,18-19 = iPad 10th gen (A14)
+                if parsed.minor <= 2 { return "Apple A14" }
+                if parsed.minor <= 11 { return "Apple M1" }
+                if parsed.minor <= 17 { return "Apple M1" }
+                return "Apple A14"
+            case 12:
+                return "Apple A14"
+            case 11:
+                return "Apple A12/A12X"
+            case 8:
+                return "Apple A12X/A12Z"
+            case 7:
+                return "Apple A10"
+            default:
+                return parsed.major > 16 ? "Apple M-series (new)" : "Apple A-series"
+            }
+        }
+
+        // MARK: Apple Vision Pro
+        // RealityDevice14,1 = Vision Pro (M2), RealityDevice15,x = Vision Pro M5
+        if id.hasPrefix("RealityDevice"),
+           let parsed = parseDeviceIdentifier(id, prefix: "RealityDevice") {
+            switch parsed.major {
+            case 14:
+                return "Apple M2"
+            case 15:
+                return "Apple M5"
+            default:
+                return parsed.major > 15 ? "Apple M-series (new)" : "Apple M2"
             }
         }
 
@@ -356,7 +444,16 @@ final class ModelManagerViewModel {
     /// ID of model currently being loaded
     var loadingModelId: String?
 
+    #if os(macOS)
+    /// Whether a model is being packaged for sharing
+    var isSharingModel: Bool = false
+
+    /// ID of model currently being shared
+    var sharingModelId: String?
+    #endif
+
     private var clearJustAddedTask: Task<Void, Never>?
+    private var modelLoadTask: Task<Void, Never>?
     #if os(macOS)
     private var preparedTransferPackages: [URL] = []
     #endif
@@ -860,6 +957,17 @@ final class ModelManagerViewModel {
         compatibilityWarningMessage = nil
     }
 
+    /// Cancel an in-progress model load
+    func cancelModelLoading() async {
+        modelLoadTask?.cancel()
+        modelLoadTask = nil
+        await InferenceService.shared.unloadModel()
+        isLoadingModel = false
+        loadingModelId = nil
+        loadingProgress = nil
+        logInfo("Model loading cancelled by user", category: .model)
+    }
+
     /// Internal method to perform model loading
     private func performModelLoad(_ model: ModelInfo, path: String) async {
         isLoadingModel = true
@@ -875,25 +983,31 @@ final class ModelManagerViewModel {
             }
         }
 
-        do {
-            let modelURL = URL(fileURLWithPath: path)
-            try await InferenceService.shared.loadModel(from: modelURL)
-            loadedModelId = model.id
+        modelLoadTask = Task { @MainActor in
+            do {
+                let modelURL = URL(fileURLWithPath: path)
+                try await InferenceService.shared.loadModel(from: modelURL)
 
-            // Save as selected model
-            await StorageService.shared.saveSelectedModelId(model.id)
+                guard !Task.isCancelled else { return }
 
-            logInfo("Model loaded: \(model.id)", category: .model)
+                loadedModelId = model.id
+                await StorageService.shared.saveSelectedModelId(model.id)
+                logInfo("Model loaded: \(model.id)", category: .model)
 
-        } catch {
-            errorMessage = error.localizedDescription
-            logError("Failed to load model: \(error)", category: .model)
+            } catch {
+                guard !Task.isCancelled else { return }
+                errorMessage = error.localizedDescription
+                logError("Failed to load model: \(error)", category: .model)
+            }
+
+            progressTask.cancel()
+            isLoadingModel = false
+            loadingModelId = nil
+            loadingProgress = nil
         }
 
-        progressTask.cancel()
-        isLoadingModel = false
-        loadingModelId = nil
-        loadingProgress = nil
+        await modelLoadTask?.value
+        modelLoadTask = nil
     }
 
     /// Unload the current model
@@ -1053,11 +1167,16 @@ final class ModelManagerViewModel {
                 description = "Local model (linked)"
             }
 
+            // Calculate actual model size
+            let sizeBytes = calculateDirectorySize(at: URL(fileURLWithPath: localPath))
+            let sizeString = sizeBytes > 0 ? ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file) : "Local"
+
             let newModel = ModelInfo(
                 id: finalModelId,
                 name: finalName,
                 description: description,
-                size: "Local",
+                size: sizeString,
+                sizeBytes: sizeBytes > 0 ? sizeBytes : nil,
                 isDownloaded: true,
                 localPath: localPath,
                 metaYamlPath: URL(fileURLWithPath: localPath).appendingPathComponent("meta.yaml").path,
@@ -1150,11 +1269,17 @@ final class ModelManagerViewModel {
         let finalModelId = uniqueLocalModelId(forDisplayName: finalName)
 
         let importedPath = try await StorageService.shared.importModelDirectory(from: resolvedModelRoot, toModelId: finalModelId)
+
+        // Calculate actual model size
+        let sizeBytes = calculateDirectorySize(at: importedPath)
+        let sizeString = sizeBytes > 0 ? ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file) : "Local"
+
         let newModel = ModelInfo(
             id: finalModelId,
             name: finalName,
             description: "Transferred model package",
-            size: "Local",
+            size: sizeString,
+            sizeBytes: sizeBytes > 0 ? sizeBytes : nil,
             isDownloaded: true,
             localPath: importedPath.path,
             metaYamlPath: importedPath.appendingPathComponent("meta.yaml").path,
@@ -1359,10 +1484,42 @@ final class ModelManagerViewModel {
     }
     #endif
 
+    // MARK: - Directory Size
+
+    /// Calculate the total size of a directory in bytes
+    func calculateDirectorySize(at url: URL) -> Int64 {
+        let fileManager = FileManager.default
+        var totalSize: Int64 = 0
+        if let contents = try? fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey]) {
+            for item in contents {
+                if let values = try? item.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey]) {
+                    if values.isDirectory == true {
+                        totalSize += calculateDirectorySize(at: item)
+                    } else if let fileSize = values.fileSize {
+                        totalSize += Int64(fileSize)
+                    }
+                }
+            }
+        }
+        return totalSize
+    }
+
+    /// Get formatted size string for a model directory
+    func formattedModelSize(for model: ModelInfo) -> String? {
+        guard let path = model.localPath else { return nil }
+        let url = URL(fileURLWithPath: path)
+        let bytes = calculateDirectorySize(at: url)
+        guard bytes > 0 else { return nil }
+        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
     // MARK: - Package Share (macOS sender)
 
     #if os(macOS)
     func shareModelToIOS(_ model: ModelInfo) async {
+        isSharingModel = true
+        sharingModelId = model.id
+
         do {
             guard model.isDownloaded, let localPath = model.localPath else {
                 throw LocalModelValidationError.invalidStructure(["Model files are unavailable."])
@@ -1373,6 +1530,9 @@ final class ModelManagerViewModel {
             preparedTransferPackages.append(packageURL)
             scheduleTransferPackageCleanup(packageURL)
 
+            isSharingModel = false
+            sharingModelId = nil
+
             if let airDrop = NSSharingService(named: .sendViaAirDrop) {
                 airDrop.perform(withItems: [packageURL])
                 logInfo("Started AirDrop share for model package: \(packageURL.lastPathComponent)", category: .model)
@@ -1381,6 +1541,8 @@ final class ModelManagerViewModel {
                 errorMessage = "AirDrop service unavailable. Opened package in Finder."
             }
         } catch {
+            isSharingModel = false
+            sharingModelId = nil
             errorMessage = error.localizedDescription
             logError("Failed to share model package: \(error)", category: .model)
         }

@@ -16,8 +16,10 @@ struct ModelCard: View {
     @Environment(ModelManagerViewModel.self) private var modelManager
 
     @State private var showingDeleteAlert = false
+    @State private var showingCancelLoadAlert = false
     @State private var showingModelDetail = false
     @State private var recommendedSampling: RecommendedSampling?
+    @State private var computedLocalSize: String?
 
     private var isLoaded: Bool {
         modelManager.loadedModelId == model.id
@@ -43,6 +45,10 @@ struct ModelCard: View {
     // Shows for both downloaded models and pre-download-checked models (cached from meta.yaml fetch)
     private var hasCompatibilityWarning: Bool {
         return modelManager.getGlobalAttentionWarning(for: model) != nil
+    }
+
+    private var displaySize: String {
+        computedLocalSize ?? model.size
     }
 
     private var deleteMessage: String {
@@ -133,7 +139,7 @@ struct ModelCard: View {
 
                 // Row 3: Metadata - compact format
                 HStack(spacing: 6) {
-                    Text(model.size)
+                    Text(displaySize)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
 
@@ -220,6 +226,16 @@ struct ModelCard: View {
         .sheet(isPresented: $showingModelDetail) {
             ModelDetailView(model: model)
         }
+        .alert("Stop Loading?", isPresented: $showingCancelLoadAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Stop", role: .destructive) {
+                Task {
+                    await modelManager.cancelModelLoading()
+                }
+            }
+        } message: {
+            Text("The model will be unloaded and loading will stop.")
+        }
         .task {
             // Load recommended sampling for downloaded models
             if model.isDownloaded, let localPath = model.localPath {
@@ -229,6 +245,10 @@ struct ModelCard: View {
                 if let metadata = ModelMetadata.load(from: metaPath) {
                     recommendedSampling = metadata.recommendedSampling
                 }
+            }
+            // Compute actual size for local models that show "Local"
+            if model.size == "Local" {
+                computedLocalSize = modelManager.formattedModelSize(for: model)
             }
         }
     }
@@ -327,8 +347,40 @@ struct ModelCard: View {
 
         case .downloaded:
             if modelManager.loadingModelId == model.id {
-                // Animated loading indicator - more visible
-                ModelLoadingIndicator()
+                // Loading in progress - show cancel button + share option
+                HStack(spacing: 6) {
+                    ModelLoadingIndicator()
+
+                    Button {
+                        showingCancelLoadAlert = true
+                    } label: {
+                        Image(systemName: "stop.circle.fill")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                    .controlSize(.small)
+
+                    #if os(macOS)
+                    if modelManager.sharingModelId == model.id {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Button {
+                            Task {
+                                await modelManager.shareModelToIOS(model)
+                            }
+                        } label: {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.blue)
+                        .controlSize(.small)
+                        .disabled(modelManager.isSharingModel)
+                    }
+                    #endif
+                }
             } else {
                 HStack(spacing: 6) {
                     // Delete button
@@ -343,17 +395,23 @@ struct ModelCard: View {
                     .controlSize(.small)
 
                     #if os(macOS)
-                    Button {
-                        Task {
-                            await modelManager.shareModelToIOS(model)
+                    if modelManager.sharingModelId == model.id {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Button {
+                            Task {
+                                await modelManager.shareModelToIOS(model)
+                            }
+                        } label: {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.caption)
                         }
-                    } label: {
-                        Image(systemName: "square.and.arrow.up")
-                            .font(.caption)
+                        .buttonStyle(.bordered)
+                        .tint(.blue)
+                        .controlSize(.small)
+                        .disabled(modelManager.isSharingModel)
                     }
-                    .buttonStyle(.bordered)
-                    .tint(.blue)
-                    .controlSize(.small)
                     #endif
 
                     // Load button
@@ -643,6 +701,7 @@ struct ModelDetailView: View {
     @State private var isLoading = true
     @State private var weightDetails: (largest: Int64, largestName: String, files: [(name: String, size: Int64)])?
     @State private var weightWarning: String?
+    @State private var computedDetailSize: String?
 
     private let accentGradient = LinearGradient(
         colors: [Color(red: 1.0, green: 0.6, blue: 0.2), Color(red: 1.0, green: 0.4, blue: 0.1)],
@@ -813,7 +872,7 @@ struct ModelDetailView: View {
             Divider().frame(height: 40)
             quickStat(value: "\(meta.batchSize)", label: "Batch", icon: "square.grid.2x2")
             Divider().frame(height: 40)
-            quickStat(value: model.size, label: "Size", icon: "externaldrive")
+            quickStat(value: computedDetailSize ?? model.size, label: "Size", icon: "externaldrive")
             Divider().frame(height: 40)
             quickStat(value: "\(meta.numChunks)", label: "Chunks", icon: "square.stack.3d.up")
         }
@@ -841,7 +900,7 @@ struct ModelDetailView: View {
     private var infoCard: some View {
         DetailCard(title: "Model Information", icon: "info.circle.fill", iconColor: .orange) {
             DetailCardRow(label: "Model ID", value: model.id, isMonospace: true)
-            DetailCardRow(label: "Size", value: model.size)
+            DetailCardRow(label: "Size", value: computedDetailSize ?? model.size)
             if let arch = model.architecture {
                 DetailCardRow(label: "Architecture", value: arch.capitalized)
             }
@@ -1131,6 +1190,11 @@ struct ModelDetailView: View {
             .path
 
         metadata = ModelMetadata.load(from: metaPath)
+
+        // Compute actual size for local models
+        if model.size == "Local" {
+            computedDetailSize = modelManager.formattedModelSize(for: model)
+        }
 
         // Load weight file details
         weightDetails = modelManager.getWeightFileDetails(for: model)

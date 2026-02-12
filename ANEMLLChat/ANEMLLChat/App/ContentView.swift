@@ -58,8 +58,37 @@ struct ContentView: View {
             showingModelSheet = true
             modelManager.lastImportedPackageModelId = nil
         }
+        .overlay {
+            if modelManager.isImportingIncomingPackage {
+                ZStack {
+                    Color.black.opacity(0.4)
+                        .ignoresSafeArea()
+                    Rectangle()
+                        .fill(.thickMaterial)
+                        .opacity(0.85)
+                        .ignoresSafeArea()
+                    VStack(spacing: 16) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text(modelManager.incomingTransferStatusMessage ?? "Importing model...")
+                            .font(.headline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(32)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .shadow(color: .black.opacity(0.3), radius: 20, y: 10)
+                    .padding(.horizontal, 40)
+                }
+                .transition(.opacity)
+                .allowsHitTesting(false)
+            }
+        }
         .toast(Binding(
-            get: { modelManager.incomingTransferStatusMessage },
+            get: {
+                // Only show toast when import is done (not during)
+                modelManager.isImportingIncomingPackage ? nil : modelManager.incomingTransferStatusMessage
+            },
             set: { modelManager.incomingTransferStatusMessage = $0 }
         ), type: .info, duration: 4)
         // Auto-show model list ONLY on true fresh start (never used before)
