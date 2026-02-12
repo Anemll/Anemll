@@ -645,21 +645,28 @@ final class ModelManagerViewModel {
 
     /// Fetch individual model details from HuggingFace API
     private static func fetchModelDetail(id: String, session: URLSession) async throws -> ModelInfo {
+        struct SiblingFile: Decodable {
+            let size: Int64?
+        }
         struct ModelDetailConfig: Decodable {
             let model_type: String?
         }
         struct ModelDetailResponse: Decodable {
-            let usedStorage: Int64?
+            let siblings: [SiblingFile]?
             let config: ModelDetailConfig?
         }
 
-        let url = URL(string: "https://huggingface.co/api/models/\(id)")!
+        // Use blobs=true to get actual file sizes from siblings
+        let url = URL(string: "https://huggingface.co/api/models/\(id)?blobs=true")!
         let (data, _) = try await session.data(from: url)
         let detail = try JSONDecoder().decode(ModelDetailResponse.self, from: data)
 
+        // Sum actual file sizes instead of using usedStorage (which includes git LFS history)
+        let totalSize: Int64? = detail.siblings?.compactMap(\.size).reduce(0, +)
+
         return ModelInfo.fromHuggingFaceRepo(
             id: id,
-            sizeBytes: detail.usedStorage,
+            sizeBytes: totalSize,
             modelType: detail.config?.model_type
         )
     }
