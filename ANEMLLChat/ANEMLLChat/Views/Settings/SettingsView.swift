@@ -47,6 +47,7 @@ struct SettingsView: View {
     @State private var largeControls = StorageService.defaultLargeControlsValue
     @State private var showMicrophone = StorageService.defaultShowMicrophoneValue
     @State private var showingResetConfirmation = false
+    @State private var showingAcknowledgements = false
     #if os(macOS)
     @State private var macOSStorageFolderPath = ""
     @State private var showingStorageFolderPicker = false
@@ -101,6 +102,9 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $showingLogs) {
             LogsView()
+        }
+        .sheet(isPresented: $showingAcknowledgements) {
+            AcknowledgementsView()
         }
         #if os(macOS)
         .fileImporter(
@@ -504,6 +508,18 @@ struct SettingsView: View {
             }
             .buttonStyle(.plain)
 
+            Button {
+                showingAcknowledgements = true
+            } label: {
+                HStack {
+                    Label("Acknowledgements", systemImage: "doc.text")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+
             Button(role: .destructive) {
                 showingResetConfirmation = true
             } label: {
@@ -834,6 +850,351 @@ struct LogsView: View {
     private func clearLogs() {
         AppLogger.shared.clearLogs()
         logs = []
+    }
+}
+
+// MARK: - Acknowledgements View
+
+struct OpenSourceLibrary: Identifiable {
+    let id = UUID()
+    let name: String
+    let url: String
+    let license: String
+    let licenseType: String
+    let copyright: String
+}
+
+private let openSourceLibraries: [OpenSourceLibrary] = [
+    OpenSourceLibrary(
+        name: "swift-transformers",
+        url: "https://github.com/huggingface/swift-transformers",
+        license: """
+        Apache License, Version 2.0
+
+        Copyright 2022 Hugging Face SAS.
+
+        Licensed under the Apache License, Version 2.0 (the "License"); \
+        you may not use this file except in compliance with the License. \
+        You may obtain a copy of the License at
+
+            http://www.apache.org/licenses/LICENSE-2.0
+
+        Unless required by applicable law or agreed to in writing, software \
+        distributed under the License is distributed on an "AS IS" BASIS, \
+        WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. \
+        See the License for the specific language governing permissions and \
+        limitations under the License.
+        """,
+        licenseType: "Apache 2.0",
+        copyright: "2022 Hugging Face SAS"
+    ),
+    OpenSourceLibrary(
+        name: "Yams",
+        url: "https://github.com/jpsim/Yams",
+        license: """
+        The MIT License (MIT)
+
+        Copyright (c) 2016 JP Simard.
+
+        Permission is hereby granted, free of charge, to any person obtaining a copy \
+        of this software and associated documentation files (the "Software"), to deal \
+        in the Software without restriction, including without limitation the rights \
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell \
+        copies of the Software, and to permit persons to whom the Software is \
+        furnished to do so, subject to the following conditions:
+
+        The above copyright notice and this permission notice shall be included in all \
+        copies or substantial portions of the Software.
+
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR \
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, \
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE \
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER \
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, \
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE \
+        SOFTWARE.
+        """,
+        licenseType: "MIT",
+        copyright: "2016 JP Simard"
+    ),
+    OpenSourceLibrary(
+        name: "Stencil",
+        url: "https://github.com/stencilproject/Stencil",
+        license: """
+        BSD 2-Clause License
+
+        Copyright (c) 2022, Kyle Fuller
+        All rights reserved.
+
+        Redistribution and use in source and binary forms, with or without \
+        modification, are permitted provided that the following conditions are met:
+
+        * Redistributions of source code must retain the above copyright notice, this \
+        list of conditions and the following disclaimer.
+
+        * Redistributions in binary form must reproduce the above copyright notice, \
+        this list of conditions and the following disclaimer in the documentation \
+        and/or other materials provided with the distribution.
+
+        THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" \
+        AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE \
+        IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE \
+        DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE \
+        FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL \
+        DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR \
+        SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER \
+        CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, \
+        OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE \
+        OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+        """,
+        licenseType: "BSD 2-Clause",
+        copyright: "2022 Kyle Fuller"
+    ),
+    OpenSourceLibrary(
+        name: "swift-argument-parser",
+        url: "https://github.com/apple/swift-argument-parser",
+        license: """
+        Apache License, Version 2.0 with Runtime Library Exception
+
+        Copyright (c) Apple Inc.
+
+        Licensed under the Apache License, Version 2.0 (the "License"); \
+        you may not use this file except in compliance with the License. \
+        You may obtain a copy of the License at
+
+            http://www.apache.org/licenses/LICENSE-2.0
+
+        Unless required by applicable law or agreed to in writing, software \
+        distributed under the License is distributed on an "AS IS" BASIS, \
+        WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. \
+        See the License for the specific language governing permissions and \
+        limitations under the License.
+
+        Runtime Library Exception: As an exception, if you use this Software to \
+        compile your source code and portions of this Software are embedded into \
+        the binary product as a result, you may redistribute such product without \
+        providing attribution as would otherwise be required by Sections 4(a), \
+        4(b) and 4(d) of the License.
+        """,
+        licenseType: "Apache 2.0",
+        copyright: "Apple Inc."
+    ),
+    OpenSourceLibrary(
+        name: "swift-collections",
+        url: "https://github.com/apple/swift-collections",
+        license: """
+        Apache License, Version 2.0 with Runtime Library Exception
+
+        Copyright (c) Apple Inc.
+
+        Licensed under the Apache License, Version 2.0 (the "License"); \
+        you may not use this file except in compliance with the License. \
+        You may obtain a copy of the License at
+
+            http://www.apache.org/licenses/LICENSE-2.0
+
+        Unless required by applicable law or agreed to in writing, software \
+        distributed under the License is distributed on an "AS IS" BASIS, \
+        WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. \
+        See the License for the specific language governing permissions and \
+        limitations under the License.
+
+        Runtime Library Exception: As an exception, if you use this Software to \
+        compile your source code and portions of this Software are embedded into \
+        the binary product as a result, you may redistribute such product without \
+        providing attribution as would otherwise be required by Sections 4(a), \
+        4(b) and 4(d) of the License.
+        """,
+        licenseType: "Apache 2.0",
+        copyright: "Apple Inc."
+    ),
+    OpenSourceLibrary(
+        name: "Jinja",
+        url: "https://github.com/maiqingqiang/Jinja",
+        license: """
+        MIT License
+
+        Copyright (c) 2024 John Mai
+
+        Permission is hereby granted, free of charge, to any person obtaining a copy \
+        of this software and associated documentation files (the "Software"), to deal \
+        in the Software without restriction, including without limitation the rights \
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell \
+        copies of the Software, and to permit persons to whom the Software is \
+        furnished to do so, subject to the following conditions:
+
+        The above copyright notice and this permission notice shall be included in all \
+        copies or substantial portions of the Software.
+
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR \
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, \
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE \
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER \
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, \
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE \
+        SOFTWARE.
+        """,
+        licenseType: "MIT",
+        copyright: "2024 John Mai"
+    ),
+    OpenSourceLibrary(
+        name: "PathKit",
+        url: "https://github.com/kylef/PathKit",
+        license: """
+        BSD 2-Clause License
+
+        Copyright (c) 2014, Kyle Fuller
+        All rights reserved.
+
+        Redistribution and use in source and binary forms, with or without \
+        modification, are permitted provided that the following conditions are met:
+
+        1. Redistributions of source code must retain the above copyright notice, this \
+        list of conditions and the following disclaimer.
+        2. Redistributions in binary form must reproduce the above copyright notice, \
+        this list of conditions and the following disclaimer in the documentation \
+        and/or other materials provided with the distribution.
+
+        THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND \
+        ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED \
+        WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE \
+        DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR \
+        ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES \
+        (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; \
+        LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND \
+        ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT \
+        (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS \
+        SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+        """,
+        licenseType: "BSD 2-Clause",
+        copyright: "2014 Kyle Fuller"
+    ),
+    OpenSourceLibrary(
+        name: "Spectre",
+        url: "https://github.com/kylef/Spectre",
+        license: """
+        BSD 2-Clause License
+
+        Copyright (c) 2015, Kyle Fuller
+        All rights reserved.
+
+        Redistribution and use in source and binary forms, with or without \
+        modification, are permitted provided that the following conditions are met:
+
+        * Redistributions of source code must retain the above copyright notice, this \
+        list of conditions and the following disclaimer.
+
+        * Redistributions in binary form must reproduce the above copyright notice, \
+        this list of conditions and the following disclaimer in the documentation \
+        and/or other materials provided with the distribution.
+
+        THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" \
+        AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE \
+        IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE \
+        DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE \
+        FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL \
+        DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR \
+        SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER \
+        CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, \
+        OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE \
+        OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+        """,
+        licenseType: "BSD 2-Clause",
+        copyright: "2015 Kyle Fuller"
+    ),
+]
+
+struct AcknowledgementsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedLibrary: OpenSourceLibrary?
+
+    var body: some View {
+        NavigationStack {
+            List(openSourceLibraries) { library in
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(library.name)
+                            .font(.body)
+                            .foregroundStyle(.primary)
+                        Text(library.licenseType)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    selectedLibrary = library
+                }
+            }
+            .navigationTitle("Acknowledgements")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                    .keyboardShortcut(.escape, modifiers: [])
+                }
+            }
+            .sheet(item: $selectedLibrary) { library in
+                LicenseDetailView(library: library, onDismiss: { selectedLibrary = nil })
+            }
+        }
+        #if os(macOS)
+        .frame(minWidth: 400, minHeight: 350)
+        #endif
+    }
+}
+
+struct LicenseDetailView: View {
+    let library: OpenSourceLibrary
+    let onDismiss: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Link(destination: URL(string: library.url)!) {
+                        HStack {
+                            Text(library.url)
+                                .font(.caption)
+                            Image(systemName: "arrow.up.right")
+                                .font(.caption2)
+                        }
+                        .foregroundStyle(.blue)
+                    }
+
+                    Divider()
+
+                    Text(library.license)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                .padding()
+            }
+            .navigationTitle(library.name)
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        onDismiss()
+                    }
+                    .keyboardShortcut(.escape, modifiers: [])
+                }
+            }
+        }
+        #if os(macOS)
+        .frame(minWidth: 450, minHeight: 350)
+        #endif
     }
 }
 

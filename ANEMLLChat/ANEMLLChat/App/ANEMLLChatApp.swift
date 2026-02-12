@@ -43,6 +43,11 @@ struct ANEMLLChatApp: App {
         // Use titleBar style to show toolbar
         .windowStyle(.titleBar)
         .defaultSize(width: 1000, height: 700)
+        .commands {
+            CommandGroup(replacing: .appInfo) {
+                AboutCommands()
+            }
+        }
         #endif
 
         #if os(macOS)
@@ -51,6 +56,35 @@ struct ANEMLLChatApp: App {
                 .environment(chatViewModel)
                 .environment(modelManager)
         }
+
+        Window("Acknowledgements", id: "acknowledgements") {
+            AcknowledgementsView()
+        }
+        .defaultSize(width: 450, height: 400)
+        .windowResizability(.contentSize)
         #endif
     }
 }
+
+#if os(macOS)
+struct AboutCommands: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("About ANEMLL Chat") {
+            NSApplication.shared.orderFrontStandardAboutPanel(options: [
+                .credits: NSAttributedString(
+                    string: "On-device LLM inference powered by Apple Neural Engine",
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: 11),
+                        .foregroundColor: NSColor.secondaryLabelColor
+                    ]
+                )
+            ])
+        }
+        Button("Acknowledgements...") {
+            openWindow(id: "acknowledgements")
+        }
+    }
+}
+#endif

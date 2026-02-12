@@ -105,7 +105,8 @@ struct ChatView: View {
             messagesView
 
             // Centered prompt when no model is loaded and not loading
-            if modelManager.loadedModelId == nil && !modelManager.isLoadingModel {
+            // Wait for initial startup (model list + auto-load) to finish before showing
+            if modelManager.hasCompletedInitialLoad && modelManager.loadedModelId == nil && !modelManager.isLoadingModel {
                 VStack(spacing: 16) {
                     Image(systemName: modelManager.errorMessage != nil ? "exclamationmark.triangle" : "cpu")
                         .font(.system(size: 40))
@@ -907,6 +908,7 @@ struct StreamingMessageView: View {
 // Flame-style animated dots for streaming/preview state
 private struct FlameDots: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var didAppear = false
     @State private var isAnimating = false
 
     let isActive: Bool
@@ -950,46 +952,52 @@ private struct FlameDots: View {
             }
         }
         .onAppear {
-            updateAnimation()
+            guard !didAppear else { return }
+            didAppear = true
+            // Defer animation start to next run loop so initial layout is settled
+            DispatchQueue.main.async {
+                updateAnimation()
+            }
         }
         .onChange(of: isActive) { _, _ in
             updateAnimation()
         }
     }
 
+    // Use midpoint values as the "resting" state so the initial appearance doesn't jump
     private func dotScale(isAnimating: Bool) -> CGFloat {
         if reduceMotion || !isActive {
-            return 0.8
+            return 0.85
         }
-        return isAnimating ? 1.05 : 0.72
+        return isAnimating ? 1.0 : 0.8
     }
 
     private func dotOpacity(isAnimating: Bool) -> Double {
         if reduceMotion || !isActive {
             return 0.55
         }
-        return isAnimating ? 1.0 : 0.22
+        return isAnimating ? 1.0 : 0.5
     }
 
     private func dotOffset(isAnimating: Bool) -> CGFloat {
         if reduceMotion || !isActive {
             return 0
         }
-        return isAnimating ? -size * 0.28 : size * 0.12
+        return isAnimating ? -size * 0.15 : size * 0.08
     }
 
     private func dotHaloOpacity(isAnimating: Bool) -> Double {
         if reduceMotion || !isActive {
             return 0.0
         }
-        return isAnimating ? 0.45 : 0.0
+        return isAnimating ? 0.35 : 0.0
     }
 
     private func dotHaloScale(isAnimating: Bool) -> CGFloat {
         if reduceMotion || !isActive {
             return 1.0
         }
-        return isAnimating ? 1.65 : 1.1
+        return isAnimating ? 1.4 : 1.1
     }
 
     private func dotAnimation(for index: Int) -> Animation {

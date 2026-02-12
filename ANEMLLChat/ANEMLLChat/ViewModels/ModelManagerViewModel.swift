@@ -54,8 +54,12 @@ enum DeviceType {
         #if os(visionOS)
         return true
         #elseif os(iOS)
-        if #available(iOS 19.1, *) {
-            return ProcessInfo.processInfo.isiOSAppOnVision
+        // Use responds(to:) to safely check for isiOSAppOnVision —
+        // direct property access crashes on older OS versions where the selector doesn't exist
+        let pi = ProcessInfo.processInfo
+        if pi.responds(to: NSSelectorFromString("isiOSAppOnVision")),
+           let value = pi.value(forKey: "isiOSAppOnVision") as? Bool {
+            return value
         }
         // Fallback: check if machine identifier indicates a RealityDevice
         let machine = machineIdentifier
@@ -441,6 +445,10 @@ final class ModelManagerViewModel {
     /// Signal from child views (e.g. ChatView) to open the model selection sheet.
     var requestModelSelection: Bool = false
 
+    /// Whether the initial model list load + auto-load attempt has completed.
+    /// Used to suppress the "Download or Select Model" prompt until startup finishes.
+    var hasCompletedInitialLoad: Bool = false
+
     /// Whether model is being loaded
     var isLoadingModel: Bool = false
 
@@ -569,6 +577,8 @@ final class ModelManagerViewModel {
         if await StorageService.shared.autoLoadLastModel {
             await autoLoadLastModel()
         }
+
+        hasCompletedInitialLoad = true
     }
 
     // MARK: - HuggingFace Collection Fetch

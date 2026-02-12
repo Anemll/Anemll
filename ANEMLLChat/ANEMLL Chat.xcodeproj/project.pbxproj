@@ -12,17 +12,16 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		A1000001000000000000000A /* ANEMLLChat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ANEMLLChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		A1000021000000000000000A /* generated-build-number.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = "generated-build-number.xcconfig"; sourceTree = "<group>"; };
+		A1000001000000000000000A /* ANEMLL Chat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "ANEMLL Chat.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		A1000002000000000000000A /* Exceptions for "ANEMLLChat" folder in "ANEMLLChat" target */ = {
+		A1000002000000000000000A /* Exceptions for "ANEMLLChat" folder in "ANEMLL Chat" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
 			);
-			target = A1000003000000000000000A /* ANEMLLChat */;
+			target = A1000003000000000000000A /* ANEMLL Chat */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -30,7 +29,7 @@
 		A1000004000000000000000A /* ANEMLLChat */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				A1000002000000000000000A /* Exceptions for "ANEMLLChat" folder in "ANEMLLChat" target */,
+				A1000002000000000000000A /* Exceptions for "ANEMLLChat" folder in "ANEMLL Chat" target */,
 			);
 			path = ANEMLLChat;
 			sourceTree = "<group>";
@@ -53,7 +52,6 @@
 		A1000006000000000000000A = {
 			isa = PBXGroup;
 			children = (
-				A1000021000000000000000A /* generated-build-number.xcconfig */,
 				A1000004000000000000000A /* ANEMLLChat */,
 				A1000007000000000000000A /* Products */,
 			);
@@ -62,7 +60,7 @@
 		A1000007000000000000000A /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				A1000001000000000000000A /* ANEMLLChat.app */,
+				A1000001000000000000000A /* ANEMLL Chat.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -70,11 +68,10 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		A1000003000000000000000A /* ANEMLLChat */ = {
+		A1000003000000000000000A /* ANEMLL Chat */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = A1000008000000000000000A /* Build configuration list for PBXNativeTarget "ANEMLLChat" */;
+			buildConfigurationList = A1000008000000000000000A /* Build configuration list for PBXNativeTarget "ANEMLL Chat" */;
 			buildPhases = (
-				A1000020000000000000000A /* Set Build Number from Git */,
 				A1000009000000000000000A /* Sources */,
 				A1000005000000000000000A /* Frameworks */,
 				A100000A000000000000000A /* Resources */,
@@ -86,13 +83,13 @@
 			fileSystemSynchronizedGroups = (
 				A1000004000000000000000A /* ANEMLLChat */,
 			);
-			name = ANEMLLChat;
+			name = "ANEMLL Chat";
 			packageProductDependencies = (
 				A100000B000000000000000A /* AnemllCore */,
 				A100000C000000000000000A /* Yams */,
 			);
 			productName = ANEMLLChat;
-			productReference = A1000001000000000000000A /* ANEMLLChat.app */;
+			productReference = A1000001000000000000000A /* ANEMLL Chat.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -110,7 +107,7 @@
 					};
 				};
 			};
-			buildConfigurationList = A100000E000000000000000A /* Build configuration list for PBXProject "ANEMLLChat" */;
+			buildConfigurationList = A100000E000000000000000A /* Build configuration list for PBXProject "ANEMLL Chat" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -128,7 +125,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				A1000003000000000000000A /* ANEMLLChat */,
+				A1000003000000000000000A /* ANEMLL Chat */,
 			);
 		};
 /* End PBXProject section */
@@ -142,28 +139,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
-
-/* Begin PBXShellScriptBuildPhase section */
-		A1000020000000000000000A /* Set Build Number from Git */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Set Build Number from Git";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "# Set build number to git commit count\nBUILD_NUMBER=$(git -C \"${PROJECT_DIR}/..\" rev-list --count HEAD 2>/dev/null || echo \"1\")\nif [ -z \"$BUILD_NUMBER\" ] || [ \"$BUILD_NUMBER\" = \"0\" ]; then\n    BUILD_NUMBER=1\nfi\necho \"Build number: $BUILD_NUMBER (git commit count)\"\n\n# Write xcconfig that overrides CURRENT_PROJECT_VERSION\nXCCONFIG=\"${PROJECT_DIR}/generated-build-number.xcconfig\"\necho \"// Auto-generated — do not edit\" > \"$XCCONFIG\"\necho \"CURRENT_PROJECT_VERSION = $BUILD_NUMBER\" >> \"$XCCONFIG\"\n";
-		};
-/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		A1000009000000000000000A /* Sources */ = {
@@ -180,6 +155,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				"ARCHS[sdk=macosx*]" = arm64;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
@@ -213,7 +189,8 @@
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				"EXCLUDED_ARCHS[sdk=macosx*]" = x86_64;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -241,6 +218,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				"ARCHS[sdk=macosx*]" = arm64;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
@@ -274,7 +252,8 @@
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				"EXCLUDED_ARCHS[sdk=macosx*]" = x86_64;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -286,31 +265,48 @@
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 			};
 			name = Release;
 		};
 		A1000013000000000000000A /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = A1000021000000000000000A /* generated-build-number.xcconfig */;
 			buildSettings = {
+				ARCHS = "$(ARCHS_STANDARD)";
+				"ARCHS[sdk=macosx*]" = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ANEMLLChat/ANEMLLChat.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = ARRY5366Y3;
+				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = NO;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
+				ENABLE_RESOURCE_ACCESS_BLUETOOTH = NO;
+				ENABLE_RESOURCE_ACCESS_CALENDARS = NO;
+				ENABLE_RESOURCE_ACCESS_CAMERA = NO;
+				ENABLE_RESOURCE_ACCESS_CONTACTS = NO;
+				ENABLE_RESOURCE_ACCESS_LOCATION = NO;
+				ENABLE_RESOURCE_ACCESS_PRINTING = NO;
+				ENABLE_RESOURCE_ACCESS_USB = NO;
+				"EXCLUDED_ARCHS[sdk=macosx*]" = x86_64;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = ANEMLLChat/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "ANEMLL Chat";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "ANEMLL Chat needs microphone access to capture your voice for speech-to-text.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "ANEMLL Chat uses speech recognition to convert your voice to text for chat input.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -318,9 +314,9 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.3.7;
-				PRODUCT_BUNDLE_IDENTIFIER = com.anemll.chat;
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				MARKETING_VERSION = 0.3.8;
+				PRODUCT_BUNDLE_IDENTIFIER = "anemll.anemll-chat.demo";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
@@ -335,25 +331,41 @@
 		};
 		A1000014000000000000000A /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = A1000021000000000000000A /* generated-build-number.xcconfig */;
 			buildSettings = {
+				ARCHS = "$(ARCHS_STANDARD)";
+				"ARCHS[sdk=macosx*]" = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ANEMLLChat/ANEMLLChat.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = ARRY5366Y3;
+				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = NO;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
+				ENABLE_RESOURCE_ACCESS_BLUETOOTH = NO;
+				ENABLE_RESOURCE_ACCESS_CALENDARS = NO;
+				ENABLE_RESOURCE_ACCESS_CAMERA = NO;
+				ENABLE_RESOURCE_ACCESS_CONTACTS = NO;
+				ENABLE_RESOURCE_ACCESS_LOCATION = NO;
+				ENABLE_RESOURCE_ACCESS_PRINTING = NO;
+				ENABLE_RESOURCE_ACCESS_USB = NO;
+				"EXCLUDED_ARCHS[sdk=macosx*]" = x86_64;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = ANEMLLChat/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "ANEMLL Chat";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "ANEMLL Chat needs microphone access to capture your voice for speech-to-text.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "ANEMLL Chat uses speech recognition to convert your voice to text for chat input.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -361,9 +373,9 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.3.7;
-				PRODUCT_BUNDLE_IDENTIFIER = com.anemll.chat;
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				MARKETING_VERSION = 0.3.8;
+				PRODUCT_BUNDLE_IDENTIFIER = "anemll.anemll-chat.demo";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
@@ -379,7 +391,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		A1000008000000000000000A /* Build configuration list for PBXNativeTarget "ANEMLLChat" */ = {
+		A1000008000000000000000A /* Build configuration list for PBXNativeTarget "ANEMLL Chat" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				A1000013000000000000000A /* Debug */,
@@ -388,7 +400,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		A100000E000000000000000A /* Build configuration list for PBXProject "ANEMLLChat" */ = {
+		A100000E000000000000000A /* Build configuration list for PBXProject "ANEMLL Chat" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				A1000011000000000000000A /* Debug */,
