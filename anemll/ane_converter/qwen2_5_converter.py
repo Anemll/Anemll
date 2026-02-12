@@ -55,6 +55,10 @@ class Qwen25Converter(BaseConverter):
         per_channel: int = 8,
         num_chunks: int = 1,
         argmax_in_model: bool = False,
+        lut_embeddings_bits=None,
+        lut_embeddings_per_channel=8,
+        lut_lmhead_bits=None,
+        lut_lmhead_per_channel=8,
     ) -> None:
         super().__init__(model)
         self.context_length = context_length
@@ -67,6 +71,10 @@ class Qwen25Converter(BaseConverter):
         self.converted_model = None
         self.num_chunks = num_chunks
         self.argmax_in_model = argmax_in_model
+        self.lut_embeddings_bits = lut_embeddings_bits
+        self.lut_embeddings_per_channel = lut_embeddings_per_channel
+        self.lut_lmhead_bits = lut_lmhead_bits
+        self.lut_lmhead_per_channel = lut_lmhead_per_channel
 
     @staticmethod
     def GetTransformerStates(model, part=None, prefix="model.model."):
@@ -103,8 +111,31 @@ class Qwen25Converter(BaseConverter):
         ]
         return states
 
+    @staticmethod
+    def _make_palettizer_config(nbits, per_channel, num_workers):
+        """Build an OpPalettizerConfig for the given bit-width / granularity."""
+        if per_channel <= 0:
+            return cto.coreml.OpPalettizerConfig(
+                mode="kmeans",
+                nbits=nbits,
+                granularity="per_tensor",
+                num_kmeans_workers=num_workers if num_workers is not None else 1,
+            )
+        return cto.coreml.OpPalettizerConfig(
+            mode="kmeans",
+            nbits=nbits,
+            granularity="per_grouped_channel",
+            group_size=per_channel,
+            num_kmeans_workers=num_workers if num_workers is not None else 1,
+        )
+
     def postprocess(self, num_workers=None):
         """Apply LUT quantization if configured.
+
+        Supports per-component LUT overrides for monolithic models via
+        lut_embeddings_bits / lut_lmhead_bits.  When set, embedding and/or
+        LM head ops get their own palettizer config while the rest use the
+        global --lut setting.
 
         Args:
             num_workers: Optional number of workers for parallel processing.
@@ -127,39 +158,69 @@ class Qwen25Converter(BaseConverter):
                     if SklearnConvergenceWarning is not None:
                         warnings.simplefilter('ignore', SklearnConvergenceWarning)
                     warnings.simplefilter('ignore', UserWarning)
-                    # Set up quantization config - use per_tensor if per_channel <= 0
-                    if use_per_tensor:
-                        config = cto.coreml.OptimizationConfig(
-                            global_config=cto.coreml.OpPalettizerConfig(
-                                mode="kmeans",
-                                nbits=self.lut_bits,
-                                granularity="per_tensor",
-                                num_kmeans_workers=(
-                                    num_workers if num_workers is not None else 1
-                                ),
-                            ),
-                        )
-                    else:
-                        config = cto.coreml.OptimizationConfig(
-                            global_config=cto.coreml.OpPalettizerConfig(
-                                mode="kmeans",
-                                nbits=self.lut_bits,
-                                granularity="per_grouped_channel",
-                                group_size=self.per_channel,
-                                num_kmeans_workers=(
-                                    num_workers if num_workers is not None else 1
-                                ),
-                            ),
-                        )
+
+                    # Default (FFN) quantization config
+                    global_cfg = self._make_palettizer_config(
+                        self.lut_bits, self.per_channel, num_workers
+                    )
+
+                    # Per-component overrides for monolithic models
+                    op_name_configs = {}
+                    has_overrides = (
+                        self.lut_embeddings_bits is not None
+                        or self.lut_lmhead_bits is not None
+                    )
+
+                    if has_overrides:
+                        prog = self.converted_model._mil_program  # noqa: SLF001
+                        for fn_name in prog.functions:
+                            fn = prog.functions[fn_name]
+                            for op in fn.operations:
+                                op_name = op.name or ""
+                                if self.lut_embeddings_bits is not None and "embed_tokens" in op_name:
+                                    op_name_configs[op_name] = self._make_palettizer_config(
+                                        self.lut_embeddings_bits,
+                                        self.lut_embeddings_per_channel,
+                                        num_workers,
+                                    )
+                                elif self.lut_lmhead_bits is not None and "lm_head" in op_name:
+                                    op_name_configs[op_name] = self._make_palettizer_config(
+                                        self.lut_lmhead_bits,
+                                        self.lut_lmhead_per_channel,
+                                        num_workers,
+                                    )
+
+                        if op_name_configs:
+                            embed_count = sum(1 for k in op_name_configs if "embed_tokens" in k)
+                            lmhead_count = sum(1 for k in op_name_configs if "lm_head" in k)
+                            if self.lut_embeddings_bits is not None:
+                                print(f"  Embeddings: {self.lut_embeddings_bits}-bit LUT (per_channel={self.lut_embeddings_per_channel}) -> {embed_count} ops")
+                            if self.lut_lmhead_bits is not None:
+                                print(f"  LM head: {self.lut_lmhead_bits}-bit LUT (per_channel={self.lut_lmhead_per_channel}) -> {lmhead_count} ops")
+
+                    config = cto.coreml.OptimizationConfig(
+                        global_config=global_cfg,
+                        op_name_configs=op_name_configs if op_name_configs else None,
+                    )
 
                     # Apply quantization
-                    self.converted_model = cto.coreml.palettize_weights(
-                        self.converted_model, config
-                    )
-                print("✅ LUT quantization completed successfully")
+                    try:
+                        self.converted_model = cto.coreml.palettize_weights(
+                            self.converted_model, config
+                        )
+                    except Exception as e:
+                        print(f"Warning: palettize_weights raised: {e}")
+                        print("Retrying without per-op overrides...")
+                        fallback_config = cto.coreml.OptimizationConfig(
+                            global_config=global_cfg,
+                        )
+                        self.converted_model = cto.coreml.palettize_weights(
+                            self.converted_model, fallback_config
+                        )
+                print("LUT quantization completed successfully")
 
             except Exception as e:
-                print(f"❌ LUT quantization failed: {str(e)}")
+                print(f"LUT quantization failed: {str(e)}")
                 print("Continuing without quantization...")
 
     @staticmethod
@@ -1264,6 +1325,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Compute argmax inside LM head for part 3 / monolithic inference.",
     )
+    parser.add_argument(
+        '--lut-embeddings',
+        type=str,
+        default=None,
+        help="Override LUT for embeddings in monolithic models. Same format as --lut. "
+             "If not set, uses --lut value.",
+    )
+    parser.add_argument(
+        '--lut-lmhead',
+        type=str,
+        default=None,
+        help="Override LUT for LM head in monolithic models. Same format as --lut. "
+             "If not set, uses --lut value.",
+    )
 
     return parser.parse_args()
 
@@ -1280,6 +1355,10 @@ def test_conversion(
     num_chunks: int = 1,
     per_channel: int = 8,
     argmax_in_model: bool = False,
+    lut_embeddings_bits=None,
+    lut_embeddings_per_channel=8,
+    lut_lmhead_bits=None,
+    lut_lmhead_per_channel=8,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
     """Convert a Qwen 2.5 model and save the result.
 
@@ -1344,6 +1423,10 @@ def test_conversion(
         num_chunks=num_chunks,
         per_channel=per_channel,
         argmax_in_model=argmax_in_model,
+        lut_embeddings_bits=lut_embeddings_bits,
+        lut_embeddings_per_channel=lut_embeddings_per_channel,
+        lut_lmhead_bits=lut_lmhead_bits,
+        lut_lmhead_per_channel=lut_lmhead_per_channel,
     )
 
     print("Starting conversion...")
@@ -1434,6 +1517,10 @@ def main() -> None:
     # Parse LUT argument
     lut_bits, per_channel = parse_lut_arg(args.lut)
 
+    # Parse per-component LUT overrides
+    lut_embeddings_bits, lut_embeddings_per_channel = parse_lut_arg(args.lut_embeddings)
+    lut_lmhead_bits, lut_lmhead_per_channel = parse_lut_arg(args.lut_lmhead)
+
     model_path = args.model if args.model else "Qwen/Qwen2.5-0.5B-Instruct"
 
     print(f"\nConverting model from: {model_path}")
@@ -1442,6 +1529,10 @@ def main() -> None:
     print(f"Context length: {args.context_length}")
     if lut_bits:
         print(f"LUT quantization: {lut_bits} bits, per_channel group size: {per_channel}")
+    if lut_embeddings_bits is not None:
+        print(f"LUT embeddings override: {lut_embeddings_bits} bits, per_channel={lut_embeddings_per_channel}")
+    if lut_lmhead_bits is not None:
+        print(f"LUT lm_head override: {lut_lmhead_bits} bits, per_channel={lut_lmhead_per_channel}")
     if args.chunk:
         print(f"Splitting into {args.chunk} chunks")
     if args.argmax:
@@ -1465,6 +1556,10 @@ def main() -> None:
             num_chunks=args.chunk or 1,
             per_channel=per_channel,
             argmax_in_model=args.argmax,
+            lut_embeddings_bits=lut_embeddings_bits,
+            lut_embeddings_per_channel=lut_embeddings_per_channel,
+            lut_lmhead_bits=lut_lmhead_bits,
+            lut_lmhead_per_channel=lut_lmhead_per_channel,
         )
         print(f"Conversion completed successfully! Result: {type(result)}")
     except Exception as e:  # pragma: no cover - CLI tool
