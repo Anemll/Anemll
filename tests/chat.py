@@ -1882,6 +1882,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        '--force-batch-prefill',
+        action='store_true',
+        help=(
+            'Force batched prefill path by enabling prefill dynamic/update-mask '
+            'behavior and disabling --prefill-via-infer.'
+        ),
+    )
+    parser.add_argument(
         '--prefill-max-and-truncate',
         action='store_true',
         help=(
@@ -1904,6 +1912,16 @@ def parse_args():
     args.state_transition_chunk1_source = None
     args.state_transition_infer_function = None
     args.state_transition_prefill_context = None
+
+    # Compatibility switch requested for benchmarking: explicitly force batched
+    # prefill path even when metadata does not advertise dynamic/update-mask flags.
+    def _apply_force_batch_prefill_override():
+        if not getattr(args, "force_batch_prefill", False):
+            return
+        args.prefill_via_infer = False
+        args.update_mask_prefill = True
+        args.prefill_dynamic_slice = True
+    _apply_force_batch_prefill_override()
 
     def _strip_model_ext(value):
         if value is None:
@@ -2174,6 +2192,10 @@ def parse_args():
             args.split_lm_head = args.num_logits  # Use num_logits as fallback
         if args.prefill_context_length is not None:
             args.state_transition_prefill_context = int(args.prefill_context_length)
+
+    # Re-apply force override after meta/default loading because those paths can
+    # overwrite update_mask_prefill/prefill_dynamic_slice from metadata.
+    _apply_force_batch_prefill_override()
 
     return args
 

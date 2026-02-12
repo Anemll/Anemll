@@ -27,6 +27,7 @@ OUTPUT_DIR="/Volumes/Models/ANE/vibethinker_1.5b_ctx4096_fp16_hybrid"
 CONTEXT=4096
 BATCH=32
 CHUNKS=3
+REMAINING_CHUNKS=3
 PREFIX="qwen25"
 LUT1="none"
 LUT2="none"
@@ -76,6 +77,8 @@ Options:
   --context N                 Context length (default: 4096)
   --batch N                   Batch size (default: 32)
   --chunks N                  Chunk count (default: 3)
+  --remaining-chunks N        Post-attention chunks for fp32 patch
+                              (final hybrid chunks = 1 + remaining-chunks, default: 3)
   --prefix STR                Model prefix (default: qwen25)
   --lut1 V                    LUT embeddings (default: none)
   --lut2 V                    LUT FFN/prefill (default: none)
@@ -111,6 +114,7 @@ while [[ $# -gt 0 ]]; do
     --context) CONTEXT="$2"; shift 2 ;;
     --batch) BATCH="$2"; shift 2 ;;
     --chunks) CHUNKS="$2"; shift 2 ;;
+    --remaining-chunks) REMAINING_CHUNKS="$2"; shift 2 ;;
     --prefix) PREFIX="$2"; shift 2 ;;
     --lut1) LUT1="$2"; shift 2 ;;
     --lut2) LUT2="$2"; shift 2 ;;
@@ -128,8 +132,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ! "${CONTEXT}" =~ ^[0-9]+$ ]] || [[ ! "${BATCH}" =~ ^[0-9]+$ ]] || [[ ! "${CHUNKS}" =~ ^[0-9]+$ ]] || [[ ! "${MAX_TOKENS}" =~ ^[0-9]+$ ]]; then
-  echo "--context, --batch, --chunks, --max-tokens must be integers" >&2
+if [[ ! "${CONTEXT}" =~ ^[0-9]+$ ]] || [[ ! "${BATCH}" =~ ^[0-9]+$ ]] || [[ ! "${CHUNKS}" =~ ^[0-9]+$ ]] || [[ ! "${REMAINING_CHUNKS}" =~ ^[0-9]+$ ]] || [[ ! "${MAX_TOKENS}" =~ ^[0-9]+$ ]]; then
+  echo "--context, --batch, --chunks, --remaining-chunks, --max-tokens must be integers" >&2
+  exit 1
+fi
+if [[ "${REMAINING_CHUNKS}" -le 0 ]]; then
+  echo "--remaining-chunks must be > 0" >&2
   exit 1
 fi
 
@@ -237,6 +245,7 @@ run_fp32_patch() {
     --reuse-out-dir
     --context-length "${CONTEXT}"
     --batch-size "${BATCH}"
+    --remaining-chunks "${REMAINING_CHUNKS}"
     --lut1 "${LUT1}"
     --lut2 "${LUT2}"
     --lut3 "${LUT3}"
@@ -285,7 +294,7 @@ fi
 
 echo "Plan:"
 echo "  Output: ${OUTPUT_DIR}"
-echo "  Context: ${CONTEXT}  Batch: ${BATCH}  Chunks: ${CHUNKS}"
+echo "  Context: ${CONTEXT}  Batch: ${BATCH}  Base chunks: ${CHUNKS}  Hybrid remaining chunks: ${REMAINING_CHUNKS}"
 echo "  LUT: ${LUT1}/${LUT2}/${LUT3}"
 echo "  Steps: ${STEPS[*]}"
 

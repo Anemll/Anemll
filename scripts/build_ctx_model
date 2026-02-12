@@ -12,8 +12,11 @@ set -eEuo pipefail
 #   and write multi-context meta.yaml.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REBUILD_SCRIPT="${SCRIPT_DIR}/rebuild_vibethinker_hybrid.sh"
+REBUILD_STEPS_SCRIPT="${SCRIPT_DIR}/rebuild_vibethinker_hybrid_steps.sh"
 COMBINE_SCRIPT="${SCRIPT_DIR}/combine_vibethinker_infer_contexts.sh"
+PROTO_FP32_SCRIPT="${REPO_ROOT}/tests/dev/proto_qwen25_chunk1_fp32.py"
 
 STEP_RAW=""
 CONTEXTS_RAW="512 1024 2048 3072 4096"
@@ -22,33 +25,43 @@ STATE_ROOT="/Volumes/Models/ANE/vibethinker_1.5b_state_transition"
 CONTEXT_ROOT=""
 OUTPUT_DIR=""
 CONTEXT_NAME_TEMPLATE="vibethinker_1.5b_ctx{context}_fp16_hybrid"
+MODEL_PATH="${HOME}/.cache/huggingface/hub/models--WeiboAI--VibeThinker-1.5B"
 
 FORCE_CLEAN=true
 SKIP_SMOKE=true
 FORCE_COMBINE=true
 STEP2_REUSE_INFER_ONLY=false
+STEP2_PURGE_NONINFER=true
+STEP1_EXPORT_ONLY=false
+STEP1_EXPORT_FP32=true
 REBUILD_EXTRA_ARGS=""
 COMBINE_EXTRA_ARGS=""
+OUTPUT_NUM_CHUNKS=""
+
+trap 'rc=$?; echo "[ERROR] build_ctx_model aborted at line ${LINENO} (exit ${rc})." >&2; exit "${rc}"' ERR
 
 usage() {
   cat <<'EOF'
 Usage:
   scripts/build_ctx_model --step <1|2|3|all> [options]
+  scripts/build_ctx_model --all [options]
 
 Steps:
-  --step 1   Equivalent to:
+  --step 1   Equivalent to (default):
                bash scripts/rebuild_vibethinker_hybrid.sh \
                  --context 4096 \
                  --output <context-root>/vibethinker_1.5b_ctx4096_fp16_hybrid \
                  --force-clean \
                  --skip-smoke
+               # full hybrid split flow (attention-only chunk_01 path)
 
-  --step 2   Equivalent to:
+  --step 2   Equivalent to (default):
                for C in 512 1024 2048 3072; do
                  bash scripts/rebuild_vibethinker_hybrid.sh \
                    --context "$C" \
                    --output "<context-root>/vibethinker_1.5b_ctx${C}_fp16_hybrid" \
                    --reuse-static-from <context-root>/vibethinker_1.5b_ctx4096_fp16_hybrid \
+                   # standard reuse (parts 3..7 + hybrid patch), not infer-only
                    --force-clean \
                    --skip-smoke
                done
@@ -59,16 +72,16 @@ Steps:
                  --max-context 4096 \
                  --context-root <context-root> \
                  --output <output> \
+                 --num-chunks <detected-from-max-context> \
                  --infer-kind FFN_PF \
                  --infer-chunk1-kind auto \
                  --prefill-kind FFN_PF \
-                 # pass --combine-extra-args "--infer-chunk1-kind FFN_attn_fp32" \
-                 # only when explicitly testing standalone FP32 infer chunk_01
                  --clean-output \
                  --force
                # Writes <output>/meta.yaml for multi-context state transition
 
 Options:
+  --all                       Equivalent to --step all
   --contexts "LIST"            Context list (comma/space separated)
                                Default: "512 1024 2048 3072 4096"
   --max-context N              Max/prefill context (default: 4096)
@@ -80,13 +93,25 @@ Options:
                                Default: <state-root>
   --context-name-template STR  Per-context folder template with {context}
                                Default: vibethinker_1.5b_ctx{context}_fp16_hybrid
+  --model-path DIR             HF model cache/snapshot root used for FP32 chunk export
+                               Default: ~/.cache/huggingface/hub/models--WeiboAI--VibeThinker-1.5B
 
   --no-force-clean             Do not pass --force-clean to rebuild script
   --clean                      Explicitly pass --force-clean (default behavior)
   --no-skip-smoke              Do not pass --skip-smoke to rebuild script
   --no-force-combine           Do not pass --force to combine script
   --step2-reuse-infer-only     Step 2 uses converter infer-only reuse mode
-                               (faster but uses regular converter chunk contract)
+                               (faster and avoids convert parts 4..7)
+  --step2-standard-reuse       Disable infer-only reuse in step 2
+                               (runs converter parts 3..7 + hybrid patch; default)
+  --step1-export-only          Step 1 runs converter steps 1..4 only
+  --step1-full-hybrid          Step 1 uses full hybrid rebuild script
+                               (includes compile/meta/tokenizer and optional smoke; default)
+  --no-step1-fp32-export       Disable standalone FP32 chunk_01 export in step 1
+                               (default exports qwen25_FFN_attn_fp32_chunk_01of03)
+  --step2-keep-noninfer        Keep non-infer artifacts in non-max step-2 folders
+                               (default purges non-infer artifacts after each context
+                                and removes infer .mlmodelc when matching .mlpackage exists)
   --rebuild-extra-args "ARGS"  Extra args appended to rebuild calls
   --combine-extra-args "ARGS"  Extra args appended to combine call
 
@@ -100,17 +125,63 @@ ctx_dir_for() {
   echo "${CONTEXT_ROOT}/${name}"
 }
 
+detect_context_num_chunks() {
+  local dir="$1"
+  local meta_path="${dir}/meta.yaml"
+  local from_meta=""
+  local path base n max=0
+
+  if [[ -f "${meta_path}" ]]; then
+    from_meta="$(awk -F: '/^[[:space:]]*num_chunks:[[:space:]]*[0-9]+/ {gsub(/[^0-9]/, "", $2); print $2; exit}' "${meta_path}" || true)"
+    if [[ "${from_meta}" =~ ^[0-9]+$ ]] && (( from_meta > 0 )); then
+      echo "${from_meta}"
+      return 0
+    fi
+  fi
+
+  shopt -s nullglob
+  for path in "${dir}"/qwen25_FFN*_chunk_*of*.mlpackage "${dir}"/qwen25_FFN*_chunk_*of*.mlmodelc; do
+    if [[ "$(basename "${path}")" == qwen25_FFN_attn_fp32_chunk_* ]]; then
+      continue
+    fi
+    base="$(basename "${path}")"
+    if [[ "${base}" =~ _chunk_[0-9]{2}of([0-9]{2})\.(mlpackage|mlmodelc)$ ]]; then
+      n=$((10#${BASH_REMATCH[1]}))
+      if (( n > max )); then
+        max="${n}"
+      fi
+    fi
+  done
+  shopt -u nullglob
+
+  if (( max > 0 )); then
+    echo "${max}"
+    return 0
+  fi
+  return 1
+}
+
 has_infer_chunk_file() {
   local dir="$1"
   local idx="$2"
-  local ext
+  local total_chunks="$3"
+  local idx_fmt total_fmt ext
+  local matches=()
+  local match_base
+
+  idx_fmt="$(printf "%02d" "${idx}")"
+  total_fmt="$(printf "%02d" "${total_chunks}")"
   for ext in mlpackage mlmodelc; do
-    if [[ -d "${dir}/qwen25_FFN_chunk_${idx}of03.${ext}" ]]; then
+    shopt -s nullglob
+    matches=( "${dir}"/qwen25_FFN*_chunk_"${idx_fmt}"of"${total_fmt}"."${ext}" )
+    shopt -u nullglob
+    for path in "${matches[@]}"; do
+      match_base="$(basename "${path}")"
+      if [[ "${match_base}" == qwen25_FFN_attn_fp32_chunk_* ]]; then
+        continue
+      fi
       return 0
-    fi
-    if [[ -d "${dir}/qwen25_FFN_PF_chunk_${idx}of03.${ext}" ]]; then
-      return 0
-    fi
+    done
   done
   return 1
 }
@@ -118,30 +189,152 @@ has_infer_chunk_file() {
 assert_context_has_infer_chunks() {
   local ctx="$1"
   local dir="$2"
-  local idx
-  for idx in 01 02 03; do
-    if ! has_infer_chunk_file "${dir}" "${idx}"; then
-      echo "[check] Context ${ctx} is missing infer chunk ${idx}of03 in ${dir}" >&2
-      echo "        Expected qwen25_FFN_chunk_* or qwen25_FFN_PF_chunk_* artifacts." >&2
+  local total_chunks="${3:-}"
+  local idx total_fmt
+
+  if [[ -z "${total_chunks}" ]]; then
+    if ! total_chunks="$(detect_context_num_chunks "${dir}")"; then
+      echo "[check] Context ${ctx} infer chunk count could not be detected in ${dir}" >&2
+      return 1
+    fi
+  fi
+
+  if [[ ! "${total_chunks}" =~ ^[0-9]+$ ]] || (( total_chunks <= 0 )); then
+    echo "[check] Context ${ctx} invalid infer chunk count '${total_chunks}' in ${dir}" >&2
+    return 1
+  fi
+
+  total_fmt="$(printf "%02d" "${total_chunks}")"
+  for ((idx=1; idx<=total_chunks; idx++)); do
+    if ! has_infer_chunk_file "${dir}" "${idx}" "${total_chunks}"; then
+      printf "[check] Context %s is missing infer chunk %02dof%s in %s\n" "${ctx}" "${idx}" "${total_fmt}" "${dir}" >&2
+      printf "        Expected qwen25_FFN*_chunk_%02dof%s.(mlpackage|mlmodelc)\n" "${idx}" "${total_fmt}" >&2
       return 1
     fi
   done
 }
 
+purge_step2_noninfer_artifacts() {
+  local dir="$1"
+  local removed=0
+  local path base package_equiv
+
+  shopt -s nullglob dotglob
+  for path in "${dir}"/*; do
+    base="$(basename "${path}")"
+    case "${base}" in
+      # Keep infer chunks and optional standalone FP32 chunk1 packages.
+      *FFN*chunk_*of*.mlpackage)
+        continue
+        ;;
+      # Keep infer .mlmodelc only when package sidecar is missing.
+      *FFN*chunk_*of*.mlmodelc)
+        package_equiv="${dir}/${base%.mlmodelc}.mlpackage"
+        if [[ -d "${package_equiv}" ]]; then
+          rm -rf "${path}"
+          removed=$((removed + 1))
+        fi
+        continue
+        ;;
+      # Keep progress file when present.
+      meta_progress.yaml)
+        continue
+        ;;
+    esac
+    rm -rf "${path}"
+    removed=$((removed + 1))
+  done
+  shopt -u nullglob dotglob
+
+  echo "[step 2] Purged ${removed} non-infer artifact(s) from ${dir}"
+}
+
+assert_context_has_fp32_chunk1() {
+  local ctx="$1"
+  local dir="$2"
+  local total_chunks="${3:-3}"
+  local total_fmt
+  total_fmt="$(printf "%02d" "${total_chunks}")"
+  if [[ -d "${dir}/qwen25_FFN_attn_fp32_chunk_01of${total_fmt}.mlpackage" || -d "${dir}/qwen25_FFN_attn_fp32_chunk_01of${total_fmt}.mlmodelc" ]]; then
+    return 0
+  fi
+  echo "[check] Context ${ctx} missing standalone FP32 chunk1 artifact in ${dir}" >&2
+  echo "        Expected qwen25_FFN_attn_fp32_chunk_01of${total_fmt}.(mlpackage|mlmodelc)" >&2
+  return 1
+}
+
+resolve_output_num_chunks() {
+  local max_dir
+  max_dir="$(ctx_dir_for "${MAX_CONTEXT}")"
+  if [[ -n "${OUTPUT_NUM_CHUNKS}" ]]; then
+    echo "${OUTPUT_NUM_CHUNKS}"
+    return 0
+  fi
+  if ! OUTPUT_NUM_CHUNKS="$(detect_context_num_chunks "${max_dir}")"; then
+    echo "[check] Could not detect infer chunk count in max context dir: ${max_dir}" >&2
+    return 1
+  fi
+  echo "${OUTPUT_NUM_CHUNKS}"
+}
+
+detect_python_bin() {
+  local candidates=(
+    "${REPO_ROOT}/env-anemll/bin/python3"
+    "/Users/anemll/SourceRelease/GITHUB/ML_playground/anemll/env-anemll/bin/python3"
+    "python3"
+  )
+  local cand
+  for cand in "${candidates[@]}"; do
+    if ! command -v "${cand}" >/dev/null 2>&1; then
+      continue
+    fi
+    if "${cand}" -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
+      echo "${cand}"
+      return 0
+    fi
+  done
+  echo "python3"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --step) STEP_RAW="$2"; shift 2 ;;
+    --all)
+      if [[ -n "${STEP_RAW}" && "${STEP_RAW}" != "all" ]]; then
+        echo "Cannot combine --all with --step ${STEP_RAW}" >&2
+        exit 1
+      fi
+      STEP_RAW="all"
+      shift 1
+      ;;
+    --step)
+      if [[ -z "${2:-}" ]]; then
+        echo "--step requires a value" >&2
+        exit 1
+      fi
+      if [[ -n "${STEP_RAW}" && "${STEP_RAW}" != "$2" ]]; then
+        echo "Conflicting step options: already set to '${STEP_RAW}', got '--step $2'" >&2
+        exit 1
+      fi
+      STEP_RAW="$2"
+      shift 2
+      ;;
     --contexts) CONTEXTS_RAW="$2"; shift 2 ;;
     --max-context) MAX_CONTEXT="$2"; shift 2 ;;
     --state-root) STATE_ROOT="$2"; shift 2 ;;
     --context-root) CONTEXT_ROOT="$2"; shift 2 ;;
     --output) OUTPUT_DIR="$2"; shift 2 ;;
     --context-name-template) CONTEXT_NAME_TEMPLATE="$2"; shift 2 ;;
+    --model-path) MODEL_PATH="$2"; shift 2 ;;
     --clean) FORCE_CLEAN=true; shift 1 ;;
     --no-force-clean) FORCE_CLEAN=false; shift 1 ;;
     --no-skip-smoke) SKIP_SMOKE=false; shift 1 ;;
     --no-force-combine) FORCE_COMBINE=false; shift 1 ;;
     --step2-reuse-infer-only) STEP2_REUSE_INFER_ONLY=true; shift 1 ;;
+    --step2-standard-reuse) STEP2_REUSE_INFER_ONLY=false; shift 1 ;;
+    --step1-export-only) STEP1_EXPORT_ONLY=true; shift 1 ;;
+    --step1-full-hybrid) STEP1_EXPORT_ONLY=false; shift 1 ;;
+    --no-step1-fp32-export) STEP1_EXPORT_FP32=false; shift 1 ;;
+    --step2-keep-noninfer) STEP2_PURGE_NONINFER=false; shift 1 ;;
     --rebuild-extra-args) REBUILD_EXTRA_ARGS="$2"; shift 2 ;;
     --combine-extra-args) COMBINE_EXTRA_ARGS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -159,8 +352,16 @@ if [[ ! -f "${REBUILD_SCRIPT}" ]]; then
   echo "Missing script: ${REBUILD_SCRIPT}" >&2
   exit 1
 fi
+if [[ ! -f "${REBUILD_STEPS_SCRIPT}" ]]; then
+  echo "Missing script: ${REBUILD_STEPS_SCRIPT}" >&2
+  exit 1
+fi
 if [[ ! -f "${COMBINE_SCRIPT}" ]]; then
   echo "Missing script: ${COMBINE_SCRIPT}" >&2
+  exit 1
+fi
+if [[ ! -f "${PROTO_FP32_SCRIPT}" ]]; then
+  echo "Missing script: ${PROTO_FP32_SCRIPT}" >&2
   exit 1
 fi
 if [[ ! "${MAX_CONTEXT}" =~ ^[0-9]+$ ]]; then
@@ -220,36 +421,95 @@ fi
 
 run_step_1() {
   local max_dir
+  local detected_chunks
   max_dir="$(ctx_dir_for "${MAX_CONTEXT}")"
 
-  local cmd=(
-    bash "${REBUILD_SCRIPT}"
-    --context "${MAX_CONTEXT}"
-    --output "${max_dir}"
-  )
-  if [[ "${FORCE_CLEAN}" == "true" ]]; then
-    cmd+=(--force-clean)
-  fi
-  if [[ "${SKIP_SMOKE}" == "true" ]]; then
-    cmd+=(--skip-smoke)
-  fi
-  if [[ -n "${REBUILD_EXTRA_ARGS}" ]]; then
-    # shellcheck disable=SC2206
-    local extra=( ${REBUILD_EXTRA_ARGS} )
-    cmd+=("${extra[@]}")
+  if [[ "${STEP1_EXPORT_ONLY}" == "true" ]]; then
+    local cmd=(
+      bash "${REBUILD_STEPS_SCRIPT}"
+      --steps "1,2,3,4"
+      --context "${MAX_CONTEXT}"
+      --output "${max_dir}"
+    )
+    if [[ "${FORCE_CLEAN}" == "true" ]]; then
+      cmd+=(--force-clean)
+    fi
+    if [[ -n "${REBUILD_EXTRA_ARGS}" ]]; then
+      cmd+=(--extra-convert-args "${REBUILD_EXTRA_ARGS}")
+    fi
+
+    echo "[step 1] max context export (steps 1..4 only)"
+    echo "         ${cmd[*]}"
+    "${cmd[@]}"
+    if ! detected_chunks="$(detect_context_num_chunks "${max_dir}")"; then
+      echo "[step 1] Could not detect chunk count after export-only build: ${max_dir}" >&2
+      exit 1
+    fi
+    if [[ "${STEP1_EXPORT_FP32}" == "true" ]]; then
+      local pybin
+      pybin="$(detect_python_bin)"
+      local fp32_cmd=(
+        "${pybin}" "${PROTO_FP32_SCRIPT}"
+        --model-path "${MODEL_PATH}"
+        --source-dir "${max_dir}"
+        --out-dir "${max_dir}"
+        --reuse-out-dir
+        --context-length "${MAX_CONTEXT}"
+        --infer-only
+        --num-chunks "${detected_chunks}"
+        --infer-only-out-base "qwen25_FFN_attn_fp32"
+        --no-compile
+      )
+      echo "[step 1] export standalone FP32 chunk1 for max context"
+      echo "         ${fp32_cmd[*]}"
+      "${fp32_cmd[@]}"
+      assert_context_has_fp32_chunk1 "${MAX_CONTEXT}" "${max_dir}" "${detected_chunks}"
+    fi
+  else
+    local cmd=(
+      bash "${REBUILD_SCRIPT}"
+      --context "${MAX_CONTEXT}"
+      --output "${max_dir}"
+    )
+    if [[ "${FORCE_CLEAN}" == "true" ]]; then
+      cmd+=(--force-clean)
+    fi
+    if [[ "${SKIP_SMOKE}" == "true" ]]; then
+      cmd+=(--skip-smoke)
+    fi
+    if [[ -n "${REBUILD_EXTRA_ARGS}" ]]; then
+      # shellcheck disable=SC2206
+      local extra=( ${REBUILD_EXTRA_ARGS} )
+      cmd+=("${extra[@]}")
+    fi
+
+    echo "[step 1] max context export (full hybrid)"
+    echo "         ${cmd[*]}"
+    "${cmd[@]}"
   fi
 
-  echo "[step 1] max context export"
-  echo "         ${cmd[*]}"
-  "${cmd[@]}"
+  if ! OUTPUT_NUM_CHUNKS="$(detect_context_num_chunks "${max_dir}")"; then
+    echo "[step 1] Could not detect infer chunk count in max context dir: ${max_dir}" >&2
+    exit 1
+  fi
+  assert_context_has_infer_chunks "${MAX_CONTEXT}" "${max_dir}" "${OUTPUT_NUM_CHUNKS}"
+  echo "[step 1] Detected infer chunk count: ${OUTPUT_NUM_CHUNKS}"
 }
 
 run_step_2() {
   local max_dir
+  local expected_chunks
   max_dir="$(ctx_dir_for "${MAX_CONTEXT}")"
   if [[ ! -d "${max_dir}" ]]; then
     echo "[step 2] Missing max context dir: ${max_dir}" >&2
     echo "Run --step 1 first, or set --context-root/--context-name-template correctly." >&2
+    exit 1
+  fi
+  expected_chunks="$(resolve_output_num_chunks)"
+  echo "[step 2] Expected infer chunks per context: ${expected_chunks}"
+  if [[ "${STEP2_REUSE_INFER_ONLY}" == "true" ]] && [[ "${expected_chunks}" != "3" ]]; then
+    echo "[step 2] --step2-reuse-infer-only currently supports 3-chunk infer exports only." >&2
+    echo "         Detected ${expected_chunks} chunks in max context. Use standard reuse mode." >&2
     exit 1
   fi
 
@@ -284,7 +544,17 @@ run_step_2() {
     echo "[step 2] context ${ctx}"
     echo "         ${cmd[*]}"
     "${cmd[@]}"
-    assert_context_has_infer_chunks "${ctx}" "${out_dir}"
+    assert_context_has_infer_chunks "${ctx}" "${out_dir}" "${expected_chunks}"
+    if [[ "${STEP2_REUSE_INFER_ONLY}" == "true" ]]; then
+      assert_context_has_fp32_chunk1 "${ctx}" "${out_dir}" "${expected_chunks}"
+    fi
+    if [[ "${STEP2_PURGE_NONINFER}" == "true" ]]; then
+      purge_step2_noninfer_artifacts "${out_dir}"
+      assert_context_has_infer_chunks "${ctx}" "${out_dir}" "${expected_chunks}"
+      if [[ "${STEP2_REUSE_INFER_ONLY}" == "true" ]]; then
+        assert_context_has_fp32_chunk1 "${ctx}" "${out_dir}" "${expected_chunks}"
+      fi
+    fi
     ran=true
   done
 
@@ -294,6 +564,8 @@ run_step_2() {
 }
 
 run_step_3() {
+  local expected_chunks
+  expected_chunks="$(resolve_output_num_chunks)"
   local cmd=(
     bash "${COMBINE_SCRIPT}"
     --contexts "${CONTEXTS[*]}"
@@ -301,6 +573,7 @@ run_step_3() {
     --context-root "${CONTEXT_ROOT}"
     --context-name-template "${CONTEXT_NAME_TEMPLATE}"
     --output "${OUTPUT_DIR}"
+    --num-chunks "${expected_chunks}"
     --infer-kind "FFN_PF"
     --infer-chunk1-kind "auto"
     --prefill-kind "FFN_PF"
@@ -314,7 +587,7 @@ run_step_3() {
       echo "[step 3] Missing context directory: ${pre_dir}" >&2
       exit 1
     fi
-    if ! assert_context_has_infer_chunks "${ctx}" "${pre_dir}"; then
+    if ! assert_context_has_infer_chunks "${ctx}" "${pre_dir}" "${expected_chunks}"; then
       echo "[step 3] Run step 2 (or rebuild missing context) before combine." >&2
       exit 1
     fi
@@ -329,7 +602,7 @@ run_step_3() {
     cmd+=("${extra[@]}")
   fi
 
-  echo "[step 3] combine contexts"
+  echo "[step 3] combine contexts (num-chunks=${expected_chunks})"
   echo "         ${cmd[*]}"
   "${cmd[@]}"
 
@@ -355,7 +628,11 @@ echo "  Contexts: ${CONTEXTS[*]}"
 echo "  Max context: ${MAX_CONTEXT}"
 echo "  Context root: ${CONTEXT_ROOT}"
 echo "  Output: ${OUTPUT_DIR}"
+echo "  Model path: ${MODEL_PATH}"
+echo "  Step1 export-only: ${STEP1_EXPORT_ONLY}"
+echo "  Step1 export FP32 chunk1: ${STEP1_EXPORT_FP32}"
 echo "  Step2 infer-only reuse: ${STEP2_REUSE_INFER_ONLY}"
+echo "  Step2 purge non-infer: ${STEP2_PURGE_NONINFER}"
 
 for step in "${STEPS[@]}"; do
   case "${step}" in

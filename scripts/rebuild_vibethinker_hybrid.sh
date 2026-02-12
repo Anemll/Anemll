@@ -17,6 +17,7 @@ OUTPUT_DIR="/Volumes/Models/ANE/vibethinker_1.5b_ctx4096_fp16_hybrid"
 CONTEXT=4096
 BATCH=32
 CHUNKS=3
+REMAINING_CHUNKS=3
 LUT1="none"
 LUT2="none"
 LUT3="none"
@@ -30,6 +31,8 @@ SKIP_SMOKE=false
 WAIT_TIMEOUT=180
 REUSE_STATIC_FROM=""
 REUSE_INFER_ONLY=false
+EXPORT_STANDALONE_FP32=false
+PURGE_LEGACY_BASE_CHUNKS=true
 
 convert_step_part_name() {
   case "${1}" in
@@ -67,6 +70,9 @@ Options:
   --context N               Context length (default: 4096)
   --batch N                 Batch size (default: 32)
   --chunks N                Number of chunks for base conversion (default: 3)
+  --remaining-chunks N      Number of post-attention chunks for hybrid patch.
+                            Final hybrid chunk count = 1 + remaining-chunks.
+                            Default: 3 (=> chunk_01of04..chunk_04of04)
   --lut1 V                  LUT for embeddings (default: none)
   --lut2 V                  LUT for FFN (default: none)
   --lut3 V                  LUT for LM head (default: none)
@@ -84,6 +90,10 @@ Options:
                             and export standalone FP32-first-attn chunk_01 infer artifact
                             (full regular chunk_01 contract, not attention-only split).
                             Skips converter parts 4..7.
+  --export-standalone-fp32 Force standalone FP32 chunk_01 artifact export in full-hybrid mode
+                            (default: disabled in full-hybrid mode; always enabled for --reuse-infer-only)
+  --keep-legacy-base-chunks Keep converter base artifacts (qwen25_FFN_chunk_*, qwen25_prefill_chunk_*)
+                            after hybrid patch. Default purges them in full-hybrid mode to avoid confusion.
   -h, --help                Show this help
 EOF
 }
@@ -96,6 +106,7 @@ while [[ $# -gt 0 ]]; do
     --context) CONTEXT="$2"; shift 2 ;;
     --batch) BATCH="$2"; shift 2 ;;
     --chunks) CHUNKS="$2"; shift 2 ;;
+    --remaining-chunks) REMAINING_CHUNKS="$2"; shift 2 ;;
     --lut1) LUT1="$2"; shift 2 ;;
     --lut2) LUT2="$2"; shift 2 ;;
     --lut3) LUT3="$2"; shift 2 ;;
@@ -109,6 +120,8 @@ while [[ $# -gt 0 ]]; do
     --force-clean) FORCE_CLEAN=true; shift 1 ;;
     --reuse-static-from) REUSE_STATIC_FROM="$2"; shift 2 ;;
     --reuse-infer-only) REUSE_INFER_ONLY=true; shift 1 ;;
+    --export-standalone-fp32) EXPORT_STANDALONE_FP32=true; shift 1 ;;
+    --keep-legacy-base-chunks) PURGE_LEGACY_BASE_CHUNKS=false; shift 1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
   esac
@@ -138,7 +151,7 @@ echo "  Repo: ${REPO_ROOT}"
 echo "  Model: ${MODEL_ID}"
 echo "  Model path: ${MODEL_PATH}"
 echo "  Output: ${OUTPUT_DIR}"
-echo "  Context: ${CONTEXT}, Batch: ${BATCH}, Chunks: ${CHUNKS}"
+echo "  Context: ${CONTEXT}, Batch: ${BATCH}, Base chunks: ${CHUNKS}, Hybrid remaining chunks: ${REMAINING_CHUNKS}"
 echo "  LUT: ${LUT1}/${LUT2}/${LUT3}"
 
 active_pids="$(pgrep -f "convert_model.sh.*--output[[:space:]]+${OUTPUT_DIR}|combine_models.py.*${OUTPUT_DIR}|compile_models.py.*${OUTPUT_DIR}" || true)"
@@ -170,46 +183,47 @@ if [[ -n "${REUSE_STATIC_FROM}" ]]; then
   echo "  Static source: ${REUSE_STATIC_FROM}"
   mkdir -p "${OUTPUT_DIR}"
 
-  copied_static=false
-  copied_static_core=false
-  shopt -s nullglob
-  for src in \
-    "${REUSE_STATIC_FROM}"/qwen25_embeddings*.mlpackage \
-    "${REUSE_STATIC_FROM}"/qwen25_embeddings*.mlmodelc \
-    "${REUSE_STATIC_FROM}"/qwen25_lm_head*.mlpackage \
-    "${REUSE_STATIC_FROM}"/qwen25_lm_head*.mlmodelc \
-    "${REUSE_STATIC_FROM}"/tokenizer.json \
-    "${REUSE_STATIC_FROM}"/tokenizer_config.json \
-    "${REUSE_STATIC_FROM}"/tokenizer.model \
-    "${REUSE_STATIC_FROM}"/special_tokens_map.json \
-    "${REUSE_STATIC_FROM}"/generation_config.json \
-    "${REUSE_STATIC_FROM}"/chat_template.jinja \
-    "${REUSE_STATIC_FROM}"/config.json \
-    "${REUSE_STATIC_FROM}"/meta.yaml; do
-    if [[ ! -e "${src}" ]]; then
-      continue
-    fi
-    dst="${OUTPUT_DIR}/$(basename "${src}")"
-    if [[ -e "${dst}" ]]; then
-      rm -rf "${dst}"
-    fi
-    cp -R "${src}" "${dst}"
-    copied_static=true
-    case "$(basename "${src}")" in
-      qwen25_embeddings*|qwen25_lm_head*) copied_static_core=true ;;
-    esac
-  done
-  shopt -u nullglob
-
-  if [[ "${copied_static_core}" != "true" ]]; then
-    echo "No static embeddings/lm_head artifacts found in: ${REUSE_STATIC_FROM}" >&2
-    exit 1
-  fi
-
   if [[ "${REUSE_INFER_ONLY}" == "true" ]]; then
     echo "  Reuse mode: infer-only (convert part 3 + standalone FP32-first-attn full chunk_01 export)"
+    echo "  Skipping static artifact copy for infer-only mode."
     step_list=(3)
   else
+    copied_static=false
+    copied_static_core=false
+    shopt -s nullglob
+    for src in \
+      "${REUSE_STATIC_FROM}"/qwen25_embeddings*.mlpackage \
+      "${REUSE_STATIC_FROM}"/qwen25_embeddings*.mlmodelc \
+      "${REUSE_STATIC_FROM}"/qwen25_lm_head*.mlpackage \
+      "${REUSE_STATIC_FROM}"/qwen25_lm_head*.mlmodelc \
+      "${REUSE_STATIC_FROM}"/tokenizer.json \
+      "${REUSE_STATIC_FROM}"/tokenizer_config.json \
+      "${REUSE_STATIC_FROM}"/tokenizer.model \
+      "${REUSE_STATIC_FROM}"/special_tokens_map.json \
+      "${REUSE_STATIC_FROM}"/generation_config.json \
+      "${REUSE_STATIC_FROM}"/chat_template.jinja \
+      "${REUSE_STATIC_FROM}"/config.json \
+      "${REUSE_STATIC_FROM}"/meta.yaml; do
+      if [[ ! -e "${src}" ]]; then
+        continue
+      fi
+      dst="${OUTPUT_DIR}/$(basename "${src}")"
+      if [[ -e "${dst}" ]]; then
+        rm -rf "${dst}"
+      fi
+      cp -R "${src}" "${dst}"
+      copied_static=true
+      case "$(basename "${src}")" in
+        qwen25_embeddings*|qwen25_lm_head*) copied_static_core=true ;;
+      esac
+    done
+    shopt -u nullglob
+
+    if [[ "${copied_static_core}" != "true" ]]; then
+      echo "No static embeddings/lm_head artifacts found in: ${REUSE_STATIC_FROM}" >&2
+      exit 1
+    fi
+
     # 3=FFN, 4=prefill, 5=combine, 6=compile, 7=meta/tokenizer.
     echo "  Reuse mode: standard (convert parts 3..7 + FP32 patch)"
     step_list=(3 4 5 6 7)
@@ -264,6 +278,11 @@ while true; do
   sleep 5
   elapsed=$((elapsed + 5))
 done
+
+if [[ ! "${REMAINING_CHUNKS}" =~ ^[0-9]+$ ]] || [[ "${REMAINING_CHUNKS}" -le 0 ]]; then
+  echo "--remaining-chunks must be a positive integer" >&2
+  exit 1
+fi
 
 if [[ -n "${REUSE_STATIC_FROM}" && "${REUSE_INFER_ONLY}" == "true" ]]; then
   echo "[3/5] Verify minimal artifacts (infer-only reuse mode)"
@@ -345,6 +364,7 @@ patch_args=(
   --reuse-out-dir
   --context-length "${CONTEXT}"
   --batch-size "${BATCH}"
+  --remaining-chunks "${REMAINING_CHUNKS}"
   --lut1 "${LUT1}" --lut2 "${LUT2}" --lut3 "${LUT3}"
   --argmax-in-model false
   --recommended-do-sample true
@@ -357,26 +377,50 @@ if [[ -n "${REUSE_STATIC_FROM}" ]]; then
 fi
 "${patch_args[@]}"
 
-echo "[4.5/5] Export standalone FP32 attention chunk_01 artifact"
-FP32_INFER_BASE="qwen25_FFN_attn_fp32"
-fp32_standalone_args=(
-  python3 "${REPO_ROOT}/tests/dev/proto_qwen25_chunk1_fp32.py"
-  --model-path "${MODEL_PATH}"
-  --source-dir "${OUTPUT_DIR}"
-  --out-dir "${OUTPUT_DIR}"
-  --reuse-out-dir
-  --context-length "${CONTEXT}"
-  --batch-size "${BATCH}"
-  --lut1 "${LUT1}" --lut2 "${LUT2}" --lut3 "${LUT3}"
-  --infer-only
-  --num-chunks "${CHUNKS}"
-  --infer-only-out-base "${FP32_INFER_BASE}"
-  --no-compile
-)
-"${fp32_standalone_args[@]}"
-if [[ ! -d "${OUTPUT_DIR}/${FP32_INFER_BASE}_chunk_01of03.mlpackage" ]]; then
-  echo "Missing standalone FP32 attention package: ${OUTPUT_DIR}/${FP32_INFER_BASE}_chunk_01of03.mlpackage" >&2
-  exit 1
+if [[ "${PURGE_LEGACY_BASE_CHUNKS}" == "true" ]]; then
+  echo "[4.2/5] Purge legacy base chunk artifacts"
+  shopt -s nullglob
+  for p in \
+    "${OUTPUT_DIR}"/qwen25_FFN_chunk_01of03.mlpackage \
+    "${OUTPUT_DIR}"/qwen25_FFN_chunk_02of03.mlpackage \
+    "${OUTPUT_DIR}"/qwen25_FFN_chunk_03of03.mlpackage \
+    "${OUTPUT_DIR}"/qwen25_FFN_chunk_01of03.mlmodelc \
+    "${OUTPUT_DIR}"/qwen25_FFN_chunk_02of03.mlmodelc \
+    "${OUTPUT_DIR}"/qwen25_FFN_chunk_03of03.mlmodelc \
+    "${OUTPUT_DIR}"/qwen25_prefill_chunk_01of03.mlpackage \
+    "${OUTPUT_DIR}"/qwen25_prefill_chunk_02of03.mlpackage \
+    "${OUTPUT_DIR}"/qwen25_prefill_chunk_03of03.mlpackage \
+    "${OUTPUT_DIR}"/qwen25_prefill_chunk_01of03.mlmodelc \
+    "${OUTPUT_DIR}"/qwen25_prefill_chunk_02of03.mlmodelc \
+    "${OUTPUT_DIR}"/qwen25_prefill_chunk_03of03.mlmodelc; do
+    [[ -e "${p}" ]] || continue
+    rm -rf "${p}"
+  done
+  shopt -u nullglob
+fi
+
+if [[ "${EXPORT_STANDALONE_FP32}" == "true" ]]; then
+  echo "[4.5/5] Export standalone FP32 attention chunk_01 artifact"
+  FP32_INFER_BASE="qwen25_FFN_attn_fp32"
+  fp32_standalone_args=(
+    python3 "${REPO_ROOT}/tests/dev/proto_qwen25_chunk1_fp32.py"
+    --model-path "${MODEL_PATH}"
+    --source-dir "${OUTPUT_DIR}"
+    --out-dir "${OUTPUT_DIR}"
+    --reuse-out-dir
+    --context-length "${CONTEXT}"
+    --batch-size "${BATCH}"
+    --lut1 "${LUT1}" --lut2 "${LUT2}" --lut3 "${LUT3}"
+    --infer-only
+    --num-chunks "${CHUNKS}"
+    --infer-only-out-base "${FP32_INFER_BASE}"
+    --no-compile
+  )
+  "${fp32_standalone_args[@]}"
+  if [[ ! -d "${OUTPUT_DIR}/${FP32_INFER_BASE}_chunk_01of03.mlpackage" ]]; then
+    echo "Missing standalone FP32 attention package: ${OUTPUT_DIR}/${FP32_INFER_BASE}_chunk_01of03.mlpackage" >&2
+    exit 1
+  fi
 fi
 
 echo "[5/5] Verify hybrid metadata"

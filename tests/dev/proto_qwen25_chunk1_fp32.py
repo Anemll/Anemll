@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Prototype: standard-compatible 3-chunk layout with FP32 attention-only first chunk.
+"""Prototype hybrid chunk export with FP32 attention-only first stage.
 
-Target runtime layout (chat.py compatible):
-  embeddings -> FFN_PF_chunk_01of03 -> FFN_PF_chunk_02of03 -> FFN_PF_chunk_03of03 -> lm_head
+Runtime layout (chat.py compatible):
+  embeddings -> FFN_PF_chunk_01ofNN -> ... -> FFN_PF_chunk_NNofNN -> lm_head
 
 Where:
-  - chunk_01of03: layer0 attention residual only (FP32, CPU_ONLY)
-  - chunk_02of03: layer0 post-attention MLP + layers1..split (FP16; optional LUT)
-  - chunk_03of03: tail layers + norm (rebuilt; optional LUT)
+  - chunk_01ofNN: layer0 attention residual only (FP32, CPU_ONLY)
+  - chunk_02ofNN..chunk_NNofNN: remaining model split across configurable chunks
+    (chunk_02 applies layer0 post-attention MLP, final chunk applies model norm).
 """
 
 from __future__ import annotations
@@ -55,6 +55,24 @@ def _chunk_bounds(total_layers: int, total_chunks: int, chunk_idx_zero_based: in
     start = chunk_idx_zero_based * base + min(chunk_idx_zero_based, rem)
     end = start + base + (1 if chunk_idx_zero_based < rem else 0)
     return start, end
+
+
+def _remaining_layer_segments(total_layers: int, remaining_chunks: int) -> list[tuple[int, int]]:
+    """Partition layers [1, total_layers) into `remaining_chunks` contiguous ranges."""
+    if remaining_chunks <= 0:
+        raise ValueError("remaining_chunks must be > 0")
+    remaining_layers = max(total_layers - 1, 0)
+    if remaining_layers == 0:
+        return [(1, 1)] * remaining_chunks
+    base, rem = divmod(remaining_layers, remaining_chunks)
+    segments: list[tuple[int, int]] = []
+    start = 1
+    for idx in range(remaining_chunks):
+        size = base + (1 if idx < rem else 0)
+        end = start + size
+        segments.append((start, end))
+        start = end
+    return segments
 
 
 def _compile_mlpackage(package_path: Path, output_dir: Path) -> None:
@@ -309,102 +327,88 @@ class Chunk1Fp32FirstAttnInferWrapper(torch.nn.Module):
         return hidden_states
 
 
-class Chunk2AfterAttnInferWrapper(torch.nn.Module):
-    """layer0 MLP + middle layers for infer."""
+class RemainingSegmentInferWrapper(torch.nn.Module):
+    """Infer wrapper for one post-attention segment."""
 
-    def __init__(self, model: Qwen25ForCausalLM, end_layer: int):
-        super().__init__()
-        self.model = model
-        self.end_layer = end_layer
-
-    def forward(self, hidden_states, position_ids, causal_mask, current_pos):
-        layer0 = self.model.model.layers[0]
-        post = layer0.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + layer0.mlp(post)
-
-        rotary = self.model.model.get_rotary_embeddings_s(current_pos)
-        return self.model.model.process_layers(
-            hidden_states,
-            position_ids,
-            causal_mask,
-            current_pos,
-            rotary,
-            start_layer=1,
-            end_layer=self.end_layer,
-            IN_PREFILL=False,
-        )
-
-
-class Chunk2AfterAttnPrefillWrapper(torch.nn.Module):
-    """layer0 MLP + middle layers for prefill."""
-
-    def __init__(self, model: Qwen25ForCausalLM, end_layer: int):
-        super().__init__()
-        self.model = model
-        self.end_layer = end_layer
-
-    def forward(self, hidden_states, position_ids, causal_mask, current_pos):
-        layer0 = self.model.model.layers[0]
-        post = layer0.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + layer0.mlp(post)
-
-        rotary = self.model.model.get_rotary_embedding_prefill(position_ids)
-        return self.model.model.process_layers(
-            hidden_states,
-            position_ids,
-            causal_mask,
-            current_pos,
-            rotary,
-            start_layer=1,
-            end_layer=self.end_layer,
-            IN_PREFILL=True,
-        )
-
-
-class Chunk3TailInferWrapper(torch.nn.Module):
-    """tail layers + final norm for infer."""
-
-    def __init__(self, model: Qwen25ForCausalLM, start_layer: int):
+    def __init__(
+        self,
+        model: Qwen25ForCausalLM,
+        start_layer: int,
+        end_layer: int,
+        *,
+        include_layer0_mlp: bool = False,
+        apply_final_norm: bool = False,
+    ):
         super().__init__()
         self.model = model
         self.start_layer = start_layer
+        self.end_layer = end_layer
+        self.include_layer0_mlp = include_layer0_mlp
+        self.apply_final_norm = apply_final_norm
 
     def forward(self, hidden_states, position_ids, causal_mask, current_pos):
+        if self.include_layer0_mlp:
+            layer0 = self.model.model.layers[0]
+            post = layer0.post_attention_layernorm(hidden_states)
+            hidden_states = hidden_states + layer0.mlp(post)
+
         rotary = self.model.model.get_rotary_embeddings_s(current_pos)
-        out = self.model.model.process_layers(
-            hidden_states,
-            position_ids,
-            causal_mask,
-            current_pos,
-            rotary,
-            start_layer=self.start_layer,
-            end_layer=None,
-            IN_PREFILL=False,
-        )
-        return self.model.model.norm(out)
+        if self.start_layer < self.end_layer:
+            hidden_states = self.model.model.process_layers(
+                hidden_states,
+                position_ids,
+                causal_mask,
+                current_pos,
+                rotary,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                IN_PREFILL=False,
+            )
+        if self.apply_final_norm:
+            hidden_states = self.model.model.norm(hidden_states)
+        return hidden_states
 
 
-class Chunk3TailPrefillWrapper(torch.nn.Module):
-    """tail layers for prefill; return first token only (matches converter behavior)."""
+class RemainingSegmentPrefillWrapper(torch.nn.Module):
+    """Prefill wrapper for one post-attention segment."""
 
-    def __init__(self, model: Qwen25ForCausalLM, start_layer: int):
+    def __init__(
+        self,
+        model: Qwen25ForCausalLM,
+        start_layer: int,
+        end_layer: int,
+        *,
+        include_layer0_mlp: bool = False,
+        return_first_token: bool = False,
+    ):
         super().__init__()
         self.model = model
         self.start_layer = start_layer
+        self.end_layer = end_layer
+        self.include_layer0_mlp = include_layer0_mlp
+        self.return_first_token = return_first_token
 
     def forward(self, hidden_states, position_ids, causal_mask, current_pos):
+        if self.include_layer0_mlp:
+            layer0 = self.model.model.layers[0]
+            post = layer0.post_attention_layernorm(hidden_states)
+            hidden_states = hidden_states + layer0.mlp(post)
+
         rotary = self.model.model.get_rotary_embedding_prefill(position_ids)
-        out = self.model.model.process_layers(
-            hidden_states,
-            position_ids,
-            causal_mask,
-            current_pos,
-            rotary,
-            start_layer=self.start_layer,
-            end_layer=None,
-            IN_PREFILL=True,
-        )
-        return out[:, 0:1, :]
+        if self.start_layer < self.end_layer:
+            hidden_states = self.model.model.process_layers(
+                hidden_states,
+                position_ids,
+                causal_mask,
+                current_pos,
+                rotary,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                IN_PREFILL=True,
+            )
+        if self.return_first_token:
+            return hidden_states[:, 0:1, :]
+        return hidden_states
 
 
 def _convert_infer_wrapper(
@@ -538,10 +542,11 @@ def _has_chunk_artifact(out_dir: Path, base: str, idx: int, num_chunks: int) -> 
     return (out_dir / f"{stem}.mlpackage").exists() or (out_dir / f"{stem}.mlmodelc").exists()
 
 
-def _update_meta_for_3chunks(
+def _update_meta_for_chunks(
     out_dir: Path,
     new_ffn_mlmodelc: str,
     new_lm_head_mlmodelc: str,
+    num_chunks: int,
     lut1_bits: int | None,
     lut2_bits: int | None,
     lut2_per: int | None,
@@ -553,7 +558,7 @@ def _update_meta_for_3chunks(
     meta_path = out_dir / "meta.yaml"
     meta = yaml.safe_load(meta_path.read_text())
     params = meta.setdefault("model_info", {}).setdefault("parameters", {})
-    params["num_chunks"] = 3
+    params["num_chunks"] = int(num_chunks)
     params["ffn"] = new_ffn_mlmodelc
     params["lm_head"] = new_lm_head_mlmodelc
     params["lut_embeddings"] = _lut_to_meta_value(lut1_bits)
@@ -564,23 +569,28 @@ def _update_meta_for_3chunks(
     params["argmax_in_model"] = bool(argmax_in_model)
     if recommended_sampling is not None:
         params["recommended_sampling"] = recommended_sampling
-    desc = meta["model_info"].get("description", "")
-    if isinstance(desc, str):
-        meta["model_info"]["description"] = desc.replace("Chunks: 2", "Chunks: 3")
+    desc = meta.setdefault("model_info", {}).get("description")
+    if not isinstance(desc, str):
+        desc = ""
+    if f"Chunks: {num_chunks}" not in desc:
+        suffix = f" Chunks: {num_chunks}."
+        meta["model_info"]["description"] = (desc.strip() + suffix).strip()
     meta_path.write_text(yaml.safe_dump(meta, sort_keys=False))
 
 
-def _assert_required_artifacts(out_dir: Path, target_base: str, lm_head_stem: str) -> None:
+def _assert_required_artifacts(
+    out_dir: Path,
+    target_base: str,
+    lm_head_stem: str,
+    num_chunks: int,
+) -> None:
     required = [
         out_dir / "meta.yaml",
         out_dir / f"{lm_head_stem}.mlmodelc",
-        out_dir / f"{target_base}_chunk_01of03.mlpackage",
-        out_dir / f"{target_base}_chunk_01of03.mlmodelc",
-        out_dir / f"{target_base}_chunk_02of03.mlpackage",
-        out_dir / f"{target_base}_chunk_02of03.mlmodelc",
-        out_dir / f"{target_base}_chunk_03of03.mlpackage",
-        out_dir / f"{target_base}_chunk_03of03.mlmodelc",
     ]
+    for idx in range(1, num_chunks + 1):
+        required.append(out_dir / f"{target_base}_chunk_{idx:02d}of{num_chunks:02d}.mlpackage")
+        required.append(out_dir / f"{target_base}_chunk_{idx:02d}of{num_chunks:02d}.mlmodelc")
 
     missing = [str(p) for p in required if not p.exists()]
     if missing:
@@ -592,7 +602,12 @@ def _assert_required_artifacts(out_dir: Path, target_base: str, lm_head_stem: st
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Prototype: chunk01 attention FP32, chunk02 after-attention, chunk03 tail.")
+    ap = argparse.ArgumentParser(
+        description=(
+            "Prototype hybrid export: chunk01 attention-only FP32 + configurable "
+            "post-attention segment chunks."
+        )
+    )
     ap.add_argument(
         "--model-path",
         default="~/.cache/huggingface/hub/models--WeiboAI--VibeThinker-1.5B",
@@ -609,7 +624,21 @@ def main() -> int:
     )
     ap.add_argument("--context-length", type=int, default=2048)
     ap.add_argument("--batch-size", type=int, default=64)
-    ap.add_argument("--num-chunks", type=int, default=3, help="Chunk count for infer-only patch naming (default: 3).")
+    ap.add_argument(
+        "--num-chunks",
+        type=int,
+        default=3,
+        help="Chunk count for infer-only patch naming (default: 3).",
+    )
+    ap.add_argument(
+        "--remaining-chunks",
+        type=int,
+        default=3,
+        help=(
+            "Number of post-attention segments for full hybrid mode "
+            "(total output chunks = 1 + remaining_chunks). Default: 3."
+        ),
+    )
     ap.add_argument("--reuse-out-dir", action="store_true", help="Do not recopy source dir if out dir exists.")
     ap.add_argument(
         "--infer-only",
@@ -689,7 +718,10 @@ def main() -> int:
     lut3_bits, lut3_per = _parse_lut_arg(args.lut3, src_lut3_bits, src_lut3_per)
 
     if lut1_bits is not None:
-        print("Warning: this prototype keeps chunk_01of03 FP32 unquantized; --lut1 is metadata-only here.")
+        print(
+            "Warning: this prototype keeps chunk_01 FP32 unquantized; "
+            "--lut1 is metadata-only here."
+        )
 
     if args.infer_only:
         source_base = f"{model_prefix}_FFN{_lut_suffix(src_lut2_bits)}"
@@ -715,16 +747,25 @@ def main() -> int:
     for p in model.parameters():
         p.requires_grad = False
 
-    # Use split matching original 2-ch tail (layers 14..end for 28-layer models).
-    split_layer, _ = _chunk_bounds(cfg.num_hidden_layers, 2, 1)
-    print(f"Middle/tail split layer: {split_layer}")
+    if args.remaining_chunks <= 0:
+        raise ValueError("--remaining-chunks must be > 0")
+    total_output_chunks = 1 + int(args.remaining_chunks)
+    segment_ranges = _remaining_layer_segments(cfg.num_hidden_layers, args.remaining_chunks)
+    print(
+        "Hybrid segmentation: "
+        f"chunk_01 attention-only + {args.remaining_chunks} remaining chunks "
+        f"(total={total_output_chunks})"
+    )
+    print(
+        "Remaining ranges: "
+        + ", ".join(
+            f"chunk_{idx + 2:02d}=[{start}:{end})"
+            for idx, (start, end) in enumerate(segment_ranges)
+        )
+    )
 
     chunk1_infer = Chunk1AttnInferWrapper(model).eval()
     chunk1_prefill = Chunk1AttnPrefillWrapper(model).eval()
-    chunk2_infer = Chunk2AfterAttnInferWrapper(model, end_layer=split_layer).eval()
-    chunk2_prefill = Chunk2AfterAttnPrefillWrapper(model, end_layer=split_layer).eval()
-    chunk3_infer = Chunk3TailInferWrapper(model, start_layer=split_layer).eval()
-    chunk3_prefill = Chunk3TailPrefillWrapper(model, start_layer=split_layer).eval()
 
     if args.infer_only:
         if args.num_chunks <= 0:
@@ -857,8 +898,8 @@ def main() -> int:
         _save_model(lm_head_ml, lm_head_pkg)
         _compile_mlpackage(lm_head_pkg, out_dir)
 
-    # Build chunk 01of03 (FP32 attention-only)
-    print("Converting chunk_01of03 infer (FP32, CPU_ONLY)...")
+    # Build chunk 01ofNN (FP32 attention-only).
+    print(f"Converting chunk_01of{total_output_chunks:02d} infer (FP32, CPU_ONLY)...")
     c1_infer_ml = _convert_infer_wrapper(
         chunk1_infer,
         model,
@@ -867,7 +908,7 @@ def main() -> int:
         precision=ct.precision.FLOAT32,
         compute_units=ct.ComputeUnit.CPU_ONLY,
     )
-    print("Converting chunk_01of03 prefill (FP32, CPU_ONLY)...")
+    print(f"Converting chunk_01of{total_output_chunks:02d} prefill (FP32, CPU_ONLY)...")
     c1_prefill_ml = _convert_prefill_wrapper(
         chunk1_prefill,
         model,
@@ -878,84 +919,70 @@ def main() -> int:
         compute_units=ct.ComputeUnit.CPU_ONLY,
     )
 
-    c1_infer_tmp = out_dir / f"{target_base}_infer_fp32_chunk_01of03.mlpackage"
-    c1_prefill_tmp = out_dir / f"{target_base}_prefill_fp32_chunk_01of03.mlpackage"
+    c1_infer_tmp = out_dir / f"{target_base}_infer_fp32_chunk_01of{total_output_chunks:02d}.mlpackage"
+    c1_prefill_tmp = out_dir / f"{target_base}_prefill_fp32_chunk_01of{total_output_chunks:02d}.mlpackage"
     _save_model(c1_infer_ml, c1_infer_tmp)
     _save_model(c1_prefill_ml, c1_prefill_tmp)
-    c1_pkg = out_dir / f"{target_base}_chunk_01of03.mlpackage"
+    c1_pkg = out_dir / f"{target_base}_chunk_01of{total_output_chunks:02d}.mlpackage"
     _combine_infer_prefill(c1_infer_tmp, c1_prefill_tmp, c1_pkg)
     shutil.rmtree(c1_infer_tmp, ignore_errors=True)
     shutil.rmtree(c1_prefill_tmp, ignore_errors=True)
     _compile_mlpackage(c1_pkg, out_dir)
 
-    # Build chunk 02of03 (post-attn + middle layers)
-    print("Converting chunk_02of03 infer (FP16)...")
-    c2_infer_ml = _convert_infer_wrapper(
-        chunk2_infer,
-        model,
-        args.context_length,
-        cfg.hidden_size,
-        precision=ct.precision.FLOAT16,
-        compute_units=ct.ComputeUnit.CPU_AND_NE,
-    )
-    print("Converting chunk_02of03 prefill (FP16)...")
-    c2_prefill_ml = _convert_prefill_wrapper(
-        chunk2_prefill,
-        model,
-        args.context_length,
-        cfg.hidden_size,
-        args.batch_size,
-        precision=ct.precision.FLOAT16,
-        compute_units=ct.ComputeUnit.CPU_AND_NE,
-    )
-
-    if quantize_ffn and lut2_bits is not None:
-        print(f"Quantizing chunk_02of03 with LUT {lut2_bits},{lut2_per} ...")
-        c2_infer_ml = _quantize_with_lut(
-            c2_infer_ml,
-            model,
-            args.context_length,
-            args.batch_size,
-            lut2_bits,
-            0 if lut2_per is None else lut2_per,
-        )
-        c2_prefill_ml = _quantize_with_lut(
-            c2_prefill_ml,
-            model,
-            args.context_length,
-            args.batch_size,
-            lut2_bits,
-            0 if lut2_per is None else lut2_per,
+    if args.copy_tail_from_source and total_output_chunks != 3:
+        raise ValueError(
+            "--copy-tail-from-source is only supported for total output chunks == 3 "
+            "(set --remaining-chunks 2)."
         )
 
-    c2_infer_tmp = out_dir / f"{target_base}_infer_tmp_chunk_02of03.mlpackage"
-    c2_prefill_tmp = out_dir / f"{target_base}_prefill_tmp_chunk_02of03.mlpackage"
-    _save_model(c2_infer_ml, c2_infer_tmp)
-    _save_model(c2_prefill_ml, c2_prefill_tmp)
-    c2_pkg = out_dir / f"{target_base}_chunk_02of03.mlpackage"
-    _combine_infer_prefill(c2_infer_tmp, c2_prefill_tmp, c2_pkg)
-    shutil.rmtree(c2_infer_tmp, ignore_errors=True)
-    shutil.rmtree(c2_prefill_tmp, ignore_errors=True)
-    _compile_mlpackage(c2_pkg, out_dir)
+    built_chunk_pkgs: list[Path] = [c1_pkg]
 
-    # Build chunk 03of03 (tail).
-    if args.copy_tail_from_source:
-        print("Copying chunk_03of03 from source tail chunk (02of02)...")
-        c3_pkg = _copy_tail_chunk_from_source(source_dir, out_dir, source_base, target_base)
-        _compile_mlpackage(c3_pkg, out_dir)
-    else:
-        print("Converting chunk_03of03 infer (FP16)...")
-        c3_infer_ml = _convert_infer_wrapper(
-            chunk3_infer,
+    # Build post-attention chunks 02..NN.
+    for seg_idx, (start_layer, end_layer) in enumerate(segment_ranges):
+        out_idx = seg_idx + 2
+        include_layer0_mlp = seg_idx == 0
+        is_last = seg_idx == len(segment_ranges) - 1
+
+        if args.copy_tail_from_source and is_last:
+            print("Copying final tail chunk from source chunk_02of02...")
+            copied = _copy_tail_chunk_from_source(source_dir, out_dir, source_base, target_base)
+            _compile_mlpackage(copied, out_dir)
+            built_chunk_pkgs.append(copied)
+            continue
+
+        print(
+            f"Converting chunk_{out_idx:02d}of{total_output_chunks:02d} infer "
+            f"(FP16) start={start_layer} end={end_layer} "
+            f"include_l0_mlp={include_layer0_mlp} final_norm={is_last}"
+        )
+        seg_infer = RemainingSegmentInferWrapper(
+            model,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            include_layer0_mlp=include_layer0_mlp,
+            apply_final_norm=is_last,
+        ).eval()
+        seg_infer_ml = _convert_infer_wrapper(
+            seg_infer,
             model,
             args.context_length,
             cfg.hidden_size,
             precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
         )
-        print("Converting chunk_03of03 prefill (FP16)...")
-        c3_prefill_ml = _convert_prefill_wrapper(
-            chunk3_prefill,
+
+        print(
+            f"Converting chunk_{out_idx:02d}of{total_output_chunks:02d} prefill (FP16)"
+        )
+        seg_prefill = RemainingSegmentPrefillWrapper(
+            model,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            include_layer0_mlp=include_layer0_mlp,
+            return_first_token=is_last,
+        ).eval()
+        seg_prefill_ml = _convert_prefill_wrapper(
+            seg_prefill,
             model,
             args.context_length,
             cfg.hidden_size,
@@ -965,17 +992,20 @@ def main() -> int:
         )
 
         if quantize_ffn and lut2_bits is not None:
-            print(f"Quantizing chunk_03of03 with LUT {lut2_bits},{lut2_per} ...")
-            c3_infer_ml = _quantize_with_lut(
-                c3_infer_ml,
+            print(
+                f"Quantizing chunk_{out_idx:02d}of{total_output_chunks:02d} "
+                f"with LUT {lut2_bits},{lut2_per} ..."
+            )
+            seg_infer_ml = _quantize_with_lut(
+                seg_infer_ml,
                 model,
                 args.context_length,
                 args.batch_size,
                 lut2_bits,
                 0 if lut2_per is None else lut2_per,
             )
-            c3_prefill_ml = _quantize_with_lut(
-                c3_prefill_ml,
+            seg_prefill_ml = _quantize_with_lut(
+                seg_prefill_ml,
                 model,
                 args.context_length,
                 args.batch_size,
@@ -983,21 +1013,23 @@ def main() -> int:
                 0 if lut2_per is None else lut2_per,
             )
 
-        c3_infer_tmp = out_dir / f"{target_base}_infer_tmp_chunk_03of03.mlpackage"
-        c3_prefill_tmp = out_dir / f"{target_base}_prefill_tmp_chunk_03of03.mlpackage"
-        _save_model(c3_infer_ml, c3_infer_tmp)
-        _save_model(c3_prefill_ml, c3_prefill_tmp)
-        c3_pkg = out_dir / f"{target_base}_chunk_03of03.mlpackage"
-        _combine_infer_prefill(c3_infer_tmp, c3_prefill_tmp, c3_pkg)
-        shutil.rmtree(c3_infer_tmp, ignore_errors=True)
-        shutil.rmtree(c3_prefill_tmp, ignore_errors=True)
-        _compile_mlpackage(c3_pkg, out_dir)
+        infer_tmp = out_dir / f"{target_base}_infer_tmp_chunk_{out_idx:02d}of{total_output_chunks:02d}.mlpackage"
+        prefill_tmp = out_dir / f"{target_base}_prefill_tmp_chunk_{out_idx:02d}of{total_output_chunks:02d}.mlpackage"
+        _save_model(seg_infer_ml, infer_tmp)
+        _save_model(seg_prefill_ml, prefill_tmp)
+        out_pkg = out_dir / f"{target_base}_chunk_{out_idx:02d}of{total_output_chunks:02d}.mlpackage"
+        _combine_infer_prefill(infer_tmp, prefill_tmp, out_pkg)
+        shutil.rmtree(infer_tmp, ignore_errors=True)
+        shutil.rmtree(prefill_tmp, ignore_errors=True)
+        _compile_mlpackage(out_pkg, out_dir)
+        built_chunk_pkgs.append(out_pkg)
 
-    # Patch metadata for 3-chunk loading.
-    _update_meta_for_3chunks(
+    # Patch metadata for N-chunk loading.
+    _update_meta_for_chunks(
         out_dir,
-        new_ffn_mlmodelc=f"{target_base}_chunk_01of03.mlmodelc",
+        new_ffn_mlmodelc=f"{target_base}_chunk_01of{total_output_chunks:02d}.mlmodelc",
         new_lm_head_mlmodelc=f"{lm_head_stem}.mlmodelc",
+        num_chunks=total_output_chunks,
         lut1_bits=lut1_bits,
         lut2_bits=lut2_bits,
         lut2_per=lut2_per,
@@ -1006,13 +1038,18 @@ def main() -> int:
         argmax_in_model=argmax_in_model,
         recommended_sampling=recommended_sampling,
     )
-    _assert_required_artifacts(out_dir, target_base=target_base, lm_head_stem=lm_head_stem)
+    _assert_required_artifacts(
+        out_dir,
+        target_base=target_base,
+        lm_head_stem=lm_head_stem,
+        num_chunks=total_output_chunks,
+    )
 
     print("\nDone.")
     print(f"Prototype directory: {out_dir}")
-    print(f"Chunk 1: {c1_pkg.name} (FP32 attention-only)")
-    print(f"Chunk 2: {c2_pkg.name} (post-attention + middle layers)")
-    print(f"Chunk 3: {c3_pkg.name} (tail)")
+    for idx, pkg in enumerate(built_chunk_pkgs, start=1):
+        role = "FP32 attention-only" if idx == 1 else "post-attention segment"
+        print(f"Chunk {idx}: {pkg.name} ({role})")
     print(f"Run test:")
     print(f"  python tests/chat.py --meta {out_dir / 'meta.yaml'} --prompt \"2+2=\" --max-tokens 32")
     return 0

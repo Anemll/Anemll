@@ -7,6 +7,7 @@ import coremltools as ct
 import os
 import sys
 import argparse
+import shutil
 from pathlib import Path
 
 # Add package root to path when running as script
@@ -17,6 +18,38 @@ if __name__ == '__main__':
     from anemll.ane_converter.metadata import AddCombinedMetadata
 else:
     from ..ane_converter.metadata import AddCombinedMetadata
+
+
+def _save_multifunction_dedup(sources, output_path, dedup_weights=False, verbose=False):
+    """Save a multifunction model, optionally applying anemll-dedup weight dedup.
+
+    Args:
+        sources: List of (mlpackage_path, src_function_name, target_function_name).
+                 First entry is the anchor for dedup.
+        output_path: Where to save the combined mlpackage.
+        dedup_weights: If True, run surgical weight dedup before combining.
+        verbose: Print dedup details.
+    """
+    if dedup_weights and len(sources) > 1:
+        try:
+            from anemll.utils.dedup_weights import prepare_dedup_sources
+        except ImportError:
+            print("Warning: dedup_weights module not available, falling back to standard combine")
+            dedup_weights = False
+
+    if dedup_weights and len(sources) > 1:
+        with prepare_dedup_sources(sources, verbose=verbose) as deduped:
+            desc = ct.utils.MultiFunctionDescriptor()
+            for path, src_fn, tgt_fn in deduped:
+                desc.add_function(path, src_fn, tgt_fn)
+            desc.default_function_name = sources[0][2]  # first entry's target fn
+            ct.utils.save_multifunction(desc, output_path)
+    else:
+        desc = ct.utils.MultiFunctionDescriptor()
+        for path, src_fn, tgt_fn in sources:
+            desc.add_function(path, src_fn, tgt_fn)
+        desc.default_function_name = sources[0][2]
+        ct.utils.save_multifunction(desc, output_path)
 
 def parse_model_args(args):
     """Parse command line arguments in the format name=model.mlpackage func=funcname."""
@@ -134,7 +167,7 @@ def validate_chunk_files(num_chunks, lut_bits=None, mode=None, prefix='llama'):
         
     return True
 
-def combine_chunks(num_chunks, lut_bits=None, mode=None, prefix='llama'):
+def combine_chunks(num_chunks, lut_bits=None, mode=None, prefix='llama', dedup_weights=False):
     """Combine FFN and prefill models into chunks."""
     try:
         # Use same naming pattern as validate_chunk_files
@@ -146,7 +179,7 @@ def combine_chunks(num_chunks, lut_bits=None, mode=None, prefix='llama'):
             ffn_template = f"{prefix}_FFN_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
             pf_template = f"{prefix}_prefill_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
             combined_template = f"{prefix}_FFN_PF_chunk_{{:02d}}of{num_chunks:02d}.mlpackage"
-        
+
         for chunk_idx in range(num_chunks):
             try:
                 # Get input model paths
@@ -154,58 +187,53 @@ def combine_chunks(num_chunks, lut_bits=None, mode=None, prefix='llama'):
                 prefill_path = pf_template.format(chunk_idx + 1)
                 output_path = combined_template.format(chunk_idx + 1)
                 temp_path = f"temp_{output_path}"
-                
+
                 print(f"\nProcessing chunk {chunk_idx+1}:")
                 print(f"  FFN: {ffn_path}")
                 print(f"  Prefill: {prefill_path}")
                 print(f"  Output: {output_path}")
-                
-                # Load models
+
+                # Load models for metadata
                 ffn_model = ct.models.MLModel(ffn_path)
                 prefill_model = ct.models.MLModel(prefill_path)
-                
-                # Create combined model
-                desc = ct.utils.MultiFunctionDescriptor()
-                desc.add_function(ffn_path, "main", "infer")
-                desc.add_function(prefill_path, "main", "prefill")
-                desc.default_function_name = "infer"
-                
+
+                # Create combined model (with optional anemll-dedup dedup)
                 print("Creating combined model...")
-                ct.utils.save_multifunction(desc, temp_path)
-                
+                sources = [(ffn_path, "main", "infer"), (prefill_path, "main", "prefill")]
+                _save_multifunction_dedup(sources, temp_path, dedup_weights=dedup_weights)
+
                 # Load the temp model to add metadata
                 print("Loading combined model...")
                 combined_model = ct.models.MLModel(temp_path)
                 if combined_model is None:
                     raise ValueError(f"Failed to load combined model")
-                
+
                 # Add metadata and save final
                 print("Adding metadata...")
                 AddCombinedMetadata(combined_model, [ffn_model, prefill_model])
                 print(f"Saving final model to: {output_path}")
                 combined_model.save(output_path)
-                
+
                 # Clean up temp file
-                import shutil
                 shutil.rmtree(temp_path, ignore_errors=True)
-                
+
                 print(f"Successfully combined chunk {chunk_idx+1}")
-                
+
             except Exception as e:
                 print(f"\nError processing chunk {chunk_idx+1}: {str(e)}")
                 import traceback
                 traceback.print_exc()
                 return False
-                
+
         return True
-        
+
     except Exception as e:
         print(f"\nError during combination process: {str(e)}")
         import traceback
         traceback.print_exc()
         return False
 
-def combine_chunks_split_rotate(num_chunks, lut_bits=None, prefix='gemma3'):
+def combine_chunks_split_rotate(num_chunks, lut_bits=None, prefix='gemma3', dedup_weights=False):
     """Combine models into 2-function files, splitting by rotation mode.
 
     This is for large models where 4 functions in one file is too complex for ANE.
@@ -217,12 +245,11 @@ def combine_chunks_split_rotate(num_chunks, lut_bits=None, prefix='gemma3'):
         num_chunks: Number of chunks
         lut_bits: LUT quantization bits (or None)
         prefix: Model name prefix
+        dedup_weights: If True, apply anemll-dedup weight dedup before combining
 
     Returns:
         bool: True if successful, False otherwise
     """
-    import shutil
-
     try:
         # Build file name templates
         if lut_bits:
@@ -270,7 +297,7 @@ def combine_chunks_split_rotate(num_chunks, lut_bits=None, prefix='gemma3'):
                         print(f"  - {f}")
                     return False
 
-                # Load models
+                # Load models for metadata
                 ffn_model = ct.models.MLModel(ffn_path)
                 ffn_rotate_model = ct.models.MLModel(ffn_rotate_path)
                 prefill_model = ct.models.MLModel(prefill_path)
@@ -278,33 +305,26 @@ def combine_chunks_split_rotate(num_chunks, lut_bits=None, prefix='gemma3'):
 
                 # Create non-rotate combined model with 2 functions (infer + prefill)
                 print("Creating non-rotate 2-function model (infer + prefill)...")
-                desc = ct.utils.MultiFunctionDescriptor()
-                desc.add_function(ffn_path, "main", "infer")
-                desc.add_function(prefill_path, "main", "prefill")
-                desc.default_function_name = "infer"
-
+                sources = [(ffn_path, "main", "infer"), (prefill_path, "main", "prefill")]
                 temp_path = f"temp_{output_path}"
-                ct.utils.save_multifunction(desc, temp_path)
+                _save_multifunction_dedup(sources, temp_path, dedup_weights=dedup_weights)
                 combined = ct.models.MLModel(temp_path)
                 AddCombinedMetadata(combined, [ffn_model, prefill_model])
                 combined.save(output_path)
                 shutil.rmtree(temp_path, ignore_errors=True)
-                print(f"  ✓ Non-rotate model saved: {output_path}")
+                print(f"  Non-rotate model saved: {output_path}")
 
                 # Create rotate combined model with 2 functions (infer_rotate + prefill_rotate)
                 print("Creating rotate 2-function model (infer_rotate + prefill_rotate)...")
-                desc_rot = ct.utils.MultiFunctionDescriptor()
-                desc_rot.add_function(ffn_rotate_path, "main", "infer_rotate")
-                desc_rot.add_function(prefill_rotate_path, "main", "prefill_rotate")
-                desc_rot.default_function_name = "infer_rotate"
-
+                sources_rot = [(ffn_rotate_path, "main", "infer_rotate"),
+                               (prefill_rotate_path, "main", "prefill_rotate")]
                 temp_rot_path = f"temp_{output_rot_path}"
-                ct.utils.save_multifunction(desc_rot, temp_rot_path)
+                _save_multifunction_dedup(sources_rot, temp_rot_path, dedup_weights=dedup_weights)
                 combined_rot = ct.models.MLModel(temp_rot_path)
                 AddCombinedMetadata(combined_rot, [ffn_rotate_model, prefill_rotate_model])
                 combined_rot.save(output_rot_path)
                 shutil.rmtree(temp_rot_path, ignore_errors=True)
-                print(f"  ✓ Rotate model saved: {output_rot_path}")
+                print(f"  Rotate model saved: {output_rot_path}")
 
                 print(f"Successfully created split-rotate chunk {chunk_idx+1}")
 
@@ -323,7 +343,7 @@ def combine_chunks_split_rotate(num_chunks, lut_bits=None, prefix='gemma3'):
         return False
 
 
-def combine_chunks_gemma3(num_chunks, lut_bits=None, prefix='gemma3'):
+def combine_chunks_gemma3(num_chunks, lut_bits=None, prefix='gemma3', dedup_weights=False):
     """Combine FFN, FFN_rotate, prefill, and prefill_rotate models into chunks with 4 functions.
 
     This is for Gemma3 models that require rotation support for positions >= sliding_window.
@@ -337,12 +357,11 @@ def combine_chunks_gemma3(num_chunks, lut_bits=None, prefix='gemma3'):
         num_chunks: Number of chunks
         lut_bits: LUT quantization bits (or None)
         prefix: Model name prefix
+        dedup_weights: If True, apply anemll-dedup weight dedup before combining
 
     Returns:
         bool: True if successful, False otherwise
     """
-    import shutil
-
     try:
         # Build file name templates
         if lut_bits:
@@ -386,22 +405,21 @@ def combine_chunks_gemma3(num_chunks, lut_bits=None, prefix='gemma3'):
                         print(f"  - {f}")
                     return False
 
-                # Load models
+                # Load models for metadata
                 ffn_model = ct.models.MLModel(ffn_path)
                 ffn_rotate_model = ct.models.MLModel(ffn_rotate_path)
                 prefill_model = ct.models.MLModel(prefill_path)
                 prefill_rotate_model = ct.models.MLModel(prefill_rotate_path)
 
-                # Create combined model with 4 functions
-                desc = ct.utils.MultiFunctionDescriptor()
-                desc.add_function(ffn_path, "main", "infer")
-                desc.add_function(ffn_rotate_path, "main", "infer_rotate")
-                desc.add_function(prefill_path, "main", "prefill")
-                desc.add_function(prefill_rotate_path, "main", "prefill_rotate")
-                desc.default_function_name = "infer"
-
+                # Create combined model with 4 functions (with optional anemll-dedup dedup)
                 print("Creating 4-function combined model...")
-                ct.utils.save_multifunction(desc, temp_path)
+                sources = [
+                    (ffn_path, "main", "infer"),
+                    (ffn_rotate_path, "main", "infer_rotate"),
+                    (prefill_path, "main", "prefill"),
+                    (prefill_rotate_path, "main", "prefill_rotate"),
+                ]
+                _save_multifunction_dedup(sources, temp_path, dedup_weights=dedup_weights)
 
                 # Load the temp model to add metadata
                 print("Loading combined model...")
@@ -462,7 +480,7 @@ def parse_lut_arg(lut_value):
         except ValueError:
             raise ValueError(f"Invalid LUT bits value: {lut_value}")
 
-def combine_monolithic(lut_bits=None, prefix='qwen', input_dir='.', output_dir='.'):
+def combine_monolithic(lut_bits=None, prefix='qwen', input_dir='.', output_dir='.', dedup_weights=False):
     """Combine monolithic infer and prefill models into single multi-function model.
 
     This creates a combined model with two functions:
@@ -474,12 +492,11 @@ def combine_monolithic(lut_bits=None, prefix='qwen', input_dir='.', output_dir='
         prefix: Model name prefix
         input_dir: Directory containing the input models
         output_dir: Directory to save the combined model
+        dedup_weights: If True, apply anemll-dedup weight dedup before combining
 
     Returns:
         bool: True if successful, False otherwise
     """
-    import shutil
-
     # Build file names
     if lut_bits:
         infer_name = f"{prefix}_monolithic_lut{lut_bits}.mlpackage"
@@ -499,6 +516,8 @@ def combine_monolithic(lut_bits=None, prefix='qwen', input_dir='.', output_dir='
     print(f"  Infer:   {infer_path}")
     print(f"  Prefill: {prefill_path}")
     print(f"  Output:  {output_path}")
+    if dedup_weights:
+        print(f"  anemll-dedup:   enabled")
 
     # Check input files exist
     if not os.path.exists(infer_path):
@@ -509,19 +528,15 @@ def combine_monolithic(lut_bits=None, prefix='qwen', input_dir='.', output_dir='
         return False
 
     try:
-        # Load models
+        # Load models for metadata
         print("Loading models...")
         infer_model = ct.models.MLModel(infer_path)
         prefill_model = ct.models.MLModel(prefill_path)
 
-        # Create combined model
+        # Create combined model (with optional anemll-dedup dedup)
         print("Creating multi-function model...")
-        desc = ct.utils.MultiFunctionDescriptor()
-        desc.add_function(infer_path, "main", "infer")
-        desc.add_function(prefill_path, "main", "prefill")
-        desc.default_function_name = "infer"
-
-        ct.utils.save_multifunction(desc, temp_path)
+        sources = [(infer_path, "main", "infer"), (prefill_path, "main", "prefill")]
+        _save_multifunction_dedup(sources, temp_path, dedup_weights=dedup_weights)
 
         # Load and add metadata
         print("Adding metadata...")
@@ -548,7 +563,7 @@ def combine_monolithic(lut_bits=None, prefix='qwen', input_dir='.', output_dir='
         return False
 
 
-def combine_monolithic_rotate(lut_bits=None, prefix='gemma3', input_dir='.', output_dir='.'):
+def combine_monolithic_rotate(lut_bits=None, prefix='gemma3', input_dir='.', output_dir='.', dedup_weights=False):
     """Combine monolithic models with rotation support into 4-function model.
 
     This creates a combined model with four functions for context >= 512:
@@ -562,12 +577,11 @@ def combine_monolithic_rotate(lut_bits=None, prefix='gemma3', input_dir='.', out
         prefix: Model name prefix
         input_dir: Directory containing the input models
         output_dir: Directory to save the combined model
+        dedup_weights: If True, apply anemll-dedup weight dedup before combining
 
     Returns:
         bool: True if successful, False otherwise
     """
-    import shutil
-
     # Build file names
     if lut_bits:
         infer_name = f"{prefix}_monolithic_lut{lut_bits}.mlpackage"
@@ -595,6 +609,8 @@ def combine_monolithic_rotate(lut_bits=None, prefix='gemma3', input_dir='.', out
     print(f"  Prefill:        {prefill_path}")
     print(f"  Prefill_rotate: {prefill_rotate_path}")
     print(f"  Output:         {output_path}")
+    if dedup_weights:
+        print(f"  anemll-dedup:          enabled")
 
     # Check input files exist
     missing = []
@@ -608,23 +624,22 @@ def combine_monolithic_rotate(lut_bits=None, prefix='gemma3', input_dir='.', out
         return False
 
     try:
-        # Load models
+        # Load models for metadata
         print("Loading models...")
         infer_model = ct.models.MLModel(infer_path)
         infer_rotate_model = ct.models.MLModel(infer_rotate_path)
         prefill_model = ct.models.MLModel(prefill_path)
         prefill_rotate_model = ct.models.MLModel(prefill_rotate_path)
 
-        # Create combined model with 4 functions
+        # Create combined model with 4 functions (with optional anemll-dedup dedup)
         print("Creating 4-function multi-function model...")
-        desc = ct.utils.MultiFunctionDescriptor()
-        desc.add_function(infer_path, "main", "infer")
-        desc.add_function(infer_rotate_path, "main", "infer_rotate")
-        desc.add_function(prefill_path, "main", "prefill")
-        desc.add_function(prefill_rotate_path, "main", "prefill_rotate")
-        desc.default_function_name = "infer"
-
-        ct.utils.save_multifunction(desc, temp_path)
+        sources = [
+            (infer_path, "main", "infer"),
+            (infer_rotate_path, "main", "infer_rotate"),
+            (prefill_path, "main", "prefill"),
+            (prefill_rotate_path, "main", "prefill_rotate"),
+        ]
+        _save_multifunction_dedup(sources, temp_path, dedup_weights=dedup_weights)
 
         # Load and add metadata
         print("Adding metadata...")
@@ -673,6 +688,11 @@ def parse_args():
                       help='Output directory for combined models (default: same as input)')
     parser.add_argument('--prefix', type=str, default='llama',
                       help='Prefix for model names (default: llama)')
+    parser.add_argument('--anemll-dedup', action='store_true', default=True,
+                      dest='dedup_weights',
+                      help='Enable anemll-dedup surgical weight dedup before combining (default: enabled)')
+    parser.add_argument('--skip-anemll-dedup', dest='dedup_weights', action='store_false',
+                      help='Skip anemll-dedup weight dedup (use standard combine)')
     return parser.parse_args()
 
 def get_model_names(args):
@@ -690,16 +710,17 @@ def get_model_names(args):
 def combine_models(args):
     input_dir = Path(args.input)
     output_dir = Path(args.output) if args.output else input_dir
-    
+
     # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # First validate all files exist
     if not validate_chunk_files(args.chunk, args.lut, None, args.prefix):
         raise FileNotFoundError("Missing required model files")
-    
+
     # Combine the chunks
-    if combine_chunks(args.chunk, args.lut, None, args.prefix):
+    dedup = getattr(args, 'dedup_weights', False)
+    if combine_chunks(args.chunk, args.lut, None, args.prefix, dedup_weights=dedup):
         print("\nAll chunks combined successfully!")
         return True
     else:
@@ -713,6 +734,12 @@ def main():
     args.lut = parse_lut_arg(args.lut)
 
     try:
+        dedup = args.dedup_weights
+        if dedup:
+            print("anemll-dedup weight dedup: enabled")
+        else:
+            print("anemll-dedup weight dedup: disabled")
+
         # Handle monolithic mode
         if args.monolithic:
             input_dir = args.input
@@ -723,7 +750,8 @@ def main():
                     lut_bits=args.lut,
                     prefix=args.prefix,
                     input_dir=input_dir,
-                    output_dir=output_dir
+                    output_dir=output_dir,
+                    dedup_weights=dedup,
                 )
             else:
                 # 2-function model (context < 512)
@@ -731,7 +759,8 @@ def main():
                     lut_bits=args.lut,
                     prefix=args.prefix,
                     input_dir=input_dir,
-                    output_dir=output_dir
+                    output_dir=output_dir,
+                    dedup_weights=dedup,
                 )
             sys.exit(0 if success else 1)
 
@@ -749,11 +778,11 @@ def main():
             print(f"\nCombining models with split-rotate (2 files per chunk)...")
             print(f"  Non-rotate file (_chunk_XXofYY): infer + prefill")
             print(f"  Rotate file (_chunk_XXofYY_rot): infer_rotate + prefill_rotate")
-            success = combine_chunks_split_rotate(args.chunk, args.lut, args.prefix)
+            success = combine_chunks_split_rotate(args.chunk, args.lut, args.prefix, dedup_weights=dedup)
         # Handle Gemma3 mode (4 functions in 1 file)
         elif args.gemma3:
             print(f"\nCombining Gemma3 models with 4 functions (infer, infer_rotate, prefill, prefill_rotate)...")
-            success = combine_chunks_gemma3(args.chunk, args.lut, args.prefix)
+            success = combine_chunks_gemma3(args.chunk, args.lut, args.prefix, dedup_weights=dedup)
         else:
             # Run standard 2-function combination
             success = combine_models(args)
