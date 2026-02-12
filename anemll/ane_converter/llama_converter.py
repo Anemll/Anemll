@@ -48,6 +48,10 @@ class LlamaConverter(BaseConverter):
         batch_size=64,
         num_chunks=1,
         argmax_in_model=False,
+        lut_embeddings_bits=None,
+        lut_embeddings_per_channel=8,
+        lut_lmhead_bits=None,
+        lut_lmhead_per_channel=8,
     ):
         super().__init__(model)
         self.context_length = context_length
@@ -59,6 +63,10 @@ class LlamaConverter(BaseConverter):
         self.batch_size = batch_size
         self.num_chunks = num_chunks
         self.argmax_in_model = argmax_in_model
+        self.lut_embeddings_bits = lut_embeddings_bits
+        self.lut_embeddings_per_channel = lut_embeddings_per_channel
+        self.lut_lmhead_bits = lut_lmhead_bits
+        self.lut_lmhead_per_channel = lut_lmhead_per_channel
 
     def convert(self, split_part=None):
         """Convert model to CoreML format with optional splitting.
@@ -431,9 +439,30 @@ class LlamaConverter(BaseConverter):
         
         print("Model preprocessing completed")
 
+    @staticmethod
+    def _make_palettizer_config(nbits, per_channel, num_workers):
+        """Build an OpPalettizerConfig for the given bit-width / granularity."""
+        if per_channel <= 0:
+            return cto.coreml.OpPalettizerConfig(
+                mode="kmeans",
+                nbits=nbits,
+                granularity="per_tensor",
+                num_kmeans_workers=num_workers if num_workers is not None else 1,
+            )
+        return cto.coreml.OpPalettizerConfig(
+            mode="kmeans",
+            nbits=nbits,
+            granularity="per_grouped_channel",
+            group_size=per_channel,
+            num_kmeans_workers=num_workers if num_workers is not None else 1,
+        )
+
     def postprocess(self, num_workers=None):
         """Postprocessing steps after conversion.
-        
+
+        Supports per-component LUT overrides for monolithic models via
+        lut_embeddings_bits / lut_lmhead_bits.
+
         Args:
             num_workers: Optional number of workers for parallel processing.
                         If None, uses default single worker.
@@ -451,26 +480,50 @@ class LlamaConverter(BaseConverter):
                     if SklearnConvergenceWarning is not None:
                         warnings.simplefilter('ignore', SklearnConvergenceWarning)
                     warnings.simplefilter('ignore', UserWarning)
-                    # Set up quantization config - use per_tensor if per_channel <= 0
-                    if use_per_tensor:
-                        config = cto.coreml.OptimizationConfig(
-                            global_config=cto.coreml.OpPalettizerConfig(
-                                mode="kmeans",
-                                nbits=self.lut_bits,
-                                granularity="per_tensor",
-                                num_kmeans_workers=num_workers if num_workers is not None else 1
-                            ),
-                        )
-                    else:
-                        config = cto.coreml.OptimizationConfig(
-                            global_config=cto.coreml.OpPalettizerConfig(
-                                mode="kmeans",
-                                nbits=self.lut_bits,
-                                granularity="per_grouped_channel",
-                                group_size=self.per_channel,
-                                num_kmeans_workers=num_workers if num_workers is not None else 1
-                            ),
-                        )
+
+                    # Default (FFN) quantization config
+                    global_cfg = self._make_palettizer_config(
+                        self.lut_bits, self.per_channel, num_workers
+                    )
+
+                    # Per-component overrides for monolithic models
+                    op_name_configs = {}
+                    has_overrides = (
+                        self.lut_embeddings_bits is not None
+                        or self.lut_lmhead_bits is not None
+                    )
+
+                    if has_overrides:
+                        prog = self.converted_model._mil_program  # noqa: SLF001
+                        for fn_name in prog.functions:
+                            fn = prog.functions[fn_name]
+                            for op in fn.operations:
+                                op_name = op.name or ""
+                                if self.lut_embeddings_bits is not None and "embed_tokens" in op_name:
+                                    op_name_configs[op_name] = self._make_palettizer_config(
+                                        self.lut_embeddings_bits,
+                                        self.lut_embeddings_per_channel,
+                                        num_workers,
+                                    )
+                                elif self.lut_lmhead_bits is not None and "lm_head" in op_name:
+                                    op_name_configs[op_name] = self._make_palettizer_config(
+                                        self.lut_lmhead_bits,
+                                        self.lut_lmhead_per_channel,
+                                        num_workers,
+                                    )
+
+                        if op_name_configs:
+                            embed_count = sum(1 for k in op_name_configs if "embed_tokens" in k)
+                            lmhead_count = sum(1 for k in op_name_configs if "lm_head" in k)
+                            if self.lut_embeddings_bits is not None:
+                                print(f"  Embeddings: {self.lut_embeddings_bits}-bit LUT (per_channel={self.lut_embeddings_per_channel}) -> {embed_count} ops")
+                            if self.lut_lmhead_bits is not None:
+                                print(f"  LM head: {self.lut_lmhead_bits}-bit LUT (per_channel={self.lut_lmhead_per_channel}) -> {lmhead_count} ops")
+
+                    config = cto.coreml.OptimizationConfig(
+                        global_config=global_cfg,
+                        op_name_configs=op_name_configs if op_name_configs else None,
+                    )
 
                     # Apply quantization in a try-except block
                     try:
@@ -479,7 +532,6 @@ class LlamaConverter(BaseConverter):
                     except ValueError as e:
                         if "Pool not running" in str(e):
                             print("Warning: Multiprocessing pool error, retrying with single process...")
-                            # Retry with single process
                             config.global_config.num_kmeans_workers = 1
                             self.converted_model = cto.coreml.palettize_weights(self.converted_model, config)
                             print("LUT quantization completed (single process)")
@@ -1217,13 +1269,29 @@ def parse_args():
         action='store_true',
         help='Compute argmax inside LM head for part 3 / monolithic inference',
     )
+    parser.add_argument(
+        '--lut-embeddings',
+        type=str,
+        default=None,
+        help="Override LUT for embeddings in monolithic models. Same format as --lut. "
+             "If not set, uses --lut value.",
+    )
+    parser.add_argument(
+        '--lut-lmhead',
+        type=str,
+        default=None,
+        help="Override LUT for LM head in monolithic models. Same format as --lut. "
+             "If not set, uses --lut value.",
+    )
 
     return parser.parse_args()
 
 def test_conversion(model_path=None, output_path=None, context_length=512, lut_bits=4,
                    model=None, skip_load_weights=False, split_part='123',
                    batch_size=64, num_chunks=1, prefix='llama', output_dir='.',
-                   per_channel=8, argmax_in_model: bool = False):
+                   per_channel=8, argmax_in_model: bool = False,
+                   lut_embeddings_bits=None, lut_embeddings_per_channel=8,
+                   lut_lmhead_bits=None, lut_lmhead_per_channel=8):
     """Test conversion of a LLAMA model to ANE format."""
     if model is None:
         print(f"Testing conversion with model from {model_path}")
@@ -1257,6 +1325,10 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
         num_chunks=num_chunks,
         per_channel=per_channel,
         argmax_in_model=argmax_in_model,
+        lut_embeddings_bits=lut_embeddings_bits,
+        lut_embeddings_per_channel=lut_embeddings_per_channel,
+        lut_lmhead_bits=lut_lmhead_bits,
+        lut_lmhead_per_channel=lut_lmhead_per_channel,
     )
 
     vocab_size_meta = int(getattr(model.config, "vocab_size", 0)) if model is not None else None
@@ -1438,6 +1510,10 @@ def main():
     # Parse LUT argument
     lut_bits, per_channel = parse_lut_arg(args.lut)
 
+    # Parse per-component LUT overrides
+    lut_embeddings_bits, lut_embeddings_per_channel = parse_lut_arg(args.lut_embeddings)
+    lut_lmhead_bits, lut_lmhead_per_channel = parse_lut_arg(args.lut_lmhead)
+
     # Set model path
     model_path = args.model if args.model else "../Meta-Llama-3.2-1B"
 
@@ -1447,6 +1523,10 @@ def main():
     print(f"Context length: {args.context_length}")
     if lut_bits:
         print(f"LUT quantization: {lut_bits} bits, per_channel group size: {per_channel}")
+    if lut_embeddings_bits is not None:
+        print(f"LUT embeddings override: {lut_embeddings_bits} bits, per_channel={lut_embeddings_per_channel}")
+    if lut_lmhead_bits is not None:
+        print(f"LUT lm_head override: {lut_lmhead_bits} bits, per_channel={lut_lmhead_per_channel}")
     if args.chunk:
         print(f"Splitting into {args.chunk} chunks")
     if args.argmax:
@@ -1493,6 +1573,10 @@ def main():
             output_dir=args.output,
             per_channel=per_channel,
             argmax_in_model=args.argmax,
+            lut_embeddings_bits=lut_embeddings_bits,
+            lut_embeddings_per_channel=lut_embeddings_per_channel,
+            lut_lmhead_bits=lut_lmhead_bits,
+            lut_lmhead_per_channel=lut_lmhead_per_channel,
         )
             
     except Exception as e:

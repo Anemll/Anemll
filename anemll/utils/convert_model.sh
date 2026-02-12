@@ -47,7 +47,8 @@ ONLY_STEP=""  # Run only this step if set
 PREFIX="llama"  # Default prefix for model names
 MODEL_PATH=""
 OUTPUT_DIR=""
-NUM_CHUNKS=2   # Default number of chunks
+NUM_CHUNKS=2   # Default number of chunks (or 'auto')
+MAX_CHUNK_MB=950  # Max chunk size in MB for --chunk auto
 
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
@@ -99,7 +100,8 @@ print_usage() {
     echo "  --restart       Restart from specific step (1-8, default: 1)"
     echo "  --only          Run only specified step and exit (1-8)"
     echo "  --prefix        Prefix for model names (default: llama)"
-    echo "  --chunk         Number of chunks to split FFN/prefill (default: 2)"
+    echo "  --chunk         Number of chunks or 'auto' (default: 2)"
+    echo "  --max-chunk-mb  Max chunk size in MB for --chunk auto (default: 950)"
     echo "  --skip-check    Skip the dependency check step"
     echo "  --force-mlprogram-compile  Force ML Program when compiling .mlpackage models"
     echo "  --allow-missing-weights  Continue conversion even if some weights are missing"
@@ -168,6 +170,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --chunk)
             NUM_CHUNKS="$2"
+            shift 2
+            ;;
+        --max-chunk-mb)
+            MAX_CHUNK_MB="$2"
             shift 2
             ;;
         --skip-check)
@@ -378,6 +384,34 @@ if [ -f "$CONFIG_FILE" ]; then
         echo "Detected vocab_size: $VOCAB_SIZE_RAW, split_lm_head: $SPLIT_LM_HEAD"
         echo "Derived lm_head_chunk_sizes: $LM_HEAD_CHUNK_SIZES_JSON"
     fi
+fi
+
+# Resolve --chunk auto
+if [ "$NUM_CHUNKS" = "auto" ]; then
+    echo ""
+    echo "Auto-detecting optimal chunk count..."
+    # Extract LUT bits from LUT_PART2 (e.g., "6" or "6,4" → "6")
+    LUT_BITS=$(echo "$LUT_PART2" | cut -d',' -f1)
+    if [ -z "$LUT_BITS" ] || [ "$LUT_BITS" = "none" ] || [ "$LUT_BITS" = "no" ] || [ "$LUT_BITS" = "false" ]; then
+        LUT_BITS=16  # FP16 if no LUT
+    fi
+
+    NUM_CHUNKS=$(python3 "$SCRIPT_DIR/calc_chunk_split.py" \
+        --auto --max-chunk-mb "$MAX_CHUNK_MB" --lut "$LUT_BITS" \
+        --overhead 1.10 "$MODEL_PATH" 2>&1)
+
+    if [ $? -ne 0 ] || [ -z "$NUM_CHUNKS" ] || ! [[ "$NUM_CHUNKS" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Failed to auto-detect chunk count: $NUM_CHUNKS"
+        echo "Please specify --chunk manually."
+        exit 1
+    fi
+
+    LUT_LABEL="LUT${LUT_BITS}"
+    if [ "$LUT_BITS" = "16" ]; then
+        LUT_LABEL="FP16"
+    fi
+    echo "Auto-detected: --chunk $NUM_CHUNKS ($LUT_LABEL, max ${MAX_CHUNK_MB}MB per chunk with 10% overhead)"
+    echo ""
 fi
 
 # Step 0: Check dependencies

@@ -52,12 +52,22 @@ class Gemma3Converter(BaseConverter):
         attention_size: int | None = None,
         fp16_scaled: bool = False,
         prefill_dynamic_slice: bool = True,
+        lut_embeddings_bits: int | None = None,
+        lut_embeddings_per_channel: int = 8,
+        lut_lmhead_bits: int | None = None,
+        lut_lmhead_per_channel: int = 8,
     ) -> None:
         super().__init__(model)
         self.context_length = context_length
         self.batch_size = batch_size
         self.lut_bits = lut_bits
         self.per_channel = per_channel
+        # Per-component LUT overrides for monolithic models.
+        # When set, these override lut_bits for the respective component.
+        self.lut_embeddings_bits = lut_embeddings_bits
+        self.lut_embeddings_per_channel = lut_embeddings_per_channel
+        self.lut_lmhead_bits = lut_lmhead_bits
+        self.lut_lmhead_per_channel = lut_lmhead_per_channel
         self.head_dim = (
             model.model.config.hidden_size // model.model.config.num_attention_heads
         )
@@ -384,8 +394,32 @@ class Gemma3Converter(BaseConverter):
             ]
         return states
 
+    @staticmethod
+    def _make_palettizer_config(nbits, per_channel, num_workers, weight_threshold):
+        """Build an OpPalettizerConfig for the given bit-width / granularity."""
+        if per_channel <= 0:
+            return cto.coreml.OpPalettizerConfig(
+                mode="kmeans",
+                nbits=nbits,
+                granularity="per_tensor",
+                num_kmeans_workers=num_workers if num_workers is not None else 1,
+                weight_threshold=weight_threshold,
+            )
+        return cto.coreml.OpPalettizerConfig(
+            mode="kmeans",
+            nbits=nbits,
+            granularity="per_grouped_channel",
+            group_size=per_channel,
+            num_kmeans_workers=num_workers if num_workers is not None else 1,
+            weight_threshold=weight_threshold,
+        )
+
     def postprocess(self, num_workers=None):
         """Apply LUT quantization if configured.
+
+        Supports per-component LUT overrides for monolithic models via
+        lut_embeddings_bits / lut_lmhead_bits.  When set, embedding and/or
+        LM head ops get a different quantization config from the FFN default.
 
         Args:
             num_workers: Optional number of workers for parallel processing.
@@ -410,40 +444,67 @@ class Gemma3Converter(BaseConverter):
                     warnings.filterwarnings("ignore", category=RuntimeWarning)
 
                     # Exclude small weights from LUT quantization (norms, etc.)
-                    # Norm weights are small: layernorm=5KB, q/k_norm=512B in FP16
-                    # Setting weight_threshold=8192 (8KB) excludes all norms but keeps
-                    # large projection weights (which are typically 1MB+)
-                    # This is more reliable than op_name_configs regex patterns which
-                    # often fail because CoreML renames ops to generic names (op_0, etc.)
                     weight_threshold = 8192  # 8KB - excludes norms (~5KB), keeps projections
                     print(f"  Using weight_threshold={weight_threshold} bytes (excludes norm weights)")
 
-                    # Set up quantization config - use per_tensor if per_channel <= 0
-                    if use_per_tensor:
-                        config = cto.coreml.OptimizationConfig(
-                            global_config=cto.coreml.OpPalettizerConfig(
-                                mode="kmeans",
-                                nbits=self.lut_bits,
-                                granularity="per_tensor",
-                                num_kmeans_workers=(
-                                    num_workers if num_workers is not None else 1
-                                ),
-                                weight_threshold=weight_threshold,
-                            ),
-                        )
-                    else:
-                        config = cto.coreml.OptimizationConfig(
-                            global_config=cto.coreml.OpPalettizerConfig(
-                                mode="kmeans",
-                                nbits=self.lut_bits,
-                                granularity="per_grouped_channel",
-                                group_size=self.per_channel,
-                                num_kmeans_workers=(
-                                    num_workers if num_workers is not None else 1
-                                ),
-                                weight_threshold=weight_threshold,
-                            ),
-                        )
+                    # Default (FFN) quantization config
+                    global_cfg = self._make_palettizer_config(
+                        self.lut_bits, self.per_channel, num_workers, weight_threshold
+                    )
+
+                    # Per-component overrides for monolithic models
+                    op_name_configs: dict = {}
+                    has_overrides = (
+                        self.lut_embeddings_bits is not None
+                        or self.lut_lmhead_bits is not None
+                    )
+
+                    if has_overrides:
+                        # Scan ops to find embedding / lm_head weights by name pattern
+                        prog = self.converted_model._mil_program  # noqa: SLF001
+                        for fn_name in prog.functions:
+                            fn = prog.functions[fn_name]
+                            for op in fn.operations:
+                                op_name = op.name or ""
+                                # Embeddings: ops whose name contains 'embed_tokens'
+                                if self.lut_embeddings_bits is not None and "embed_tokens" in op_name:
+                                    cfg = self._make_palettizer_config(
+                                        self.lut_embeddings_bits,
+                                        self.lut_embeddings_per_channel,
+                                        num_workers,
+                                        weight_threshold,
+                                    )
+                                    op_name_configs[op_name] = cfg
+                                # LM head: ops whose name contains 'lm_head'
+                                elif self.lut_lmhead_bits is not None and "lm_head" in op_name:
+                                    cfg = self._make_palettizer_config(
+                                        self.lut_lmhead_bits,
+                                        self.lut_lmhead_per_channel,
+                                        num_workers,
+                                        weight_threshold,
+                                    )
+                                    op_name_configs[op_name] = cfg
+
+                        if op_name_configs:
+                            embed_count = sum(1 for k in op_name_configs if "embed_tokens" in k)
+                            lmhead_count = sum(1 for k in op_name_configs if "lm_head" in k)
+                            if self.lut_embeddings_bits is not None:
+                                print(
+                                    f"  Embeddings: {self.lut_embeddings_bits}-bit LUT "
+                                    f"(per_channel={self.lut_embeddings_per_channel}) "
+                                    f"-> {embed_count} ops"
+                                )
+                            if self.lut_lmhead_bits is not None:
+                                print(
+                                    f"  LM head: {self.lut_lmhead_bits}-bit LUT "
+                                    f"(per_channel={self.lut_lmhead_per_channel}) "
+                                    f"-> {lmhead_count} ops"
+                                )
+
+                    config = cto.coreml.OptimizationConfig(
+                        global_config=global_cfg,
+                        op_name_configs=op_name_configs if op_name_configs else None,
+                    )
 
                     # Apply quantization
                     self.converted_model = cto.coreml.palettize_weights(
@@ -2046,6 +2107,20 @@ def parse_args() -> argparse.Namespace:
              "(e.g., '4', '4,8', '4,0' for per-tensor). Default per_channel is 8.",
     )
     parser.add_argument(
+        "--lut-embeddings",
+        type=str,
+        default=None,
+        help="Override LUT for embeddings in monolithic models. Same format as --lut. "
+             "If not set, uses --lut value.",
+    )
+    parser.add_argument(
+        "--lut-lmhead",
+        type=str,
+        default=None,
+        help="Override LUT for LM head in monolithic models. Same format as --lut. "
+             "If not set, uses --lut value.",
+    )
+    parser.add_argument(
         "--chunk",
         type=int,
         default=None,
@@ -2264,6 +2339,10 @@ def test_conversion(
     prefill_dynamic_slice: bool = False,
     single_cache: bool = False,
     chunk_no: Optional[int] = None,
+    lut_embeddings_bits: Optional[int] = None,
+    lut_embeddings_per_channel: int = 8,
+    lut_lmhead_bits: Optional[int] = None,
+    lut_lmhead_per_channel: int = 8,
 ) -> ct.models.MLModel | List[ct.models.MLModel]:
     """Convert a Gemma3 model and save the result.
 
@@ -2433,6 +2512,10 @@ def test_conversion(
         attention_size=attention_size,
         fp16_scaled=fp16_scaled,  # Exclude scaled tensors from LUT quantization
         prefill_dynamic_slice=prefill_dynamic_slice,
+        lut_embeddings_bits=lut_embeddings_bits,
+        lut_embeddings_per_channel=lut_embeddings_per_channel,
+        lut_lmhead_bits=lut_lmhead_bits,
+        lut_lmhead_per_channel=lut_lmhead_per_channel,
     )
 
     print("Starting conversion...")
@@ -2579,6 +2662,14 @@ def main() -> None:
         else:
             print(f"LUT quantization: {lut_bits} bits, per_channel group size: {per_channel}")
 
+    # Parse per-component LUT overrides
+    lut_embeddings_bits, lut_embeddings_per_channel = parse_lut_arg(args.lut_embeddings)
+    lut_lmhead_bits, lut_lmhead_per_channel = parse_lut_arg(args.lut_lmhead)
+    if lut_embeddings_bits is not None:
+        print(f"LUT embeddings override: {lut_embeddings_bits} bits, per_channel={lut_embeddings_per_channel}")
+    if lut_lmhead_bits is not None:
+        print(f"LUT lm_head override: {lut_lmhead_bits} bits, per_channel={lut_lmhead_per_channel}")
+
     try:
         print("\nCalling test_conversion()...")
         result = test_conversion(
@@ -2601,6 +2692,10 @@ def main() -> None:
             prefill_dynamic_slice=prefill_dynamic_slice,
             single_cache=single_cache,
             chunk_no=args.chunk_no,
+            lut_embeddings_bits=lut_embeddings_bits,
+            lut_embeddings_per_channel=lut_embeddings_per_channel,
+            lut_lmhead_bits=lut_lmhead_bits,
+            lut_lmhead_per_channel=lut_lmhead_per_channel,
         )
         print(f"Conversion completed successfully! Result: {type(result)}")
     except Exception as e:  # pragma: no cover - CLI tool

@@ -6,6 +6,7 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 
 ### 🔄 **What's New in 0.3.5**
 - **🗜️ ANEMLL-Dedup** - Surgical weight deduplication for multifunction CoreML models. Replaces palettized weight blobs that are semantically identical (verified via dequantization) before `save_multifunction`, enabling CoreML's dedup pass to share them. Typical savings: **~50%** on combined infer+prefill packages. Enabled by default in `combine_models.py` and conversion scripts. [Documentation](./docs/anemll-dedup.md)
+- **📐 Auto Chunk Split** - `--chunk auto` in `convert_model.sh` automatically calculates the optimal number of FFN chunks based on model architecture, LUT quantization level, and a configurable max chunk size (default 950 MB with 10% overhead). Also available as a standalone calculator: `python anemll/utils/calc_chunk_split.py`. [Documentation](./docs/calc_chunk_split.md)
 - **🔬 ANE Profiler** - CoreML/ANE profiling without Xcode: analyze which ops run on ANE vs GPU vs CPU, benchmark timing, identify fallbacks, and generate compatibility reports. [Documentation](./anemll/utils/ANE_PROFILER.md)
 - **📦 Auto-activate virtual environment** - `convert_model.sh` and `check_dependencies.sh` now auto-activate a project venv (`env-anemll`, `anemll-env`, `.venv`, or `venv`) when none is active. Override with `ANEMLL_VENV` or disable with `ANEMLL_AUTO_VENV=0`.
 - **🦙 Gemma 3 converter** - Improvements to Gemma 3 conversion pipeline.

@@ -15,6 +15,8 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 CONTEXT_LENGTH=512
 BATCH_SIZE=64
 LUT_BITS=4          # Default LUT bits for all components
+LUT_EMBEDDINGS=""   # Override LUT for embeddings (empty = use LUT_BITS)
+LUT_LMHEAD=""       # Override LUT for LM head (empty = use LUT_BITS)
 PREFIX=""           # Auto-detect based on architecture
 MODEL_PATH=""
 OUTPUT_DIR=""
@@ -51,8 +53,10 @@ print_usage() {
     echo "  --output        Output directory for converted models (required)"
     echo "  --context       Context length (default: 512)"
     echo "  --batch         Batch size for prefill (default: 64)"
-    echo "  --lut           LUT bits for all components (default: 4)"
+    echo "  --lut           LUT bits for FFN layers (default: 4)"
     echo "                  Format: 'bits' or 'bits,per_channel' (e.g., '4' or '4,8')"
+    echo "  --lut-embeddings  Override LUT for embeddings (default: same as --lut)"
+    echo "  --lut-lmhead      Override LUT for LM head (default: same as --lut)"
     echo "  --prefix        Prefix for model names (default: auto-detect)"
     echo "  --restart       Restart from specific step (1-6, 2b, 2c; default: 1)"
     echo "  --only          Run only specified step and exit (1-6, 2b, 2c)"
@@ -107,6 +111,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --lut)
             LUT_BITS="$2"
+            shift 2
+            ;;
+        --lut-embeddings)
+            LUT_EMBEDDINGS="$2"
+            shift 2
+            ;;
+        --lut-lmhead)
+            LUT_LMHEAD="$2"
             shift 2
             ;;
         --restart)
@@ -331,6 +343,12 @@ echo "Prefix:         $PREFIX"
 echo "Context length: $CONTEXT_LENGTH"
 echo "Batch size:     $BATCH_SIZE"
 echo "LUT bits:       $LUT_BITS"
+if [ ! -z "$LUT_EMBEDDINGS" ]; then
+    echo "LUT embeddings: $LUT_EMBEDDINGS"
+fi
+if [ ! -z "$LUT_LMHEAD" ]; then
+    echo "LUT lm_head:    $LUT_LMHEAD"
+fi
 echo "Argmax in model:$ARGMAX_IN_MODEL"
 echo "=========================================="
 echo ""
@@ -383,10 +401,18 @@ run_step() {
     fi
 }
 
-# Prepare LUT parameter
+# Prepare LUT parameters
 LUT_PARAM=""
 if [ ! -z "$LUT_BITS" ]; then
     LUT_PARAM="--lut $LUT_BITS"
+fi
+LUT_EMBED_PARAM=""
+if [ ! -z "$LUT_EMBEDDINGS" ]; then
+    LUT_EMBED_PARAM="--lut-embeddings $LUT_EMBEDDINGS"
+fi
+LUT_LMHEAD_PARAM=""
+if [ ! -z "$LUT_LMHEAD" ]; then
+    LUT_LMHEAD_PARAM="--lut-lmhead $LUT_LMHEAD"
 fi
 
 # Prepare argmax parameter
@@ -416,6 +442,8 @@ fi
 run_step 1 "Converting Monolithic Inference Model" "$CONVERTER \
     --part monolithic \
     $LUT_PARAM \
+    $LUT_EMBED_PARAM \
+    $LUT_LMHEAD_PARAM \
     $ARGMAX_PARAM \
     $SINGLE_CACHE_PARAM \
     --context-length $CONTEXT_LENGTH \
@@ -428,6 +456,8 @@ run_step 1 "Converting Monolithic Inference Model" "$CONVERTER \
 run_step 2 "Converting Monolithic Prefill Model" "$CONVERTER \
     --part monolithic_prefill \
     $LUT_PARAM \
+    $LUT_EMBED_PARAM \
+    $LUT_LMHEAD_PARAM \
     $ARGMAX_PARAM \
     $DYNAMIC_PREFILL_SLICE_PARAM \
     $SINGLE_CACHE_PARAM \
@@ -448,6 +478,8 @@ if [ "$HAS_SWA" = true ] && [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
     run_step "2b" "Converting Monolithic Inference Rotate Model" "$CONVERTER \
         --part monolithic_rotate \
         $LUT_PARAM \
+        $LUT_EMBED_PARAM \
+        $LUT_LMHEAD_PARAM \
         $ARGMAX_PARAM \
         $SINGLE_CACHE_PARAM \
         --context-length $CONTEXT_LENGTH \
@@ -460,6 +492,8 @@ if [ "$HAS_SWA" = true ] && [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
     run_step "2c" "Converting Monolithic Prefill Rotate Model" "$CONVERTER \
         --part monolithic_prefill_rotate \
         $LUT_PARAM \
+        $LUT_EMBED_PARAM \
+        $LUT_LMHEAD_PARAM \
         $ARGMAX_PARAM \
         $DYNAMIC_PREFILL_SLICE_PARAM \
         $SINGLE_CACHE_PARAM \
@@ -537,6 +571,8 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
         --arg model_path "$MODEL_PATH" \
         --arg output_dir "$OUTPUT_DIR" \
         --arg lut_bits "${LUT_BITS:-none}" \
+        --arg lut_embeddings "${LUT_EMBEDDINGS:-}" \
+        --arg lut_lmhead "${LUT_LMHEAD:-}" \
         --arg prefix "$PREFIX" \
         --arg architecture "$ARCH" \
         --arg fp16_scale "${FP16_SCALE:-}" \
@@ -557,6 +593,8 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
             context_length: $context_length,
             batch_size: $batch_size,
             lut_bits: $lut_bits,
+            lut_embeddings: (if $lut_embeddings == "" then null else $lut_embeddings end),
+            lut_lmhead: (if $lut_lmhead == "" then null else $lut_lmhead end),
             prefix: $prefix,
             architecture: $architecture,
             argmax_in_model: $argmax_in_model,
@@ -633,7 +671,7 @@ EOF_CONFIG
 
         ANEMLL_CONVERSION_INFO=\"\$CONVERSION_INFO\" python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
-            \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \"${LUT_BITS:-none}\" \
+            \"${LUT_EMBEDDINGS:-${LUT_BITS:-none}}\" \"${LUT_BITS:-none}\" \"${LUT_LMHEAD:-${LUT_BITS:-none}}\" \
             1 \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \
             --monolithic $ARGMAX_PARAM $ROTATE_META_FLAG $SLIDING_WINDOW_FLAG $UPDATE_MASK_PREFILL_FLAG $PREFILL_DYNAMIC_SLICE_FLAG $SINGLE_CACHE_META_FLAG
     "
