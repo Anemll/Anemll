@@ -115,6 +115,8 @@ def generate_monolithic_meta(
     prefix,
     arch,
     output_dir,
+    lut_embeddings=None,
+    lut_lmhead=None,
     argmax_in_model=False,
     rotate=False,
     sliding_window=None,
@@ -180,6 +182,18 @@ def generate_monolithic_meta(
 
     if lut_per_channel is not None:
         meta_parts.append(f'    lut_per_channel: {lut_per_channel}')
+
+    # Per-component LUT overrides (only if different from main lut_bits)
+    if lut_embeddings is not None:
+        emb_val, emb_pc, _ = parse_lut_value(lut_embeddings)
+        meta_parts.append(f'    lut_embeddings: {emb_val}')
+        if emb_pc is not None:
+            meta_parts.append(f'    lut_embeddings_per_channel: {emb_pc}')
+    if lut_lmhead is not None:
+        lmh_val, lmh_pc, _ = parse_lut_value(lut_lmhead)
+        meta_parts.append(f'    lut_lmhead: {lmh_val}')
+        if lmh_pc is not None:
+            meta_parts.append(f'    lut_lmhead_per_channel: {lmh_pc}')
 
     argmax_line = f'\n    argmax_in_model: true' if argmax_in_model else ''
     vocab_line = f'\n    vocab_size: {vocab_size}' if vocab_size is not None else ''
@@ -347,15 +361,24 @@ def main():
         if len(sys.argv) != 11:
             print("Usage: python3 generate_meta_yaml.py <model_name> <context> <batch> <lut_bits> <lut_bits> <lut_bits> <num_chunks> <prefix> <arch> <output_dir> --monolithic [--argmax] [--rotate] [--update-mask-prefill] [--dynamic-prefill-slice|--static-prefill-slice] [--single-cache] [--sliding-window N]")
             sys.exit(1)
-        # For monolithic, all LUT values should be the same (use the first one)
+        # Positional args: [4]=lut_emb, [5]=lut_ffn, [6]=lut_lmh
+        # For monolithic, use FFN LUT as the main lut_bits (filename & global config)
+        lut_emb_arg = sys.argv[4]
+        lut_ffn_arg = sys.argv[5]
+        lut_lmh_arg = sys.argv[6]
+        # Per-component overrides: only pass if different from FFN default
+        emb_override = lut_emb_arg if lut_emb_arg != lut_ffn_arg else None
+        lmh_override = lut_lmh_arg if lut_lmh_arg != lut_ffn_arg else None
         generate_monolithic_meta(
             model_name=sys.argv[1],
             context=sys.argv[2],
             batch=sys.argv[3],
-            lut_bits=sys.argv[4],  # Use first LUT value for all
+            lut_bits=lut_ffn_arg,  # FFN LUT = main lut_bits
             prefix=sys.argv[8],
             arch=sys.argv[9],
             output_dir=sys.argv[10],
+            lut_embeddings=emb_override,
+            lut_lmhead=lmh_override,
             # Optional metadata from conversion info (if provided)
             vocab_size=conversion_info_dict.get('vocab_size') if conversion_info_dict else None,
             lm_head_chunk_sizes=conversion_info_dict.get('lm_head_chunk_sizes') if conversion_info_dict else None,

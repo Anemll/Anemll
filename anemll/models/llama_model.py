@@ -1224,12 +1224,14 @@ class LlamaForCausalLM(nn.Module):
                 else:
                     filtered_state_dict["lm_head.weight"] = v
 
-        # Load filtered weights
+        # Load filtered weights (lm_head only at this stage)
         missing_keys, unexpected_keys = self.load_state_dict(filtered_state_dict, strict=False)
         allow_missing = os.environ.get("ANEMLL_ALLOW_MISSING_WEIGHTS", "").lower() in ("1", "true", "yes")
-        if missing_keys:
-            print(f"Missing keys: {missing_keys}")
-            # Highlight actionable TODO in red for conversion logs
+        # Filter out keys that belong to the base model — those are loaded in Stage 2 below
+        stage1_expected_missing = [k for k in missing_keys if k.startswith("model.")]
+        stage1_actual_missing = [k for k in missing_keys if not k.startswith("model.")]
+        if stage1_actual_missing:
+            print(f"Missing keys (lm_head stage): {stage1_actual_missing}")
             print("\033[91mTODO: Weights not found or renamed. Check checkpoint prefixes and model config.\033[0m")
             print("Hint: set ANEMLL_ALLOW_MISSING_WEIGHTS=1 (or --allow-missing-weights in convert scripts) to continue anyway.")
         if unexpected_keys:

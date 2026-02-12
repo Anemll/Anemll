@@ -142,9 +142,10 @@ fi
 if [ "$MODEL_FORMAT" = "monolithic" ]; then
     NUM_CHUNKS=1
     if [ -n "$LUT_BITS" ]; then
+        # Use lut_bits as FFN default; per-component overrides from meta take precedence
         LUT_FFN="$LUT_BITS"
-        LUT_LMHEAD="$LUT_BITS"
-        LUT_EMBEDDINGS="$LUT_BITS"
+        [ -z "$LUT_LMHEAD" ] && LUT_LMHEAD="$LUT_BITS"
+        [ -z "$LUT_EMBEDDINGS" ] && LUT_EMBEDDINGS="$LUT_BITS"
     fi
 else
     # Validate and set default values for LUT parameters
