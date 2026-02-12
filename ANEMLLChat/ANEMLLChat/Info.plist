@@ -2,8 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleDevelopmentRegion</key>
-	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
@@ -13,12 +11,12 @@
 			<string>Editor</string>
 			<key>LSHandlerRank</key>
 			<string>Owner</string>
-			<key>LSTypeIsPackage</key>
-			<true/>
 			<key>LSItemContentTypes</key>
 			<array>
 				<string>com.anemll.model-package</string>
 			</array>
+			<key>LSTypeIsPackage</key>
+			<true/>
 		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
@@ -33,18 +31,24 @@
 			</array>
 		</dict>
 	</array>
+	<key>LSMinimumSystemVersion</key>
+	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict/>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
-			<key>UTTypeIdentifier</key>
-			<string>com.anemll.model-package</string>
-			<key>UTTypeDescription</key>
-			<string>ANEMLL Model Package</string>
 			<key>UTTypeConformsTo</key>
 			<array>
 				<string>public.directory</string>
 				<string>com.apple.package</string>
 			</array>
+			<key>UTTypeDescription</key>
+			<string>ANEMLL Model Package</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.anemll.model-package</string>
 			<key>UTTypeTagSpecification</key>
 			<dict>
 				<key>public.filename-extension</key>
@@ -54,28 +58,8 @@
 			</dict>
 		</dict>
 	</array>
-	<key>CFBundleExecutable</key>
-	<string>$(EXECUTABLE_NAME)</string>
-	<key>CFBundleIdentifier</key>
-	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
-	<key>CFBundleInfoDictionaryVersion</key>
-	<string>6.0</string>
-	<key>CFBundleName</key>
-	<string>$(PRODUCT_NAME)</string>
-	<key>CFBundlePackageType</key>
-	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
-	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
-	<key>CFBundleVersion</key>
-	<string>1</string>
-	<key>LSMinimumSystemVersion</key>
-	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
-	<key>UIFileSharingEnabled</key>
-	<true/>
-	<key>UILaunchScreen</key>
-	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>

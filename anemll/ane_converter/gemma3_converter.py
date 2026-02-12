@@ -756,74 +756,74 @@ class Gemma3Converter(BaseConverter):
                 class MonolithicWrapper(torch.nn.Module):
                     """Wrapper combining embeddings + transformer + LM head (prefill with update_mask)."""
 
-                def __init__(
-                    self, model: Gemma3ForCausalLM, context_length: int, is_prefill: bool,
-                    argmax_in_model: bool = False, is_prefill_rotate: bool = False
-                ) -> None:
-                    super().__init__()
-                    self.model = model
-                    self.context_length = context_length
-                    self.is_prefill = is_prefill
-                    self.is_prefill_rotate = is_prefill_rotate
-                    self.argmax_in_model = argmax_in_model
+                    def __init__(
+                        self, model: Gemma3ForCausalLM, context_length: int, is_prefill: bool,
+                        argmax_in_model: bool = False, is_prefill_rotate: bool = False
+                    ) -> None:
+                        super().__init__()
+                        self.model = model
+                        self.context_length = context_length
+                        self.is_prefill = is_prefill
+                        self.is_prefill_rotate = is_prefill_rotate
+                        self.argmax_in_model = argmax_in_model
 
-                    # Determine LM head mode
-                    if hasattr(model, "lm_head16_1"):
-                        self.lm_head_mode = "16"
-                        self.lm_heads = [
-                            getattr(model, f"lm_head16_{i}") for i in range(1, 17)
-                        ]
-                        self.chunk_size = 16384  # 262144 / 16
-                    elif hasattr(model, "lm_head8_1"):
-                        self.lm_head_mode = "8"
-                        self.lm_heads = [
-                            getattr(model, f"lm_head8_{i}") for i in range(1, 9)
-                        ]
-                        self.chunk_size = 32768  # 262144 / 8
-                    elif hasattr(model, "lm_head2_1"):
-                        self.lm_head_mode = "2"
-                        self.lm_heads = [model.lm_head2_1, model.lm_head2_2]
-                        self.chunk_size = 131072  # 262144 / 2
-                    elif hasattr(model, "lm_head1"):
-                        self.lm_head_mode = "1"
-                        self.lm_head = model.lm_head1
-                        self.chunk_size = 262144
-                    else:
-                        self.lm_head_mode = "linear"
-                        self.lm_head = model.lm_head
-                        self.chunk_size = 262144
+                        # Determine LM head mode
+                        if hasattr(model, "lm_head16_1"):
+                            self.lm_head_mode = "16"
+                            self.lm_heads = [
+                                getattr(model, f"lm_head16_{i}") for i in range(1, 17)
+                            ]
+                            self.chunk_size = 16384  # 262144 / 16
+                        elif hasattr(model, "lm_head8_1"):
+                            self.lm_head_mode = "8"
+                            self.lm_heads = [
+                                getattr(model, f"lm_head8_{i}") for i in range(1, 9)
+                            ]
+                            self.chunk_size = 32768  # 262144 / 8
+                        elif hasattr(model, "lm_head2_1"):
+                            self.lm_head_mode = "2"
+                            self.lm_heads = [model.lm_head2_1, model.lm_head2_2]
+                            self.chunk_size = 131072  # 262144 / 2
+                        elif hasattr(model, "lm_head1"):
+                            self.lm_head_mode = "1"
+                            self.lm_head = model.lm_head1
+                            self.chunk_size = 262144
+                        else:
+                            self.lm_head_mode = "linear"
+                            self.lm_head = model.lm_head
+                            self.chunk_size = 262144
 
-                def forward(
-                    self,
-                    input_ids: torch.Tensor,
-                    position_ids: torch.Tensor,
-                    causal_mask: torch.Tensor,
-                    current_pos: torch.Tensor,
-                    update_mask: torch.Tensor,
-                ) -> tuple:
-                    # Step 1: Embeddings (with Gemma3 scaling)
-                    hidden_states = self.model.model.embed_tokens(input_ids)
-                    hidden_states = hidden_states * self.model.model.embedding_scale
-                    hidden_states = hidden_states.to(MODEL_DTYPE)
+                    def forward(
+                        self,
+                        input_ids: torch.Tensor,
+                        position_ids: torch.Tensor,
+                        causal_mask: torch.Tensor,
+                        current_pos: torch.Tensor,
+                        update_mask: torch.Tensor,
+                    ) -> tuple:
+                        # Step 1: Embeddings (with Gemma3 scaling)
+                        hidden_states = self.model.model.embed_tokens(input_ids)
+                        hidden_states = hidden_states * self.model.model.embedding_scale
+                        hidden_states = hidden_states.to(MODEL_DTYPE)
 
-                    # Step 2: Transformer layers (RoPE handled inside process_layers)
-                    hidden_states = self.model.model.process_layers(
-                        hidden_states,
-                        position_ids,
-                        causal_mask,
-                        current_pos,
-                        start_layer=0,
-                        end_layer=None,
-                        IN_PREFILL=self.is_prefill,
-                        IN_PREFILL_ROTATE=self.is_prefill_rotate,
-                        update_mask=update_mask,
-                    )
+                        # Step 2: Transformer layers (RoPE handled inside process_layers)
+                        hidden_states = self.model.model.process_layers(
+                            hidden_states,
+                            position_ids,
+                            causal_mask,
+                            current_pos,
+                            start_layer=0,
+                            end_layer=None,
+                            IN_PREFILL=self.is_prefill,
+                            IN_PREFILL_ROTATE=self.is_prefill_rotate,
+                            update_mask=update_mask,
+                        )
 
-                    # Apply final normalization
-                    hidden_states = self.model.model.norm(hidden_states)
+                        # Apply final normalization
+                        hidden_states = self.model.model.norm(hidden_states)
 
-                    # Prefill output: return only the first token to minimize output size
-                    return hidden_states[:, 0:1, :]
+                        # Prefill output: return only the first token to minimize output size
+                        return hidden_states[:, 0:1, :]
             else:
                 class MonolithicWrapper(torch.nn.Module):
                     """Wrapper combining embeddings + transformer + LM head (prefill, dynamic slice)."""
@@ -1116,7 +1116,10 @@ class Gemma3Converter(BaseConverter):
             num_chunks = 1
 
         # Build output specifications
-        if argmax_in_model:
+        if is_prefill:
+            # Prefill models only update KV cache; output hidden state for API compatibility.
+            outputs = [ct.TensorType(name="output_hidden_states", dtype=np.float16)]
+        elif argmax_in_model:
             # Output 2 tensors: argmax_idx[num_chunks] and argmax_val[num_chunks]
             # Note: shape is inferred automatically by coremltools
             # Using int32 for CoreML compatibility (int16 is not supported for outputs)

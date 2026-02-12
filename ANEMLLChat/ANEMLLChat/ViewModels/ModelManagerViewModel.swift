@@ -96,6 +96,147 @@ enum DeviceType {
 
     /// Maximum weight file size in bytes (1GB for limited devices)
     static let maxWeightFileSize: Int64 = 1_073_741_824  // 1 GB
+
+    // [ANE-COMPAT:M1-A14] Global attention compatibility check
+    /// Whether this device supports Gemma3 global attention (KV-cache rotation).
+    /// M1 Macs and A14 (and earlier) iOS devices cannot handle the global attention
+    /// KV-cache implementation. Both M1 and A14 are first-gen Apple Silicon families
+    /// and share this limitation.
+    static var supportsGlobalAttention: Bool {
+        let chip = chipName.lowercased()
+        // M1 (including M1 Pro, M1 Max, M1 Ultra) does NOT support it
+        if chip.range(of: #"\bm1\b"#, options: .regularExpression) != nil { return false }
+        if chip.range(of: #"\bm1 "#, options: .regularExpression) != nil { return false }
+        // A14 and earlier don't support it
+        if chip.range(of: #"\ba1[0-4]\b"#, options: .regularExpression) != nil { return false }
+        if chip.range(of: #"\ba[1-9]\b"#, options: .regularExpression) != nil { return false }
+        // Intel Macs
+        if chip.contains("intel") { return false }
+        // Unknown chips — be conservative
+        if chip.contains("unknown") { return false }
+        // Everything else (M2+, A15+) supports it
+        return true
+    }
+
+    // MARK: - Device Info
+
+    /// Machine identifier (e.g., "arm64", "iPad14,5", "iPhone16,1")
+    static var machineIdentifier: String {
+        var sysinfo = utsname()
+        uname(&sysinfo)
+        return withUnsafePointer(to: &sysinfo.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+                String(validatingUTF8: $0)
+            }
+        } ?? "unknown"
+    }
+
+    /// CPU/chip brand string (e.g., "Apple M1", "Apple M4 Pro")
+    /// On macOS uses sysctl; on iOS infers from device identifier
+    static var chipName: String {
+        #if os(macOS)
+        var size: size_t = 0
+        sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
+        if size > 0 {
+            var buffer = [CChar](repeating: 0, count: size)
+            sysctlbyname("machdep.cpu.brand_string", &buffer, &size, nil, 0)
+            let brand = String(cString: buffer).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !brand.isEmpty { return brand }
+        }
+        return hasMSeriesChip ? "Apple Silicon" : "Intel"
+        #else
+        return chipNameFromIdentifier(machineIdentifier)
+        #endif
+    }
+
+    /// Physical memory in bytes
+    static var physicalMemory: UInt64 {
+        ProcessInfo.processInfo.physicalMemory
+    }
+
+    /// Physical memory formatted (e.g., "8 GB")
+    static var physicalMemoryString: String {
+        ByteCountFormatter.string(fromByteCount: Int64(physicalMemory), countStyle: .memory)
+    }
+
+    /// Number of active processor cores
+    static var processorCount: Int {
+        ProcessInfo.processInfo.activeProcessorCount
+    }
+
+    /// OS version string
+    static var osVersionString: String {
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        #if os(macOS)
+        return "macOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
+        #elseif os(visionOS)
+        return "visionOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
+        #else
+        let device = UIDevice.current
+        return "\(device.systemName) \(device.systemVersion)"
+        #endif
+    }
+
+    /// Full device summary for logging
+    static var deviceSummary: String {
+        let chip = chipName
+        let mem = physicalMemoryString
+        let cores = processorCount
+        let os = osVersionString
+        let machine = machineIdentifier
+        let mSeries = hasMSeriesChip ? "M-series" : "non-M-series"
+        return "\(os) | \(chip) (\(mSeries)) | \(cores) cores | \(mem) RAM | \(machine)"
+    }
+
+    /// Infer Apple chip name from iOS/iPadOS device identifier
+    private static func chipNameFromIdentifier(_ id: String) -> String {
+        if id.hasPrefix("iPhone") {
+            let parts = id.replacingOccurrences(of: "iPhone", with: "").split(separator: ",")
+            if let major = parts.first, let num = Int(major) {
+                switch num {
+                case 17: return "Apple A18 Pro"
+                case 16: return "Apple A17 Pro"
+                case 15: return "Apple A16"
+                case 14: return "Apple A15"
+                case 13: return "Apple A14"
+                case 12: return "Apple A13"
+                case 11: return "Apple A12"
+                case 10: return "Apple A11"
+                default: return "Apple A-series"
+                }
+            }
+        }
+
+        if id.hasPrefix("iPad") {
+            let parts = id.replacingOccurrences(of: "iPad", with: "").split(separator: ",")
+            if let major = parts.first, let num = Int(major) {
+                switch num {
+                case 16: return "Apple M4"
+                case 14:
+                    if let minor = parts.last, let m = Int(minor), m >= 8 {
+                        return "Apple M2"
+                    }
+                    return "Apple M2"
+                case 13:
+                    if let minor = parts.last, let m = Int(minor), m >= 16 {
+                        return "Apple M1"
+                    }
+                    if let minor = parts.last, let m = Int(minor), m >= 4 {
+                        return "Apple M1"
+                    }
+                    return "Apple A14"
+                case 12: return "Apple A14"
+                case 11: return "Apple A12/A12X"
+                case 8: return "Apple A12X/A12Z"
+                case 7: return "Apple A10"
+                default: return "Apple A-series"
+                }
+            }
+        }
+
+        if id.contains("arm64") { return "Apple Silicon" }
+        return "Unknown (\(id))"
+    }
 }
 
 enum LocalModelImportMode: String, CaseIterable, Sendable {
@@ -264,35 +405,64 @@ final class ModelManagerViewModel {
 
     // MARK: - Model Loading
 
-    /// Load model list (defaults + custom)
+    /// HuggingFace collection URL for dynamic model list
+    private static let collectionURL = URL(string: "https://huggingface.co/api/collections/anemll/anemll-chat")!
+
+    /// Load model list: try HF collection → cache → hardcoded defaults, then merge custom models
     func loadModels() async {
         logInfo("Loading models...", category: .model)
 
-        // Start with defaults - these should ALWAYS be available
-        var models = ModelInfo.defaultModels
-        logDebug("Starting with \(models.count) default models", category: .model)
+        // Step 1: Get base model list (collection → cache → defaults)
+        var models: [ModelInfo]
 
-        // Add custom models (if any)
         do {
-            let customModels = try await StorageService.shared.loadModelsRegistry()
-            for custom in customModels {
-                if !models.contains(where: { $0.id == custom.id }) {
-                    models.append(custom)
-                    logDebug("Added custom model: \(custom.id)", category: .model)
+            let fetched = try await fetchCollectionModels()
+            models = fetched
+            logInfo("Fetched \(fetched.count) models from HuggingFace collection", category: .model)
+            // Cache for offline use
+            await StorageService.shared.saveCollectionCache(fetched)
+        } catch {
+            print("[Collection] ERROR: \(error)")
+            logWarning("Failed to fetch collection: \(error)", category: .model)
+            // Try cache
+            if let cached = await StorageService.shared.loadCollectionCache() {
+                models = cached
+                logInfo("Using \(cached.count) cached collection models", category: .model)
+            } else {
+                models = ModelInfo.defaultModels
+                logInfo("Using \(models.count) hardcoded default models", category: .model)
+            }
+        }
+
+        // Step 2: Add custom models from registry (local imports/links and downloaded HF models only)
+        // The collection fetch (Step 1) is the authoritative source for HuggingFace models.
+        // Only merge registry entries that are locally imported/linked or actually downloaded.
+        // This prevents stale HF entries (from old author-search) from polluting the model list.
+        do {
+            let registryModels = try await StorageService.shared.loadModelsRegistry()
+            for entry in registryModels {
+                guard !models.contains(where: { $0.id == entry.id }) else { continue }
+                // Keep: local imports, local links, and downloaded HF models
+                // Skip: non-downloaded HF models (the collection already covers those)
+                if entry.sourceKind == .localImported || entry.sourceKind == .localLinked || entry.isDownloaded {
+                    models.append(entry)
+                    logDebug("Added custom model: \(entry.id)", category: .model)
+                } else {
+                    logDebug("Skipped stale registry entry: \(entry.id)", category: .model)
                 }
             }
         } catch {
             logWarning("Failed to load custom models: \(error)", category: .model)
-            // Continue with defaults only
         }
 
-        // Check model availability and reset stale download state
+        // Step 3: Check model availability and reset stale download state
         for i in models.indices {
             models[i] = await refreshedModelStatus(for: models[i])
         }
 
         // Update the published property - this triggers UI update
         availableModels = models
+        refreshGlobalAttentionCompatibilityCache()
         logInfo("Loaded \(models.count) models (\(downloadedModels.count) downloaded)", category: .model)
 
         // Auto-load last model after models are loaded (if setting enabled)
@@ -301,20 +471,145 @@ final class ModelManagerViewModel {
         }
     }
 
-    /// Refresh download status for all models
-    func refreshModelStatus() async {
-        var refreshedModels: [ModelInfo] = []
-        refreshedModels.reserveCapacity(availableModels.count)
+    // MARK: - HuggingFace Collection Fetch
 
-        for model in availableModels {
+    /// Fetch model list from HuggingFace collection API
+    private func fetchCollectionModels() async throws -> [ModelInfo] {
+        let collectionURL = Self.collectionURL
+        print("[Collection] Fetching from: \(collectionURL)")
+
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 10
+        let session = URLSession(configuration: config)
+
+        let (collectionData, response) = try await session.data(from: collectionURL)
+        if let httpResponse = response as? HTTPURLResponse {
+            print("[Collection] HTTP \(httpResponse.statusCode), \(collectionData.count) bytes")
+        }
+
+        // Decode collection response
+        struct CollectionItem: Decodable {
+            let id: String
+            let type: String?
+            let position: Int?
+        }
+        struct CollectionResponse: Decodable {
+            let items: [CollectionItem]
+        }
+
+        let collection = try JSONDecoder().decode(CollectionResponse.self, from: collectionData)
+        let modelItems = collection.items
+            .filter { ($0.type ?? "model") == "model" }
+            .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
+
+        print("[Collection] Found \(modelItems.count) models in collection")
+
+        // Fetch per-model details concurrently
+        let models = await withTaskGroup(of: (Int, ModelInfo?).self) { group in
+            for (index, item) in modelItems.enumerated() {
+                group.addTask {
+                    do {
+                        let modelInfo = try await Self.fetchModelDetail(id: item.id, session: session)
+                        print("[Collection] Fetched detail for: \(item.id)")
+                        return (index, modelInfo)
+                    } catch {
+                        print("[Collection] Failed detail for \(item.id): \(error)")
+                        // Fall back to parsing from repo ID only
+                        return (index, ModelInfo.fromHuggingFaceRepo(id: item.id, sizeBytes: nil, modelType: nil))
+                    }
+                }
+            }
+
+            var results: [(Int, ModelInfo)] = []
+            for await result in group {
+                if let model = result.1 {
+                    results.append((result.0, model))
+                }
+            }
+            return results.sorted { $0.0 < $1.0 }.map(\.1)
+        }
+
+        print("[Collection] Returning \(models.count) models")
+        return models
+    }
+
+    /// Fetch individual model details from HuggingFace API
+    private static func fetchModelDetail(id: String, session: URLSession) async throws -> ModelInfo {
+        struct ModelDetailConfig: Decodable {
+            let model_type: String?
+        }
+        struct ModelDetailResponse: Decodable {
+            let usedStorage: Int64?
+            let config: ModelDetailConfig?
+        }
+
+        let url = URL(string: "https://huggingface.co/api/models/\(id)")!
+        let (data, _) = try await session.data(from: url)
+        let detail = try JSONDecoder().decode(ModelDetailResponse.self, from: data)
+
+        return ModelInfo.fromHuggingFaceRepo(
+            id: id,
+            sizeBytes: detail.usedStorage,
+            modelType: detail.config?.model_type
+        )
+    }
+
+    /// Refresh download status for all models and discover new ones from HuggingFace collection
+    func refreshModelStatus() async {
+        // Discover new models from HuggingFace curated collection (not author search)
+        var discovered: [ModelInfo] = []
+        do {
+            discovered = try await fetchCollectionModels()
+        } catch {
+            logWarning("Failed to fetch collection during refresh: \(error)", category: .model)
+        }
+        var models = availableModels
+
+        // Merge newly discovered models
+        var addedCount = 0
+        for newModel in discovered {
+            if !models.contains(where: { $0.id == newModel.id }) {
+                models.append(newModel)
+                addedCount += 1
+                logInfo("Discovered new model: \(newModel.id)", category: .model)
+            }
+        }
+        if addedCount > 0 {
+            logInfo("Discovered \(addedCount) new model(s) from HuggingFace", category: .model)
+        }
+
+        // Refresh download status for all models
+        var refreshedModels: [ModelInfo] = []
+        refreshedModels.reserveCapacity(models.count)
+
+        for model in models {
             refreshedModels.append(await refreshedModelStatus(for: model))
         }
         availableModels = refreshedModels
+        refreshGlobalAttentionCompatibilityCache()
+
+        // Save registry so newly discovered models persist
+        if addedCount > 0 {
+            try? await StorageService.shared.saveModelsRegistry(availableModels)
+        }
+
+        lastRefreshDiscoveredCount = addedCount
     }
+
+    /// Number of models discovered in last refresh (for UI feedback)
+    var lastRefreshDiscoveredCount: Int = 0
 
     // MARK: - Download
 
-    /// Download a model (public API - sets state and starts download)
+    // [ANE-COMPAT:M1-A14] Pre-download compatibility warning state
+    /// Warning message shown before downloading an incompatible model
+    var downloadCompatibilityWarningMessage: String?
+    /// Whether to show the pre-download compatibility warning alert
+    var showDownloadCompatibilityWarningAlert: Bool = false
+    /// Model pending download (waiting for user confirmation after compatibility check)
+    private var pendingDownloadModel: ModelInfo?
+
+    /// Download a model (public API - checks compatibility then starts download)
     func downloadModel(_ model: ModelInfo) async {
         guard model.sourceKind == .huggingFace else {
             errorMessage = "Only HuggingFace models support download."
@@ -322,12 +617,88 @@ final class ModelManagerViewModel {
         }
         guard !model.isDownloaded, !model.isDownloading else { return }
 
-        // Set state immediately so UI updates
+        // [ANE-COMPAT:M1-A14] On M1/A14, fetch meta.yaml first to check compatibility
+        if !DeviceType.supportsGlobalAttention {
+            if let warning = await fetchAndCheckPreDownloadCompatibility(for: model) {
+                downloadCompatibilityWarningMessage = warning
+                pendingDownloadModel = model
+                showDownloadCompatibilityWarningAlert = true
+                logWarning("Pre-download compatibility warning for \(model.id): \(warning)", category: .download)
+                return
+            }
+        }
+
+        // No compatibility issue — start download immediately
+        await startDownload(model)
+    }
+
+    /// Continue downloading after user confirmed pre-download compatibility warning
+    func confirmDownloadModel() async {
+        guard let model = pendingDownloadModel else {
+            clearPendingDownloadState()
+            return
+        }
+        clearPendingDownloadState()
+        await startDownload(model)
+    }
+
+    /// Cancel download after pre-download compatibility warning
+    func cancelDownloadModel() {
+        clearPendingDownloadState()
+    }
+
+    private func clearPendingDownloadState() {
+        pendingDownloadModel = nil
+        showDownloadCompatibilityWarningAlert = false
+        downloadCompatibilityWarningMessage = nil
+    }
+
+    /// Internal: set UI state and kick off performDownload
+    private func startDownload(_ model: ModelInfo) async {
         downloadingModelId = model.id
         updateModelDownloading(model.id, isDownloading: true)
-
-        // Perform the actual download
         await performDownload(model)
+    }
+
+    // [ANE-COMPAT:M1-A14] Fetch meta.yaml from HuggingFace and check for global attention incompatibility
+    /// Returns a warning message if the model is incompatible, or nil if OK / unknown.
+    /// Caches the result so ModelCard can display "Not Compatible" even before download.
+    private func fetchAndCheckPreDownloadCompatibility(for model: ModelInfo) async -> String? {
+        logInfo("Fetching meta.yaml for pre-download compatibility check: \(model.id)", category: .download)
+
+        guard let yamlContent = await DownloadService.shared.fetchMetaYaml(for: model.id) else {
+            logDebug("No meta.yaml available for pre-download check — proceeding with download", category: .download)
+            return nil
+        }
+
+        logInfo("Pre-download meta.yaml fetched for \(model.id), checking compatibility...", category: .download)
+
+        // Parse the YAML content using ModelMetadata's parsing logic
+        guard let metadata = ModelMetadata.loadFromString(yamlContent) else {
+            logDebug("Failed to parse meta.yaml for pre-download check — proceeding with download", category: .download)
+            return nil
+        }
+
+        // Only Gemma architecture is affected
+        let isGemma = metadata.isGemmaFamily
+            || model.architecture?.lowercased() == "gemma"
+            || model.id.lowercased().contains("gemma")
+        guard isGemma else {
+            // Cache as "checked, no warning" so we don't re-fetch
+            cacheGlobalAttentionWarning(nil, for: model.id)
+            return nil
+        }
+
+        // When contextLength > slidingWindow, global attention layers are needed
+        guard let sw = metadata.slidingWindow, metadata.contextLength > sw else {
+            cacheGlobalAttentionWarning(nil, for: model.id)
+            return nil
+        }
+
+        let warning = "This Gemma model uses global attention (context \(metadata.contextLength) > SWA \(sw)) which is not compatible with \(DeviceType.chipName). Requires Apple M2+ (Mac) or A15+ (iPhone/iPad). You can still download it, but it may not load correctly."
+        // Cache so ModelCard shows "Not Compatible" tag immediately
+        cacheGlobalAttentionWarning(warning, for: model.id)
+        return warning
     }
 
     /// Cancel ongoing download
@@ -360,6 +731,7 @@ final class ModelManagerViewModel {
                     availableModels[index].metaYamlPath = nil
                 }
             }
+            clearCachedGlobalAttentionWarning(for: model.id)
 
             try? await StorageService.shared.saveModelsRegistry(availableModels)
 
@@ -384,8 +756,27 @@ final class ModelManagerViewModel {
     /// Whether to show the weight warning alert
     var showWeightWarningAlert: Bool = false
 
+    // [ANE-COMPAT:M1-A14] Compatibility warning state
+    /// Warning message shown before loading an incompatible model
+    var compatibilityWarningMessage: String?
+
+    /// Whether to show the compatibility warning alert
+    var showCompatibilityWarningAlert: Bool = false
+
     /// Model pending load (waiting for user confirmation)
     private var pendingLoadModel: ModelInfo?
+
+    /// Which warning gate the user is currently confirming before load.
+    private enum PendingLoadWarning {
+        case none
+        case weightSize
+        case compatibility
+    }
+    private var pendingLoadWarning: PendingLoadWarning = .none
+
+    // [ANE-COMPAT:M1-A14] Cache post-download compatibility checks
+    private var globalAttentionWarningByModelId: [String: String] = [:]
+    private var globalAttentionCheckedModelIds: Set<String> = []
 
     /// Load a model for inference
     func loadModelForInference(_ model: ModelInfo) async {
@@ -398,12 +789,26 @@ final class ModelManagerViewModel {
             return
         }
 
+        // Reset stale warning state from a previous load attempt.
+        clearPendingLoadState()
+
         // Check for weight size warning
         if let warning = getWeightSizeWarning(for: model) {
             weightWarningMessage = warning
             pendingLoadModel = model
+            pendingLoadWarning = .weightSize
             showWeightWarningAlert = true
             logWarning("Model has weight size warning: \(warning)", category: .model)
+            return
+        }
+
+        // [ANE-COMPAT:M1-A14] Check for global attention compatibility
+        if let compatWarning = getGlobalAttentionWarning(for: model) {
+            compatibilityWarningMessage = compatWarning
+            pendingLoadModel = model
+            pendingLoadWarning = .compatibility
+            showCompatibilityWarningAlert = true
+            logWarning("Model has compatibility warning: \(compatWarning)", category: .model)
             return
         }
 
@@ -413,23 +818,46 @@ final class ModelManagerViewModel {
     /// Continue loading model after user confirmed weight warning
     func confirmLoadModel() async {
         guard let model = pendingLoadModel, let path = model.localPath else {
-            pendingLoadModel = nil
-            showWeightWarningAlert = false
+            clearPendingLoadState()
             return
         }
 
-        showWeightWarningAlert = false
-        weightWarningMessage = nil
-        pendingLoadModel = nil
+        switch pendingLoadWarning {
+        case .weightSize:
+            showWeightWarningAlert = false
+            weightWarningMessage = nil
 
-        await performModelLoad(model, path: path)
+            // If weights are acknowledged, still enforce Gemma global-attention warning.
+            if let compatWarning = getGlobalAttentionWarning(for: model) {
+                compatibilityWarningMessage = compatWarning
+                showCompatibilityWarningAlert = true
+                pendingLoadWarning = .compatibility
+                logWarning("Model has compatibility warning: \(compatWarning)", category: .model)
+                return
+            }
+
+            pendingLoadModel = nil
+            pendingLoadWarning = .none
+            await performModelLoad(model, path: path)
+
+        case .compatibility, .none:
+            clearPendingLoadState()
+            await performModelLoad(model, path: path)
+        }
     }
 
     /// Cancel model load
     func cancelLoadModel() {
+        clearPendingLoadState()
+    }
+
+    private func clearPendingLoadState() {
         pendingLoadModel = nil
+        pendingLoadWarning = .none
         showWeightWarningAlert = false
+        showCompatibilityWarningAlert = false
         weightWarningMessage = nil
+        compatibilityWarningMessage = nil
     }
 
     /// Internal method to perform model loading
@@ -1150,6 +1578,8 @@ final class ModelManagerViewModel {
         )
     }
 
+    // (HuggingFace author-search discovery removed — refresh now uses the curated collection API)
+
     // MARK: - Helpers
 
     nonisolated private static func normalizePackageRelativePath(_ rawPath: String) -> String? {
@@ -1583,6 +2013,15 @@ final class ModelManagerViewModel {
             availableModels[index].metaYamlPath = path.appendingPathComponent("meta.yaml").path
             availableModels[index].downloadProgress = nil
             availableModels[index].downloadError = nil
+
+            // Parse meta.yaml immediately after download to evaluate M1/A14 compatibility.
+            let warning = evaluateGlobalAttentionWarning(for: availableModels[index])
+            cacheGlobalAttentionWarning(warning, for: id)
+            if let warning {
+                logWarning("Post-download compatibility warning for \(id): \(warning)", category: .model)
+            } else {
+                logDebug("Post-download compatibility check passed: \(id)", category: .model)
+            }
         }
     }
 
@@ -1591,6 +2030,7 @@ final class ModelManagerViewModel {
             availableModels[index].isDownloading = false
             availableModels[index].downloadError = error
         }
+        clearCachedGlobalAttentionWarning(for: id)
     }
 
     // MARK: - Weight File Size Checking
@@ -1679,5 +2119,72 @@ final class ModelManagerViewModel {
     func hasOversizedWeights(for model: ModelInfo) -> Bool {
         guard let details = getWeightFileDetails(for: model) else { return false }
         return details.largest > DeviceType.maxWeightFileSize
+    }
+
+    // MARK: - ANE Compatibility Checking
+
+    // [ANE-COMPAT:M1-A14] Check model compatibility with device
+    /// Check if a model uses global attention that is incompatible with this device.
+    /// Works for both downloaded models (reads meta.yaml from disk) and pre-checked models
+    /// (returns cached result from pre-download meta.yaml fetch).
+    /// Returns a warning message, or nil if compatible.
+    /// NOTE: Currently only Gemma models are affected. Other architectures (Qwen, LLaMA)
+    /// may report sliding_window but don't have the same KV-cache rotation issue.
+    func getGlobalAttentionWarning(for model: ModelInfo) -> String? {
+        guard !DeviceType.supportsGlobalAttention else { return nil }
+
+        // Return cached result if available (covers both post-download and pre-download checks)
+        if globalAttentionCheckedModelIds.contains(model.id) {
+            return globalAttentionWarningByModelId[model.id]
+        }
+
+        // For downloaded models, evaluate from local meta.yaml
+        guard model.isDownloaded else { return nil }
+
+        let warning = evaluateGlobalAttentionWarning(for: model)
+        cacheGlobalAttentionWarning(warning, for: model.id)
+        return warning
+    }
+
+    private func evaluateGlobalAttentionWarning(for model: ModelInfo) -> String? {
+        guard !DeviceType.supportsGlobalAttention else { return nil }
+        guard let metaPath = model.metaYamlPath else { return nil }
+        guard let metadata = ModelMetadata.load(from: metaPath) else { return nil }
+
+        // Only Gemma architecture is affected by this limitation.
+        let isGemma = metadata.isGemmaFamily
+            || model.architecture?.lowercased() == "gemma"
+            || model.id.lowercased().contains("gemma")
+        guard isGemma else { return nil }
+
+        // When contextLength > slidingWindow, the model uses global attention layers
+        // beyond the SWA range — this requires M2+/A15+ hardware
+        guard let sw = metadata.slidingWindow, metadata.contextLength > sw else { return nil }
+        return "This Gemma model uses global attention (context \(metadata.contextLength) > SWA \(sw)) which is not compatible with \(DeviceType.chipName). Requires Apple M2+ (Mac) or A15+ (iPhone/iPad)."
+    }
+
+    private func cacheGlobalAttentionWarning(_ warning: String?, for modelId: String) {
+        globalAttentionCheckedModelIds.insert(modelId)
+        if let warning {
+            globalAttentionWarningByModelId[modelId] = warning
+        } else {
+            globalAttentionWarningByModelId.removeValue(forKey: modelId)
+        }
+    }
+
+    private func clearCachedGlobalAttentionWarning(for modelId: String) {
+        globalAttentionCheckedModelIds.remove(modelId)
+        globalAttentionWarningByModelId.removeValue(forKey: modelId)
+    }
+
+    private func refreshGlobalAttentionCompatibilityCache() {
+        globalAttentionWarningByModelId.removeAll()
+        globalAttentionCheckedModelIds.removeAll()
+
+        guard !DeviceType.supportsGlobalAttention else { return }
+        for model in availableModels where model.isDownloaded {
+            let warning = evaluateGlobalAttentionWarning(for: model)
+            cacheGlobalAttentionWarning(warning, for: model.id)
+        }
     }
 }

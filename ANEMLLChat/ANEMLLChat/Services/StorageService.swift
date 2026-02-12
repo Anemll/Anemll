@@ -483,12 +483,18 @@ actor StorageService {
     }
 
     /// Save custom models to registry
+    /// Only persists models that are locally imported/linked or actually downloaded.
+    /// Non-downloaded HuggingFace models are not saved — the collection fetch is the
+    /// authoritative source for those and saving them would create stale registry entries.
     func saveModelsRegistry(_ models: [ModelInfo]) async throws {
         try ensureDirectoryExists(appDataRootDirectory)
 
-        // Only save custom models (not defaults)
+        // Only save: (a) not a hardcoded default, AND (b) locally imported/linked or downloaded
         let customModels = models.filter { model in
-            !ModelInfo.defaultModels.contains(where: { $0.id == model.id })
+            guard !ModelInfo.defaultModels.contains(where: { $0.id == model.id }) else { return false }
+            return model.sourceKind == .localImported
+                || model.sourceKind == .localLinked
+                || model.isDownloaded
         }
 
         do {
@@ -514,6 +520,42 @@ actor StorageService {
         } catch {
             logWarning("Failed to load models registry: \(error)", category: .storage)
             return []
+        }
+    }
+
+    // MARK: - Collection Cache
+
+    /// File for cached HuggingFace collection models
+    private var collectionCacheFile: URL {
+        appDataRootDirectory.appendingPathComponent("collection_cache.json")
+    }
+
+    /// Save fetched collection models to cache
+    func saveCollectionCache(_ models: [ModelInfo]) {
+        do {
+            try ensureDirectoryExists(appDataRootDirectory)
+            let data = try encoder.encode(models)
+            try data.write(to: collectionCacheFile, options: .atomic)
+            logDebug("Saved \(models.count) collection models to cache", category: .storage)
+        } catch {
+            logWarning("Failed to save collection cache: \(error)", category: .storage)
+        }
+    }
+
+    /// Load cached collection models (returns nil if no cache or decode error)
+    func loadCollectionCache() -> [ModelInfo]? {
+        guard fileManager.fileExists(atPath: collectionCacheFile.path) else {
+            return nil
+        }
+
+        do {
+            let data = try Data(contentsOf: collectionCacheFile)
+            let models = try decoder.decode([ModelInfo].self, from: data)
+            logInfo("Loaded \(models.count) models from collection cache", category: .storage)
+            return models
+        } catch {
+            logWarning("Failed to load collection cache: \(error)", category: .storage)
+            return nil
         }
     }
 

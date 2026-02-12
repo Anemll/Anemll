@@ -671,20 +671,31 @@ final class InferenceService: ObservableObject {
     }
 
     private func detectTemplate(from config: YAMLConfig) -> String {
-        // Detect template from model path or config
-        let path = config.modelPath.lowercased()
+        // Detect template from model_prefix (authoritative) with fallback to model_path
+        let prefix = config.modelPrefix.lowercased()
 
-        if path.contains("gemma") {
-            return path.contains("gemma3") ? "gemma3" : "gemma"
-        } else if path.contains("qwen") {
+        if prefix.contains("gemma3") {
+            return "gemma3"
+        } else if prefix.contains("gemma") {
+            return "gemma"
+        } else if prefix.contains("qwen") {
             return "qwen"
-        } else if path.contains("deepseek") {
+        } else if prefix.contains("deepseek") {
             return "deepseek"
-        } else if path.contains("deephermes") {
+        } else if prefix.contains("deephermes") {
             return "deephermes"
-        } else if path.contains("llama") {
+        } else if prefix.contains("llama") {
             return "llama3"
         }
+
+        // Fallback: check model_path in case model_prefix is generic/default
+        let path = config.modelPath.lowercased()
+        if path.contains("gemma3") { return "gemma3" }
+        if path.contains("gemma") { return "gemma" }
+        if path.contains("qwen") { return "qwen" }
+        if path.contains("deepseek") { return "deepseek" }
+        if path.contains("deephermes") { return "deephermes" }
+        if path.contains("llama") { return "llama3" }
 
         return "default"
     }

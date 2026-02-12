@@ -13,6 +13,9 @@ struct InputBar: View {
 
     @FocusState private var isFocused: Bool
     @State private var showLoadingToast = false
+    @State private var showNoModelToast = false
+    @State private var showMicErrorToast = false
+    @State private var micErrorText = ""
     @State private var speechService = SpeechRecognitionService.shared
     @State private var textBeforeSpeech = ""  // Text in input before speech started
     @AppStorage("sendButtonOnLeft") private var sendButtonOnLeft = false
@@ -61,7 +64,21 @@ struct InputBar: View {
 
             // Toast overlay - appears above input bar
             if showLoadingToast {
-                LoadingToastView(message: "Model still loading...")
+                LoadingToastView(message: "Model still loading...", icon: "hourglass")
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .top).combined(with: .opacity),
+                        removal: .opacity
+                    ))
+                    .offset(y: -50)
+            } else if showNoModelToast {
+                LoadingToastView(message: "No model loaded", icon: "cpu.fill")
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .top).combined(with: .opacity),
+                        removal: .opacity
+                    ))
+                    .offset(y: -50)
+            } else if showMicErrorToast {
+                LoadingToastView(message: micErrorText, icon: "mic.slash.fill")
                     .transition(.asymmetric(
                         insertion: .move(edge: .top).combined(with: .opacity),
                         removal: .opacity
@@ -95,6 +112,21 @@ struct InputBar: View {
             } else if !isListening && wasListening {
                 // Speech just stopped - clear the saved text
                 textBeforeSpeech = ""
+            }
+        }
+        // Show speech service errors as toast (mic permission denied, etc.)
+        .onChange(of: speechService.errorMessage) { _, newError in
+            if let error = newError, !error.isEmpty {
+                micErrorText = error
+                withAnimation(.easeOut(duration: 0.2)) {
+                    showMicErrorToast = true
+                }
+                Task {
+                    try? await Task.sleep(for: .seconds(3))
+                    withAnimation(.easeIn(duration: 0.3)) {
+                        showMicErrorToast = false
+                    }
+                }
             }
         }
     }
@@ -171,7 +203,7 @@ struct InputBar: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(chatVM.isGenerating)
+        .disabled(chatVM.isGenerating && !speechService.isListening)
         .help(speechService.isListening ? "Stop listening" : "Voice input")
     }
 
@@ -206,7 +238,8 @@ struct InputBar: View {
     private var canSend: Bool {
         !chatVM.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !chatVM.isGenerating &&
-        !modelManager.isLoadingModel
+        !modelManager.isLoadingModel &&
+        modelManager.loadedModelId != nil
     }
 
     private var isPrefill: Bool {
@@ -225,7 +258,13 @@ struct InputBar: View {
     private func sendMessage() {
         // Check if model is still loading
         if modelManager.isLoadingModel {
-            showToast()
+            showToast(loading: true)
+            return
+        }
+
+        // Check if no model is loaded
+        if modelManager.loadedModelId == nil {
+            showToast(loading: false)
             return
         }
 
@@ -238,9 +277,13 @@ struct InputBar: View {
         isFocused = false
     }
 
-    private func showToast() {
+    private func showToast(loading: Bool) {
         withAnimation(.easeOut(duration: 0.2)) {
-            showLoadingToast = true
+            if loading {
+                showLoadingToast = true
+            } else {
+                showNoModelToast = true
+            }
         }
 
         // Auto-dismiss after 2 seconds
@@ -248,6 +291,7 @@ struct InputBar: View {
             try? await Task.sleep(for: .seconds(2))
             withAnimation(.easeIn(duration: 0.3)) {
                 showLoadingToast = false
+                showNoModelToast = false
             }
         }
     }
@@ -450,11 +494,18 @@ private struct InferenceStopGlyph: View {
 
 private struct LoadingToastView: View {
     let message: String
+    var icon: String? = nil
 
     var body: some View {
         HStack(spacing: 8) {
-            ProgressView()
-                .controlSize(.small)
+            if let icon = icon {
+                Image(systemName: icon)
+                    .font(.subheadline)
+                    .foregroundStyle(.orange)
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+            }
 
             Text(message)
                 .font(.subheadline)

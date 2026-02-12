@@ -771,35 +771,6 @@ def load_models(args,metadata):
             print("\nLoading FFN+PREFILL model(s)...")
         ffn_path = parse_model_path(args.ffn)
         chunk_no, total_chunks = parse_ffn_filename(ffn_path)
-        infer_function_name = (
-            getattr(args, "state_transition_infer_function", None)
-            or "infer"
-        )
-        need_prefill_ctx_infer = (
-            infer_function_name != "infer"
-            and bool(getattr(args, "prefill_max_and_truncate", False))
-        )
-        if not args.eval and infer_function_name != "infer":
-            print(f"Using context-routed infer function: {infer_function_name}")
-            if need_prefill_ctx_infer:
-                print("Also loading default infer for max-context prefill remainder tokens")
-
-        def _load_infer_with_fallback(model_path):
-            if infer_function_name == "infer":
-                return load_model(model_path, function_name="infer", compute_unit=compute_unit)
-            try:
-                return load_model(
-                    model_path,
-                    function_name=infer_function_name,
-                    compute_unit=compute_unit,
-                )
-            except Exception as e:
-                if not args.eval:
-                    print(
-                        f"  Note: function '{infer_function_name}' not found in "
-                        f"{Path(model_path).name}; falling back to 'infer' ({e})"
-                    )
-                return load_model(model_path, function_name="infer", compute_unit=compute_unit)
 
         ffn_models = []
         if chunk_no and total_chunks:
@@ -826,15 +797,9 @@ def load_models(args,metadata):
                         print(f"Loading PF chunk: {Path(pf_chunk_path).name}")
                     try:
                         chunk_dict = {
-                            'infer': _load_infer_with_fallback(ffn_chunk_path),
+                            'infer': load_model(ffn_chunk_path, function_name='infer', compute_unit=compute_unit),
                             'prefill': load_model(pf_chunk_path, function_name='prefill', compute_unit=compute_unit)
                         }
-                        if need_prefill_ctx_infer:
-                            chunk_dict['infer_prefill_ctx'] = load_model(
-                                ffn_chunk_path,
-                                function_name='infer',
-                                compute_unit=compute_unit,
-                            )
                         try:
                             chunk_dict['infer_rotate'] = load_model(ffn_chunk_path, function_name='infer_rotate', compute_unit=compute_unit)
                         except Exception:
@@ -858,15 +823,9 @@ def load_models(args,metadata):
                     try:
                         # For chunked models, we need both infer and prefill functions
                         chunk_dict = {
-                            'infer': _load_infer_with_fallback(chunk_path),
+                            'infer': load_model(chunk_path, function_name='infer', compute_unit=compute_unit),
                             'prefill': load_model(chunk_path, function_name='prefill', compute_unit=compute_unit)
                         }
-                        if need_prefill_ctx_infer:
-                            chunk_dict['infer_prefill_ctx'] = load_model(
-                                chunk_path,
-                                function_name='infer',
-                                compute_unit=compute_unit,
-                            )
                         # Try to load rotation functions only if context > sliding_window
                         # If context_length <= sliding_window, rotation is never needed
                         sliding_window = getattr(args, 'sliding_window', None)
@@ -1042,16 +1001,6 @@ def _predict_with_optional_update_mask(model, inputs, state, update_mask):
             return model.predict(inputs, state)
         raise
 
-
-def _extract_hidden_states(output_dict):
-    if "output_hidden_states" in output_dict:
-        return output_dict["output_hidden_states"]
-    if "hidden_states" in output_dict:
-        return output_dict["hidden_states"]
-    if output_dict:
-        return next(iter(output_dict.values()))
-    raise KeyError("No output tensors returned by model.predict()")
-
 def initialize_causal_mask(context_length, eval_mode=False):
     """Initialize causal mask for transformer attention."""
     causal_mask = make_causal_mask(context_length, 0)
@@ -1061,8 +1010,7 @@ def initialize_causal_mask(context_length, eval_mode=False):
     return causal_mask
 
 def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None,
-                causal_mask=None, sliding_window=None, single_token_mode=False, use_update_mask=True,
-                single_token_prefill_only=False):
+                causal_mask=None, sliding_window=None, single_token_mode=False, use_update_mask=True):
     """Run prefill on the input sequence.
 
     For Gemma3 with 4-function models:
@@ -1118,10 +1066,8 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
                     # Use per-chunk state if state is a list, otherwise use unified state
                     chunk_state = state[chunk_idx] if isinstance(state, list) else state
                     update_mask = make_update_mask(mask_len, batch_pos, batch_size) if use_update_mask else None
-                    output = _predict_with_optional_update_mask(
-                        ffn_model[prefill_func_name], inputs, chunk_state, update_mask
-                    )
-                    hidden_states = torch.from_numpy(_extract_hidden_states(output))
+                    output = _predict_with_optional_update_mask(ffn_model[prefill_func_name], inputs, chunk_state, update_mask)
+                    hidden_states = torch.from_numpy(output['output_hidden_states'])
 
             batch_pos = batch_end
 
@@ -1131,13 +1077,8 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
         position_ids = torch.tensor([batch_pos], dtype=torch.int32)
         single_causal_mask = causal_mask[:, :, batch_pos:batch_pos + 1, :]
 
-        # Determine which function to use for single-token fallback path.
-        if single_token_prefill_only:
-            infer_func_name = 'infer_prefill_ctx'
-        else:
-            infer_func_name = (
-                'infer_rotate' if (batch_pos >= sliding_window and has_rotation) else 'infer'
-            )
+        # Determine which infer function to use
+        infer_func_name = 'infer_rotate' if (batch_pos >= sliding_window and has_rotation) else 'infer'
 
         # Run embeddings
         hidden_states = torch.from_numpy(
@@ -1148,9 +1089,6 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
 
         for chunk_idx, ffn_model in enumerate(ffn_models):
             if isinstance(ffn_model, dict):
-                chunk_func_name = infer_func_name
-                if single_token_prefill_only and chunk_func_name not in ffn_model:
-                    chunk_func_name = 'infer'
                 inputs = {
                     'hidden_states': hidden_states.numpy().astype(np.float16),
                     'position_ids': position_ids.numpy().astype(np.int32),
@@ -1158,8 +1096,8 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
                     'current_pos': np.array([batch_pos], dtype=np.int32)
                 }
                 chunk_state = state[chunk_idx] if isinstance(state, list) else state
-                output = ffn_model[chunk_func_name].predict(inputs, chunk_state)
-                hidden_states = torch.from_numpy(_extract_hidden_states(output))
+                output = ffn_model[infer_func_name].predict(inputs, chunk_state)
+                hidden_states = torch.from_numpy(output['output_hidden_states'])
 
         batch_pos += 1
 
@@ -1245,7 +1183,7 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
                 print(f"[ERROR]   causal_mask shape={single_causal_mask.shape}")
                 print(f"[ERROR]   Exception: {e}")
                 raise
-            hidden_states = torch.from_numpy(_extract_hidden_states(output))
+            hidden_states = torch.from_numpy(output['output_hidden_states'])
     
     # Run LM head
     lm_output = lmhead_model.predict({'hidden_states': hidden_states.numpy().astype(np.float16)})
@@ -1338,29 +1276,12 @@ def create_unified_state(ffn_models, context_length, eval_mode=False, metadata=N
         Either a single state (if all chunks have same state interface) or
         a list of states (one per chunk, for inconsistent models)
     """
-    prefer_infer_state = False
-    if metadata:
-        prefer_infer_state = bool(
-            metadata.get('prefill_via_infer', False)
-            or (
-                metadata.get('state_transition_infer_function')
-                and not metadata.get('prefill_max_and_truncate', False)
-            )
-        )
-    if not eval_mode and prefer_infer_state:
-        print("Creating state from infer function (context-routed state mode)")
-
-    def _pick_state_model(chunk_dict):
-        if prefer_infer_state:
-            return chunk_dict.get('infer') or chunk_dict.get('prefill')
-        return chunk_dict.get('prefill') or chunk_dict.get('infer')
-
     # First, check if all chunks have consistent state interfaces
     # by checking if each chunk's state has global cache
     chunk_has_global = []
     for idx, fm in enumerate(ffn_models):
         if isinstance(fm, dict):
-            model = _pick_state_model(fm)
+            model = fm.get('prefill') or fm.get('infer')
         else:
             model = fm
 
@@ -1389,8 +1310,7 @@ def create_unified_state(ffn_models, context_length, eval_mode=False, metadata=N
             state_chunk_idx = metadata['global_cache_chunk_idx']
 
         if isinstance(ffn_models[0], dict):
-            state_model = _pick_state_model(ffn_models[state_chunk_idx])
-            state = state_model.make_state()
+            state = ffn_models[state_chunk_idx]['prefill'].make_state()
         else:
             state = ffn_models[state_chunk_idx].make_state()
 
@@ -1408,119 +1328,12 @@ def create_unified_state(ffn_models, context_length, eval_mode=False, metadata=N
         states = []
         for idx, fm in enumerate(ffn_models):
             if isinstance(fm, dict):
-                model = _pick_state_model(fm)
+                model = fm.get('prefill') or fm.get('infer')
             else:
                 model = fm
             states.append(model.make_state())
 
         return states
-
-def _state_name_candidates():
-    return [
-        "model_model_kv_cache_0",
-        "model.model.kv_cache_0",
-        "kv_cache_0",
-        "model_model_kv_cache_local",
-        "model.model.kv_cache_local",
-        "kv_cache_local",
-        "model_model_kv_cache_global",
-        "model.model.kv_cache_global",
-        "kv_cache_global",
-    ]
-
-
-def _copy_state_prefix_single(src_state, dst_state, target_context_length, eval_mode=False, label="state"):
-    if not hasattr(src_state, "read_state") or not hasattr(dst_state, "write_state"):
-        return False
-
-    touched = False
-    for state_name in _state_name_candidates():
-        try:
-            src_tensor = src_state.read_state(state_name)
-            dst_tensor = dst_state.read_state(state_name)
-        except Exception:
-            continue
-
-        if (
-            not isinstance(src_tensor, np.ndarray)
-            or not isinstance(dst_tensor, np.ndarray)
-            or src_tensor.ndim < 3
-            or dst_tensor.ndim < 3
-        ):
-            continue
-
-        copy_len = min(
-            int(target_context_length),
-            int(src_tensor.shape[2]),
-            int(dst_tensor.shape[2]),
-        )
-        d0 = min(int(src_tensor.shape[0]), int(dst_tensor.shape[0]))
-        d1 = min(int(src_tensor.shape[1]), int(dst_tensor.shape[1]))
-        d3 = min(int(src_tensor.shape[3]), int(dst_tensor.shape[3]))
-        if copy_len <= 0 or d0 <= 0 or d1 <= 0 or d3 <= 0:
-            continue
-
-        projected = np.zeros_like(dst_tensor)
-        projected[:d0, :d1, :copy_len, :d3] = src_tensor[:d0, :d1, :copy_len, :d3]
-        dst_state.write_state(state_name, projected)
-        touched = True
-        if not eval_mode:
-            print(
-                f"  Projected {label}.{state_name}: "
-                f"{src_tensor.shape[2]} -> {dst_tensor.shape[2]} (copied first {copy_len})"
-            )
-    return touched
-
-
-def project_state_to_context(state, ffn_models, target_context_length, metadata=None, eval_mode=False):
-    if target_context_length is None:
-        return state
-    target_context_length = int(target_context_length)
-    if target_context_length <= 0:
-        raise ValueError(f"Invalid target_context_length: {target_context_length}")
-
-    if isinstance(state, list):
-        projected_state = []
-        for fm in ffn_models:
-            if isinstance(fm, dict):
-                model = fm.get("infer") or fm.get("prefill")
-            else:
-                model = fm
-            projected_state.append(model.make_state())
-    else:
-        state_chunk_idx = 0
-        if metadata and metadata.get("global_cache_chunk_idx") is not None:
-            state_chunk_idx = int(metadata["global_cache_chunk_idx"])
-        if isinstance(ffn_models[0], dict):
-            model = ffn_models[state_chunk_idx].get("infer") or ffn_models[state_chunk_idx].get("prefill")
-        else:
-            model = ffn_models[state_chunk_idx]
-        projected_state = model.make_state()
-
-    if isinstance(state, list) and isinstance(projected_state, list):
-        copied_any = False
-        for idx, (src, dst) in enumerate(zip(state, projected_state)):
-            copied_any = _copy_state_prefix_single(
-                src,
-                dst,
-                target_context_length,
-                eval_mode=eval_mode,
-                label=f"chunk{idx}",
-            ) or copied_any
-    else:
-        copied_any = _copy_state_prefix_single(
-            state,
-            projected_state,
-            target_context_length,
-            eval_mode=eval_mode,
-            label="chunk0",
-        )
-
-    if not copied_any:
-        raise RuntimeError(
-            "Could not project KV cache into target infer-context state."
-        )
-    return projected_state
 
 def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False, no_think=False):
     """Interactive chat loop."""
@@ -1528,25 +1341,11 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
     batch_size = metadata.get('batch_size', 64)
     update_mask_prefill = metadata.get('update_mask_prefill', False) if metadata else False
     prefill_dynamic_slice = metadata.get('prefill_dynamic_slice', False) if metadata else False
-    prefill_via_infer = bool(metadata.get('prefill_via_infer', False))
-    prefill_max_and_truncate = bool(metadata.get('prefill_max_and_truncate', False))
-    prefill_context_length = int(metadata.get('state_transition_prefill_context', context_length))
-
-    single_token_mode = prefill_via_infer or not (update_mask_prefill or prefill_dynamic_slice)
-    if prefill_max_and_truncate and prefill_context_length > context_length and not prefill_via_infer:
-        # Step-2 validation mode: use max-context prefill first, then truncate.
-        single_token_mode = False
-
-    if not warmup and not eval_mode:
-        if prefill_via_infer:
-            print("Prefill mode: infer-only (single-token prefill for all contexts).")
-        elif not (update_mask_prefill or prefill_dynamic_slice) and not prefill_max_and_truncate:
+    single_token_mode = False
+    if not (update_mask_prefill or prefill_dynamic_slice):
+        single_token_mode = True
+        if not warmup and not eval_mode:
             print("No update_mask_prefill or prefill_dynamic_slice; forcing single-token prefill for compatibility.")
-        if prefill_max_and_truncate and prefill_context_length > context_length:
-            print(
-                f"Prefill mode: max-context prefill at {prefill_context_length} "
-                f"then truncate state to {context_length}."
-            )
     
     if not warmup and not eval_mode:
         print(f"\nUsing context length: {context_length}")
@@ -1640,51 +1439,19 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 # Get sliding_window for rotation support (Gemma3)
                 sliding_window = metadata.get('sliding_window', None)
 
-                # Optional state-transition test mode:
-                # prefill on larger context, then truncate state for smaller decode context.
-                prefill_run_context = context_length
-                prefill_mask = causal_mask
-                if prefill_max_and_truncate and prefill_context_length > context_length:
-                    prefill_run_context = prefill_context_length
-                    if context_pos > context_length:
-                        raise ValueError(
-                            f"Prompt length ({context_pos}) exceeds target decode context "
-                            f"({context_length}) for truncate test."
-                        )
-                    if (prefill_mask is None) or (
-                        prefill_mask.shape[-1] != prefill_run_context
-                    ):
-                        prefill_mask_np = make_causal_mask(prefill_run_context, 0)
-                        prefill_mask = torch.tensor(prefill_mask_np, dtype=torch.float16)
-
                 _ = run_prefill(
                     embed_model,
                     ffn_models,
                     input_ids,
                     context_pos,
-                    prefill_run_context,
+                    context_length,
                     batch_size,
                     state,
-                    prefill_mask,
+                    causal_mask,
                     sliding_window,
                     single_token_mode=single_token_mode,
                     use_update_mask=update_mask_prefill,
-                    single_token_prefill_only=(prefill_run_context != context_length),
                 )
-
-                if prefill_run_context != context_length:
-                    if not warmup and not eval_mode:
-                        print(
-                            f"Projecting state: prefill {prefill_run_context} "
-                            f"-> infer context {context_length}"
-                        )
-                    state = project_state_to_context(
-                        state=state,
-                        ffn_models=ffn_models,
-                        target_context_length=context_length,
-                        metadata=metadata,
-                        eval_mode=eval_mode,
-                    )
                 
                 # Calculate prefill timing
                 prefill_time = time.time() - prefill_start
@@ -1864,91 +1631,13 @@ def parse_args():
                        help='Enable debug output (position, state, shapes)')
     parser.add_argument('--split-rotate', action='store_true',
                        help='Split rotate mode: FFN and PF are separate model files')
-    parser.add_argument(
-        '--state-transition-infer-fn',
-        type=str,
-        default=None,
-        help=(
-            'Override infer function name for chunked state-transition models '
-            '(e.g. infer_ctx512).'
-        ),
-    )
-    parser.add_argument(
-        '--prefill-via-infer',
-        action='store_true',
-        help=(
-            'Force prefill to run token-by-token via infer function only '
-            '(useful to validate non-max contexts).'
-        ),
-    )
-    parser.add_argument(
-        '--force-batch-prefill',
-        action='store_true',
-        help=(
-            'Force batched prefill path by enabling prefill dynamic/update-mask '
-            'behavior and disabling --prefill-via-infer.'
-        ),
-    )
-    parser.add_argument(
-        '--prefill-max-and-truncate',
-        action='store_true',
-        help=(
-            'Run prefill using max-context prefill function, then truncate KV state '
-            'to target --context-length before decode.'
-        ),
-    )
-    parser.add_argument(
-        '--prefill-context-length',
-        type=int,
-        default=None,
-        help=(
-            'Prefill context length used with --prefill-max-and-truncate '
-            '(default: state_transition_prefill_context from meta.yaml).'
-        ),
-    )
 
     args = parser.parse_args()
-    args.state_transition_chunk1_kind = None
-    args.state_transition_chunk1_source = None
-    args.state_transition_infer_function = None
-    args.state_transition_prefill_context = None
-
-    # Compatibility switch requested for benchmarking: explicitly force batched
-    # prefill path even when metadata does not advertise dynamic/update-mask flags.
-    def _apply_force_batch_prefill_override():
-        if not getattr(args, "force_batch_prefill", False):
-            return
-        args.prefill_via_infer = False
-        args.update_mask_prefill = True
-        args.prefill_dynamic_slice = True
-    _apply_force_batch_prefill_override()
 
     def _strip_model_ext(value):
         if value is None:
             return None
         return value.replace('.mlmodelc', '').replace('.mlpackage', '')
-
-    def _resolve_state_transition_chunk1_info(model_dir: str, context_length: int):
-        manifest_path = Path(model_dir) / "state_transition_manifest.yaml"
-        if not manifest_path.exists():
-            return None, None
-        try:
-            manifest = yaml.safe_load(manifest_path.read_text()) or {}
-            chunk1 = None
-            for item in manifest.get("chunks", []):
-                if int(item.get("chunk", 0)) == 1:
-                    chunk1 = item
-                    break
-            if not isinstance(chunk1, dict):
-                return None, None
-            ctx_key = str(int(context_length))
-            kinds = chunk1.get("infer_source_kinds", {}) or {}
-            sources = chunk1.get("infer_sources", {}) or {}
-            kind = kinds.get(ctx_key)
-            source = sources.get(ctx_key)
-            return kind, source
-        except Exception:
-            return None, None
     
     # If meta.yaml is provided, load parameters from it
     if args.meta:
@@ -2112,50 +1801,6 @@ def parse_args():
                 args.update_mask_prefill = params.get('update_mask_prefill', False)
                 args.prefill_dynamic_slice = params.get('prefill_dynamic_slice', False)
 
-                # Optional state-transition routing diagnostics.
-                # Prefer manifest resolution (actual combine source map), then fallback to meta params.
-                if args.context_length is not None:
-                    kind, source = _resolve_state_transition_chunk1_info(args.d, args.context_length)
-                    if kind is None:
-                        kind_map = params.get('state_transition_chunk1_infer_kinds', {}) or {}
-                        if isinstance(kind_map, dict):
-                            kind = kind_map.get(str(int(args.context_length)))
-                    args.state_transition_chunk1_kind = kind
-                    args.state_transition_chunk1_source = source
-
-                # State-transition infer routing:
-                # infer_ctx{context} is selected when meta advertises context map/template.
-                infer_template = params.get('state_transition_infer_function_template')
-                infer_contexts_raw = params.get('state_transition_infer_contexts', []) or []
-                infer_contexts = set()
-                if isinstance(infer_contexts_raw, (list, tuple)):
-                    for c in infer_contexts_raw:
-                        try:
-                            infer_contexts.add(int(c))
-                        except Exception:
-                            pass
-                if args.context_length is not None and int(args.context_length) in infer_contexts:
-                    if isinstance(infer_template, str) and "{context}" in infer_template:
-                        try:
-                            args.state_transition_infer_function = infer_template.format(
-                                context=int(args.context_length)
-                            )
-                        except Exception:
-                            args.state_transition_infer_function = f"infer_ctx{int(args.context_length)}"
-                    else:
-                        args.state_transition_infer_function = f"infer_ctx{int(args.context_length)}"
-                if args.state_transition_infer_fn:
-                    args.state_transition_infer_function = args.state_transition_infer_fn
-
-                prefill_ctx = params.get('state_transition_prefill_context')
-                if prefill_ctx is not None:
-                    try:
-                        args.state_transition_prefill_context = int(prefill_ctx)
-                    except Exception:
-                        args.state_transition_prefill_context = None
-                if args.prefill_context_length is not None:
-                    args.state_transition_prefill_context = int(args.prefill_context_length)
-
                 if not args.eval:
                     print(f"\nLoaded parameters from {args.meta}:")
                     print(f"  Context Length: {args.context_length}")
@@ -2171,16 +1816,6 @@ def parse_args():
                     print(f"  Embeddings: {args.embed}")
                     print(f"  LM Head: {args.lmhead}")
                     print(f"  FFN: {args.ffn}")
-                    if args.state_transition_infer_function:
-                        print(f"  Inference Function: {args.state_transition_infer_function}")
-                    if args.state_transition_prefill_context:
-                        print(f"  Prefill Context Source: {args.state_transition_prefill_context}")
-                    if args.state_transition_chunk1_kind:
-                        print(f"  Chunk1 Infer Kind ({args.context_length}): {args.state_transition_chunk1_kind}")
-                        if args.state_transition_chunk1_kind == "FFN_attn_fp32":
-                            print("  Chunk1 FP32 Routing: enabled")
-                        if args.state_transition_chunk1_source:
-                            print(f"  Chunk1 Source: {args.state_transition_chunk1_source}")
             
         except Exception as e:
             print(f"\nError loading meta.yaml: {str(e)}")
@@ -2190,12 +1825,6 @@ def parse_args():
         args.is_monolithic = False
         if not hasattr(args, 'split_lm_head') or args.split_lm_head is None:
             args.split_lm_head = args.num_logits  # Use num_logits as fallback
-        if args.prefill_context_length is not None:
-            args.state_transition_prefill_context = int(args.prefill_context_length)
-
-    # Re-apply force override after meta/default loading because those paths can
-    # overwrite update_mask_prefill/prefill_dynamic_slice from metadata.
-    _apply_force_batch_prefill_override()
 
     return args
 
@@ -2891,30 +2520,12 @@ def main():
             metadata['lm_head_chunk_sizes'] = _parse_lm_head_chunk_sizes(
                 getattr(args, 'lm_head_chunk_sizes', None)
             )
-            metadata['prefill_via_infer'] = bool(getattr(args, 'prefill_via_infer', False))
-            metadata['prefill_max_and_truncate'] = bool(
-                getattr(args, 'prefill_max_and_truncate', False)
-            )
-            if getattr(args, 'state_transition_prefill_context', None):
-                metadata['state_transition_prefill_context'] = int(
-                    args.state_transition_prefill_context
-                )
-            metadata['state_transition_infer_function'] = getattr(
-                args,
-                'state_transition_infer_function',
-                None,
-            )
 
             if not args.eval:
                 print(f"\nMetadata after load_models: {metadata}")
                 print(f"Using split_lm_head value: {metadata.get('split_lm_head', 8)}")
                 if metadata.get('argmax_in_model'):
                     print("Argmax mode enabled for LM head")
-                if metadata.get('state_transition_infer_function'):
-                    print(
-                        "Context-routed infer function: "
-                        f"{metadata.get('state_transition_infer_function')}"
-                    )
 
             # Create unified state once (use chunk with global cache if available)
             state = create_unified_state(ffn_models, metadata['context_length'], args.eval, metadata=metadata)

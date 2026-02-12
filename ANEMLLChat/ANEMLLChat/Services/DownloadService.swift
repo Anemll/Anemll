@@ -109,8 +109,15 @@ actor DownloadService: NSObject {
     // MARK: - Public API
 
     /// Download a model from HuggingFace
+    /// - Parameters:
+    ///   - modelId: HuggingFace model ID
+    ///   - compatibilityCheck: Called after meta.yaml downloads with (metaYamlPath, fileList).
+    ///     Return `true` to continue downloading, `false` to cancel.
+    ///   - progress: Progress callback
+    ///   - completion: Completion callback
     func downloadModel(
         _ modelId: String,
+        compatibilityCheck: (@Sendable (URL, [String: Int64]) async -> Bool)? = nil,
         progress: @escaping @Sendable (DownloadProgress) -> Void,
         completion: @escaping @Sendable (Result<URL, DownloadError>) -> Void
     ) async {
@@ -137,16 +144,54 @@ actor DownloadService: NSObject {
             let initialProgress = DownloadProgress(
                 totalBytes: totalBytesExpected[modelId] ?? 0,
                 downloadedBytes: 0,
-                currentFile: files.first?.name ?? "",
+                currentFile: "meta.yaml",
                 filesCompleted: 0,
                 totalFiles: files.count,
                 bytesPerSecond: 0
             )
             progress(initialProgress)
 
-            // Download each file
-            for (index, file) in files.enumerated() {
-                currentFileIndex[modelId] = index
+            // Step 1: Download meta.yaml first — model can't work without it
+            // and we need it for the compatibility check before downloading large weight files
+            let metaFile = files.first { $0.name == "meta.yaml" }
+            let remainingFiles = files.filter { $0.name != "meta.yaml" }
+
+            if let metaFile = metaFile {
+                currentFileIndex[modelId] = 0
+                currentFileName[modelId] = metaFile.name
+                try await downloadFile(metaFile, to: destDir, modelId: modelId)
+
+                // Run compatibility check before downloading anything else
+                if let check = compatibilityCheck {
+                    let metaURL = destDir.appendingPathComponent("meta.yaml")
+                    let fileSizes = Dictionary(
+                        files.map { ($0.name, $0.size) },
+                        uniquingKeysWith: { first, _ in first }
+                    )
+                    let shouldContinue = await check(metaURL, fileSizes)
+                    if !shouldContinue {
+                        logInfo("Download cancelled by compatibility check: \(modelId)", category: .download)
+                        completion(.failure(.cancelled))
+                        cleanup(modelId: modelId)
+                        return
+                    }
+                }
+
+                let metaProgress = DownloadProgress(
+                    totalBytes: totalBytesExpected[modelId] ?? 0,
+                    downloadedBytes: downloadedBytesTotal[modelId] ?? 0,
+                    currentFile: metaFile.name,
+                    filesCompleted: 1,
+                    totalFiles: files.count,
+                    bytesPerSecond: 0
+                )
+                progress(metaProgress)
+            }
+
+            // Step 2: Download remaining files
+            for (index, file) in remainingFiles.enumerated() {
+                let overallIndex = (metaFile != nil ? 1 : 0) + index
+                currentFileIndex[modelId] = overallIndex
                 currentFileName[modelId] = file.name
 
                 try await downloadFile(file, to: destDir, modelId: modelId)
@@ -156,7 +201,7 @@ actor DownloadService: NSObject {
                     totalBytes: totalBytesExpected[modelId] ?? 0,
                     downloadedBytes: downloadedBytesTotal[modelId] ?? 0,
                     currentFile: file.name,
-                    filesCompleted: index + 1,
+                    filesCompleted: overallIndex + 1,
                     totalFiles: files.count,
                     bytesPerSecond: 0
                 )
@@ -201,6 +246,29 @@ actor DownloadService: NSObject {
     /// Check if a download is in progress
     func isDownloading(_ modelId: String) -> Bool {
         downloadTasks[modelId] != nil
+    }
+
+    // MARK: - Pre-download Meta Fetch
+
+    // [ANE-COMPAT:M1-A14] Fetch just meta.yaml from HuggingFace before starting full download
+    /// Fetches the raw content of meta.yaml for a given model repo without downloading the full model.
+    /// Returns the YAML string, or nil if the file doesn't exist or fetch fails.
+    func fetchMetaYaml(for modelId: String) async -> String? {
+        let urlString = "https://huggingface.co/\(modelId)/resolve/main/meta.yaml"
+        guard let url = URL(string: urlString) else { return nil }
+
+        do {
+            let (data, response) = try await urlSession.data(from: url)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200 else {
+                logDebug("meta.yaml not found for \(modelId) (status: \((response as? HTTPURLResponse)?.statusCode ?? 0))", category: .download)
+                return nil
+            }
+            return String(data: data, encoding: .utf8)
+        } catch {
+            logDebug("Failed to fetch meta.yaml for \(modelId): \(error)", category: .download)
+            return nil
+        }
     }
 
     // MARK: - HuggingFace API

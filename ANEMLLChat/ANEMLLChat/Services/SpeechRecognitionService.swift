@@ -8,6 +8,9 @@
 import Foundation
 import Speech
 import AVFoundation
+#if os(macOS)
+import AppKit
+#endif
 
 /// Service for speech recognition using Apple's Speech framework
 @MainActor
@@ -84,11 +87,14 @@ final class SpeechRecognitionService {
             let granted = await AVCaptureDevice.requestAccess(for: .audio)
             if !granted {
                 logWarning("Microphone permission denied by user", category: .inference)
+                errorMessage = "Microphone permission denied"
             }
             return granted
         case .denied:
-            logWarning("Microphone permission was previously denied. User must enable in System Settings > Privacy & Security > Microphone", category: .inference)
-            errorMessage = "Microphone access denied. Please enable in System Settings > Privacy & Security > Microphone"
+            logWarning("Microphone permission denied. Opening System Settings > Privacy & Security > Microphone", category: .inference)
+            errorMessage = "Mic denied — opening Privacy settings..."
+            // Open System Settings directly to the microphone pane
+            openMicrophoneSettings()
             return false
         case .restricted:
             logWarning("Microphone access is restricted on this device", category: .inference)
@@ -98,6 +104,24 @@ final class SpeechRecognitionService {
             logWarning("Unknown microphone authorization status", category: .inference)
             return false
         }
+    }
+
+    /// Open System Settings to the microphone privacy pane
+    private func openMicrophoneSettings() {
+        // Try multiple URL schemes — macOS changes these between versions
+        let urls = [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy"
+        ]
+        for urlString in urls {
+            if let url = URL(string: urlString), NSWorkspace.shared.open(url) {
+                logInfo("Opened System Settings via: \(urlString)", category: .inference)
+                return
+            }
+        }
+        // Last resort: open System Settings app
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app"))
     }
     #endif
 
