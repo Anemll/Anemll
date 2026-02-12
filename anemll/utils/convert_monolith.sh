@@ -29,6 +29,7 @@ ATTENTION_WINDOW=""
 DYNAMIC_PREFILL_SLICE=true
 STATIC_PREFILL_SLICE=false
 SINGLE_CACHE=false
+SKIP_ANEMLL_DEDUP=false
 
 # Default converter; may be overridden after parsing config.json
 CONVERTER="python3 -m anemll.ane_converter.llama_converter"
@@ -62,6 +63,7 @@ print_usage() {
     echo "  --dynamic-prefill-slice  Use dynamic slicing for prefill KV writes (default ON)"
     echo "  --static-prefill-slice   Disable dynamic slicing for prefill KV writes"
     echo "  --single-cache           Use unified KV cache (Gemma3 only; disables rotate)"
+    echo "  --skip-anemll-dedup      Skip anemll-dedup weight dedup in combine step (default: enabled)"
     echo ""
     echo "Steps:"
     echo "  1. Convert monolithic inference model (embed + FFN + lm_head)"
@@ -142,6 +144,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --single-cache)
             SINGLE_CACHE=true
+            shift
+            ;;
+        --skip-anemll-dedup)
+            SKIP_ANEMLL_DEDUP=true
             shift
             ;;
         --help|-h)
@@ -468,13 +474,18 @@ fi
 # Step 3: Combine into Multi-Function Model
 # Includes rotation functions if context > sliding_window
 ROTATE_FLAG=""
+SKIP_DEDUP_FLAG=""
 if [ "$HAS_SWA" = true ] && [ "$CONTEXT_LENGTH" -gt "$SLIDING_WINDOW" ]; then
     ROTATE_FLAG="--rotate"
+fi
+if [ "$SKIP_ANEMLL_DEDUP" = true ]; then
+    SKIP_DEDUP_FLAG="--skip-anemll-dedup"
 fi
 run_step 3 "Combining Monolithic Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
     --monolithic \
     $LUT_PARAM \
     $ROTATE_FLAG \
+    $SKIP_DEDUP_FLAG \
     --prefix \"$PREFIX\" \
     --input \"$OUTPUT_DIR\" \
     --output \"$OUTPUT_DIR\""

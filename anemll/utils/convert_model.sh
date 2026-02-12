@@ -61,6 +61,7 @@ DYNAMIC_PREFILL_SLICE=true
 STATIC_PREFILL_SLICE=false
 SINGLE_CACHE=false
 CHUNK_NO=""
+SKIP_ANEMLL_DEDUP=false
 
 # Default converter; may be overridden after parsing config.json
 CONVERTER="python3 -m anemll.ane_converter.llama_converter"
@@ -108,6 +109,7 @@ print_usage() {
     echo "                  Recommended: 0.48 for 270M, 0.82 for 1B, 0.1875 for 4B QAT"
     echo "  --clamp         Runtime residual clamping value (e.g., 55000)"
     echo "                  Alternative to --fp16-scale for overflow prevention"
+    echo "  --skip-anemll-dedup Disable anemll-dedup weight dedup in combine step (default: enabled)"
     echo ""
     echo "Examples:"
     echo "  # Use default per_channel (8) for all parts"
@@ -212,6 +214,10 @@ while [[ $# -gt 0 ]]; do
         --chunk-no)
             CHUNK_NO="$2"
             shift 2
+            ;;
+        --skip-anemll-dedup)
+            SKIP_ANEMLL_DEDUP=true
+            shift
             ;;
         *)
             echo "Unknown parameter: $1"
@@ -643,6 +649,7 @@ fi
 # For Gemma3 with context > 512, use --gemma3 flag to combine 4 functions
 GEMMA3_FLAG=""
 SPLIT_ROTATE_FLAG=""
+SKIP_DEDUP_FLAG=""
 if [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
     if [ $CONTEXT_LENGTH -gt $SLIDING_WINDOW ] && [ "$SINGLE_CACHE" != true ]; then
         GEMMA3_FLAG="--gemma3"
@@ -652,6 +659,9 @@ if [ "$SPLIT_ROTATE" = true ]; then
     SPLIT_ROTATE_FLAG="--split-rotate"
     GEMMA3_FLAG=""
 fi
+if [ "$SKIP_ANEMLL_DEDUP" = true ]; then
+    SKIP_DEDUP_FLAG="--skip-anemll-dedup"
+fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "5" ]; then
     if [ ! -z "$LUT_PART2" ]; then
@@ -660,6 +670,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "5" ]; then
             $LUT2_PARAM \
             $SPLIT_ROTATE_FLAG \
             $GEMMA3_FLAG \
+            $SKIP_DEDUP_FLAG \
             --prefix \"$PREFIX\" \
             --input \"$OUTPUT_DIR\" \
             --output \"$OUTPUT_DIR\""
@@ -668,6 +679,7 @@ if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "5" ]; then
             --chunk $NUM_CHUNKS \
             $SPLIT_ROTATE_FLAG \
             $GEMMA3_FLAG \
+            $SKIP_DEDUP_FLAG \
             --prefix \"$PREFIX\" \
             --input \"$OUTPUT_DIR\" \
             --output \"$OUTPUT_DIR\""

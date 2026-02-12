@@ -5,10 +5,11 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 ## 🚀 Version 0.3.5 Alpha Release - ANE Profiler & Workflow Improvements
 
 ### 🔄 **What's New in 0.3.5**
+- **🗜️ ANEMLL-Dedup** - Surgical weight deduplication for multifunction CoreML models. Replaces palettized weight blobs that are semantically identical (verified via dequantization) before `save_multifunction`, enabling CoreML's dedup pass to share them. Typical savings: **~50%** on combined infer+prefill packages. Enabled by default in `combine_models.py` and conversion scripts. [Documentation](./docs/anemll-dedup.md)
 - **🔬 ANE Profiler** - CoreML/ANE profiling without Xcode: analyze which ops run on ANE vs GPU vs CPU, benchmark timing, identify fallbacks, and generate compatibility reports. [Documentation](./anemll/utils/ANE_PROFILER.md)
 - **📦 Auto-activate virtual environment** - `convert_model.sh` and `check_dependencies.sh` now auto-activate a project venv (`env-anemll`, `anemll-env`, `.venv`, or `venv`) when none is active. Override with `ANEMLL_VENV` or disable with `ANEMLL_AUTO_VENV=0`.
 - **🦙 Gemma 3 converter** - Improvements to Gemma 3 conversion pipeline.
-- **📊 Conversion Monitor** - Real-time progress monitoring for model conversion: `python anemll/utils/monitor_conversion.py <output_dir>`
+- **📊 Conversion Monitor** - Real-time progress monitoring for model conversion and multi-context builds: `python anemll/utils/monitor_conversion.py <output_dir>`. Now supports `build_ctx_model` pipeline tracking with per-context step progress.
 
 ### 🔄 **What's New in 0.3.4**
 - **📊 lm-evaluation-harness Support** - Model evaluation with standard benchmarks (BoolQ, ARC Challenge, etc.) - [Documentation](./evaluate/ane/README.md)
