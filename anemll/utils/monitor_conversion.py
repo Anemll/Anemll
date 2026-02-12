@@ -682,6 +682,34 @@ def get_running_process(output_dir: Path) -> tuple:
             timeout=5
         )
         for line in result.stdout.split('\n'):
+            # Detect proto_qwen25_chunk1_fp32.py (hybrid chunk1 rebuild)
+            if 'proto_qwen25_chunk1_fp32' in line and 'grep' not in line:
+                if '--out-dir' in line:
+                    parts = line.split('--out-dir')
+                    if len(parts) > 1:
+                        out_dir_val = parts[1].strip().split()[0]
+                        if not out_dir_val.rstrip('/').endswith(output_dir.name):
+                            continue
+                if '--rebuild-hybrid-chunk1' in line:
+                    return (3, 'Hybrid Chunk1 Rebuild (all 4)')
+                elif '--rebuild-ffn-chunk' in line:
+                    chunk_num = '?'
+                    parts = line.split('--rebuild-ffn-chunk')
+                    if len(parts) > 1:
+                        chunk_num = parts[1].strip().split()[0]
+                    return (3, f'Rebuild FFN chunk {chunk_num}')
+                elif '--rebuild-prefill-chunk' in line:
+                    chunk_num = '?'
+                    parts = line.split('--rebuild-prefill-chunk')
+                    if len(parts) > 1:
+                        chunk_num = parts[1].strip().split()[0]
+                    return (4, f'Rebuild Prefill chunk {chunk_num}')
+                elif '--infer-only' in line:
+                    return (3, 'FP32 Attn Infer Only')
+                elif '--prefill-only' in line:
+                    return (4, 'FP32 Attn Prefill Only')
+                else:
+                    return (3, 'Hybrid Chunk1 Full Build')
             if 'converter' in line and str(output_dir) in line and 'grep' not in line:
                 # Extract --part value
                 if '--part ' in line:
@@ -1002,7 +1030,7 @@ def get_config_from_meta(output_dir: Path) -> dict:
 
 
 def find_running_conversion() -> str:
-    """Find output directory of running convert_model.sh process."""
+    """Find output directory of running convert_model.sh or proto_qwen25_chunk1_fp32.py process."""
     import subprocess
     try:
         result = subprocess.run(
@@ -1017,6 +1045,12 @@ def find_running_conversion() -> str:
                 parts = line.split('--output')
                 if len(parts) > 1:
                     # Get the path after --output
+                    output_part = parts[1].strip().split()[0]
+                    return output_part
+            elif 'proto_qwen25_chunk1_fp32' in line and '--out-dir' in line and 'grep' not in line:
+                # Detect hybrid chunk1 rebuild script
+                parts = line.split('--out-dir')
+                if len(parts) > 1:
                     output_part = parts[1].strip().split()[0]
                     return output_part
             elif 'converter' in line and '--output' in line:

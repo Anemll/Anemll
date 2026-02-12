@@ -643,13 +643,18 @@ def main() -> int:
     ap.add_argument(
         "--infer-only",
         action="store_true",
-        help="Only rebuild FFN chunk_01 infer in FP32 and keep existing FFN chunk_02/03 artifacts.",
+        help="Only rebuild FP32 attention chunk_01 infer (no prefill).",
+    )
+    ap.add_argument(
+        "--prefill-only",
+        action="store_true",
+        help="Only rebuild FP32 attention chunk_01 prefill (no infer).",
     )
     ap.add_argument(
         "--infer-only-out-base",
         default=None,
         help=(
-            "Optional output base stem for infer-only FP32 chunk export "
+            "Optional output base stem for FP32 chunk export "
             "(e.g. qwen25_FFN_attn_fp32). If omitted, overwrites the regular FFN chunk_01 base."
         ),
     )
@@ -684,23 +689,88 @@ def main() -> int:
     ap.add_argument("--recommended-temperature", type=float, default=None, help="Set recommended_sampling.temperature in meta.")
     ap.add_argument("--recommended-top-p", type=float, default=None, help="Set recommended_sampling.top_p in meta.")
     ap.add_argument("--recommended-top-k", type=int, default=None, help="Set recommended_sampling.top_k in meta.")
+    ap.add_argument(
+        "--rebuild-ffn-chunk",
+        type=int,
+        default=None,
+        help=(
+            "Rebuild a single FFN+prefill chunk (1-indexed) with layer0 MLP + layers[start:end]. "
+            "Uses standard converter layer partition (not hybrid). "
+            "Applies LUT if --lut2 is set."
+        ),
+    )
+    ap.add_argument(
+        "--rebuild-prefill-chunk",
+        type=int,
+        default=None,
+        help=(
+            "Rebuild only the prefill for a single chunk (1-indexed) with layer0 MLP + layers[start:end]. "
+            "Uses standard converter layer partition. Applies LUT if --lut2 is set."
+        ),
+    )
+    ap.add_argument(
+        "--rebuild-hybrid-chunk1",
+        action="store_true",
+        help=(
+            "Rebuild all 4 hybrid chunk1 artifacts in one shot: "
+            "FP32 attention infer+prefill and FFN+prefill chunk_01 (layer0 MLP + layers). "
+            "Reads config from meta.yaml in --out-dir. No --source-dir needed."
+        ),
+    )
     args = ap.parse_args()
 
     model_path = _resolve_model_path(args.model_path)
-    source_dir = Path(args.source_dir).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
+
+    # --rebuild-hybrid-chunk1 doesn't need source-dir, reads meta from out-dir
+    if args.rebuild_hybrid_chunk1:
+        source_dir = out_dir
+    else:
+        source_dir = Path(args.source_dir).expanduser().resolve()
 
     if not source_dir.exists():
         raise FileNotFoundError(source_dir)
 
-    if out_dir.exists() and not args.reuse_out_dir:
+    if out_dir.exists() and not (args.reuse_out_dir or args.rebuild_hybrid_chunk1):
         shutil.rmtree(out_dir)
-    if not out_dir.exists():
+    if not out_dir.exists() and not args.rebuild_hybrid_chunk1:
         print(f"Cloning source directory to: {out_dir}")
         shutil.copytree(source_dir, out_dir)
+    if args.rebuild_hybrid_chunk1 and not out_dir.exists():
+        raise FileNotFoundError(f"--rebuild-hybrid-chunk1 requires existing out-dir: {out_dir}")
 
     meta_params = _load_meta_params(source_dir, allow_missing=args.infer_only)
     model_prefix = str(meta_params.get("model_prefix", "qwen25"))
+
+    # For rebuild modes, override CLI defaults with meta.yaml values when not
+    # explicitly provided on the command line.  This prevents the common mistake
+    # of building all contexts with the default --context-length 2048.
+    _rebuild_mode = (
+        args.rebuild_hybrid_chunk1
+        or args.rebuild_ffn_chunk is not None
+        or args.rebuild_prefill_chunk is not None
+    )
+    if _rebuild_mode and meta_params:
+        _cli_set = {a.split("=")[0].lstrip("-") for a in sys.argv[1:] if a.startswith("-")}
+        _cli_set_normalized = set()
+        for k in _cli_set:
+            _cli_set_normalized.add(k.replace("-", "_"))
+
+        if "context_length" not in _cli_set_normalized:
+            meta_ctx = meta_params.get("context_length")
+            if meta_ctx is not None:
+                args.context_length = int(meta_ctx)
+                print(f"[meta] context_length={args.context_length} (from meta.yaml)")
+        if "batch_size" not in _cli_set_normalized:
+            meta_bs = meta_params.get("batch_size")
+            if meta_bs is not None:
+                args.batch_size = int(meta_bs)
+                print(f"[meta] batch_size={args.batch_size} (from meta.yaml)")
+        if "num_chunks" not in _cli_set_normalized:
+            meta_nc = meta_params.get("num_chunks")
+            if meta_nc is not None:
+                args.num_chunks = int(meta_nc)
+                print(f"[meta] num_chunks={args.num_chunks} (from meta.yaml)")
     src_lut1_bits, src_lut1_per = _meta_lut_to_tuple(
         meta_params.get("lut_embeddings"),
         meta_params.get("lut_embeddings_per_channel"),
@@ -735,7 +805,9 @@ def main() -> int:
     print(f"LUT config: lut1={args.lut1 or src_lut1_bits}, lut2={args.lut2 or src_lut2_bits}, lut3={args.lut3 or src_lut3_bits}")
     quantize_ffn = not (args.no_quantize_chunk2 or args.no_quantize_ffn)
 
-    _clean_existing_ffn_pf_chunks(out_dir, model_prefix)
+    if not (args.rebuild_hybrid_chunk1 or args.rebuild_ffn_chunk is not None
+            or args.rebuild_prefill_chunk is not None or args.infer_only or args.prefill_only):
+        _clean_existing_ffn_pf_chunks(out_dir, model_prefix)
 
     cfg = Qwen25Config.from_json(str(model_path / "config.json"))
     cfg.context_length = args.context_length
@@ -746,6 +818,209 @@ def main() -> int:
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
+
+    # --rebuild-ffn-chunk / --rebuild-prefill-chunk: export a single chunk with layer0-MLP + layers[start:end]
+    rebuild_chunk = args.rebuild_ffn_chunk if args.rebuild_ffn_chunk is not None else args.rebuild_prefill_chunk
+    build_ffn = args.rebuild_ffn_chunk is not None
+    build_prefill = args.rebuild_prefill_chunk is not None or args.rebuild_ffn_chunk is not None
+    if args.rebuild_prefill_chunk is not None and args.rebuild_ffn_chunk is None:
+        build_ffn = False
+    if rebuild_chunk is not None:
+        chunk_idx_1 = rebuild_chunk  # 1-indexed
+        total_chunks = args.num_chunks
+        if chunk_idx_1 < 1 or chunk_idx_1 > total_chunks:
+            raise ValueError(f"--rebuild-ffn-chunk {chunk_idx_1} out of range [1, {total_chunks}]")
+        chunk_idx_0 = chunk_idx_1 - 1
+
+        # Use standard converter layer partition
+        total_layers = cfg.num_hidden_layers
+        base_c, rem_c = divmod(total_layers, total_chunks)
+        start_layer = chunk_idx_0 * base_c + min(chunk_idx_0, rem_c)
+        end_layer = start_layer + base_c + (1 if chunk_idx_0 < rem_c else 0)
+
+        # For chunk 1 in hybrid: skip layer0 attention, include layer0 MLP
+        include_layer0_mlp = (start_layer == 0)
+        if include_layer0_mlp:
+            start_layer = 1  # attention handled by FP32 chunk
+
+        is_last = (chunk_idx_1 == total_chunks)
+        ffn_base = f"{model_prefix}_FFN{_lut_suffix(lut2_bits)}"
+        chunk_stem = f"{ffn_base}_chunk_{chunk_idx_1:02d}of{total_chunks:02d}"
+
+        seg_infer_ml = None
+        seg_prefill_ml = None
+
+        if build_ffn:
+            print(
+                f"Rebuilding FFN {chunk_stem}: "
+                f"layers[{start_layer}:{end_layer}) "
+                f"include_l0_mlp={include_layer0_mlp} final_norm={is_last}"
+            )
+            seg_infer = RemainingSegmentInferWrapper(
+                model,
+                start_layer=start_layer,
+                end_layer=end_layer,
+                include_layer0_mlp=include_layer0_mlp,
+                apply_final_norm=is_last,
+            ).eval()
+            seg_infer_ml = _convert_infer_wrapper(
+                seg_infer, model, args.context_length, cfg.hidden_size,
+                precision=ct.precision.FLOAT16,
+                compute_units=ct.ComputeUnit.CPU_AND_NE,
+            )
+
+        prefill_base = f"{model_prefix}_prefill{_lut_suffix(lut2_bits)}"
+        prefill_stem = f"{prefill_base}_chunk_{chunk_idx_1:02d}of{total_chunks:02d}"
+
+        if build_prefill:
+            print(
+                f"Rebuilding prefill {prefill_stem}: "
+                f"layers[{start_layer}:{end_layer}) "
+                f"include_l0_mlp={include_layer0_mlp} return_first_token={is_last}"
+            )
+            seg_prefill = RemainingSegmentPrefillWrapper(
+                model,
+                start_layer=start_layer,
+                end_layer=end_layer,
+                include_layer0_mlp=include_layer0_mlp,
+                return_first_token=is_last,
+            ).eval()
+            seg_prefill_ml = _convert_prefill_wrapper(
+                seg_prefill, model, args.context_length, cfg.hidden_size,
+                args.batch_size,
+                precision=ct.precision.FLOAT16,
+                compute_units=ct.ComputeUnit.CPU_AND_NE,
+            )
+
+        if quantize_ffn and lut2_bits is not None:
+            print(f"Quantizing with LUT {lut2_bits},{lut2_per} ...")
+            if seg_infer_ml is not None:
+                seg_infer_ml = _quantize_with_lut(
+                    seg_infer_ml, model, args.context_length, args.batch_size,
+                    lut2_bits, 0 if lut2_per is None else lut2_per,
+                )
+            if seg_prefill_ml is not None:
+                seg_prefill_ml = _quantize_with_lut(
+                    seg_prefill_ml, model, args.context_length, args.batch_size,
+                    lut2_bits, 0 if lut2_per is None else lut2_per,
+                )
+
+        print(f"\nDone. Rebuilt:")
+        if seg_infer_ml is not None:
+            ffn_pkg = out_dir / f"{chunk_stem}.mlpackage"
+            _save_model(seg_infer_ml, ffn_pkg)
+            if not args.no_compile:
+                _compile_mlpackage(ffn_pkg, out_dir)
+            print(f"  FFN:     {ffn_pkg.name}")
+
+        if seg_prefill_ml is not None:
+            prefill_pkg = out_dir / f"{prefill_stem}.mlpackage"
+            _save_model(seg_prefill_ml, prefill_pkg)
+            if not args.no_compile:
+                _compile_mlpackage(prefill_pkg, out_dir)
+            print(f"  Prefill: {prefill_pkg.name}")
+        return 0
+
+    # --rebuild-hybrid-chunk1: all 4 chunk1 artifacts in one shot
+    if args.rebuild_hybrid_chunk1:
+        total_chunks = args.num_chunks
+        total_layers = cfg.num_hidden_layers
+        base_c, rem_c = divmod(total_layers, total_chunks)
+        end_layer = base_c + (1 if 0 < rem_c else 0)
+
+        ffn_base = f"{model_prefix}_FFN{_lut_suffix(lut2_bits)}"
+        ffn_stem = f"{ffn_base}_chunk_01of{total_chunks:02d}"
+        prefill_base = f"{model_prefix}_prefill{_lut_suffix(lut2_bits)}"
+        prefill_stem = f"{prefill_base}_chunk_01of{total_chunks:02d}"
+        fp32_infer_base = f"{model_prefix}_FFN_attn_fp32"
+        fp32_prefill_base = f"{model_prefix}_prefill_attn_fp32"
+        fp32_infer_stem = f"{fp32_infer_base}_chunk_01of{total_chunks:02d}"
+        fp32_prefill_stem = f"{fp32_prefill_base}_chunk_01of{total_chunks:02d}"
+
+        print(f"=== Hybrid chunk1 rebuild (total_chunks={total_chunks}, layers=28) ===")
+        print(f"  FP32 attention: layer0 attention only")
+        print(f"  ANE chunk1: layer0 MLP + layers[1:{end_layer})")
+
+        # 1. FP32 attention infer
+        print(f"\n[1/4] FP32 attention infer: {fp32_infer_stem}")
+        fp32_infer_wrapper = Chunk1AttnInferWrapper(model).eval()
+        fp32_infer_ml = _convert_infer_wrapper(
+            fp32_infer_wrapper, model, args.context_length, cfg.hidden_size,
+            precision=ct.precision.FLOAT32,
+            compute_units=ct.ComputeUnit.CPU_ONLY,
+        )
+        fp32_infer_pkg = out_dir / f"{fp32_infer_stem}.mlpackage"
+        _save_model(fp32_infer_ml, fp32_infer_pkg)
+
+        # 2. FP32 attention prefill
+        print(f"\n[2/4] FP32 attention prefill: {fp32_prefill_stem}")
+        fp32_prefill_wrapper = Chunk1AttnPrefillWrapper(model).eval()
+        fp32_prefill_ml = _convert_prefill_wrapper(
+            fp32_prefill_wrapper, model, args.context_length, cfg.hidden_size,
+            args.batch_size,
+            precision=ct.precision.FLOAT32,
+            compute_units=ct.ComputeUnit.CPU_ONLY,
+        )
+        fp32_prefill_pkg = out_dir / f"{fp32_prefill_stem}.mlpackage"
+        _save_model(fp32_prefill_ml, fp32_prefill_pkg)
+
+        # 3. ANE FFN chunk1 (layer0 MLP + layers 1..end_layer)
+        print(f"\n[3/4] ANE FFN infer: {ffn_stem} (layer0 MLP + layers[1:{end_layer}))")
+        ffn_infer_wrapper = RemainingSegmentInferWrapper(
+            model, start_layer=1, end_layer=end_layer,
+            include_layer0_mlp=True, apply_final_norm=False,
+        ).eval()
+        ffn_infer_ml = _convert_infer_wrapper(
+            ffn_infer_wrapper, model, args.context_length, cfg.hidden_size,
+            precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+        )
+
+        # 4. ANE prefill chunk1 (layer0 MLP + layers 1..end_layer)
+        print(f"\n[4/4] ANE prefill: {prefill_stem} (layer0 MLP + layers[1:{end_layer}))")
+        prefill_wrapper = RemainingSegmentPrefillWrapper(
+            model, start_layer=1, end_layer=end_layer,
+            include_layer0_mlp=True, return_first_token=False,
+        ).eval()
+        prefill_ml = _convert_prefill_wrapper(
+            prefill_wrapper, model, args.context_length, cfg.hidden_size,
+            args.batch_size,
+            precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+        )
+
+        # Quantize ANE chunks
+        if quantize_ffn and lut2_bits is not None:
+            print(f"\nQuantizing ANE chunks with LUT {lut2_bits},{lut2_per} ...")
+            ffn_infer_ml = _quantize_with_lut(
+                ffn_infer_ml, model, args.context_length, args.batch_size,
+                lut2_bits, 0 if lut2_per is None else lut2_per,
+            )
+            prefill_ml = _quantize_with_lut(
+                prefill_ml, model, args.context_length, args.batch_size,
+                lut2_bits, 0 if lut2_per is None else lut2_per,
+            )
+
+        # Save ANE chunks
+        ffn_pkg = out_dir / f"{ffn_stem}.mlpackage"
+        _save_model(ffn_infer_ml, ffn_pkg)
+        prefill_pkg = out_dir / f"{prefill_stem}.mlpackage"
+        _save_model(prefill_ml, prefill_pkg)
+
+        # Compile all 4
+        if not args.no_compile:
+            print("\nCompiling...")
+            _compile_mlpackage(fp32_infer_pkg, out_dir)
+            _compile_mlpackage(fp32_prefill_pkg, out_dir)
+            _compile_mlpackage(ffn_pkg, out_dir)
+            _compile_mlpackage(prefill_pkg, out_dir)
+
+        print(f"\nDone. Rebuilt 4 hybrid chunk1 artifacts:")
+        print(f"  FP32 infer:   {fp32_infer_pkg.name}")
+        print(f"  FP32 prefill: {fp32_prefill_pkg.name}")
+        print(f"  ANE FFN:      {ffn_pkg.name}")
+        print(f"  ANE prefill:  {prefill_pkg.name}")
+        return 0
 
     if args.remaining_chunks <= 0:
         raise ValueError("--remaining-chunks must be > 0")
@@ -767,69 +1042,70 @@ def main() -> int:
     chunk1_infer = Chunk1AttnInferWrapper(model).eval()
     chunk1_prefill = Chunk1AttnPrefillWrapper(model).eval()
 
-    if args.infer_only:
+    if args.infer_only or args.prefill_only:
         if args.num_chunks <= 0:
             raise ValueError("--num-chunks must be > 0")
 
-        chunk1_start, chunk1_end = _chunk_bounds(cfg.num_hidden_layers, args.num_chunks, 0)
-        if chunk1_start != 0:
-            raise RuntimeError(
-                f"Unexpected chunk partition for chunk_01: start={chunk1_start}, end={chunk1_end}"
-            )
-        chunk1_infer_compatible = Chunk1Fp32FirstAttnInferWrapper(
-            model,
-            end_layer=chunk1_end,
-        ).eval()
-
         infer_only_base = args.infer_only_out_base.strip() if args.infer_only_out_base else target_base
         overwrite_mode = infer_only_base == target_base
-        print(
-            "Infer-only mode: exporting "
-            f"{infer_only_base}_chunk_01of{args.num_chunks:02d} in FP32-first-attn mode "
-            f"(chunk_01 end_layer={chunk1_end})"
-            + (" (overwrite mode)" if overwrite_mode else " (standalone mode)")
-        )
-        c1_infer_ml = _convert_infer_wrapper(
-            chunk1_infer_compatible,
-            model,
-            args.context_length,
-            cfg.hidden_size,
-            precision=ct.precision.FLOAT32,
-            compute_units=ct.ComputeUnit.CPU_ONLY,
-        )
+        prefill_attn_base = infer_only_base.replace("_FFN_", "_prefill_")
+        build_infer = not args.prefill_only
+        build_prefill = not args.infer_only
 
-        c1_pkg = out_dir / f"{infer_only_base}_chunk_01of{args.num_chunks:02d}.mlpackage"
-        _save_model(c1_infer_ml, c1_pkg)
-        if not args.no_compile:
-            _compile_mlpackage(c1_pkg, out_dir)
+        # If both flags given, build both
+        if args.infer_only and args.prefill_only:
+            build_infer = True
+            build_prefill = True
 
-        if overwrite_mode:
-            for idx in range(2, args.num_chunks + 1):
-                if not _has_chunk_artifact(out_dir, target_base, idx, args.num_chunks):
-                    raise FileNotFoundError(
-                        f"Missing existing infer chunk {idx:02d}of{args.num_chunks:02d} in {out_dir} "
-                        f"(expected {target_base}_chunk_{idx:02d}of{args.num_chunks:02d}.mlpackage/.mlmodelc)."
-                    )
+        c1_infer_pkg = None
+        c1_prefill_pkg = None
 
-        # Update meta only when present; infer-only context folders may skip meta.yaml.
-        if overwrite_mode and meta_params and (out_dir / "meta.yaml").exists():
-            meta_path = out_dir / "meta.yaml"
-            meta = yaml.safe_load(meta_path.read_text())
-            params = meta.setdefault("model_info", {}).setdefault("parameters", {})
-            params["num_chunks"] = int(args.num_chunks)
-            params["lut_ffn"] = _lut_to_meta_value(lut2_bits)
-            params["ffn"] = (
-                f"{target_base}_chunk_01of{args.num_chunks:02d}.mlpackage"
-                if args.no_compile
-                else f"{target_base}_chunk_01of{args.num_chunks:02d}.mlmodelc"
+        if build_infer:
+            print(
+                f"FP32 attention infer: exporting "
+                f"{infer_only_base}_chunk_01of{args.num_chunks:02d} "
+                f"(layer0 attention residual only)"
             )
-            meta_path.write_text(yaml.safe_dump(meta, sort_keys=False))
+            chunk1_attn_infer = Chunk1AttnInferWrapper(model).eval()
+            c1_infer_ml = _convert_infer_wrapper(
+                chunk1_attn_infer,
+                model,
+                args.context_length,
+                cfg.hidden_size,
+                precision=ct.precision.FLOAT32,
+                compute_units=ct.ComputeUnit.CPU_ONLY,
+            )
+            c1_infer_pkg = out_dir / f"{infer_only_base}_chunk_01of{args.num_chunks:02d}.mlpackage"
+            _save_model(c1_infer_ml, c1_infer_pkg)
+            if not args.no_compile:
+                _compile_mlpackage(c1_infer_pkg, out_dir)
 
-        print("\nDone (infer-only).")
-        print(f"FP32 attention artifact: {c1_pkg.name}")
-        if not overwrite_mode:
-            print(f"Original FFN chunks preserved under base: {target_base}")
-        print(f"Compile: {'disabled' if args.no_compile else 'enabled'}")
+        if build_prefill:
+            print(
+                f"FP32 attention prefill: exporting "
+                f"{prefill_attn_base}_chunk_01of{args.num_chunks:02d} "
+                f"(layer0 attention residual only)"
+            )
+            chunk1_attn_prefill = Chunk1AttnPrefillWrapper(model).eval()
+            c1_prefill_ml = _convert_prefill_wrapper(
+                chunk1_attn_prefill,
+                model,
+                args.context_length,
+                cfg.hidden_size,
+                args.batch_size,
+                precision=ct.precision.FLOAT32,
+                compute_units=ct.ComputeUnit.CPU_ONLY,
+            )
+            c1_prefill_pkg = out_dir / f"{prefill_attn_base}_chunk_01of{args.num_chunks:02d}.mlpackage"
+            _save_model(c1_prefill_ml, c1_prefill_pkg)
+            if not args.no_compile:
+                _compile_mlpackage(c1_prefill_pkg, out_dir)
+
+        print("\nDone (FP32 attention).")
+        if c1_infer_pkg:
+            print(f"  Infer:   {c1_infer_pkg.name}")
+        if c1_prefill_pkg:
+            print(f"  Prefill: {c1_prefill_pkg.name}")
         return 0
 
     # Build lm_head according to --lut3 so metadata can point to a matching artifact.
