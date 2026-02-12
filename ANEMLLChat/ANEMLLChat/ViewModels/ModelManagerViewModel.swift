@@ -50,7 +50,7 @@ enum DeviceType {
     }
 
     /// Detect if an iOS/iPadOS app is running on Apple Vision Pro (iPad compatibility mode)
-    private static var isRunningOnVisionPro: Bool {
+    static var isRunningOnVisionPro: Bool {
         #if os(visionOS)
         return true
         #elseif os(iOS)
@@ -437,6 +437,9 @@ final class ModelManagerViewModel {
 
     private var recentlyHandledIncomingURLKeys: [String: Date] = [:]
     #endif
+
+    /// Signal from child views (e.g. ChatView) to open the model selection sheet.
+    var requestModelSelection: Bool = false
 
     /// Whether model is being loaded
     var isLoadingModel: Bool = false
@@ -996,6 +999,7 @@ final class ModelManagerViewModel {
 
             } catch {
                 guard !Task.isCancelled else { return }
+                loadedModelId = nil
                 errorMessage = error.localizedDescription
                 logError("Failed to load model: \(error)", category: .model)
             }

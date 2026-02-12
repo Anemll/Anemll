@@ -6,6 +6,9 @@
 //
 
 import Foundation
+#if os(iOS)
+import UIKit
+#endif
 
 #if os(macOS)
 enum StorageMigrationMode: String, Sendable {
@@ -671,8 +674,17 @@ actor StorageService {
     static let defaultAutoLoadLastModelValue: Bool = true
     static let defaultEnableMarkupValue: Bool = true
     static let defaultSendButtonOnLeftValue: Bool = false
-    static let defaultLoadLastChatValue: Bool = true  // Load last chat on startup by default
-    static let defaultLargeControlsValue: Bool = false  // Large controls for accessibility
+    static let defaultLoadLastChatValue: Bool = false  // Don't load last chat on startup by default
+    static let defaultLargeControlsValue: Bool = {
+        // Default to large controls on iPad and visionOS for better touch targets
+        #if os(visionOS)
+        return true
+        #elseif os(iOS)
+        return UIDevice.current.userInterfaceIdiom == .pad  // Also true in iPad compat mode on visionOS
+        #else
+        return false
+        #endif
+    }()
     static let defaultShowMicrophoneValue: Bool = true  // Show microphone button by default
 
     // Sampling defaults

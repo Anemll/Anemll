@@ -18,8 +18,9 @@ struct InputBar: View {
     @State private var micErrorText = ""
     @State private var speechService = SpeechRecognitionService.shared
     @State private var textBeforeSpeech = ""  // Text in input before speech started
+    @State private var isSpeechActive = false  // Track speech session to ignore recognizedText clearing
     @AppStorage("sendButtonOnLeft") private var sendButtonOnLeft = false
-    @AppStorage("largeControls") private var largeControls = false
+    @AppStorage("largeControls") private var largeControls = StorageService.defaultLargeControlsValue
     @AppStorage("showMicrophone") private var showMicrophone = true
 
     private var actionButtonSize: CGFloat {
@@ -27,6 +28,18 @@ struct InputBar: View {
         return largeControls ? 60 : 30
         #else
         return 30
+        #endif
+    }
+
+    /// Extra trailing padding on visionOS to avoid overlapping the system copy-paste overlay
+    private var visionOSTrailingPadding: CGFloat {
+        #if os(visionOS)
+        return sendButtonOnLeft ? 0 : 28
+        #elseif os(iOS)
+        if DeviceType.isRunningOnVisionPro && !sendButtonOnLeft { return 28 }
+        return 0
+        #else
+        return 0
         #endif
     }
 
@@ -58,6 +71,7 @@ struct InputBar: View {
                 }
             }
             .padding(.horizontal, 16)
+            .padding(.trailing, visionOSTrailingPadding)
             .padding(.vertical, 12)
             .modifier(InputBarGlassModifier())
             .shadow(color: .black.opacity(0.2), radius: 12, y: 6)
@@ -90,6 +104,9 @@ struct InputBar: View {
         // The recognizedText is updated continuously with the full transcription,
         // so we replace (not append) the speech portion each time
         .onChange(of: speechService.recognizedText) { _, newText in
+            // Ignore recognizedText being cleared when speech stops — keep composed text
+            guard isSpeechActive else { return }
+
             // Combine the text that existed before speech with the new recognized text
             if textBeforeSpeech.isEmpty {
                 chatVM.inputText = newText
@@ -107,10 +124,12 @@ struct InputBar: View {
         // Track when speech starts/stops to manage text properly
         .onChange(of: speechService.isListening) { wasListening, isListening in
             if isListening && !wasListening {
-                // Speech just started - save current input text
+                // Speech just started - save current input text and mark session active
                 textBeforeSpeech = chatVM.inputText
+                isSpeechActive = true
             } else if !isListening && wasListening {
-                // Speech just stopped - clear the saved text
+                // Speech just stopped - deactivate session so recognizedText clearing is ignored
+                isSpeechActive = false
                 textBeforeSpeech = ""
             }
         }
@@ -168,15 +187,14 @@ struct InputBar: View {
             .onSubmit {
                 sendMessage()
             }
-            #if os(macOS)
-            .onKeyPress(.return, phases: .down) { _ in
-                if !NSEvent.modifierFlags.contains(.shift) {
-                    sendMessage()
-                    return .handled
+            .onKeyPress(.return, phases: .down) { press in
+                if press.modifiers.contains(.shift) {
+                    // Shift+Enter: insert newline (let system handle it)
+                    return .ignored
                 }
-                return .ignored
+                sendMessage()
+                return .handled
             }
-            #endif
     }
 
     // MARK: - Microphone Button

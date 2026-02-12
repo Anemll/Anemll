@@ -21,7 +21,7 @@ struct ContentView: View {
     @State private var showingConversationSheet = false
     @State private var hasCheckedInitialState = false
     @State private var showingClearAllAlert = false
-    @AppStorage("largeControls") private var largeControls = false
+    @AppStorage("largeControls") private var largeControls = StorageService.defaultLargeControlsValue
 
     var body: some View {
         #if os(iOS)
@@ -57,6 +57,11 @@ struct ContentView: View {
             guard importedModelId != nil else { return }
             showingModelSheet = true
             modelManager.lastImportedPackageModelId = nil
+        }
+        .onChange(of: modelManager.requestModelSelection) { _, requested in
+            guard requested else { return }
+            showingModelSheet = true
+            modelManager.requestModelSelection = false
         }
         .overlay {
             if modelManager.isImportingIncomingPackage {
@@ -129,6 +134,11 @@ struct ContentView: View {
                     window.styleMask.insert(.resizable)
                     window.minSize = NSSize(width: 720, height: 560)
                 }
+        }
+        .onChange(of: modelManager.requestModelSelection) { _, requested in
+            guard requested else { return }
+            showingModelSheet = true
+            modelManager.requestModelSelection = false
         }
         // Auto-show model list ONLY on true fresh start (never used before)
         .task {
@@ -360,6 +370,16 @@ struct ContentView: View {
 
             Spacer()
 
+            #if os(macOS)
+            // Settings button (opens standard macOS Settings scene)
+            SettingsLink {
+                Image(systemName: "gearshape")
+            }
+            .buttonStyle(.accessoryBar)
+            .controlSize(.small)
+            .help("Settings (⌘,)")
+            #endif
+
             // Models button - compact pill style (combines model name + loading progress)
             Button {
                 showingModelSheet = true
@@ -439,31 +459,17 @@ struct ContentView: View {
                 .foregroundStyle(.primary)
 
             // Action area
-            if modelManager.loadedModelId == nil {
-                Text("Load a model to get started")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+            Text("Start a new conversation")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
 
-                Button {
-                    showingModelSheet = true
-                } label: {
-                    Label("Select Model", systemImage: "cpu")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-            } else {
-                Text("Start a new conversation")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-
-                Button {
-                    chatVM.newConversation()
-                } label: {
-                    Label("New Conversation", systemImage: "plus")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+            Button {
+                chatVM.newConversation()
+            } label: {
+                Label("New Conversation", systemImage: "plus")
             }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
 
             Spacer()
         }
@@ -701,13 +707,17 @@ private struct DownloadProgressPill: View {
                         .frame(maxWidth: 80)
                 }
 
-                // Progress percentage
+                // Progress percentage or preparing state
                 if let progress = modelManager.downloadProgress {
                     Text("\(Int(progress.progress * 100))%")
                         .font(.caption2)
                         .fontWeight(.bold)
                         .foregroundStyle(.blue)
                         .monospacedDigit()
+                } else {
+                    Text("Preparing...")
+                        .font(.caption2)
+                        .foregroundStyle(.blue.opacity(0.7))
                 }
             }
             .padding(.horizontal, 8)

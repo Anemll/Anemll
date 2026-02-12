@@ -357,6 +357,14 @@ struct ModelListView: View {
 
                 if let progress = modelManager.downloadProgress {
                     DownloadProgressView(progress: progress)
+                } else {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Preparing download...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             .padding(.vertical, 4)

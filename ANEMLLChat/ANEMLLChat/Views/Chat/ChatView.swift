@@ -104,6 +104,36 @@ struct ChatView: View {
             // Messages
             messagesView
 
+            // Centered prompt when no model is loaded and not loading
+            if modelManager.loadedModelId == nil && !modelManager.isLoadingModel {
+                VStack(spacing: 16) {
+                    Image(systemName: modelManager.errorMessage != nil ? "exclamationmark.triangle" : "cpu")
+                        .font(.system(size: 40))
+                        .foregroundStyle(modelManager.errorMessage != nil ? .red : .secondary)
+
+                    if let error = modelManager.errorMessage {
+                        Text("Model loading failed")
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 32)
+                    }
+
+                    Button {
+                        modelManager.requestModelSelection = true
+                    } label: {
+                        Label("Download or Select Model", systemImage: "arrow.down.circle")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(true)
+            }
+
             if let progress = modelManager.loadingProgress, modelManager.isLoadingModel {
                 // Full-screen frosted glass overlay to dim text behind
                 ZStack(alignment: .center) {
