@@ -2130,9 +2130,19 @@ final class ModelManagerViewModel {
         #if os(macOS)
         if let base64 = model.bookmarkDataBase64, let bookmarkData = Data(base64Encoded: base64) {
             var isStale = false
+            // Try security-scoped resolution first, then fall back to non-scoped
             if let resolvedURL = try? URL(
                 resolvingBookmarkData: bookmarkData,
                 options: [.withSecurityScope, .withoutUI],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            ) {
+                _ = resolvedURL.startAccessingSecurityScopedResource()
+                return resolvedURL.path
+            }
+            if let resolvedURL = try? URL(
+                resolvingBookmarkData: bookmarkData,
+                options: [.withoutUI],
                 relativeTo: nil,
                 bookmarkDataIsStale: &isStale
             ) {
@@ -2158,11 +2168,18 @@ final class ModelManagerViewModel {
     private func makeBookmarkDataBase64(for url: URL) -> String? {
         #if os(macOS)
         do {
+            // Try security-scoped bookmark first (works in sandboxed apps)
             let bookmark = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
             return bookmark.base64EncodedString()
         } catch {
-            logWarning("Failed to create security-scoped bookmark: \(error)", category: .model)
-            return nil
+            // Fall back to non-scoped bookmark (works without sandbox)
+            do {
+                let bookmark = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+                return bookmark.base64EncodedString()
+            } catch {
+                logWarning("Failed to create bookmark: \(error)", category: .model)
+                return nil
+            }
         }
         #else
         return nil

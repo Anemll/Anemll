@@ -34,10 +34,8 @@ struct ANEMLLChatApp: App {
                         await modelManager.handleIncomingTransferURL(url)
                     }
                 }
-                #if os(iOS)
-                // Force dark mode on iOS/iPadOS/visionOS to match hardcoded dark backgrounds
+                // Force dark mode to match hardcoded dark backgrounds throughout the app
                 .preferredColorScheme(.dark)
-                #endif
         }
         #if os(macOS)
         // Use titleBar style to show toolbar

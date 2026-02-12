@@ -77,5 +77,11 @@
 	<string>ANEMLL Chat uses speech recognition to convert your voice to text for chat input.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>ANEMLL Chat needs microphone access to capture your voice for speech-to-text.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>ANEMLL Chat needs access to load local CoreML models.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>ANEMLL Chat needs access to load local CoreML models.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>ANEMLL Chat needs access to load local CoreML models.</string>
 </dict>
 </plist>
