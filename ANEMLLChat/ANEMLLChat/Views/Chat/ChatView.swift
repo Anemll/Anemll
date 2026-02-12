@@ -375,20 +375,26 @@ struct ChatView: View {
                             scheduleAutoScroll()
                         }
                     }
-                    // Use onScrollPhaseChange to detect user scroll (fires only on phase transitions, not every frame)
-                    #if os(macOS)
+                    // Detect user scroll to interrupt auto-follow (all platforms)
                     .onScrollPhaseChange { oldPhase, newPhase in
-                        // User started interacting with scroll
                         if newPhase == .interacting || newPhase == .decelerating {
-                            // Stop follow mode when user scrolls manually
                             if scrollMode == .follow {
                                 setScrollMode(.manual)
                                 autoFollowSuspendedByUser = true
                             }
-                            // Note: Don't show chevron here unconditionally
-                            // Let the BottomVisiblePreferenceKey handler decide based on actual position
                         }
                     }
+                    #if os(iOS)
+                    // Also detect tap-to-stop on iOS (onScrollPhaseChange doesn't fire for taps)
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { _ in
+                                if scrollMode == .follow && chatVM.isGenerating {
+                                    setScrollMode(.manual)
+                                    autoFollowSuspendedByUser = true
+                                }
+                            }
+                    )
                     #endif
                 }
 
