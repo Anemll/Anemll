@@ -238,12 +238,12 @@ struct ModelCard: View {
         }
         .task {
             // Load recommended sampling for downloaded models
-            if model.isDownloaded, let localPath = model.localPath {
-                let metaPath = URL(fileURLWithPath: localPath)
-                    .appendingPathComponent("meta.yaml")
-                    .path
-                if let metadata = ModelMetadata.load(from: metaPath) {
-                    recommendedSampling = metadata.recommendedSampling
+            if model.isDownloaded {
+                modelManager.withLinkedModelAccess(for: model) { modelURL in
+                    let metaPath = modelURL.appendingPathComponent("meta.yaml").path
+                    if let metadata = ModelMetadata.load(from: metaPath) {
+                        recommendedSampling = metadata.recommendedSampling
+                    }
                 }
             }
             // Compute actual size for local models that show "Local"
@@ -1180,23 +1180,22 @@ struct ModelDetailView: View {
         isLoading = true
         defer { isLoading = false }
 
-        guard model.isDownloaded,
-              let localPath = model.localPath else {
-            return
+        guard model.isDownloaded else { return }
+
+        // Use withLinkedModelAccess for security-scoped bookmark resolution.
+        // getWeightFileDetails/formattedModelSize resolve bookmarks internally,
+        // but ModelMetadata.load reads the file directly so we need access here.
+        modelManager.withLinkedModelAccess(for: model) { modelURL in
+            let metaPath = modelURL.appendingPathComponent("meta.yaml").path
+            metadata = ModelMetadata.load(from: metaPath)
         }
-
-        let metaPath = URL(fileURLWithPath: localPath)
-            .appendingPathComponent("meta.yaml")
-            .path
-
-        metadata = ModelMetadata.load(from: metaPath)
 
         // Compute actual size for local models
         if model.size == "Local" {
             computedDetailSize = modelManager.formattedModelSize(for: model)
         }
 
-        // Load weight file details
+        // Load weight file details (these resolve bookmarks internally)
         weightDetails = modelManager.getWeightFileDetails(for: model)
         weightWarning = modelManager.getWeightSizeWarning(for: model)
     }
