@@ -1023,6 +1023,10 @@ class Gemma3Converter(BaseConverter):
                     # Apply final normalization
                     hidden_states = self.model.model.norm(hidden_states)
 
+                    # Prefill output: return only hidden states, skip LM head
+                    if self.is_prefill:
+                        return hidden_states[:, 0:1, :]
+
                     # Step 3: LM Head
                     if self.lm_head_mode != "linear":
                         hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2)
