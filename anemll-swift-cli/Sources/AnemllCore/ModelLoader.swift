@@ -101,7 +101,7 @@ public actor ModelLoader {
     private static func loadMLModel(at url: URL, configuration: MLModelConfiguration) throws -> MLModel {
         try MLModel(contentsOf: url, configuration: configuration)
     }
-    
+
     /// Helper class to avoid data races with currentProgress
     private actor ProgressTracker {
         private var currentProgress = 0.0
@@ -333,76 +333,93 @@ public actor ModelLoader {
                     detail: "Inference \(i)/\(configCopy.numChunks)"
                 )
                 
-                print("Loading inference chunk \(i): \(chunkPath)")
-                modelConfig.functionName = "infer"
+                // Old models (< 0.3.0) use single-function .mlmodelc files — no functionName needed.
+                let isLegacyModel = configCopy.configVersion.compare("0.3.0", options: .numeric) == .orderedAscending
 
-                // Load inference model and fail immediately if it fails
                 var inferModel: MLModel
-                do {
-                    inferModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
-                    print("✅ Inference chunk \(i) loaded")
-                } catch {
-                    print("❌ Error loading inference chunk \(i): \(error)")
-                    throw ModelError.inferenceError("Failed to load inference chunk \(i): \(String(reflecting: error))")
-                }
-
-                try await progressTracker.updateProgress(
-                    increment: chunkProgressIncrement,
-                    stage: "FFN Chunk Loaded",
-                    detail: "Inference \(i)/\(configCopy.numChunks)"
-                )
-
-                // Load prefill model for this chunk
-                try await progressTracker.updateProgress(
-                    increment: 0.0,
-                    stage: "Loading FFN Chunk",
-                    detail: "Prefill \(i)/\(configCopy.numChunks)"
-                )
-
-                print("Loading prefill chunk \(i): \(chunkPath)")
-                modelConfig.functionName = "prefill"
-
-                // Load prefill model and fail immediately if it fails
                 var prefillModel: MLModel
-                do {
-                    prefillModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
-                    print("✅ Prefill chunk \(i) loaded")
-                } catch {
-                    print("❌ Error loading prefill chunk \(i): \(error)")
-                    throw ModelError.inferenceError("Failed to load prefill chunk \(i): \(String(reflecting: error))")
-                }
-
-                try await progressTracker.updateProgress(
-                    increment: chunkProgressIncrement,
-                    stage: "FFN Chunk Loaded",
-                    detail: "Prefill \(i)/\(configCopy.numChunks)"
-                )
-
-                // Try to load rotation functions (4-function model for Gemma3 with sliding window)
                 var inferRotateModel: MLModel? = nil
                 var prefillRotateModel: MLModel? = nil
 
-                // Only try loading rotation functions if sliding window is configured
-                if configCopy.slidingWindow != nil {
-                    print("Sliding window configured, attempting to load rotation functions...")
-                    modelConfig.functionName = "infer_rotate"
+                if isLegacyModel {
+                    // Legacy single-function model: load without functionName, same as embeddings
+                    print("Loading chunk \(i) (legacy single-function format): \(chunkPath)")
                     do {
-                        inferRotateModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
-                        print("✅ Inference rotate chunk \(i) loaded")
+                        inferModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                        prefillModel = inferModel
+                        print("✅ Chunk \(i) loaded (legacy format)")
                     } catch {
-                        print("ℹ️ Inference rotate function not available (2-function model)")
+                        print("❌ Error loading chunk \(i): \(error)")
+                        throw ModelError.inferenceError("Failed to load chunk \(i): \(String(reflecting: error))")
                     }
 
-                    modelConfig.functionName = "prefill_rotate"
+                    try await progressTracker.updateProgress(
+                        increment: chunkProgressIncrement * 2,
+                        stage: "FFN Chunk Loaded",
+                        detail: "Chunk \(i)/\(configCopy.numChunks)"
+                    )
+                } else {
+                    // Multi-function model (>= 0.3.0): load infer and prefill functions separately
+                    print("Loading inference chunk \(i): \(chunkPath)")
+                    modelConfig.functionName = "infer"
                     do {
-                        prefillRotateModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
-                        print("✅ Prefill rotate chunk \(i) loaded")
+                        inferModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                        print("✅ Inference chunk \(i) loaded")
                     } catch {
-                        print("ℹ️ Prefill rotate function not available (2-function model)")
+                        print("❌ Error loading inference chunk \(i): \(error)")
+                        throw ModelError.inferenceError("Failed to load inference chunk \(i): \(String(reflecting: error))")
                     }
 
-                    if inferRotateModel != nil && prefillRotateModel != nil {
-                        print("✅ Chunk \(i) loaded as 4-function model (with rotation support)")
+                    try await progressTracker.updateProgress(
+                        increment: chunkProgressIncrement,
+                        stage: "FFN Chunk Loaded",
+                        detail: "Inference \(i)/\(configCopy.numChunks)"
+                    )
+
+                    try await progressTracker.updateProgress(
+                        increment: 0.0,
+                        stage: "Loading FFN Chunk",
+                        detail: "Prefill \(i)/\(configCopy.numChunks)"
+                    )
+
+                    print("Loading prefill chunk \(i): \(chunkPath)")
+                    modelConfig.functionName = "prefill"
+                    do {
+                        prefillModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                        print("✅ Prefill chunk \(i) loaded")
+                    } catch {
+                        print("❌ Error loading prefill chunk \(i): \(error)")
+                        throw ModelError.inferenceError("Failed to load prefill chunk \(i): \(String(reflecting: error))")
+                    }
+
+                    try await progressTracker.updateProgress(
+                        increment: chunkProgressIncrement,
+                        stage: "FFN Chunk Loaded",
+                        detail: "Prefill \(i)/\(configCopy.numChunks)"
+                    )
+
+                    // Try to load rotation functions (4-function model for Gemma3 with sliding window)
+                    if configCopy.slidingWindow != nil {
+                        print("Sliding window configured, attempting to load rotation functions...")
+                        modelConfig.functionName = "infer_rotate"
+                        do {
+                            inferRotateModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                            print("✅ Inference rotate chunk \(i) loaded")
+                        } catch {
+                            print("ℹ️ Inference rotate function not available (2-function model)")
+                        }
+
+                        modelConfig.functionName = "prefill_rotate"
+                        do {
+                            prefillRotateModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                            print("✅ Prefill rotate chunk \(i) loaded")
+                        } catch {
+                            print("ℹ️ Prefill rotate function not available (2-function model)")
+                        }
+
+                        if inferRotateModel != nil && prefillRotateModel != nil {
+                            print("✅ Chunk \(i) loaded as 4-function model (with rotation support)")
+                        }
                     }
                 }
 
@@ -503,49 +520,100 @@ public actor ModelLoader {
             detail: "Inference function"
         )
 
-        print("Loading monolithic infer function...")
-        modelConfig.functionName = "infer"
+        // Old models (< 0.3.0) use single-function .mlmodelc files — no functionName needed.
+        let isLegacyModel = config.configVersion.compare("0.3.0", options: .numeric) == .orderedAscending
+
         let inferModel: MLModel
-        do {
-            inferModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
-            print("✅ Monolithic infer function loaded")
-        } catch {
-            print("❌ Error loading monolithic infer function: \(error)")
-            throw ModelError.inferenceError("Failed to load monolithic infer function: \(String(reflecting: error))")
-        }
-
-        try await progressTracker.updateProgress(
-            increment: 0.4,
-            stage: "Monolithic Infer Loaded",
-            detail: nil
-        )
-
-        // Load prefill model
-        try await progressTracker.updateProgress(
-            increment: 0.0,
-            stage: "Loading Monolithic Model",
-            detail: "Prefill function"
-        )
-
-        print("Loading monolithic prefill function...")
-        modelConfig.functionName = "prefill"
         let prefillModel: MLModel
-        do {
-            prefillModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
-            print("✅ Monolithic prefill function loaded")
-        } catch {
-            print("❌ Error loading monolithic prefill function: \(error)")
-            throw ModelError.inferenceError("Failed to load monolithic prefill function: \(String(reflecting: error))")
+        var inferRotateModel: MLModel? = nil
+        var prefillRotateModel: MLModel? = nil
+
+        if isLegacyModel {
+            // Legacy single-function model: load once, use for both infer and prefill
+            print("Loading monolithic model (legacy single-function format)...")
+            do {
+                inferModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
+                prefillModel = inferModel
+                print("✅ Monolithic model loaded (legacy format)")
+            } catch {
+                print("❌ Error loading monolithic model: \(error)")
+                throw ModelError.inferenceError("Failed to load monolithic model: \(String(reflecting: error))")
+            }
+
+            try await progressTracker.updateProgress(
+                increment: 0.9,
+                stage: "Monolithic Model Loaded",
+                detail: "legacy format"
+            )
+        } else {
+            // Multi-function model (>= 0.3.0): load infer and prefill functions separately
+            print("Loading monolithic infer function...")
+            modelConfig.functionName = "infer"
+            do {
+                inferModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
+                print("✅ Monolithic infer function loaded")
+            } catch {
+                print("❌ Error loading monolithic infer function: \(error)")
+                throw ModelError.inferenceError("Failed to load monolithic infer function: \(String(reflecting: error))")
+            }
+
+            try await progressTracker.updateProgress(
+                increment: 0.4,
+                stage: "Monolithic Infer Loaded",
+                detail: nil
+            )
+
+            try await progressTracker.updateProgress(
+                increment: 0.0,
+                stage: "Loading Monolithic Model",
+                detail: "Prefill function"
+            )
+
+            print("Loading monolithic prefill function...")
+            modelConfig.functionName = "prefill"
+            do {
+                prefillModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
+                print("✅ Monolithic prefill function loaded")
+            } catch {
+                print("❌ Error loading monolithic prefill function: \(error)")
+                throw ModelError.inferenceError("Failed to load monolithic prefill function: \(String(reflecting: error))")
+            }
+
+            try await progressTracker.updateProgress(
+                increment: 0.5,
+                stage: "Monolithic Prefill Loaded",
+                detail: nil
+            )
         }
 
-        try await progressTracker.updateProgress(
-            increment: 0.5,
-            stage: "Monolithic Prefill Loaded",
-            detail: nil
-        )
+        // Optional rotation functions for sliding-window models.
+        if let slidingWindow = config.slidingWindow, config.contextLength > slidingWindow {
+            print("Loading optional monolithic rotate functions...")
+
+            modelConfig.functionName = "infer_rotate"
+            do {
+                inferRotateModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
+                print("✅ Monolithic infer_rotate function loaded")
+            } catch {
+                print("⚠️ Monolithic infer_rotate function unavailable: \(error)")
+            }
+
+            modelConfig.functionName = "prefill_rotate"
+            do {
+                prefillRotateModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
+                print("✅ Monolithic prefill_rotate function loaded")
+            } catch {
+                print("⚠️ Monolithic prefill_rotate function unavailable: \(error)")
+            }
+        }
 
         // Create FFNChunk with monolithic models
-        let monolithicChunk = FFNChunk(inferModel: inferModel, prefillModel: prefillModel)
+        let monolithicChunk = FFNChunk(
+            inferModel: inferModel,
+            prefillModel: prefillModel,
+            inferRotateModel: inferRotateModel,
+            prefillRotateModel: prefillRotateModel
+        )
 
         // Final progress update
         try await progressTracker.updateProgress(

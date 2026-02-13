@@ -352,6 +352,40 @@ private typealias Float16 = Float
         }
     }
 
+    private var monolithicHasRotationSupport: Bool {
+        ffnChunks.first?.hasRotationSupport ?? false
+    }
+
+    private func monolithicInferModel(for position: Int) throws -> MLModel {
+        guard let chunk = ffnChunks?.first else {
+            throw InferenceError.inferenceError("Monolithic chunk is not initialized")
+        }
+        guard let slidingWindow = slidingWindow, position >= slidingWindow else {
+            return chunk.inferModel
+        }
+        if let rotateModel = chunk.inferRotateModel {
+            return rotateModel
+        }
+        throw InferenceError.inferenceError(
+            "Position \(position) reached sliding_window=\(slidingWindow), but infer_rotate is unavailable"
+        )
+    }
+
+    private func monolithicPrefillModel(for batchPos: Int) throws -> MLModel {
+        guard let chunk = ffnChunks?.first else {
+            throw InferenceError.inferenceError("Monolithic chunk is not initialized")
+        }
+        guard let slidingWindow = slidingWindow, batchPos >= slidingWindow else {
+            return chunk.prefillModel
+        }
+        if let rotateModel = chunk.prefillRotateModel {
+            return rotateModel
+        }
+        throw InferenceError.inferenceError(
+            "Batch position \(batchPos) reached sliding_window=\(slidingWindow), but prefill_rotate is unavailable"
+        )
+    }
+
     private func cosineFromAccumulators(dot: Float, normA: Float, normB: Float) -> Float {
         let denominator = sqrt(normA) * sqrt(normB)
         if denominator == 0 {
@@ -798,6 +832,10 @@ private typealias Float16 = Float
             print("✅ Batch prefill enabled (partial batches supported)")
         } else {
             print("⚠️  No update_mask_prefill or prefill_dynamic_slice; partial batches use single-token prefill")
+        }
+
+        if isMonolithic, let slidingWindow, !hasRotation {
+            print("⚠️  Monolithic model has sliding_window=\(slidingWindow) but rotate functions are unavailable; generation will stop before that boundary to avoid ANE failure")
         }
 
         // Create full causal mask - needed for attention
@@ -1804,9 +1842,6 @@ private typealias Float16 = Float
             print("Has update_mask:", hasUpdateMask)
         }
 
-        let prefillModel = ffnChunks[0].prefillModel
-        let inferModel = ffnChunks[0].inferModel
-
         var batchPos = 0
 
         // Match Python tests/chat.py monolithic behavior:
@@ -1931,6 +1966,9 @@ private typealias Float16 = Float
             // Create input feature provider
             let prefillInput = try MLDictionaryFeatureProvider(dictionary: inputDict)
 
+            // Select rotate/non-rotate prefill function based on position.
+            let prefillModel = try monolithicPrefillModel(for: batchPos)
+
             // Run prediction on serial queue for consistent execution context
             var predictionError: Error?
             predictionQueue.sync { [self] in
@@ -1994,6 +2032,9 @@ private typealias Float16 = Float
                 "causal_mask": singleMask,
                 "current_pos": currentPosArray
             ])
+
+            // Select rotate/non-rotate infer function based on position.
+            let inferModel = try monolithicInferModel(for: batchPos)
 
             var predictionError: Error?
             predictionQueue.sync { [self] in
@@ -2658,13 +2699,14 @@ private typealias Float16 = Float
         temperature: Float,
         tokenizer: Tokenizer? = nil
     ) async throws -> Int {
-        let monolithicModel = ffnChunks[0].inferModel
-
         // Safety check: ensure position is within bounds
         let safePos = currentPos - 1
         guard safePos >= 0 && safePos < contextLength else {
             throw InferenceError.inferenceError("Position \(safePos) out of bounds for context length \(contextLength)")
         }
+
+        // Switch to infer_rotate after sliding-window boundary when available.
+        let monolithicModel = try monolithicInferModel(for: safePos)
 
         // Create input tensor for single token
         let tokenArray = try MLMultiArray(shape: [1, 1], dataType: .int32)
@@ -2991,13 +3033,14 @@ private typealias Float16 = Float
             throw InferenceError.inferenceError("generateNextTokenArgmaxSync called but argmaxInModel is false")
         }
 
-        let monolithicModel = ffnChunks[0].inferModel
-
         // Safety check: ensure position is within bounds
         let safePos = currentPos - 1
         guard safePos >= 0 && safePos < contextLength else {
             throw InferenceError.inferenceError("Position \(safePos) out of bounds for context length \(contextLength)")
         }
+
+        // Switch to infer_rotate after sliding-window boundary when available.
+        let monolithicModel = try monolithicInferModel(for: safePos)
 
         // Use pre-allocated input arrays
         guard let tokenArray = argmaxTokenArray,
@@ -3287,6 +3330,14 @@ private typealias Float16 = Float
                     stopReason = "abort_generation"+String(abort_generation)
                     if debugLevel >= 1 {
                         print("\nStopping: abort_generation (\(abort_generation))")
+                    }
+                    break
+                }
+
+                if isMonolithic, let slidingWindow, currentPos >= slidingWindow, !monolithicHasRotationSupport {
+                    stopReason = "sliding_window_requires_rotate"
+                    if debugLevel >= 1 {
+                        print("\nStopping: reached sliding_window=\(slidingWindow) without rotate functions (currentPos=\(currentPos))")
                     }
                     break
                 }

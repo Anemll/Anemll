@@ -1282,11 +1282,37 @@ def run_monolithic_prefill_with_rotation(prefill_model, prefill_rotate_model, in
                                       single_token_mode=single_token_mode, mask_len=mask_len,
                                       use_update_mask=use_update_mask)
 
+    if mask_len is None:
+        mask_len = max(context_length, sliding_window)
+
+    # In single-token mode, bypass batch prefill and route tokens through infer /
+    # infer_rotate directly.
+    if single_token_mode:
+        batch_pos = 0
+        while batch_pos < context_pos:
+            token = input_ids[:, batch_pos:batch_pos + 1]
+            position_ids = torch.tensor([batch_pos], dtype=torch.int32)
+            single_causal_mask = causal_mask[:, :, batch_pos:batch_pos + 1, :]
+
+            use_rotation = infer_rotate_model is not None and batch_pos >= sliding_window
+            single_model = infer_rotate_model if use_rotation else (
+                infer_model if infer_model is not None else prefill_model
+            )
+
+            inputs = {
+                'input_ids': token.numpy().astype(np.int32),
+                'position_ids': position_ids.numpy().astype(np.int32),
+                'causal_mask': single_causal_mask.numpy().astype(np.float16),
+                'current_pos': position_ids.numpy().astype(np.int32)
+            }
+            single_model.predict(inputs, state)
+            batch_pos += 1
+
+        return torch.tensor([context_pos], dtype=torch.int32)
+
     # Phase 1: Fill mode for positions 0 to sliding_window-1
     print_system(f"Prefill Phase 1: Fill mode (0 to {sliding_window-1})")
     batch_pos = 0
-    if mask_len is None:
-        mask_len = max(context_length, sliding_window)
     while batch_pos < sliding_window:
         batch_end = min(batch_pos + batch_size, sliding_window)
         current_batch_size = batch_end - batch_pos
@@ -1324,7 +1350,8 @@ def run_monolithic_prefill_with_rotation(prefill_model, prefill_rotate_model, in
             'causal_mask': batch_causal_mask.numpy().astype(np.float16),
             'current_pos': np.array([batch_pos], dtype=np.int32)
         }
-        prefill_rotate_model.predict(inputs, state)
+        update_mask = make_update_mask(mask_len, batch_pos, batch_size) if use_update_mask else None
+        _predict_with_optional_update_mask(prefill_rotate_model, inputs, state, update_mask)
         batch_pos = batch_end
 
     # Handle remainder tokens without padding (token-by-token rotation)
@@ -1360,7 +1387,8 @@ def run_monolithic_prefill_with_rotation(prefill_model, prefill_rotate_model, in
                 'causal_mask': batch_causal_mask.numpy().astype(np.float16),
                 'current_pos': np.array([batch_pos], dtype=np.int32)
             }
-            prefill_rotate_model.predict(inputs, state)
+            update_mask = make_update_mask(mask_len, batch_pos, batch_size) if use_update_mask else None
+            _predict_with_optional_update_mask(prefill_rotate_model, inputs, state, update_mask)
 
     return torch.tensor([context_pos], dtype=torch.int32)
 
@@ -1761,10 +1789,9 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
                         window_shifted = True
 
                     # Generate next token
-                    # Select the appropriate model based on position:
-                    # - pos < sliding_window: use infer_model (fill mode)
-                    # - pos >= sliding_window: use infer_rotate_model (rotation mode) if available
-                    if sliding_window is not None and pos >= sliding_window and infer_rotate_model is not None:
+                    # Switch on the actual token position passed to the model (pos - 1).
+                    current_pos = pos - 1
+                    if sliding_window is not None and current_pos >= sliding_window and infer_rotate_model is not None:
                         current_infer_model = infer_rotate_model
                     else:
                         current_infer_model = infer_model
