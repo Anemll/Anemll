@@ -368,7 +368,6 @@ enum LocalModelValidationError: LocalizedError {
 }
 
 enum ModelPackageImportError: LocalizedError {
-    case unsupportedPlatform
     case invalidPackageRoot
     case missingManifest
     case invalidManifest
@@ -380,8 +379,6 @@ enum ModelPackageImportError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .unsupportedPlatform:
-            return "Model package import is supported on iOS only."
         case .invalidPackageRoot:
             return "Could not resolve model package folder."
         case .missingManifest:
@@ -429,7 +426,6 @@ final class ModelManagerViewModel {
     /// Error message
     var errorMessage: String?
 
-    #if os(iOS)
     /// Non-error status shown while/after importing an incoming package.
     var incomingTransferStatusMessage: String?
 
@@ -440,7 +436,6 @@ final class ModelManagerViewModel {
     var lastImportedPackageModelId: String?
 
     private var recentlyHandledIncomingURLKeys: [String: Date] = [:]
-    #endif
 
     /// Signal from child views (e.g. ChatView) to open the model selection sheet.
     var requestModelSelection: Bool = false
@@ -563,13 +558,23 @@ final class ModelManagerViewModel {
             logWarning("Failed to load custom models: \(error)", category: .model)
         }
 
-        // Step 3: Check model availability and reset stale download state
-        for i in models.indices {
+        // Step 3: Check model availability and reset stale download state.
+        // Show models immediately so the UI isn't blank while linked models are checked.
+        availableModels = models
+
+        // Check non-linked models first (fast, local-only I/O)
+        for i in models.indices where models[i].sourceKind != .localLinked {
             models[i] = await refreshedModelStatus(for: models[i])
         }
-
-        // Update the published property - this triggers UI update
         availableModels = models
+
+        // Check linked models (may involve bookmark resolution + network I/O, each with a timeout)
+        for i in models.indices where models[i].sourceKind == .localLinked {
+            models[i] = await refreshedModelStatus(for: models[i])
+            // Update UI progressively so each result appears as soon as it's ready
+            availableModels = models
+        }
+
         refreshGlobalAttentionCompatibilityCache()
         logInfo("Loaded \(models.count) models (\(downloadedModels.count) downloaded)", category: .model)
 
@@ -695,12 +700,16 @@ final class ModelManagerViewModel {
             logInfo("Discovered \(addedCount) new model(s) from HuggingFace", category: .model)
         }
 
-        // Refresh download status for all models
+        // Refresh download status for all models (non-linked first, then linked with timeout)
         var refreshedModels: [ModelInfo] = []
         refreshedModels.reserveCapacity(models.count)
 
         for model in models {
             refreshedModels.append(await refreshedModelStatus(for: model))
+            // Update UI progressively for linked models (may have timeout delays)
+            if model.sourceKind == .localLinked {
+                availableModels = refreshedModels + Array(models.dropFirst(refreshedModels.count))
+            }
         }
         availableModels = refreshedModels
         refreshGlobalAttentionCompatibilityCache()
@@ -897,13 +906,22 @@ final class ModelManagerViewModel {
 
     /// Load a model for inference
     func loadModelForInference(_ model: ModelInfo) async {
-        guard model.isDownloaded, let path = model.localPath else {
-            if model.sourceKind == .localLinked {
+        // For linked models, resolve bookmark to get security-scoped access
+        let path: String
+        if model.sourceKind == .localLinked {
+            guard let url = resolveLinkedModelURL(for: model) else {
                 errorMessage = "Linked source folder is unavailable. Re-link or re-import this model."
-            } else {
-                errorMessage = "Model not downloaded"
+                return
             }
-            return
+            path = url.path
+            // Note: security-scoped access stays active until stopAccessingSecurityScopedResource()
+            // is called — performModelLoad will use the path while access is held.
+        } else {
+            guard model.isDownloaded, let localPath = model.localPath else {
+                errorMessage = "Model not downloaded"
+                return
+            }
+            path = localPath
         }
 
         // Reset stale warning state from a previous load attempt.
@@ -934,9 +952,26 @@ final class ModelManagerViewModel {
 
     /// Continue loading model after user confirmed weight warning
     func confirmLoadModel() async {
-        guard let model = pendingLoadModel, let path = model.localPath else {
+        guard let model = pendingLoadModel else {
             clearPendingLoadState()
             return
+        }
+
+        // Resolve path for linked models via bookmark
+        let path: String
+        if model.sourceKind == .localLinked {
+            guard let url = resolveLinkedModelURL(for: model) else {
+                errorMessage = "Linked source folder is unavailable. Re-link or re-import this model."
+                clearPendingLoadState()
+                return
+            }
+            path = url.path
+        } else {
+            guard let localPath = model.localPath else {
+                clearPendingLoadState()
+                return
+            }
+            path = localPath
         }
 
         switch pendingLoadWarning {
@@ -1156,6 +1191,10 @@ final class ModelManagerViewModel {
     func addLocalModel(from droppedURL: URL, displayName: String, mode: LocalModelImportMode) async {
         errorMessage = nil
 
+        // Start security-scoped access for the picker URL (needed for sandboxed apps).
+        let accessGranted = droppedURL.startAccessingSecurityScopedResource()
+        defer { if accessGranted { droppedURL.stopAccessingSecurityScopedResource() } }
+
         do {
             let inspection = try inspectLocalModelFolder(droppedURL)
             let requestedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1220,7 +1259,6 @@ final class ModelManagerViewModel {
     // MARK: - Package Import (iOS receiver)
 
     func handleIncomingTransferURL(_ url: URL) async {
-        #if os(iOS)
         guard shouldProcessIncomingTransferURL(url) else {
             logDebug("Ignoring duplicate incoming transfer URL: \(url.path)", category: .model)
             return
@@ -1239,12 +1277,8 @@ final class ModelManagerViewModel {
             logError("Failed to import transferred model package: \(error)", category: .model)
         }
         isImportingIncomingPackage = false
-        #else
-        logInfo("Ignoring incoming transfer URL on non-iOS platform: \(url.path)", category: .model)
-        #endif
     }
 
-    #if os(iOS)
     private func importModelPackage(from incomingURL: URL) async throws -> ModelInfo {
         let accessStarted = incomingURL.startAccessingSecurityScopedResource()
         defer {
@@ -1415,8 +1449,19 @@ final class ModelManagerViewModel {
     private func cleanupIncomingPackageArtifactsIfNeeded(incomingURL: URL, resolvedPackageRoot: URL) {
         let fileManager = FileManager.default
         let documentsRoot = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0].standardizedFileURL
+        #if os(macOS)
+        // macOS: models/conversations under ~/.cache/anemll/
+        let appDataRoot = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache", isDirectory: true)
+            .appendingPathComponent("anemll", isDirectory: true)
+            .standardizedFileURL
+        let modelsRoot = appDataRoot.appendingPathComponent("Models", isDirectory: true).standardizedFileURL
+        let conversationsRoot = appDataRoot.appendingPathComponent("Conversations", isDirectory: true).standardizedFileURL
+        #else
+        // iOS: models/conversations under Documents/
         let modelsRoot = documentsRoot.appendingPathComponent("Models", isDirectory: true).standardizedFileURL
         let conversationsRoot = documentsRoot.appendingPathComponent("Conversations", isDirectory: true).standardizedFileURL
+        #endif
         let inboxRoot = documentsRoot
             .appendingPathComponent("Inbox", isDirectory: true)
             .standardizedFileURL
@@ -1503,7 +1548,6 @@ final class ModelManagerViewModel {
         if child == parent { return true }
         return child.hasPrefix(parent.hasSuffix("/") ? parent : parent + "/")
     }
-    #endif
 
     // MARK: - Directory Size
 
@@ -1527,11 +1571,11 @@ final class ModelManagerViewModel {
 
     /// Get formatted size string for a model directory
     func formattedModelSize(for model: ModelInfo) -> String? {
-        guard let path = model.localPath else { return nil }
-        let url = URL(fileURLWithPath: path)
-        let bytes = calculateDirectorySize(at: url)
-        guard bytes > 0 else { return nil }
-        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        return withLinkedModelAccess(for: model) { url in
+            let bytes = calculateDirectorySize(at: url)
+            guard bytes > 0 else { return nil }
+            return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        } ?? nil
     }
 
     // MARK: - Package Share (macOS sender)
@@ -1863,20 +1907,88 @@ final class ModelManagerViewModel {
             }
 
         case .localLinked:
-            let resolvedPath = resolveLinkedModelPath(for: model) ?? model.linkedPath ?? model.localPath
-            guard let resolvedPath else {
-                model.isDownloaded = false
-                model.downloadError = "Linked source folder is not configured."
-                return model
+            logDebug("Checking linked model: \(model.id) path=\(model.linkedPath ?? model.localPath ?? "nil")", category: .model)
+
+            // Capture Sendable values for the off-main-actor task.
+            // Both bookmark resolution and file validation can block for 30+ seconds
+            // on unreachable network volumes, so everything runs inside a timeout.
+            let bookmarkBase64 = model.bookmarkDataBase64
+            let fallbackPath = model.linkedPath ?? model.localPath
+
+            let linkedCheckResult: (path: String, issues: [String])? = await withTaskGroup(
+                of: (String, [String])?.self
+            ) { group in
+                group.addTask(priority: .userInitiated) {
+                    // Step 1: Resolve bookmark (this can block on stale network mounts)
+                    var resolvedPath: String? = nil
+                    #if os(macOS)
+                    if let base64 = bookmarkBase64, let bookmarkData = Data(base64Encoded: base64) {
+                        var isStale = false
+                        if let url = try? URL(
+                            resolvingBookmarkData: bookmarkData,
+                            options: [.withSecurityScope, .withoutUI],
+                            relativeTo: nil,
+                            bookmarkDataIsStale: &isStale
+                        ) {
+                            _ = url.startAccessingSecurityScopedResource()
+                            resolvedPath = url.path
+                        } else if let url = try? URL(
+                            resolvingBookmarkData: bookmarkData,
+                            options: [.withoutUI],
+                            relativeTo: nil,
+                            bookmarkDataIsStale: &isStale
+                        ) {
+                            resolvedPath = url.path
+                        }
+                    }
+                    #endif
+                    let finalPath = resolvedPath ?? fallbackPath
+                    guard let finalPath else { return nil }
+
+                    // Step 2: Validate the model directory
+                    let pathURL = URL(fileURLWithPath: finalPath)
+                    let fm = FileManager.default
+                    var issues: [String] = []
+                    var isDirectory: ObjCBool = false
+                    guard fm.fileExists(atPath: pathURL.path, isDirectory: &isDirectory),
+                          isDirectory.boolValue else {
+                        return (finalPath, ["not a folder"])
+                    }
+                    if !fm.fileExists(atPath: pathURL.appendingPathComponent("meta.yaml").path) {
+                        issues.append("meta.yaml")
+                    }
+                    let hasMLModelc = ((try? fm.contentsOfDirectory(at: pathURL, includingPropertiesForKeys: nil)) ?? [])
+                        .contains { $0.pathExtension.lowercased() == "mlmodelc" }
+                    if !hasMLModelc {
+                        issues.append("*.mlmodelc")
+                    }
+                    return (finalPath, issues)
+                }
+                group.addTask {
+                    try? await Task.sleep(for: .seconds(3))
+                    return nil  // timeout sentinel
+                }
+                // First to finish wins
+                for await result in group {
+                    group.cancelAll()
+                    return result
+                }
+                return nil
             }
 
-            let linkedRoot = URL(fileURLWithPath: resolvedPath)
-            let issues = validationIssues(forModelRoot: linkedRoot)
-            model.localPath = linkedRoot.path
-            model.linkedPath = linkedRoot.path
-            model.metaYamlPath = linkedRoot.appendingPathComponent("meta.yaml").path
-            model.isDownloaded = issues.isEmpty
-            model.downloadError = issues.isEmpty ? nil : "Linked source folder missing: \(issues.joined(separator: ", "))"
+            if let result = linkedCheckResult {
+                let linkedRoot = URL(fileURLWithPath: result.path)
+                model.localPath = linkedRoot.path
+                model.linkedPath = linkedRoot.path
+                model.metaYamlPath = linkedRoot.appendingPathComponent("meta.yaml").path
+                model.isDownloaded = result.issues.isEmpty
+                model.downloadError = result.issues.isEmpty ? nil : "Linked source folder missing: \(result.issues.joined(separator: ", "))"
+            } else {
+                // Timed out — bookmark resolution or file access hung on unreachable network volume
+                logWarning("Linked model \(model.id) path check timed out (network unreachable?): \(fallbackPath ?? "nil")", category: .model)
+                model.isDownloaded = false
+                model.downloadError = "Linked source folder is unreachable (timed out). Remove and re-link when the volume is mounted."
+            }
         }
 
         return model
@@ -2127,6 +2239,12 @@ final class ModelManagerViewModel {
     }
 
     private func resolveLinkedModelPath(for model: ModelInfo) -> String? {
+        return resolveLinkedModelURL(for: model)?.path
+    }
+
+    /// Resolve a linked model's bookmark into a security-scoped URL.
+    /// The caller must call `stopAccessingSecurityScopedResource()` when done.
+    private func resolveLinkedModelURL(for model: ModelInfo) -> URL? {
         #if os(macOS)
         if let base64 = model.bookmarkDataBase64, let bookmarkData = Data(base64Encoded: base64) {
             var isStale = false
@@ -2138,7 +2256,7 @@ final class ModelManagerViewModel {
                 bookmarkDataIsStale: &isStale
             ) {
                 _ = resolvedURL.startAccessingSecurityScopedResource()
-                return resolvedURL.path
+                return resolvedURL
             }
             if let resolvedURL = try? URL(
                 resolvingBookmarkData: bookmarkData,
@@ -2146,11 +2264,59 @@ final class ModelManagerViewModel {
                 relativeTo: nil,
                 bookmarkDataIsStale: &isStale
             ) {
-                return resolvedURL.path
+                return resolvedURL
             }
         }
         #endif
-        return model.linkedPath ?? model.localPath
+        if let path = model.linkedPath ?? model.localPath {
+            return URL(fileURLWithPath: path)
+        }
+        return nil
+    }
+
+    /// Execute a closure with security-scoped access to a linked model's folder.
+    /// For non-linked models, runs the closure with the local path directly.
+    /// Automatically starts/stops security-scoped resource access.
+    func withLinkedModelAccess<T>(for model: ModelInfo, body: (URL) -> T) -> T? {
+        if model.sourceKind == .localLinked {
+            guard let url = resolveLinkedModelURL(for: model) else { return nil }
+            defer { url.stopAccessingSecurityScopedResource() }
+            return body(url)
+        } else {
+            guard let path = model.localPath else { return nil }
+            return body(URL(fileURLWithPath: path))
+        }
+    }
+
+    /// Async version of withLinkedModelAccess.
+    func withLinkedModelAccess<T>(for model: ModelInfo, body: (URL) async -> T) async -> T? {
+        if model.sourceKind == .localLinked {
+            guard let url = resolveLinkedModelURL(for: model) else { return nil }
+            let result = await body(url)
+            url.stopAccessingSecurityScopedResource()
+            return result
+        } else {
+            guard let path = model.localPath else { return nil }
+            return await body(URL(fileURLWithPath: path))
+        }
+    }
+
+    /// Async throwing version of withLinkedModelAccess.
+    func withLinkedModelAccess<T>(for model: ModelInfo, body: (URL) async throws -> T) async throws -> T? {
+        if model.sourceKind == .localLinked {
+            guard let url = resolveLinkedModelURL(for: model) else { return nil }
+            do {
+                let result = try await body(url)
+                url.stopAccessingSecurityScopedResource()
+                return result
+            } catch {
+                url.stopAccessingSecurityScopedResource()
+                throw error
+            }
+        } else {
+            guard let path = model.localPath else { return nil }
+            return try await body(URL(fileURLWithPath: path))
+        }
     }
 
     private func markModelAsJustAdded(_ id: String) {
@@ -2239,50 +2405,49 @@ final class ModelManagerViewModel {
     /// - Parameter model: The model to check
     /// - Returns: Tuple with (largestWeightSize, largestWeightName, allWeightFiles) or nil if not available
     func getWeightFileDetails(for model: ModelInfo) -> (largest: Int64, largestName: String, files: [(name: String, size: Int64)])? {
-        guard let localPath = model.localPath else { return nil }
+        return withLinkedModelAccess(for: model) { modelDir in
+            let fileManager = FileManager.default
 
-        let modelDir = URL(fileURLWithPath: localPath)
-        let fileManager = FileManager.default
+            guard fileManager.fileExists(atPath: modelDir.path) else { return nil }
 
-        guard fileManager.fileExists(atPath: modelDir.path) else { return nil }
+            var weightFiles: [(name: String, size: Int64)] = []
 
-        var weightFiles: [(name: String, size: Int64)] = []
+            // Check all .mlmodelc directories for weight.bin files
+            do {
+                let contents = try fileManager.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil)
+                let mlmodelcDirs = contents.filter { $0.pathExtension == "mlmodelc" }
 
-        // Check all .mlmodelc directories for weight.bin files
-        do {
-            let contents = try fileManager.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil)
-            let mlmodelcDirs = contents.filter { $0.pathExtension == "mlmodelc" }
+                for mlmodelcDir in mlmodelcDirs {
+                    let dirName = mlmodelcDir.lastPathComponent
 
-            for mlmodelcDir in mlmodelcDirs {
-                let dirName = mlmodelcDir.lastPathComponent
+                    // Check both possible weight file locations
+                    let weightPaths = [
+                        mlmodelcDir.appendingPathComponent("weights/weight.bin"),
+                        mlmodelcDir.appendingPathComponent("weight.bin")
+                    ]
 
-                // Check both possible weight file locations
-                let weightPaths = [
-                    mlmodelcDir.appendingPathComponent("weights/weight.bin"),
-                    mlmodelcDir.appendingPathComponent("weight.bin")
-                ]
-
-                for weightPath in weightPaths {
-                    if fileManager.fileExists(atPath: weightPath.path) {
-                        if let attrs = try? fileManager.attributesOfItem(atPath: weightPath.path),
-                           let size = attrs[.size] as? Int64, size > 0 {
-                            weightFiles.append((name: dirName, size: size))
+                    for weightPath in weightPaths {
+                        if fileManager.fileExists(atPath: weightPath.path) {
+                            if let attrs = try? fileManager.attributesOfItem(atPath: weightPath.path),
+                               let size = attrs[.size] as? Int64, size > 0 {
+                                weightFiles.append((name: dirName, size: size))
+                            }
+                            break
                         }
-                        break
                     }
                 }
+            } catch {
+                logError("Error getting weight file details: \(error)", category: .model)
+                return nil
             }
-        } catch {
-            logError("Error getting weight file details: \(error)", category: .model)
-            return nil
-        }
 
-        guard !weightFiles.isEmpty else { return nil }
+            guard !weightFiles.isEmpty else { return nil }
 
-        let sorted = weightFiles.sorted { $0.size > $1.size }
-        let largest = sorted.first!
+            let sorted = weightFiles.sorted { $0.size > $1.size }
+            let largest = sorted.first!
 
-        return (largest: largest.size, largestName: largest.name, files: weightFiles)
+            return (largest: largest.size, largestName: largest.name, files: weightFiles)
+        } ?? nil
     }
 
     /// Get warning message if weight files exceed 1GB on limited devices
@@ -2348,8 +2513,13 @@ final class ModelManagerViewModel {
 
     private func evaluateGlobalAttentionWarning(for model: ModelInfo) -> String? {
         guard !DeviceType.supportsGlobalAttention else { return nil }
-        guard let metaPath = model.metaYamlPath else { return nil }
-        guard let metadata = ModelMetadata.load(from: metaPath) else { return nil }
+
+        // Resolve bookmark for linked models to read meta.yaml
+        let metadata: ModelMetadata? = withLinkedModelAccess(for: model) { modelURL in
+            let metaPath = modelURL.appendingPathComponent("meta.yaml").path
+            return ModelMetadata.load(from: metaPath)
+        } ?? nil
+        guard let metadata else { return nil }
 
         // Only Gemma architecture is affected by this limitation.
         let isGemma = metadata.isGemmaFamily

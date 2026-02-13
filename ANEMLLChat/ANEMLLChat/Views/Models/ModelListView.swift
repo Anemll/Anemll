@@ -405,6 +405,33 @@ struct ModelListView: View {
                                 .foregroundStyle(.red)
                                 .lineLimit(2)
                         }
+
+                        // Show the broken path for linked/imported models so user can identify it
+                        if model.sourceKind != .huggingFace,
+                           let path = model.linkedPath ?? model.localPath {
+                            HStack(spacing: 4) {
+                                Text(path)
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+
+                                Button {
+                                    #if os(macOS)
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(path, forType: .string)
+                                    #else
+                                    UIPasteboard.general.string = path
+                                    #endif
+                                } label: {
+                                    Image(systemName: "doc.on.doc")
+                                        .font(.caption2)
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(.secondary)
+                                .help("Copy path")
+                            }
+                        }
                     }
 
                     Spacer()
@@ -420,6 +447,18 @@ struct ModelListView: View {
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(.orange)
+                    } else {
+                        // Remove button for broken linked/imported models
+                        Button(role: .destructive) {
+                            Task {
+                                await modelManager.deleteModel(model)
+                            }
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.title2)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.red)
                     }
                 }
                 .padding(.vertical, 4)
@@ -1005,6 +1044,9 @@ struct AddModelView: View {
 
     #if os(macOS)
     private func inspectLocalFolder(_ url: URL) {
+        // fileImporter returns a security-scoped URL — start access before any file I/O.
+        let accessGranted = url.startAccessingSecurityScopedResource()
+        defer { if accessGranted { url.stopAccessingSecurityScopedResource() } }
         selectedLocalFolder = url
         do {
             let inspection = try modelManager.inspectLocalModelFolder(url)
