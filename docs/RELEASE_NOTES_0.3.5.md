@@ -1,6 +1,6 @@
-# ANEMLL 0.3.5 Alpha Release Notes
+# ANEMLL 0.3.5 Beta Release Notes
 
-Release type: `Alpha`
+Release type: `Beta`
 Version: `0.3.5`
 
 ## Summary
@@ -301,7 +301,7 @@ See also: `tests/dev/STATE_TRANSITION_EXPERIMENTS.md`
 - For smallest model size:
   - Ensure ANEMLL-Dedup is enabled (default) — check for `--skip-anemll-dedup` if sizes look large.
 
-## Known Constraints (Alpha)
+## Known Constraints (Beta)
 
 - Quantization quality varies by architecture and LUT configuration.
 - M1 Macs and A14 iOS devices limited to 512-context monolithic Gemma 3 models.
