@@ -39,24 +39,20 @@ For complete release notes, see [`docs/RELEASE_NOTES_0.3.5.md`](./docs/RELEASE_N
 🆕 New 0.3.4.models with benchmarks are [here](https://huggingface.co/collections/anemll/anemll-034-686c21c2cb05c715eb3f6a26)
 
 
-### 📦 **Quick Start (New Simplified Workflow)**
+### Quick Start
 ```bash
-# 1. Setup environment (one-time)
-./create_python39_env.sh
-# or (uv-based setup)
-./create_uv_env.sh
-
-# 2. Install dependencies (auto-detects virtual environment)
+# 1. Setup environment (uv recommended)
+brew install uv              # one-time
+./create_uv_env.sh           # creates env-anemll with Python 3.9
+source env-anemll/bin/activate
 ./install_dependencies.sh
 
-# 3. Test conversion pipeline
-python tests/test_qwen_model.py       # Test Qwen 3 models
-python tests/test_qwen2.5_model.py    # Test Qwen 2.5 models
-python tests/test_llama_model.py      # Test LLaMA models
-python tests/test_gemma3_model.py     # Test Gemma 3 270M (monolithic + argmax)
-python tests/test_gemma3_1B_model.py  # Test Gemma 3 1B (chunked, LUT6, 4096 ctx)
+# 2. Test conversion pipeline
+python tests/test_gemma3_model.py     # Gemma 3 270M (monolithic + argmax)
+python tests/test_qwen_model.py       # Qwen 3
+python tests/test_llama_model.py      # LLaMA
 
-# 4. Convert your own models
+# 3. Convert your own models
 ./anemll/utils/convert_model.sh --model <path> --output <dir>
 ```
 
@@ -281,46 +277,34 @@ See [chat.md](./docs/chat.md) for more details
 - **Xcode Command Line Tools** (for CoreML compiler)
 - Dependencies: coremltools>=9.0, transformers>=4.36.0, numpy>=1.24.0, scikit-learn<=1.5.1
 
-### 📦 Installation (New Streamlined Process)
+### Installation
 
-**🚀 One-Command Setup:**
+**Recommended: UV Setup (fast, reproducible):**
 ```bash
-# 1. Create Python environment with correct version (auto-detects Python 3.9/3.10/3.11)
-./create_python39_env.sh
-
-# 2. Install all dependencies (auto-detects and activates virtual environment)
-./install_dependencies.sh
-
-# 3. Verify installation with automated tests (downloads models automatically)
-./tests/conv/test_qwen_simple.sh    # Test Qwen conversion (auto-downloads ~2.4GB)
-./tests/conv/test_llama_simple.sh   # Test LLaMA conversion (auto-downloads ~500MB)
-```
-
-**🔧 Manual Setup (if needed):**
-```bash
-# Create virtual environment with Python 3.9 (recommended)
-python3.9 -m venv env-anemll
-source env-anemll/bin/activate
-
-# Install dependencies
-./install_dependencies.sh
-```
-
-**⚡ UV Setup (recommended for reproducible envs):**
-```bash
-# Install uv once
+# Install uv (once)
 brew install uv
 
-# Create env-anemll with Python 3.9 and seeded pip
+# Create env-anemll with Python 3.9 and install dependencies
 ./create_uv_env.sh
 source env-anemll/bin/activate
-
-# Install dependencies
 ./install_dependencies.sh
 
-# Alternative direct UV install
-uv pip install -r requirements.txt
-uv pip install -e .
+# Verify
+python --version           # Should show 3.9.x
+python -c "import coremltools; print(coremltools.__version__)"
+```
+
+**Alternative: Standard venv:**
+```bash
+./create_python39_env.sh
+source env-anemll/bin/activate
+./install_dependencies.sh
+```
+
+**Test the pipeline:**
+```bash
+./tests/conv/test_qwen_simple.sh    # Qwen3-0.6B end-to-end (auto-downloads ~2.4GB)
+./tests/conv/test_llama_simple.sh   # SmolLM-135M end-to-end (auto-downloads ~500MB)
 ```
 
 > **📝 Note on Test Scripts:** The automated test scripts will automatically download required models from HuggingFace:
