@@ -814,6 +814,11 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
         (cp \"$MODEL_PATH/vocab.json\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/merges.txt\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/chat_template.jinja\" \"$OUTPUT_DIR/\" || true) && \
+        (cp \"$MODEL_PATH/added_tokens.json\" \"$OUTPUT_DIR/\" || true) && \
+        (cp \"$MODEL_PATH/special_tokens_map.json\" \"$OUTPUT_DIR/\" || true) && \
+        (cp \"$MODEL_PATH/tokenizer_config_search.json\" \"$OUTPUT_DIR/\" || true) && \
+        (cp \"$MODEL_PATH/generation_config.json\" \"$OUTPUT_DIR/\" || true) && \
+        (cp \"$MODEL_PATH/preprocessor_config.json\" \"$OUTPUT_DIR/\" || true) && \
         
         # Create config.json if it doesn't exist
         if [ ! -f \"$OUTPUT_DIR/config.json\" ]; then

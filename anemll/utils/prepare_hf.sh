@@ -202,6 +202,20 @@ prepare_common_files() {
     if [ -f "$INPUT_DIR/tokenizer.model" ]; then
         cp "$INPUT_DIR/tokenizer.model" "$target_dir/"
     fi
+
+    # Copy additional tokenizer/support files if they exist
+    for extra_file in \
+        added_tokens.json \
+        special_tokens_map.json \
+        tokenizer_config_search.json \
+        generation_config.json \
+        preprocessor_config.json
+    do
+        if [ -f "$INPUT_DIR/$extra_file" ]; then
+            cp "$INPUT_DIR/$extra_file" "$target_dir/"
+            echo "Copied $extra_file"
+        fi
+    done
     
     # Copy tokenizer vocabulary files if they exist
     if [ -f "$INPUT_DIR/vocab.json" ]; then
