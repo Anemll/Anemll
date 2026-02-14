@@ -10,8 +10,9 @@ import glob
 import subprocess
 from typing import List, Optional
 import argparse
+import coremltools as ct
 
-def compile_model(model_path: str, target_dir: str = "./") -> bool:
+def compile_model(model_path: str, target_dir: str = "./", force_mlprogram: bool = False) -> bool:
     """Compile a single CoreML model using coremlcompiler.
     
     Args:
@@ -23,6 +24,9 @@ def compile_model(model_path: str, target_dir: str = "./") -> bool:
     """
     try:
         cmd = ["xcrun", "coremlcompiler", "compile", model_path, target_dir]
+        # Optionally force ML Program when compiling .mlpackage files.
+        if force_mlprogram and model_path.endswith(".mlpackage"):
+            cmd += ["--add-mlprogram-if-eligible", "force"]
         print(f"\nCompiling {os.path.basename(model_path)}...")
         result = subprocess.run(cmd, capture_output=True, text=True)
         
@@ -39,17 +43,18 @@ def compile_model(model_path: str, target_dir: str = "./") -> bool:
 
 def get_part_name(part: str) -> str:
     """Map part number to model name component.
-    
+
     Args:
-        part: Part number ("1", "2", "3")
-    
+        part: Part number ("1", "2", "3", "monolithic")
+
     Returns:
         str: Model name component
     """
     part_map = {
         "1": "embeddings",
         "2": "FFN_PF",  # For combined FFN/prefill
-        "3": "lm_head"
+        "3": "lm_head",
+        "monolithic": "monolithic_full"  # For combined monolithic model
     }
     return part_map.get(part, part)
 
@@ -80,7 +85,7 @@ def find_chunk_models(lut_bits: int, num_chunks: int, part: str = "2", prefix: s
         pattern = f"{prefix}_{part_name}_lut{lut_bits}_chunk_*of{num_chunks:02d}.mlpackage"
         return sorted(glob.glob(pattern))
 
-def compile_chunks(lut_bits: int, num_chunks: int, target_dir: str = "./") -> bool:
+def compile_chunks(lut_bits: int, num_chunks: int, target_dir: str = "./", force_mlprogram: bool = False) -> bool:
     """Compile all chunks of a model.
     
     Args:
@@ -98,12 +103,12 @@ def compile_chunks(lut_bits: int, num_chunks: int, target_dir: str = "./") -> bo
         
     success = True
     for model in models:
-        if not compile_model(model, target_dir):
+        if not compile_model(model, target_dir, force_mlprogram=force_mlprogram):
             success = False
             
     return success
 
-def compile_part(part: str, lut_bits: Optional[int] = None, target_dir: str = "./", prefix: str = "llama") -> bool:
+def compile_part(part: str, lut_bits: Optional[int] = None, target_dir: str = "./", prefix: str = "llama", force_mlprogram: bool = False) -> bool:
     """Compile a specific model part.
     
     Args:
@@ -124,24 +129,77 @@ def compile_part(part: str, lut_bits: Optional[int] = None, target_dir: str = ".
         print(f"Model file not found: {model_path}")
         return False
         
-    return compile_model(model_path, target_dir)
+    return compile_model(model_path, target_dir, force_mlprogram=force_mlprogram)
+
+def parse_lut_arg(lut_value):
+    """Parse LUT argument and extract just the bits value.
+
+    Args:
+        lut_value: String value from command line (e.g., '6' or '6,4')
+
+    Returns:
+        int or None: Just the lut_bits value (per_channel is ignored for file naming)
+    """
+    if lut_value is None:
+        return None
+
+    lut_str = str(lut_value).strip().lower()
+
+    # Handle "none" as no LUT quantization
+    if lut_str in ('none', 'no', 'false', ''):
+        return None
+
+    if ',' in lut_value:
+        # Extract just the bits value, ignore per_channel for file naming
+        parts = lut_value.split(',')
+        try:
+            return int(parts[0])
+        except ValueError:
+            raise ValueError(f"Invalid LUT bits value: {parts[0]}")
+    else:
+        try:
+            return int(lut_value)
+        except ValueError:
+            raise ValueError(f"Invalid LUT bits value: {lut_value}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Compile models to MLModelC format')
-    parser.add_argument('part', type=str, help='Model part to compile (1, 2, or 3)')
-    parser.add_argument('--lut', type=int, help='LUT bits used in quantization (optional)')
+    parser.add_argument('part', type=str, help='Model part to compile (1, 2, 3, monolithic, or all)')
+    parser.add_argument('--lut', type=str, help='LUT bits used in quantization (optional). Format: "bits" or "bits,per_channel" (e.g., "6" or "6,4")')
     parser.add_argument('--chunk', type=int, help='Number of chunks (for part 2)')
     parser.add_argument('--prefix', type=str, default='llama', help='Model name prefix')
     parser.add_argument('--input', type=str, default='.', help='Input directory containing models')
     parser.add_argument('--output', type=str, default=None, help='Output directory (default: same as input)')
+    parser.add_argument('--recursive', action='store_true', help='When part=all, search for .mlpackage recursively')
+    parser.add_argument('--force-mlprogram', action='store_true', help='Force ML Program when compiling .mlpackage models')
+    parser.add_argument('--split-rotate', action='store_true', help='For Gemma3 split-rotate (compile FFN+PF files separately)')
     return parser.parse_args()
 
 def main():
     args = parse_args()
-    
+
+    # Parse LUT argument to extract just the bits value
+    args.lut = parse_lut_arg(args.lut)
+
     # Set output dir to input dir if not specified
     output_dir = args.output if args.output else args.input
-    
+    os.makedirs(output_dir, exist_ok=True)
+
+    if args.part == "all":
+        # Compile every .mlpackage under input (optionally recursive).
+        pattern = "**/*.mlpackage" if args.recursive else "*.mlpackage"
+        search_root = os.path.abspath(args.input)
+        models = sorted(glob.glob(os.path.join(search_root, pattern), recursive=args.recursive))
+        if not models:
+            print(f"Error: No .mlpackage files found under {search_root} (recursive={args.recursive})")
+            return 1
+        print(f"Found {len(models)} .mlpackage files under {search_root}")
+        success = True
+        for model_path in models:
+            if not compile_model(model_path, output_dir, force_mlprogram=args.force_mlprogram):
+                success = False
+        return 0 if success else 1
+
     # Construct input filename based on part and parameters
     if args.part == '1':
         # Try both naming patterns for embeddings (with and without LUT suffix)
@@ -164,21 +222,43 @@ def main():
             return 1
         # Make LUT optional for part 2
         lut_suffix = f'_lut{args.lut}' if args.lut else ''
-        # For part 2, compile all chunks
-        for i in range(args.chunk):
-            chunk_name = f'{args.prefix}_FFN_PF{lut_suffix}_chunk_{i+1:02d}of{args.chunk:02d}.mlpackage'
-            input_path = os.path.join(args.input, chunk_name)
-            compile_model(input_path, output_dir)
+        # For split-rotate, compile non-rotate and rotate files separately
+        # Non-rotate file: FFN_PF_chunk_XXofYY (infer + prefill)
+        # Rotate file: FFN_PF_chunk_XXofYY_rot (infer_rotate + prefill_rotate)
+        # NOTE: Multi-function models REQUIRE ML Program format for function_name loading
+        if args.split_rotate:
+            for i in range(args.chunk):
+                non_rotate_name = f'{args.prefix}_FFN_PF{lut_suffix}_chunk_{i+1:02d}of{args.chunk:02d}.mlpackage'
+                rotate_name = f'{args.prefix}_FFN_PF{lut_suffix}_chunk_{i+1:02d}of{args.chunk:02d}_rot.mlpackage'
+                # Always force ML Program for multi-function models (required for function_name)
+                compile_model(os.path.join(args.input, non_rotate_name), output_dir, force_mlprogram=True)
+                compile_model(os.path.join(args.input, rotate_name), output_dir, force_mlprogram=True)
+        else:
+            # Standard combined FFN_PF files
+            for i in range(args.chunk):
+                chunk_name = f'{args.prefix}_FFN_PF{lut_suffix}_chunk_{i+1:02d}of{args.chunk:02d}.mlpackage'
+                input_path = os.path.join(args.input, chunk_name)
+                compile_model(input_path, output_dir, force_mlprogram=args.force_mlprogram)
+        return 0
+    elif args.part == 'monolithic':
+        # Compile monolithic combined model
+        lut_suffix = f'_lut{args.lut}' if args.lut else ''
+        input_name = f'{args.prefix}_monolithic_full{lut_suffix}.mlpackage'
+        input_path = os.path.join(args.input, input_name)
+        if not os.path.exists(input_path):
+            print(f"Error: Monolithic model not found: {input_path}")
+            return 1
+        compile_model(input_path, output_dir, force_mlprogram=args.force_mlprogram)
         return 0
     else:
         print(f"Error: Invalid part {args.part}")
         return 1
-    
+
     input_path = os.path.join(args.input, input_name)
     if not os.path.exists(input_path):
         print(f"Error: Model file not found: {input_path}")
         return 1
-    compile_model(input_path, output_dir)
+    compile_model(input_path, output_dir, force_mlprogram=args.force_mlprogram)
     return 0
 
 if __name__ == "__main__":

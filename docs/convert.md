@@ -37,6 +37,29 @@ Basic usage example:
 
 > See [Convert Model Guide](convert_model.md) for detailed parameters and examples.
 
+## Monolithic Model Conversion
+
+For smaller models (1B-3B parameters), you can use monolithic conversion which creates a single CoreML model file containing embeddings, transformer layers, and LM head combined:
+
+```bash
+./anemll/utils/convert_monolith.sh --model <path_to_model> --output <output_directory> [options]
+```
+
+Basic usage example:
+```bash
+./anemll/utils/convert_monolith.sh \
+    --model ../Qwen3-0.6B \
+    --output ./converted_models \
+    --lut 4
+```
+
+**Benefits of Monolithic Conversion:**
+- Single model file simplifies deployment
+- Reduced overhead from inter-model communication
+- Smaller total size due to eliminated redundant structure
+
+> See [Monolithic Model Conversion Guide](convert_monolith.md) for detailed parameters and examples.
+
 ## Model Size and Chunks
 
 Choose the number of chunks based on your model size. Here are the recommended configurations:
@@ -181,6 +204,7 @@ python ./tests/chat_full.py --meta ./converted_models/meta.yaml
 See [Chat Guide](./chat.md) for detailed usage of chat interfaces.
 
 ## See Also
+- [Monolithic Model Conversion](convert_monolith.md) - Single-file model conversion for smaller models
 - [Manual Conversion Steps](manual_conversion.md) - For detailed conversion steps
 - [Converting DeepSeek Models](ConvertingDeepSeek.md) - For larger model conversion
 - [Compile Models Documentation](compile_models.md) - Details about compilation

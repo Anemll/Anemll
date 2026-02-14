@@ -24,11 +24,17 @@ python ./anemll/utils/compile_models.py PART [OPTIONS]
   - `1`: Embedding model
   - `2`: FFN model
   - `3`: LM Head model
-- `--lut`: LUT quantization bits (typically 6)
+  - `monolithic`: Combined monolithic model (when named `{prefix}_monolithic_full*.mlpackage`)
+  - `all`: Compile **all** `.mlpackage` files in a directory (works with arbitrary filenames like `*_combined.mlpackage`)
+- `--lut`: LUT quantization configuration
+  - Simple format: `--lut 6` (6 bits, uses default per_channel group size of 8)
+  - Advanced format: `--lut 6,4` (6 bits with per_channel group size of 4)
+  - Note: Only the bits value affects file naming; per_channel is used during model conversion
 - `--chunk`: Number of chunks (for FFN models)
 - `--prefix`: Model name prefix (default: 'llama')
 - `--input-dir`: (Optional) Input directory containing MLPackage files
 - `--output-dir`: (Optional) Output directory for compiled models
+ - `--recursive`: (Optional, `PART=all`) Search for `.mlpackage` files recursively
 
 ## Example Usage
 
@@ -42,6 +48,73 @@ python ./anemll/utils/compile_models.py 3 --lut 6
 
 # Compile FFN with Chunking
 python ./anemll/utils/compile_models.py 2 --lut 6 --chunk 2
+```
+
+### Compile everything in a model directory (recommended for Swift CLI)
+```bash
+python ./anemll/utils/compile_models.py all \
+  --input /Volumes/Models/ANE/gemma3_1b_lut6_ctx4096 \
+  --output /Volumes/Models/ANE/gemma3_1b_lut6_ctx4096/compiled_mlmodelc
+```
+
+## Full Model Conversion Examples
+
+### Gemma 3 270M (Monolithic + Argmax - Quick Testing)
+```bash
+# Convert Gemma 3 270M - monolithic model with argmax for quick testing
+./anemll/utils/convert_monolith.sh \
+    --model google/gemma-3-270m-it \
+    --output /path/to/output/gemma3_270m_lut4_ctx512 \
+    --context 512 \
+    --batch 64 \
+    --lut 4 \
+    --prefix gemma3 \
+    --argmax
+
+# Test the converted model
+python3 tests/chat.py --meta /path/to/output/gemma3_270m_lut4_ctx512/meta.yaml --prompt "Hello!"
+```
+
+**Monolithic Model Features:**
+- Single CoreML file containing embeddings, FFN, and LM head
+- Argmax computed inside model (outputs token IDs instead of logits)
+- Ideal for small models and quick testing
+
+### Gemma 3 1B with 4K Context (Chunked Format - Recommended)
+```bash
+# Convert Gemma 3 1B with LUT6 quantization and 4096 context (standard chunked format)
+./anemll/utils/convert_model.sh \
+    --model google/gemma-3-1b-it \
+    --output /path/to/output/gemma3_1b_lut6_ctx4096 \
+    --context 4096 \
+    --batch 64 \
+    --lut1 6 \
+    --lut2 6 \
+    --lut3 6 \
+    --chunk 1
+
+# Test the converted model
+python3 tests/chat.py --meta /path/to/output/gemma3_1b_lut6_ctx4096/meta.yaml --prompt "Hello!"
+```
+
+**Chunked Model Features:**
+- Separate embeddings, FFN, and LM head CoreML files
+- Split KV cache with interleaved local (512 sliding window) and global attention layers
+- 4-function model support (infer, infer_rotate, prefill, prefill_rotate) for context > 512
+- Automatic rotation mode switching when position >= sliding_window (512)
+- 16-way LM head splitting for efficient 262K vocabulary handling
+
+### Qwen 3 0.6B
+```bash
+# Convert Qwen 3 0.6B
+./anemll/utils/convert_model.sh \
+    --model Qwen/Qwen3-0.6B \
+    --output /path/to/output/qwen3_0.6b \
+    --context 2048 \
+    --batch 64 \
+    --lut2 4 \
+    --lut3 6 \
+    --chunk 1
 ```
 
 ### Using Custom Prefix

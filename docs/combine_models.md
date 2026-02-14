@@ -20,17 +20,38 @@ python ./anemll/utils/combine_models.py [OPTIONS]
 
 ### Command Line Arguments
 
-- `--lut`: LUT quantization bits (typically 6)
+- `--lut`: LUT quantization configuration
+  - Simple format: `--lut 6` (6 bits, uses default per_channel group size of 8)
+  - Advanced format: `--lut 6,4` (6 bits with per_channel group size of 4)
+  - Note: Only the bits value affects file naming; per_channel is used during model conversion
 - `--chunk`: Number of chunks the model is split into
 - `--input-dir`: (Optional) Input directory containing the MLPackage files
 - `--output-dir`: (Optional) Output directory for combined MLPackage files
+- `--monolithic`: Combine monolithic models instead of chunked FFN/prefill models
+- `--prefix`: Model prefix (default: `llama`)
 
 ## Example Usage
+
+### Chunked Models (Standard)
 
 Basic usage with 6-bit quantization and 2 chunks:
 ```bash
 python ./anemll/utils/combine_models.py --lut 6 --chunk 2
 ```
+
+### Monolithic Models
+
+For monolithic model conversion, use the `--monolithic` flag:
+```bash
+python ./anemll/utils/combine_models.py \
+    --monolithic \
+    --lut 4 \
+    --prefix qwen \
+    --input ./converted \
+    --output ./converted
+```
+
+This combines `{prefix}_monolithic.mlpackage` and `{prefix}_monolithic_prefill.mlpackage` into a single `{prefix}_monolithic_combined.mlpackage` with both inference and prefill functions.
 
 ## Input Files
 
@@ -87,5 +108,6 @@ This utility is typically used after converting the individual model parts and b
 
 - [ANE_converter.py](ANE_converter.md): Creates initial MLPackage files
 - [compile_models.py](compile_models.md): Compiles combined models for deployment
+- [convert_monolith.md](convert_monolith.md): Monolithic model conversion workflow
 
 For the complete conversion workflow, refer to the [convert.md](convert.md) documentation. 

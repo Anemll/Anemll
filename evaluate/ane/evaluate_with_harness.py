@@ -1686,14 +1686,12 @@ def main():
     print(f"Few-shot: {args.num_shots or 0}")
     print()
     
-    # Create table header
-    print("|    Tasks    |Version|Filter|n-shot| Metric |   |Value|   |Stderr|")
-    print("|-------------|------:|------|-----:|--------|---|----:|---|-----:|")
+    # Create markdown table header (accuracy only)
+    print("| Task | Accuracy |")
+    print("|------|----------|")
     
     # Print results for each task
     for task_idx, (task, metrics) in enumerate(results["results"].items()):
-        # Get version from task alias or default to 1
-        version = 1
         task_alias = metrics.get('alias', task)
         
         # Group metrics by type (acc, acc_norm, etc.)
@@ -1713,30 +1711,22 @@ def main():
                     metric_groups[base_metric] = {}
                 metric_groups[base_metric]['value'] = value
         
-        # Print each metric
-        for metric_idx, (metric_name, metric_data) in enumerate(metric_groups.items()):
+        # Filter to only show 'acc' metrics
+        metric_groups = {k: v for k, v in metric_groups.items() if k == 'acc'}
+        
+        # Print accuracy for this task
+        if 'acc' in metric_groups:
+            metric_data = metric_groups['acc']
             value = metric_data.get('value', 0.0)
-            stderr = metric_data.get('stderr', 0.0)
             
-            # Convert to float if they're strings
+            # Convert to float if it's a string
             try:
                 value = float(value)
             except (TypeError, ValueError):
                 value = 0.0
-            try:
-                stderr = float(stderr)
-            except (TypeError, ValueError):
-                stderr = 0.0
             
-            # Determine if higher is better (most metrics are, except perplexity-like)
-            higher_is_better = "↑" if not metric_name.startswith('ppl') else "↓"
-            
-            if metric_idx == 0:
-                # First row shows task name
-                print(f"|{task_alias:<13}|{version:>7}|{'none':>6}|{args.num_shots or 0:>6}|{metric_name:<8}|{higher_is_better:>3}|{value:>7.4f}|±  |{stderr:>5.4f}|")
-            else:
-                # Subsequent rows are blank in task column
-                print(f"|{'':<13}|{'':<7}|{'none':>6}|{'':<6}|{metric_name:<8}|{higher_is_better:>3}|{value:>7.4f}|±  |{stderr:>5.4f}|")
+            # Print markdown table row
+            print(f"| {task_alias} | {value:.4f} |")
     
     print()
     print("Detailed results saved to:", output_path)

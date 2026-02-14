@@ -3,6 +3,37 @@
 # check_dependencies.sh
 # This script checks for necessary dependencies before running convert_model.sh
 
+# Auto-activate a local virtual environment if none is active.
+# - If you already activated a venv, we leave it alone.
+# - You can override with ANEMLL_VENV (venv dir) or ANEMLL_VENV_ACTIVATE (activate script).
+# - Disable with ANEMLL_AUTO_VENV=0.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+if [ -z "${VIRTUAL_ENV:-}" ] && [ "${ANEMLL_AUTO_VENV:-1}" != "0" ]; then
+    ACTIVATE_CANDIDATES=()
+    if [ -n "${ANEMLL_VENV_ACTIVATE:-}" ]; then
+        ACTIVATE_CANDIDATES+=("${ANEMLL_VENV_ACTIVATE}")
+    fi
+    if [ -n "${ANEMLL_VENV:-}" ]; then
+        ACTIVATE_CANDIDATES+=("${ANEMLL_VENV}/bin/activate")
+    fi
+    ACTIVATE_CANDIDATES+=(
+        "${PROJECT_ROOT}/env-anemll/bin/activate"
+        "${PROJECT_ROOT}/anemll-env/bin/activate"
+        "${PROJECT_ROOT}/.venv/bin/activate"
+        "${PROJECT_ROOT}/venv/bin/activate"
+    )
+
+    for ACTIVATE in "${ACTIVATE_CANDIDATES[@]}"; do
+        if [ -f "${ACTIVATE}" ]; then
+            # shellcheck disable=SC1090
+            source "${ACTIVATE}"
+            echo "Activated Python environment: ${ACTIVATE}"
+            break
+        fi
+    done
+fi
+
 # Function to display usage
 usage() {
     echo "Usage: $0 [--skip-check] [--model <model_directory>] [--context <context_length>] [--batch <batch_size>] [other options for convert_model.sh]"
@@ -55,20 +86,55 @@ if [ "$SKIP_CHECK" = false ]; then
     command -v python >/dev/null 2>&1 || { echo >&2 "Python is required but it's not installed. Aborting. (Issue #1)"; echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."; exit 1; }
 
     echo "Checking if pip is installed..."
-    command -v pip >/dev/null 2>&1 || { echo >&2 "pip is required but it's not installed. Aborting. (Issue #2)"; echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."; exit 1; }
+    # Try multiple methods to check pip (handles uv environments)
+    PIP_CMD=""
+    if command -v pip >/dev/null 2>&1; then
+        PIP_CMD="pip"
+    elif python -m pip --version >/dev/null 2>&1; then
+        PIP_CMD="python -m pip"
+    elif command -v uv >/dev/null 2>&1 && uv pip --version >/dev/null 2>&1; then
+        PIP_CMD="uv pip"
+    fi
 
-    echo "Checking if coremltools is installed via pip..."
-    if ! pip show coremltools >/dev/null 2>&1; then
-        echo "coremltools is required but not installed via pip. Aborting. (Issue #3)"
+    # If no pip/uv in PATH but coremltools is already importable (e.g. uv-managed env), allow it
+    if [ -z "$PIP_CMD" ]; then
+        if python -c "import coremltools" 2>/dev/null; then
+            PIP_CMD="python -m pip"
+            echo "Note: pip not in PATH but coremltools is importable (e.g. uv); continuing."
+        fi
+    fi
+
+    if [ -z "$PIP_CMD" ]; then
+        echo >&2 "pip is required but it's not installed. Aborting. (Issue #2)"
+        echo "If using uv, try: uv pip install coremltools"
+        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
+        exit 1
+    fi
+    echo "Using: $PIP_CMD"
+
+    echo "Checking if coremltools is installed..."
+    # Try pip show first, fall back to Python import check
+    coremltools_version=""
+    if $PIP_CMD show coremltools >/dev/null 2>&1; then
+        coremltools_version=$($PIP_CMD show coremltools | grep Version | awk '{print $2}')
+    elif python -c "import coremltools; print(coremltools.__version__)" >/dev/null 2>&1; then
+        # Fallback: check via Python import (works with uv and other package managers)
+        coremltools_version=$(python -c "import coremltools; print(coremltools.__version__)" 2>/dev/null)
+        echo "Note: coremltools found via Python import (uv/conda environment detected)"
+    fi
+
+    if [ -z "$coremltools_version" ]; then
+        echo "coremltools is required but not installed. Aborting. (Issue #3)"
+        echo "If using uv: uv pip install coremltools>=9.0"
+        echo "If using pip: pip install coremltools>=9.0"
         echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
         exit 1
     fi
 
     # Check coremltools version
-    coremltools_version=$(pip show coremltools | grep Version | awk '{print $2}')
     coremltools_major_version=$(echo "$coremltools_version" | cut -d. -f1)
-    if [ "$coremltools_major_version" -lt 8 ]; then
-        echo "coremltools version 8.x or higher is required. Aborting. (Issue #9)"
+    if [ "$coremltools_major_version" -lt 9 ]; then
+        echo "coremltools version 9.x or higher is required. Aborting. (Issue #9)"
         echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
         exit 1
     fi
@@ -172,7 +238,7 @@ if [ "$SKIP_CHECK" = false ]; then
 
         # Check for supported architectures in config.json
         echo "Checking for supported architectures in config.json..."
-        SUPPORTED_ARCHS=("llama" "qwen")
+        SUPPORTED_ARCHS=("llama" "qwen" "gemma")
         CONFIG_ARCH=$(jq -r '.architectures[]' "$MODEL_DIR/config.json" 2>/dev/null)
         CONFIG_MODEL_TYPE=$(jq -r '.model_type' "$MODEL_DIR/config.json" 2>/dev/null)
 

@@ -240,9 +240,108 @@ jq --arg end_time "$TIME_STR_METADATA_END" \
    '.metadata.time_end_run_eval = $end_time |
     .metadata.total_duration_run_eval = $duration' "$COMBINED_OUTPUT_FILENAME" > tmp_combined.json && mv tmp_combined.json "$COMBINED_OUTPUT_FILENAME"
 
+# Function to print nice combined results summary
+print_combined_results() {
+    local json_file="$1"
+    
+    if [ ! -f "$json_file" ]; then
+        return 1
+    fi
+    
+    # Check if results exist
+    local has_results=$(jq -e '.results | length > 0' "$json_file" 2>/dev/null)
+    if [ $? -ne 0 ] || [ "$has_results" != "true" ]; then
+        return 1
+    fi
+    
+    echo ""
+    echo "=========================================================="
+    echo "COMBINED EVALUATION RESULTS SUMMARY"
+    echo "=========================================================="
+    echo ""
+    
+    # Print metadata
+    local model_path=$(jq -r '.metadata.model_path // "N/A"' "$json_file")
+    local date_str=$(jq -r '.metadata.date // "N/A"' "$json_file")
+    local num_shots=$(jq -r '.metadata.num_shots // "N/A"' "$json_file")
+    
+    echo "Model:        $model_path"
+    echo "Date:         $date_str"
+    echo "Num shots:    $num_shots"
+    echo ""
+    
+    # Print results table header
+    printf "%-20s" "Task"
+    printf "%-25s" "Metric"
+    printf "%15s" "Value"
+    printf "%15s" "Std Error"
+    echo ""
+    echo "----------------------------------------------------------"
+    
+    # Extract and print each task's results
+    # Get all task names
+    local tasks=$(jq -r '.results | keys[]' "$json_file")
+    
+    for task in $tasks; do
+        # Get all metrics for this task (excluding metadata, alias, and stderr fields)
+        # Metrics are stored as "metric_name,filter" (e.g., "acc,none", "acc_stderr,none")
+        local metrics=$(jq -r --arg task "$task" \
+            '.results[$task] | to_entries[] | 
+             select(.key | test("^alias$|^metadata$") | not) |
+             select(.key | test("_stderr") | not) |
+             select(.value | type == "number") |
+             .key' "$json_file")
+        
+        for metric_full in $metrics; do
+            # Extract base metric name (before comma) for display
+            local metric_display=$(echo "$metric_full" | cut -d',' -f1)
+            local value=$(jq -r --arg task "$task" --arg metric "$metric_full" \
+                '.results[$task][$metric]' "$json_file")
+            
+            # Try to get stderr if available (format: "metric_stderr,filter")
+            # Check if metric_full has a filter part (contains comma)
+            if echo "$metric_full" | grep -q ','; then
+                local filter_part=$(echo "$metric_full" | cut -d',' -f2-)
+                local stderr_key="${metric_display}_stderr,$filter_part"
+            else
+                local stderr_key="${metric_display}_stderr"
+            fi
+            
+            local stderr_val=$(jq -r --arg task "$task" --arg stderr_key "$stderr_key" \
+                '.results[$task][$stderr_key] // empty' "$json_file" 2>/dev/null)
+            
+            # If stderr_key didn't match and we had a filter, try without the filter part
+            if ([ -z "$stderr_val" ] || [ "$stderr_val" = "null" ]) && echo "$metric_full" | grep -q ','; then
+                stderr_key="${metric_display}_stderr"
+                stderr_val=$(jq -r --arg task "$task" --arg stderr_key "$stderr_key" \
+                    '.results[$task][$stderr_key] // empty' "$json_file" 2>/dev/null)
+            fi
+            
+            if [ -n "$stderr_val" ] && [ "$stderr_val" != "null" ] && [ "$stderr_val" != "" ]; then
+                printf "%-20s" "$task"
+                printf "%-25s" "$metric_display"
+                printf "%15.4f" "$value"
+                printf "%15.4f" "$stderr_val"
+                echo ""
+            else
+                printf "%-20s" "$task"
+                printf "%-25s" "$metric_display"
+                printf "%15.4f" "$value"
+                printf "%15s" "N/A"
+                echo ""
+            fi
+        done
+    done
+    
+    echo ""
+    echo "=========================================================="
+    echo "Combined results saved to: $json_file"
+    echo "Total script duration: $TOTAL_SCRIPT_DURATION_FORMATTED"
+    echo "=========================================================="
+}
+
+# Print combined results if available
+print_combined_results "$COMBINED_OUTPUT_FILENAME"
+
 echo ""
-echo "=========================================================="
-echo "Evaluation script run complete!"
-echo "Combined results for all tasks saved to: $COMBINED_OUTPUT_FILENAME"
-echo "Total script duration: $TOTAL_SCRIPT_DURATION_FORMATTED"
-echo "==========================================================" 
+echo "Evaluation script run complete!" 

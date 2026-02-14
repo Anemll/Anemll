@@ -27,15 +27,23 @@ If you confident it's incorrectly reporting an issue, you can skip the check by 
 - Error message: "pip is required but it's not installed. Aborting. (Issue #2)"
 
 **Solution:**
-- Install pip by following the instructions at [pip.pypa.io](https://pip.pypa.io/en/stable/installation/).
-- Verify the installation by running `pip --version`.
+
+- **If you're using pip:** Install pip by following the instructions at [pip.pypa.io](https://pip.pypa.io/en/stable/installation/). Verify with `pip --version`.
+
+- **If you're using UV:** Create and activate a UV environment with seeded pip:
+  ```bash
+  uv venv --python 3.9 --seed env-anemll
+  source env-anemll/bin/activate
+  ```
+  Then install dependencies (for example: `uv pip install -r requirements.txt`). Verify with `pip --version` or `uv pip --version`.
 
 ### 3. CoreML Tools Not Installed
 **Problem:**
 - Error message: "coremltools is required but not installed via pip. Aborting. (Issue #3)"
 
 **Solution:**
-- Install coremltools using pip: `pip install coremltools`.
+- Install coremltools using pip: `pip install "coremltools>=9.0"`.
+- Install coremltools using uv: `uv pip install "coremltools>=9.0"`.
 - Verify the installation by running `pip show coremltools`.
 
 ### 4. CoreML Compiler Not Found
@@ -85,10 +93,11 @@ If you confident it's incorrectly reporting an issue, you can skip the check by 
 
 ### 9. CoreML Tools Version Too Low
 **Problem:**
-- Error message: "coremltools version 8.x or higher is required. Aborting. (Issue #8)"
+- Error message: "coremltools version 9.x or higher is required. Aborting. (Issue #9)"
 
 **Solution:**
-- Upgrade coremltools to version 8.x or higher using pip: `pip install --upgrade coremltools`.
+- Upgrade coremltools to version 9.0+ using pip: `pip install --upgrade "coremltools>=9.0"`.
+- Or with UV: `uv pip install --upgrade "coremltools>=9.0"`.
 - Verify the version by running `pip show coremltools`.
 
 ## Additional Help

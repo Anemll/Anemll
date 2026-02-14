@@ -305,6 +305,28 @@ class Qwen25Attention(nn.Module):
         # Note: Qwen 2.5 does not use per-head normalization
         self.scale = 1 / math.sqrt(self.head_dim)
 
+    @staticmethod
+    def _stable_attention_weights(
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        scale: float,
+        causal_mask: torch.Tensor | None = None,
+        q_seq_len: int | None = None,
+        k_seq_len: int | None = None,
+    ) -> torch.Tensor:
+        """Compute attention weights in fp32 to avoid fp16 overflow/NaNs."""
+        q = query_states.to(torch.float32)
+        k = key_states.to(torch.float32)
+        attn_logits = torch.matmul(q, k.transpose(-1, -2)) * float(scale)
+
+        if causal_mask is not None:
+            qq = q_seq_len if q_seq_len is not None else attn_logits.shape[-2]
+            kk = k_seq_len if k_seq_len is not None else attn_logits.shape[-1]
+            attn_logits = attn_logits + causal_mask.to(torch.float32)[:, :, :qq, :kk]
+
+        # Softmax in fp32 for numerical stability; cast back for downstream compute.
+        return torch.softmax(attn_logits, dim=-1).to(MODEL_DTYPE)
+
     def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
         """
         Repeat key/value heads n_rep times, while keeping the batch dimension intact.
@@ -403,15 +425,16 @@ class Qwen25Attention(nn.Module):
             query_states, key_states, cos, sin
         )
 
-        attn_weights = (
-            torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scale
+        attn_weights = self._stable_attention_weights(
+            query_states,
+            key_states,
+            self.scale,
+            causal_mask=causal_mask,
+            q_seq_len=seq_len,
+            k_seq_len=seq_len,
         )
-        if causal_mask is not None:
-            # Slice causal mask to match seq_len x seq_len for attention weights
-            causal_mask_slice = causal_mask[:, :, :seq_len, :seq_len]
-            attn_weights = attn_weights + causal_mask_slice.to(attn_weights.dtype)
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = torch.matmul(attn_weights.to(torch.float32), value_states.to(torch.float32))
+        attn_output = attn_output.to(MODEL_DTYPE)
         attn_output = (
             attn_output.permute(0, 2, 1, 3).contiguous().view(bsz, seq_len, -1)
         )
@@ -435,20 +458,21 @@ class Qwen25Attention(nn.Module):
         key_states = self.repeat_kv(K_layer_cache, n_rep)
         value_states = self.repeat_kv(V_layer_cache, n_rep)
 
-        # Compute attention using optimized path for batch_size=1
-        attn_weights = torch.matmul(query_states.to(MODEL_DTYPE), key_states.transpose(-1, -2).to(MODEL_DTYPE)) * self.scale
-        
-        if causal_mask is not None:
-            # Match the causal mask to the actual dimensions being used
-            q_seq_len = query_states.shape[-2]  # Query sequence length (usually 1 for single token)
-            k_seq_len = key_states.shape[-2]   # Key sequence length (actual filled cache length)
-            attn_weights = attn_weights + causal_mask.to(MODEL_DTYPE)[:, :, :q_seq_len, :k_seq_len]
+        # Compute attention in fp32 to avoid inf/NaN on larger Qwen2-style models.
+        q_seq_len = query_states.shape[-2]  # Usually 1 for single token
+        k_seq_len = key_states.shape[-2]    # Full cache width
+        attn_weights = self._stable_attention_weights(
+            query_states,
+            key_states,
+            self.scale,
+            causal_mask=causal_mask,
+            q_seq_len=q_seq_len,
+            k_seq_len=k_seq_len,
+        )
 
-        # Optimized softmax for batch_size=1
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-        
         # Compute attention output directly without einsum
-        attn_output = torch.matmul(attn_weights, value_states.to(MODEL_DTYPE))
+        attn_output = torch.matmul(attn_weights.to(torch.float32), value_states.to(torch.float32))
+        attn_output = attn_output.to(MODEL_DTYPE)
         
         # Reshape before projecting: [1, heads, q_len, head_dim] -> [1, q_len, heads*head_dim]
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -474,18 +498,22 @@ class Qwen25Attention(nn.Module):
         key_states = self.repeat_kv(K_layer_cache, n_rep)
         value_states = self.repeat_kv(V_layer_cache, n_rep)
         
-        # Compute scaled dot-product attention
-        attn_weights = torch.einsum('bhqd,bhkd->bhqk', query_states.to(MODEL_DTYPE), key_states.to(MODEL_DTYPE)) * self.scale
-        
-        if causal_mask is not None:
-            # Slice causal mask to match actual query and key sequence lengths
-            q_seq_len = query_states.shape[2]  # Query sequence length
-            k_seq_len = min(key_states.shape[2], self.config.context_length)  # Key sequence length
-            mask_slice = causal_mask.to(MODEL_DTYPE)[:, :, :q_seq_len, :k_seq_len]
-            attn_weights = attn_weights + mask_slice
-        
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-        attn_output = torch.einsum('bhqk,bhkd->bhqd', attn_weights, value_states.to(MODEL_DTYPE))
+        # Compute scaled dot-product attention in fp32 for numerical stability.
+        q_seq_len = query_states.shape[2]  # Query sequence length
+        k_seq_len = min(key_states.shape[2], self.config.context_length)  # Key sequence length
+        attn_weights = self._stable_attention_weights(
+            query_states,
+            key_states,
+            self.scale,
+            causal_mask=causal_mask,
+            q_seq_len=q_seq_len,
+            k_seq_len=k_seq_len,
+        )
+        attn_output = torch.einsum(
+            'bhqk,bhkd->bhqd',
+            attn_weights.to(torch.float32),
+            value_states.to(torch.float32),
+        ).to(MODEL_DTYPE)
         
         # Reshape before projecting: [batch, heads, actual_seq_len, head_dim] -> [batch, actual_seq_len, heads*head_dim]
         # Use actual tensor dimensions instead of input q_len
@@ -929,10 +957,21 @@ class Qwen25Model(nn.Module):
         # Filter out expected missing keys including KV cache buffer
         expected_missing = ['kv_cache_0']  # KV cache buffer is initialized separately
         missing = [m for m in missing if m not in expected_missing]
-        if missing or unexpected:
+        allow_missing = os.environ.get("ANEMLL_ALLOW_MISSING_WEIGHTS", "").lower() in ("1", "true", "yes")
+        if missing:
             print("Missing keys", missing)
+            if unexpected:
+                print("Unexpected keys", unexpected)
+            # Highlight actionable TODO in red for conversion logs
+            print("\033[91mTODO: Weights not found or renamed. Check checkpoint prefixes and model config.\033[0m")
+            print("Hint: set ANEMLL_ALLOW_MISSING_WEIGHTS=1 (or --allow-missing-weights in convert scripts) to continue anyway.")
+            if allow_missing:
+                print("Continuing despite missing weights (ANEMLL_ALLOW_MISSING_WEIGHTS=1).")
+                return True
+            return False
+        if unexpected:
             print("Unexpected keys", unexpected)
-        return not missing and not unexpected
+        return True
 
 
 class Qwen25ForCausalLM(nn.Module):

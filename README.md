@@ -2,14 +2,28 @@
 
 ANEMLL (pronounced like "animal") is an open-source project focused on accelerating the porting of Large Language Models (LLMs) to tensor processors, starting with the Apple Neural Engine (ANE).
 
-## 🚀 Version 0.3.4 Alpha Release - Enhanced Evaluation & Quality Improved Stability
+## Version 0.3.5 Alpha Release
+
+For complete release notes, see [`docs/RELEASE_NOTES_0.3.5.md`](./docs/RELEASE_NOTES_0.3.5.md).
+
+### What's New in 0.3.5
+- **ANEMLL Chat redesign** — Fully rebuilt iOS/macOS/visionOS reference app with voice input, AirDrop model sharing, local model import/linking, Markdown rendering, and thinking mode. [TestFlight Beta](https://testflight.apple.com/join/jrQq1D1C)
+- **Gemma 3 family** — Full support for 270M, 1B, 4B QAT with sliding-window + global attention, FP16 scaling, and up to 4K context.
+- **Monolithic models** — Single-file conversion and inference for all architectures (LLaMA, Qwen, Qwen 2.5, Gemma 3) with ANEMLL-Dedup for ~50% size reduction.
+- **In-model argmax** (`--argmax`) — Moves argmax into the CoreML LM head, outputting per-chunk winner index+value instead of full logits. Drastically reduces ANE-to-host data transfer. Extensible to top-k sampling. Recorded in `meta.yaml` as `argmax_in_model: true`.
+- **Swift inference stability** — IOSurface-backed buffers, serial prediction queue, ping-pong/ring buffer patterns eliminate ANE race conditions on iOS.
+- **ANEMLL-Dedup** — Surgical weight deduplication for multifunction CoreML models (~50% savings). [Documentation](./docs/anemll-dedup.md)
+- **Qwen 3 multi-chunk fix** — Fixed inference divergence caused by applying final RMSNorm on every FFN chunk instead of only the last.
+- **New conversion tools** — ANE Profiler ([docs](./anemll/utils/ANE_PROFILER.md)), auto chunk calculator ([docs](./docs/calc_chunk_split.md)), FP16 preflight, real-time conversion monitor.
+- **Chat CLI improvements** — New `--st` (single-token prefill for debugging), `--cpu`, `--debug-argmax`, `--mem-report`, `--split-rotate`, `--sliding-window` flags. Architecture-aware stop-token detection.
+- **Auto-activate venv** — `convert_model.sh` and `check_dependencies.sh` auto-activate project venvs. Override with `ANEMLL_VENV` or disable with `ANEMLL_AUTO_VENV=0`.
 
 ### 🔄 **What's New in 0.3.4**
 - **📊 lm-evaluation-harness Support** - Model evaluation with standard benchmarks (BoolQ, ARC Challenge, etc.) - [Documentation](./evaluate/ane/README.md)
 - **🎯 New RMSN-orm Implementation** - Precise calculation with ANE hardware ops
 - **🐛 Fixed RoPE Tensor Size Bug** - Resolved random overflows (existing pre-0.3.4 models should be re-converted)
 
-####Example ANE vs HF on MPS backend 
+#### Example ANE vs HF on MPS backend 
 
 | Task        | HF-FP16 | ANEMLL-FP16 | DIFF % |
 |-------------|---------|--------------|--------|
@@ -25,20 +39,20 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 🆕 New 0.3.4.models with benchmarks are [here](https://huggingface.co/collections/anemll/anemll-034-686c21c2cb05c715eb3f6a26)
 
 
-### 📦 **Quick Start (New Simplified Workflow)**
+### Quick Start
 ```bash
-# 1. Setup environment (one-time)
-./create_python39_env.sh
-
-# 2. Install dependencies (auto-detects virtual environment)
+# 1. Setup environment (uv recommended)
+brew install uv              # one-time
+./create_uv_env.sh           # creates env-anemll with Python 3.9
+source env-anemll/bin/activate
 ./install_dependencies.sh
 
-# 3. Test conversion pipeline
-python tests/test_qwen_model.py     # Test Qwen 3 models
-python tests/test_qwen2.5_model.py  # Test Qwen 2.5 models
-python tests/test_llama_model.py    # Test LLaMA models
+# 2. Test conversion pipeline
+python tests/test_gemma3_model.py     # Gemma 3 270M (monolithic + argmax)
+python tests/test_qwen_model.py       # Qwen 3
+python tests/test_llama_model.py      # LLaMA
 
-# 4. Convert your own models
+# 3. Convert your own models
 ./anemll/utils/convert_model.sh --model <path> --output <dir>
 ```
 
@@ -53,27 +67,29 @@ python tests/test_llama_model.py    # Test LLaMA models
 
 See update [Roadmap.md](./Roadmap.MD) for more details
 
-## Main Components in 0.3.4 Alpha Release
+## Main Components in 0.3.5 Alpha Release
 
-ANEMLL provides five main components for Apple Neural Engine inference development:
+ANEMLL provides six main components for Apple Neural Engine inference development:
 
 1. [LLM Conversion Tools](./docs/convert.md) - Scripts and code to convert models directly from Hugging Face weights
    - [Single-shot Conversion Script](./docs/convert_model.md)
 
-2. [Swift Reference Implementation](./docs/swift_cli.md) - Optimized inference code for Swift applications
+2. [ANE Profiler](./anemll/utils/ANE_PROFILER.md) - CoreML/ANE profiling without Xcode (analyze compute plan, benchmark all units, compatibility reports). Requires CoreMLTools 9.0+ and macOS 15+.
+
+3. [Swift Reference Implementation](./docs/swift_cli.md) - Optimized inference code for Swift applications
    - Sample CLI application in `anemll-swift-cli`
    - Core inference engine implementation
 
-3. [Python Sample Code](./docs/chat.md) - Reference implementation and testing tools
+4. [Python Sample Code](./docs/chat.md) - Reference implementation and testing tools
    - Basic chat interface (`chat.py`)
    - Advanced conversation management (`chat_full.py`)
 
-4. [iOS/macOS Sample Applications](./docs/sample_apps.md) - Ready-to-use example applications (Alpha, now on TestFlight)
-   - SwiftUI Chat interface
-   - Model Downloads and integration example
-   - Conversation management
+5. [iOS/macOS Sample Applications](./docs/sample_apps.md) - Redesigned ANEMLL Chat app with voice input, AirDrop sharing, Markdown, and thinking mode. [TestFlight Beta](https://testflight.apple.com/join/jrQq1D1C)
+   - SwiftUI Chat interface (iOS, macOS, visionOS)
+   - HuggingFace model downloads, local import, network drive linking
+   - Conversation management with streaming and performance metrics
 
-5. [ANEMLL-BENCH](https://github.com/anemll/anemll-bench) - Apple Neural Engine Benchmarking
+6. [ANEMLL-BENCH](https://github.com/anemll/anemll-bench) - Apple Neural Engine Benchmarking
    - Performance testing and comparison
    - Model optimization metrics
    - Hardware-specific benchmarks
@@ -82,11 +98,12 @@ ANEMLL provides five main components for Apple Neural Engine inference developme
 ### Pre-converted Models
 
 We provide sample converted models ready for use:
-- **LLAMA 3.1/3.2** (1B and B variants) including iOS "friendly builds"
-- **🆕 Qwen 3** (0.6B and 4B) - **New in 0.3.3!** Initial support with custom converter
-- **🆕 Qwen 2.5** (0.5B-Instruct) - **New in 0.3.3!** Initial support with custom converter
-- **DeepSeek** distilled models
-- **DeepHermes** distilled models
+- **Gemma 3** (270M, 1B, 4B QAT) — SWA + global attention, up to 4K context, monolithic and chunked
+- **LLaMA 3.1/3.2** (1B, 8B) — including iOS "friendly builds"
+- **Qwen 3** (0.6B, 1.7B) — thinking mode support
+- **Qwen 2.5** (0.5B) — monolithic available
+- **DeepSeek R1** (8B distilled) — via LLaMA converter
+- **DeepHermes** (3B, 8B) — LLaMA-based fine-tuned models
 
 > [!NOTE]
 > Please note that Quantization should be improved. LUT4 quality is fairly low due to lack of Block Quantization on Apple Neural Engine.
@@ -98,6 +115,7 @@ We provide sample converted models ready for use:
 - **LLaMA Testing**: `python tests/test_llama_model.py`
 - **Qwen 3 Testing**: `python tests/test_qwen_model.py`
 - **Qwen 2.5 Testing**: `python tests/test_qwen2.5_model.py`
+- **Gemma 3 Testing**: `python tests/test_gemma3_model.py`
 
 #### Test Any HuggingFace Model
 ```bash
@@ -111,6 +129,50 @@ We provide sample converted models ready for use:
 ./tests/conv/test_hf_model.sh meta-llama/Llama-3.2-8B-Instruct /tmp/llama8b 4
 ```
 
+#### Gemma 3 Model Conversion
+Gemma 3 models use a split KV cache architecture with interleaved local (sliding window) and global attention layers.
+
+> **Note:** The conversion script now auto-detects HuggingFace model names and downloads them automatically!
+
+```bash
+# Convert Gemma 3 270M (small, good for testing)
+./anemll/utils/convert_model.sh \
+    --model google/gemma-3-270m-it \
+    --output /path/to/output/gemma3_270m \
+    --context 512 \
+    --batch 64 \
+    --lut2 4 \
+    --lut3 6 \
+    --chunk 1
+
+# Convert Gemma 3 1B with LUT6 and 4K context (single chunk)
+./anemll/utils/convert_model.sh \
+    --model google/gemma-3-1b-it \
+    --output /path/to/output/gemma3_1b_lut6_ctx4096 \
+    --context 4096 \
+    --batch 64 \
+    --lut1 6 \
+    --lut2 6 \
+    --lut3 6 \
+    --chunk 1
+
+# Test the converted model
+python3 tests/chat.py --meta /path/to/output/gemma3_270m/meta.yaml --prompt "Hello!"
+```
+
+**Gemma 3 Notes:**
+- HuggingFace model names (e.g., `google/gemma-3-1b-it`) are auto-detected and downloaded
+- **270M model**: Uses monolithic format (single CoreML file) with argmax - ideal for quick testing
+- **1B model**: Uses standard chunked format (separate embeddings, FFN, LM head)
+- Uses split KV cache: local layers (sliding window 512) + global layers (full context)
+- For context > 512: 4-function models (infer, infer_rotate, prefill, prefill_rotate) enable automatic cache rotation
+- Recommended: `--chunk 1` for all Gemma 3 models (1B fits in single chunk)
+- Supports context lengths up to 4096 (512-2048 recommended for optimal ANE performance)
+- Large vocabulary (262K tokens) uses 16-way LM head splitting
+- Requires HuggingFace login for gated models: `hf login`
+
+> **⚠️ FP16 Overflow Warning**: Gemma 3 models can produce activations exceeding FP16 range (65,504). See [FP16 Compatibility](#fp16-compatibility-for-ane) below.
+
 #### Features
 - **Auto-downloads models**: No manual setup required, downloads models from HuggingFace
 - **Fast validation**: Uses unquantized FP16 conversion for quick pipeline testing
@@ -122,16 +184,16 @@ We provide sample converted models ready for use:
 
 Visit our [Hugging Face repository](https://huggingface.co/anemll) for the latest converted models.
 
-### ⚠️ **Important Alpha Release Notes**
-> This is **Alpha Release 0.3.3** - **QWEN 3 & QWEN 2.5 support is experimental**
+### Important Alpha Release Notes
+> This is **Alpha Release 0.3.5** — Gemma 3, monolithic models, in-model argmax, ANEMLL Chat redesign, and ANE stability fixes.
 > - **Breaking Change**: `install_dependencies.sh` moved to project root
-> - **Enhanced Python Support**: Now supports Python 3.9-3.13 (recommended: 3.9-3.11)
-> - **New Architecture**: Initial Qwen 3 and Qwen 2.5 support with custom converter optimizations
-> - **Improved Testing**: Automated validation scripts for conversion workflows
-> 
+> - **Dependency baseline**: `coremltools>=9.0`
+> - **Stable architectures**: LLaMA 3.1/3.2, DeepSeek R1, DeepHermes, Qwen 3, Qwen 2.5, Gemma 3
+> - **New conversion modes**: Monolithic (`convert_monolith.sh`), in-model argmax (`--argmax`), per-component LUT (`--lut-embeddings`, `--lut-lmhead`)
+>
 > Please visit https://huggingface.co/anemll for pre-converted models and follow [@anemll](https://x.com/anemll) for updates
-> 
-> ⭐ **Please star this repo to support the project!**
+>
+> Star this repo to support the project!
 
 
 
@@ -213,31 +275,36 @@ See [chat.md](./docs/chat.md) for more details
 - **Minimum 16GB RAM** (32GB recommended for 8B models)
 - **Python 3.9-3.11** (Python 3.9 strongly recommended for best compatibility)
 - **Xcode Command Line Tools** (for CoreML compiler)
-- Dependencies: coremltools>=8.2, transformers>=4.36.0, numpy>=1.24.0, scikit-learn<=1.5.1
+- Dependencies: coremltools>=9.0, transformers>=4.36.0, numpy>=1.24.0, scikit-learn<=1.5.1
 
-### 📦 Installation (New Streamlined Process)
+### Installation
 
-**🚀 One-Command Setup:**
+**Recommended: UV Setup (fast, reproducible):**
 ```bash
-# 1. Create Python environment with correct version (auto-detects Python 3.9/3.10/3.11)
-./create_python39_env.sh
+# Install uv (once)
+brew install uv
 
-# 2. Install all dependencies (auto-detects and activates virtual environment)
+# Create env-anemll with Python 3.9 and install dependencies
+./create_uv_env.sh
+source env-anemll/bin/activate
 ./install_dependencies.sh
 
-# 3. Verify installation with automated tests (downloads models automatically)
-./tests/conv/test_qwen_simple.sh    # Test Qwen conversion (auto-downloads ~2.4GB)
-./tests/conv/test_llama_simple.sh   # Test LLaMA conversion (auto-downloads ~500MB)
+# Verify
+python --version           # Should show 3.9.x
+python -c "import coremltools; print(coremltools.__version__)"
 ```
 
-**🔧 Manual Setup (if needed):**
+**Alternative: Standard venv:**
 ```bash
-# Create virtual environment with Python 3.9 (recommended)
-python3.9 -m venv env-anemll
+./create_python39_env.sh
 source env-anemll/bin/activate
-
-# Install dependencies
 ./install_dependencies.sh
+```
+
+**Test the pipeline:**
+```bash
+./tests/conv/test_qwen_simple.sh    # Qwen3-0.6B end-to-end (auto-downloads ~2.4GB)
+./tests/conv/test_llama_simple.sh   # SmolLM-135M end-to-end (auto-downloads ~500MB)
 ```
 
 > **📝 Note on Test Scripts:** The automated test scripts will automatically download required models from HuggingFace:
@@ -288,22 +355,27 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 - **DeepHermes** (3B, 8B) - LLaMA-based fine-tuned models
 - **Context lengths**: Up to 2048 tokens (512-1024 recommended for optimal ANE performance, 4K verified)
 
-**🆕 Qwen Family (Alpha - New in 0.3.3!)**
-- **Qwen 3** (0.6B, 1.7B, 4B) - Initial support with custom converter
-- **Qwen 2.5** (0.5B-Instruct, 1.5B, 3B, 7B) - Initial support with custom converter
-- **Architecture**: Transformer with RMSNorm, SwiGLU, and RoPE
-- **Context lengths**: Up to 32K (512-2048 recommended for ANE, 4K verified)
-- **Status**: Experimental - please report issues, needs TopK and Temperature support
+**Qwen Family (Stable)**
+- **Qwen 3** (0.6B, 1.7B, 8B) — chunked and monolithic, thinking mode support
+- **Qwen 2.5** (0.5B, 1.5B, 3B, 7B) — chunked and monolithic
+- **Context lengths**: Up to 4K (512-2048 recommended for ANE)
+
+**Gemma 3 Family (Stable)**
+- **Gemma 3** (270M, 1B, 4B QAT) — split KV cache with sliding-window + global attention
+- **Context lengths**: Up to 4096 tokens (512-2048 recommended for ANE)
+- **Special features**: SWA + global attention, FP16 scaling, in-model argmax, 4-function rotation support
+- **M1/A14 limitation**: Constrained to 512-context monolithic models due to ANE non-uniform state shape restrictions
 
 ### 🔧 **Model Specifications**
 
-| Model Family | Sizes | Context | ANE Optimized | Status |
-|-------------|-------|---------|---------------|---------|
-| LLaMA 3.1/3.2 | 1B, 8B | 512-2048 | ✅ Yes | 🟢 Stable |
-| DeepSeek R1 | 8B | 512-1024 | ✅ Yes | 🟢 Stable |
-| DeepHermes | 3B, 8B | 512-1024 | ✅ Yes | 🟢 Stable |
-| Qwen 3 | 0.6B, 4B | 512-2048 | ⚠️ Experimental | 🟡 Alpha |
-| Qwen 2.5 | 0.5B, 1.5B, 3B, 7B | 512-2048 | ⚠️ Experimental | 🟡 Alpha |
+| Model Family | Sizes | Context | Chunked | Monolithic | Status |
+|-------------|-------|---------|---------|------------|--------|
+| LLaMA 3.1/3.2 | 1B, 8B | 512-2048 | Yes | Yes | Stable |
+| DeepSeek R1 | 8B | 512-1024 | Yes | — | Stable |
+| DeepHermes | 3B, 8B | 512-1024 | Yes | — | Stable |
+| Qwen 3 | 0.6B, 1.7B, 8B | 512-4096 | Yes | Yes | Stable |
+| Qwen 2.5 | 0.5B, 1.5B, 3B, 7B | 512-2048 | Yes | Yes | Stable |
+| Gemma 3 | 270M, 1B, 4B QAT | 512-4096 | Yes | Yes | Stable |
 
 ### 🎯 **ANE Performance Notes**
 - **Recommended context**: 512-1024 tokens for best performance
@@ -314,15 +386,92 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 ### 🚀 **Coming Soon**
 - **Additional Qwen 2.5 variants** (14B, 32B)
 - **Mistral family** support
-- **Gemma models**
 - **Enhanced quantization** (GPTQ, SpinQuant integration)
-- **Larger context lengths** (4K, 8K optimization)
+- **Larger context lengths** (8K, 16K optimization)
 
 ### 📥 **Pre-converted Models**
 Ready-to-use models available at [Hugging Face](https://huggingface.co/anemll):
 - iOS-friendly builds (unzipped .mlmodelc)
 - Standard builds for macOS development
 - Multiple quantization levels (FP16, LUT4, LUT6)
+
+## FP16 Compatibility for ANE
+
+Apple Neural Engine (ANE) operates in FP16 precision, which can only represent values up to ±65,504. Some models (particularly Gemma 3) produce activations that exceed this range, causing NaN/Inf failures.
+
+### The Problem
+
+Models trained in BF16 (range ±3.4×10³⁸) may have:
+- **Residual accumulation overflow**: The cumulative `hidden = hidden + attention + mlp` grows too large
+- **All sub-tensors within range**: Individual attention, MLP, and norm outputs are fine
+- **Overflow in layer outputs**: Combined residual stream exceeds FP16 max
+
+This affects **all Gemma 3 sizes** (270M through 27B) - see [Unsloth's analysis](https://unsloth.ai/blog/gemma3).
+
+### FP16 Compatibility Check Tool
+
+Check any HuggingFace model for ANE compatibility:
+
+```bash
+# Quick check
+python anemll/utils/fp16_compatibility_check.py --model google/gemma-3-1b-it
+
+# Full analysis with clamp sweep
+python anemll/utils/fp16_compatibility_check.py --model google/gemma-3-4b-it-qat-int4-unquantized --sweep
+```
+
+Recommended one-command pre-conversion sweep:
+
+```bash
+./anemll/utils/fp16_preflight.sh --model <model_id_or_path>
+```
+
+This runs the sweep by default and writes a JSON report to `tests/dev/logs/`.
+
+The tool reports:
+- Weight analysis (are weights within FP16 range?)
+- Precision tests (BF16, FP16, FP16→FP32)
+- Residual accumulation analysis
+- Recommended scaling factor (α)
+
+### Solutions
+
+We support two approaches:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Weight Scaling** (Recommended) | Zero runtime overhead, 100% quality match | Requires preprocessing |
+| **Runtime Clamping** | Simple to implement | Adds ops per layer |
+
+#### Weight Scaling (Recommended)
+
+For Gemma 3 models, apply a weight-only transformation:
+
+```python
+alpha = 0.1875  # 3/16, adjust based on model
+
+# 1. Scale embedding weights
+embed_tokens.weight *= alpha
+
+# 2. Transform post-norm weights (Gemma uses (1+w) gain)
+for layer in layers:
+    post_attention_layernorm.weight = alpha * (1 + w_old) - 1
+    post_feedforward_layernorm.weight = alpha * (1 + w_old) - 1
+```
+
+#### Model-Specific α Values
+
+| Model | Peak Activation | α Recommended | Status |
+|-------|-----------------|---------------|--------|
+| gemma-3-270m | 104,162 (1.6x) | 0.48 | 100% match |
+| gemma-3-1b-it | 61,040 (0.93x) | 0.82 | 100% match |
+| gemma-3-4b-it-qat | 292,969 (4.5x) | 0.17-0.1875 | 100% match |
+
+### Documentation
+
+- [GEMMA3_FP16_SCALING.md](./docs/GEMMA3_FP16_SCALING.md) - Detailed scaling guide
+- [fp16_compatibility_check.py](./anemll/utils/fp16_compatibility_check.py) - Diagnostic tool
+- [fp16_preflight.sh](./anemll/utils/fp16_preflight.sh) - One-command FP16 pre-conversion sweep
 
 ## Acknowledgements
 

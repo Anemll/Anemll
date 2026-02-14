@@ -3,9 +3,15 @@
 #  Use of this source code is governed by a MIT license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/license/mit
 
-import pkg_resources
 from enum import Enum
 import os
+
+# Use importlib.metadata (Python 3.8+) instead of deprecated pkg_resources
+try:
+    from importlib.metadata import version, PackageNotFoundError
+except ImportError:
+    # Fallback for Python < 3.8 (though project requires 3.9+)
+    from importlib_metadata import version, PackageNotFoundError
 
 class ModelPart(Enum):
     EMBEDDINGS = "1"
@@ -18,10 +24,10 @@ def get_anemll_version():
     """Get Anemll version from PKG-INFO."""
     try:
         # First try to get version from installed package
-        version = pkg_resources.get_distribution('anemll').version
-        if version:
-            return version
-    except pkg_resources.DistributionNotFound:
+        package_version = version('anemll')
+        if package_version:
+            return package_version
+    except PackageNotFoundError:
         try:
             # If running as script, try to find PKG-INFO relative to this file
             current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -112,6 +118,18 @@ def AddMetadata(model, params=None):
             
         if 'lut_bits' in params and params['lut_bits'] is not None:
             model.user_defined_metadata["com.anemll.lut_bits"] = str(params['lut_bits'])
+
+        if 'argmax_in_model' in params and params['argmax_in_model']:
+            model.user_defined_metadata["com.anemll.argmax_in_model"] = "true"
+
+        if 'vocab_size' in params and params['vocab_size'] is not None:
+            model.user_defined_metadata["com.anemll.vocab_size"] = str(params['vocab_size'])
+
+        if 'lm_head_chunk_sizes' in params and params['lm_head_chunk_sizes'] is not None:
+            chunk_sizes = params['lm_head_chunk_sizes']
+            if isinstance(chunk_sizes, (list, tuple)):
+                chunk_sizes = ",".join(str(int(x)) for x in chunk_sizes)
+            model.user_defined_metadata["com.anemll.lm_head_chunk_sizes"] = str(chunk_sizes)
             
         if 'function_names' in params and params['function_names'] is not None:
             model.short_description = f"Combined model with functions: {', '.join(params['function_names'])}"
@@ -249,4 +267,3 @@ def AddCombinedMetadata(target_model, source_models):
         print("\nFull traceback:")
         traceback.print_exc()
         raise
-

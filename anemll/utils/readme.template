@@ -6,6 +6,7 @@ tags:
 - LLaMA
 - Qwen
 - DeepSeek
+- Gemma
 - Apple
 - Apple Neural Engine
 - DeepHermes
@@ -27,21 +28,22 @@ For more information, visit the [ANEMLL GitHub repository](https://github.com/an
 
 ## License
 
-ANEMLL is licensed under the [MIT License](https://opensource.org/license/mit).  
+ANEMLL is licensed under the [MIT License](https://opensource.org/license/mit).
 The original model may require a separate license depending on the architecture:
 - LLaMA models: Based on Meta's LLaMA and may require Meta's license
 - Qwen models: Based on Alibaba's Qwen and may require Alibaba's license
+- Gemma models: Based on Google's Gemma and subject to Gemma Terms of Use
 - Other models: Check respective original model licenses
 
-This model is converted for CoreML using ANEMLL's open-source conversion pipeline. It supports multiple LLM architectures including LLaMA, Qwen, and DeepSeek variants.
+This model is converted for CoreML using ANEMLL's open-source conversion pipeline. It supports multiple LLM architectures including LLaMA, Qwen, Gemma, and DeepSeek variants.
 
 ---
 
 ## Requirements
 
-- **macOS Sequoia** with Apple Neural Engine and 8GB RAM or more
-- **CoreML Tools** and **HuggingFace Transformers** libraries 
-- **Python 3.9**
+- **macOS 15 (Sequoia)** or later with Apple Neural Engine and 8GB RAM or more
+- **CoreML Tools 9.x+** and **HuggingFace Transformers** libraries
+- **Python 3.9+**
 
 `chat.py` provides a sample inference script.  
 `chat_full.py` provides a sample inference script with history and conversation management.  
@@ -80,12 +82,12 @@ find . -type f -name "*.zip" -exec unzip {} \;
 
 3. Install dependencies:
 ```bash
-pip install coremltools transformers
+pip install "coremltools>=9.0" transformers
 ```
 
 **Coremltools:**
 
-See coremltools installation guide at https://coremltools.readme.io/v4.0/docs/installation 
+See coremltools installation guide at https://apple.github.io/coremltools/docs-guides/source/installing-coremltools.html 
 
 **How to Run**
 
@@ -133,6 +135,7 @@ This is a CoreML model converted using ANEMLL for Apple Neural Engine inference.
 - Context Length: %CONTEXT_LENGTH%
 - Batch Size: %BATCH_SIZE%
 - Number of Chunks: %NUM_CHUNKS%
+- LUT Quantization: %LUT_BITS%
 
 ## Quick Start
 
@@ -148,5 +151,3 @@ Try our sample Chat-Bot app on TestFlight:
 > - Demonstrates proper model integration and provides a reference implementation
 > - iOS requires unzipped MLMODELC files and config.json for offline tokenizer
 > - macOS supports both zipped and unzipped model formats
-
-```

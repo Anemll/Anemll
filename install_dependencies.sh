@@ -198,7 +198,7 @@ fi
 
 # Install CoreML Tools (must be after PyTorch)
 echo "🧠 Installing CoreML Tools..."
-$PIP_CMD install coremltools>=8.2
+$PIP_CMD install coremltools>=9.0
 
 # Install core ANEMLL dependencies
 echo "📚 Installing core dependencies..."
@@ -272,9 +272,10 @@ echo ""
 echo "🎉 Installation complete!"
 echo ""
 echo "📋 Next steps:"
-echo "  1. Verify your virtual environment is activated"
+echo "  1. Activate your environment (if in a new terminal):"
+echo "       source env-anemll/bin/activate"
 echo "  2. Test conversion with: ./anemll/utils/convert_model.sh --help"
-echo "  3. Run tests with: python tests/test_qwen_model.py"
+echo "  3. Run tests with: python tests/test_gemma3_model.py"
 echo ""
 echo "📖 For more information, see:"
 echo "  - README.md for usage instructions"

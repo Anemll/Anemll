@@ -8,6 +8,16 @@ The `convert_model.sh` script automates the conversion of LLAMA models to CoreML
 ./anemll/utils/convert_model.sh --model <path_to_model> --output <output_directory> [options]
 ```
 
+## Recommended Preflight
+
+Before conversion, run an FP16 compatibility sweep:
+
+```bash
+./anemll/utils/fp16_preflight.sh --model <model_id_or_path>
+```
+
+This catches FP16 overflow risks early and saves a JSON report under `tests/dev/logs/`.
+
 ## Parameters
 
 ### Required Parameters
@@ -23,17 +33,95 @@ The `convert_model.sh` script automates the conversion of LLAMA models to CoreML
 |-----------|-------------|---------|
 | `--context` | Context length | 512 |
 | `--batch` | Batch size for prefill | 64 |
-| `--lut1` | LUT bits for embeddings | none |
-| `--lut2` | LUT bits for FFN/prefill | 4 |
-| `--lut3` | LUT bits for LM head | 6 |
+| `--lut1` | LUT bits for embeddings (see LUT Format below) | none |
+| `--lut2` | LUT bits for FFN/prefill (see LUT Format below) | 4 |
+| `--lut3` | LUT bits for LM head (see LUT Format below) | 6 |
 | `--restart` | Restart from specific step | 1 |
 | `--only` | Run only specified step and exit | none |
-| `--chunk` | Number of chunks to split FFN/prefill | 2 |
+| `--chunk` | Number of chunks or `auto` (see below) | 2 |
+| `--max-chunk-mb` | Max chunk size in MB for `--chunk auto` | 950 |
 | `--prefix` | Prefix for model names | llama |
+
+### LUT Quantization Format
+
+The `--lut1`, `--lut2`, and `--lut3` arguments support two formats:
+
+1. **Simple format**: `--lut2 6`
+   - Specifies only the number of quantization bits
+   - Uses default per_channel group size of 8
+
+2. **Advanced format**: `--lut2 6,4`
+   - First value (6): Number of quantization bits
+   - Second value (4): Per-channel group size for grouped quantization
+   - Example: `--lut2 6,4` means 6-bit quantization with group size of 4 channels
+
+**Examples:**
+```bash
+# Use default per_channel group size (8)
+--lut2 6 --lut3 6
+
+# Custom per_channel group sizes
+--lut2 6,4 --lut3 6,16
+
+# Mix of formats
+--lut2 4 --lut3 6,4
+```
+
+## Auto Chunk Detection
+
+Use `--chunk auto` to automatically determine the optimal number of chunks based on the model's weight sizes and your LUT quantization setting:
+
+```bash
+./anemll/utils/convert_model.sh \
+    --model Qwen/Qwen3-4B \
+    --output ./converted_models \
+    --lut2 6,4 \
+    --chunk auto
+# Auto-detected: --chunk 4 (LUT6, max 950MB per chunk with 10% overhead)
+```
+
+The auto-detection:
+1. Reads `config.json` from the model directory
+2. Calculates per-layer weight sizes based on architecture parameters
+3. Applies the LUT compression ratio from `--lut2` (e.g., LUT6 = 37.5% of FP16)
+4. Adds a 10% safety overhead for metadata and alignment
+5. Finds the minimum number of chunks where the largest chunk fits under the limit
+
+You can customize the max chunk size with `--max-chunk-mb`:
+
+```bash
+# Stricter limit for memory-constrained devices
+./anemll/utils/convert_model.sh \
+    --model Qwen/Qwen3-4B \
+    --output ./converted_models \
+    --lut2 6 \
+    --chunk auto \
+    --max-chunk-mb 500
+```
+
+Small models that fit in a single chunk will automatically get `--chunk 1` (monolithic):
+
+```bash
+./anemll/utils/convert_model.sh \
+    --model google/gemma-3-1b-it \
+    --output ./converted_models \
+    --lut2 6 \
+    --chunk auto
+# Auto-detected: --chunk 1 (LUT6, max 950MB per chunk with 10% overhead)
+```
+
+For the standalone calculator, see [Chunk Split Calculator](calc_chunk_split.md).
 
 ## New Arguments
 
 - `--skip-check`: Skip the dependency check step.
+- `--skip-anemll-dedup`: Disable weight deduplication in the combine step.
+- `--argmax`: Compute argmax inside the LM head model.
+- `--fp16-scale`: FP16 residual scaling for Gemma3 models (e.g., `auto`, `0.1875`).
+- `--split-rotate`: Create separate files for rotate/non-rotate functions per chunk.
+
+Related helper script:
+- `./anemll/utils/fp16_preflight.sh`: one-command FP16 pre-conversion sweep (recommended before `convert_model.sh`)
 
 ## Examples
 
@@ -108,6 +196,33 @@ The `convert_model.sh` script automates the conversion of LLAMA models to CoreML
     --chunk 2
 ```
 > Note: No LUT quantization uses FP16 precision, providing best quality but slower inference and larger model size
+
+### Auto Chunk with Qwen3 4B
+```bash
+./anemll/utils/convert_model.sh \
+    --model Qwen/Qwen3-4B \
+    --output /Volumes/Models/ANE/qwen3-4b-ctx4096 \
+    --context 4096 \
+    --lut2 6,4 \
+    --lut3 6,4 \
+    --chunk auto \
+    --argmax
+```
+
+### Gemma3 4B QAT with FP16 Scaling
+```bash
+./anemll/utils/convert_model.sh \
+    --model google/gemma-3-4b-it-qat-int4-unquantized \
+    --output /Volumes/Models/ANE/gemma3-4b-qat-ctx4096 \
+    --context 4096 \
+    --lut1 8,4 \
+    --lut2 6,4 \
+    --lut3 6,4 \
+    --chunk auto \
+    --argmax \
+    --fp16-scale auto
+```
+> Note: QAT models may have reduced quality with LUT quantization. See [FP16 Scaling](FP16_SCALING.md) for details.
 
 ### DeepSeek Model Conversion
 ```bash

@@ -21,6 +21,7 @@ wheels/
 *.egg
 env-anemll/
 anemll-swift-cli/.build/
+ANEMLLChat/.build/
 lib/
 bin/
 share/
@@ -39,4 +40,11 @@ results/
 xcuserdata/
 *.xcuserstate
 *.xcworkspacexcuserdata/
+ANEMLLChat/generated-build-number.xcconfig
 =*
+
+ane_*.log
+tests/dev/segmented_results/*
+tests/dev/segment_analysis/*
+tests/dev/_runs/
+tests/dev/MLXSpeedTest/

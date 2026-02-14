@@ -385,8 +385,24 @@ class ANELM(LM):
                         print(f"First token: {cont_tokens[0]} ('{self.tokenizer.decode([cont_tokens[0]])}')")
                 
                 if len(cont_tokens) > 0:
-                    first_token_score = prefix_log_probs[cont_tokens[0]].item()
-                    first_token_is_greedy = (cont_tokens[0] == max_idx)
+                    if prefix_log_probs is None:
+                        if self.debug and j < 2: print(f"  Warning: No log probabilities for prefix")
+                        continuation_scores.append(-float('inf'))
+                        continuation_is_greedy.append(False)
+                        continue
+                    try:
+                        if cont_tokens[0] >= len(prefix_log_probs):
+                            if self.debug and j < 2: print(f"  Warning: First token {cont_tokens[0]} out of bounds (vocab size: {len(prefix_log_probs)})")
+                            continuation_scores.append(-float('inf'))
+                            continuation_is_greedy.append(False)
+                            continue
+                        first_token_score = prefix_log_probs[cont_tokens[0]].item()
+                        first_token_is_greedy = (cont_tokens[0] == max_idx)
+                    except (IndexError, RuntimeError) as e:
+                        if self.debug and j < 2: print(f"  Error scoring first token {cont_tokens[0]}: {str(e)}")
+                        continuation_scores.append(-float('inf'))
+                        continuation_is_greedy.append(False)
+                        continue
                     
                     if len(cont_tokens) > 1:
                         self.model.reset_state()
@@ -400,10 +416,25 @@ class ANELM(LM):
                             next_token = cont_tokens[k + 1]
                             token_tensor = torch.tensor([[current_token]], dtype=torch.int32)
                             log_probs_cont = self.model.compute_logprobs(token_tensor)
-                            token_score = log_probs_cont[next_token].item()
-                            token_is_greedy_val = (torch.argmax(log_probs_cont).item() == next_token)
-                            rest_scores_list.append(token_score)
-                            rest_is_greedy_list.append(token_is_greedy_val)
+                            if log_probs_cont is None:
+                                if self.debug and k < 3: print(f"  Warning: No log probabilities for token at position {k}")
+                                rest_scores_list.append(-float('inf'))
+                                rest_is_greedy_list.append(False)
+                                continue
+                            try:
+                                if next_token >= len(log_probs_cont):
+                                    if self.debug and k < 3: print(f"  Warning: Token {next_token} out of bounds (vocab size: {len(log_probs_cont)})")
+                                    rest_scores_list.append(-float('inf'))
+                                    rest_is_greedy_list.append(False)
+                                else:
+                                    token_score = log_probs_cont[next_token].item()
+                                    token_is_greedy_val = (torch.argmax(log_probs_cont).item() == next_token)
+                                    rest_scores_list.append(token_score)
+                                    rest_is_greedy_list.append(token_is_greedy_val)
+                            except (IndexError, RuntimeError) as e:
+                                if self.debug and k < 3: print(f"  Error scoring token {next_token}: {str(e)}")
+                                rest_scores_list.append(-float('inf'))
+                                rest_is_greedy_list.append(False)
                             if k < len(cont_tokens) - 2: _ = self.model.predict(token_tensor)
                         total_score = first_token_score + sum(rest_scores_list)
                         is_all_greedy = first_token_is_greedy and all(rest_is_greedy_list)
@@ -677,8 +708,24 @@ class ANELM(LM):
             if self.debug and i_cont == 0: print(f"Scoring continuation tokens (first continuation only)")
                 
             if len(cont_tokens) > 0:
-                first_token_score = prefix_log_probs[cont_tokens[0]].item()
-                first_token_is_greedy = (cont_tokens[0] == max_idx)
+                if prefix_log_probs is None:
+                    if self.debug and i_cont < 2: print(f"  Warning: No log probabilities for prefix")
+                    scores.append(-float('inf'))
+                    is_greedy.append(False)
+                    continue
+                try:
+                    if cont_tokens[0] >= len(prefix_log_probs):
+                        if self.debug and i_cont < 2: print(f"  Warning: First token {cont_tokens[0]} out of bounds (vocab size: {len(prefix_log_probs)})")
+                        scores.append(-float('inf'))
+                        is_greedy.append(False)
+                        continue
+                    first_token_score = prefix_log_probs[cont_tokens[0]].item()
+                    first_token_is_greedy = (cont_tokens[0] == max_idx)
+                except (IndexError, RuntimeError) as e:
+                    if self.debug and i_cont < 2: print(f"  Error scoring first token {cont_tokens[0]}: {str(e)}")
+                    scores.append(-float('inf'))
+                    is_greedy.append(False)
+                    continue
                 if self.debug and i_cont == 0:
                     first_token_text = self.tokenizer.decode([cont_tokens[0]])
                     print(f"First token: {cont_tokens[0]} ('{first_token_text}') - score: {first_token_score:.4f}")
@@ -694,10 +741,25 @@ class ANELM(LM):
                         next_token = cont_tokens[j_token_idx + 1]
                         token_tensor = torch.tensor([[current_token]], dtype=torch.int32)
                         log_probs_cont = self.model.compute_logprobs(token_tensor)
-                        token_score = log_probs_cont[next_token].item()
-                        token_is_greedy_val = (torch.argmax(log_probs_cont).item() == next_token)
-                        rest_scores_list.append(token_score)
-                        rest_is_greedy_list.append(token_is_greedy_val)
+                        if log_probs_cont is None:
+                            if self.debug and j_token_idx < 3: print(f"  Warning: No log probabilities for token at position {j_token_idx}")
+                            rest_scores_list.append(-float('inf'))
+                            rest_is_greedy_list.append(False)
+                            continue
+                        try:
+                            if next_token >= len(log_probs_cont):
+                                if self.debug and j_token_idx < 3: print(f"  Warning: Token {next_token} out of bounds (vocab size: {len(log_probs_cont)})")
+                                rest_scores_list.append(-float('inf'))
+                                rest_is_greedy_list.append(False)
+                            else:
+                                token_score = log_probs_cont[next_token].item()
+                                token_is_greedy_val = (torch.argmax(log_probs_cont).item() == next_token)
+                                rest_scores_list.append(token_score)
+                                rest_is_greedy_list.append(token_is_greedy_val)
+                        except (IndexError, RuntimeError) as e:
+                            if self.debug and j_token_idx < 3: print(f"  Error scoring token {next_token}: {str(e)}")
+                            rest_scores_list.append(-float('inf'))
+                            rest_is_greedy_list.append(False)
                         if j_token_idx < len(cont_tokens) - 2: _ = self.model.predict(token_tensor)
                     total_score = first_token_score + sum(rest_scores_list)
                     is_all_greedy = first_token_is_greedy and all(rest_is_greedy_list)

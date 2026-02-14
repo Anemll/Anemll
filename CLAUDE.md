@@ -6,6 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ANEMLL (pronounced "animal") is an open-source project for accelerating Large Language Models (LLMs) on Apple Neural Engine (ANE). The project converts Hugging Face models to CoreML format for on-device inference on Apple devices.
 
+## Command Allowlist (Claude Code)
+
+Approved commands for Claude Code in this repo:
+```bash
+osascript -e 'tell application "System Events" to key code 121'  # page down
+sleep 0.5
+export ANEMLL_HOST="http://127.0.0.1:8765"
+curl ...
+```
+
 ## Development Commands
 
 ### Environment Setup
@@ -35,7 +45,7 @@ You can verify the environment is active by checking:
 # Single-shot model conversion script
 ./anemll/utils/convert_model.sh --model <path_to_model> --output <output_directory>
 
-# With additional options
+# With additional options (default per_channel group size of 8)
 ./anemll/utils/convert_model.sh \
     --model ./models/llama-3.1-1b \
     --output ./converted_models \
@@ -44,6 +54,14 @@ You can verify the environment is active by checking:
     --lut2 4 \
     --lut3 6 \
     --chunk 2
+
+# With custom per_channel group sizes
+# Format: --lutX bits,per_channel (e.g., --lut2 6,4 means 6 bits with group size 4)
+./anemll/utils/convert_model.sh \
+    --model ./models/llama-3.1-1b \
+    --output ./converted_models \
+    --lut2 6,4 \
+    --lut3 6,16
 ```
 
 ### Testing and Chat Interfaces
@@ -116,10 +134,25 @@ pip install -e ".[dev]"
    - `Tokenizer.swift`: Tokenization handling
    - `YAMLConfig.swift`: Configuration file parsing
 
-5. **iOS/macOS Sample App** (`anemll-chatbot/`)
-   - SwiftUI-based chat interface
-   - Model management and downloading
-   - Core ML inference integration
+5. **iOS/macOS Sample Apps**
+   - `anemll-chatbot/`: SwiftUI-based chat interface for iOS/macOS
+   - `ANEMLLChat/`: macOS-specific chat application with enhanced UI
+   - Both apps share `AnemllCore` library for inference
+   - Model management, downloading, and Core ML inference integration
+
+### ANEMLLChat App Architecture
+
+The macOS `ANEMLLChat` app uses:
+- **InferenceService**: Manages model loading and text generation
+- **ChatViewModel**: Handles conversation state and UI updates
+- **StorageService**: Persists settings and conversations to UserDefaults
+
+**Key Settings** (stored in `com.anemll.chat` UserDefaults):
+- `systemPrompt`: Default is empty (matches CLI behavior)
+- `repetitionDetectionEnabled`: Default is `false` (matches CLI behavior)
+- `temperature`, `maxTokens`, `debugLevel`
+
+**History Trimming**: The app trims conversation history when it exceeds `stateLength - 100` tokens, matching CLI behavior. Old message pairs (user + assistant) are removed to fit within context.
 
 ### Conversion Pipeline
 
@@ -160,6 +193,38 @@ The model conversion follows an 8-step process:
 
 3. **Weight Reshaping**: Weights from HuggingFace models need proper reshaping for Conv2d format
 
+4. **KV-Cache State Updates Must Use Static Slicing Only**:
+
+   Any slice bounds that depend on runtime values (`current_pos`, dynamic `seq_len`) will compile into
+   `slice_by_index` with unresolved parameters, causing ANE failure: "Failed to retrieve parameter end."
+
+   ```python
+   # ✅ OK - Static slices with fixed bounds
+   cache[:, :, 0:seq_len, :]           # seq_len is fixed at trace time (e.g., batch_size=64)
+   torch.narrow(cache, dim=2, start=1, length=sw-1)  # constant start/length
+
+   # ✅ OK - Rotation using shift-left + append with constant bounds
+   shifted = cache[:, :, 1:, :]        # constant slice
+   new_cache = torch.cat([shifted, new_kv], dim=2)
+
+   # ❌ NOT OK - Dynamic slice bounds
+   cache[:, :, current_pos:current_pos+1, :]      # dynamic start
+   cache[:, :, current_pos:current_pos+seq_len, :]  # dynamic start and end
+   cache[:, :, :current_pos+1, :]                 # dynamic end
+
+   # ❌ NOT OK - Mask/gather logic with int32 ops (blocks ANE)
+   mask = torch.arange(sw) >= current_pos  # greater_equal
+   result = torch.where(mask, new_val, cache)  # logical ops
+   ```
+
+   **Correct Semantics for KV Cache**:
+   - **Normal prefill** (< sliding_window): Left-fill from position 0 with static `[0:batch_size]`
+   - **Rotate prefill** (>= sliding_window): Shift-left + append using static `narrow()` + `cat()`
+   - **Single token infer**: Left-fill with static slice
+   - **Single token infer_rotate**: Shift-left + append with static bounds
+
+   If you need dynamic position writes, use separate compiled functions with fixed bounds for each case.
+
 ### Testing Infrastructure
 
 The project includes extensive testing files (test_*.py) focusing on:
@@ -170,6 +235,27 @@ The project includes extensive testing files (test_*.py) focusing on:
 - Single vs multi-token inference verification
 
 These tests are primarily for development validation rather than CI/CD.
+
+### IMPORTANT: CoreML Testing Guidelines
+
+**ALWAYS use Apple Neural Engine for testing** - NEVER use `CPU_ONLY`:
+```python
+# CORRECT - Always use ANE
+compute_unit = ct.ComputeUnit.CPU_AND_NE  # or ct.ComputeUnit.ALL
+
+# WRONG - Never use this for testing
+compute_unit = ct.ComputeUnit.CPU_ONLY  # Models may work on CPU but fail on ANE!
+```
+
+This is critical because:
+- Models are optimized specifically for ANE
+- CPU_ONLY may work but doesn't validate actual ANE compatibility
+- Production deployment targets ANE, so testing must use ANE
+
+**Known Issue**: Multi-function compiled models (.mlmodelc) with 4 functions may fail to load
+prefill functions on ANE with error: "function_name must be nil unless model type is ML Program".
+This is a CoreML limitation. Workaround: use `--split-rotate` to create separate files for
+rotate and non-rotate functions.
 
 ## Development Guidelines
 
@@ -204,6 +290,22 @@ Currently supports:
 - DeepHermes (3B, 8B)
 
 Pre-converted models available at https://huggingface.co/anemll
+
+## ANEMLLChat vs CLI Parity
+
+The macOS ANEMLLChat app should match CLI (`anemllcli`) behavior:
+
+| Feature | CLI | App |
+|---------|-----|-----|
+| System prompt | Only if `--system` provided | Only if configured in Settings |
+| Repetition detection | None | Off by default (toggle in Settings) |
+| History trimming | Trims when > stateLength-100 | Same logic |
+| Context display | `[History: N tokens]` | `N ctx` (input + output tokens) |
+
+**Common Issues**:
+- If app gives different output than CLI, check Settings → System Prompt is "No Prompt"
+- If generation stops early, check Settings → Repetition Detection is OFF
+- Context mismatch: App now shows `historyTokens` (input + output) matching CLI
 
 #QWEN TEST
 export_coreml.py is a test file for Qwen export development

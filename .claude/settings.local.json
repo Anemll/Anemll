@@ -1,12 +1,21 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep:*)",
-      "Bash(diff:*)",
-      "Bash(ls:*)",
-      "Bash(swift build:*)",
-      "Bash(swift run:*)"
+      "Bash(export ANEMLL_HOST=\"http://127.0.0.1:8765\")",
+      "Bash(export ANEMLL_TOKEN=\"D9DBFE3B-D181-4CD2-BC9B-0B6444034D99\":*)",
+      "Bash(__NEW_LINE__ sleep 15)",
+      "Bash(__NEW_LINE__ sleep 3)",
+      "Bash(git add:*)",
+      "Bash(export ANEMLL_TOKEN=\"D3E0BB7D-A687-419A-8984-065D5B28D413\":*)",
+      "Bash(/usr/bin/python3:*)",
+      "Bash(xcodebuild:*)",
+      "Bash(source:*)",
+      "Bash(./scripts/convert_qwen25_0.5b_instruct.sh:*)"
     ],
-    "deny": []
+    "deny": [],
+    "ask": []
+  },
+  "sandbox": {
+    "network": {}
   }
 }

@@ -966,10 +966,21 @@ class QwenModel(nn.Module):
         # Filter out expected missing keys including KV cache buffer
         expected_missing = ['kv_cache_0']  # KV cache buffer is initialized separately
         missing = [m for m in missing if m not in expected_missing]
-        if missing or unexpected:
+        allow_missing = os.environ.get("ANEMLL_ALLOW_MISSING_WEIGHTS", "").lower() in ("1", "true", "yes")
+        if missing:
             print("Missing keys", missing)
+            if unexpected:
+                print("Unexpected keys", unexpected)
+            # Highlight actionable TODO in red for conversion logs
+            print("\033[91mTODO: Weights not found or renamed. Check checkpoint prefixes and model config.\033[0m")
+            print("Hint: set ANEMLL_ALLOW_MISSING_WEIGHTS=1 (or --allow-missing-weights in convert scripts) to continue anyway.")
+            if allow_missing:
+                print("Continuing despite missing weights (ANEMLL_ALLOW_MISSING_WEIGHTS=1).")
+                return True
+            return False
+        if unexpected:
             print("Unexpected keys", unexpected)
-        return not missing and not unexpected
+        return True
 
 
 class QwenForCausalLM(nn.Module):

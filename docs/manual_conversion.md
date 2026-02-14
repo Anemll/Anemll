@@ -154,3 +154,83 @@ with open('converted_models/meta.yaml', 'w') as f:
 > Note: If you used [convert_model.sh](convert_model.md) to convert the model, you can also run chat using the generated meta.yaml: 
 
 This file is used by the chat interfaces to automatically configure model parameters.
+
+---
+
+## Monolithic Model Conversion
+
+For smaller models (1B-3B parameters), you can create a single monolithic model instead of chunked models. This simplifies deployment and reduces overhead.
+
+### 1. Convert Monolithic Inference Model
+> Creates `{prefix}_monolithic.mlpackage`
+
+```bash
+python -m anemll.ane_converter.llama_converter \
+    --part monolithic \
+    --lut 4 \
+    --context-length 512 \
+    --batch-size 64 \
+    --model "../Meta-Llama-3.2-1B"
+```
+
+### 2. Convert Monolithic Prefill Model
+> Creates `{prefix}_monolithic_prefill.mlpackage`
+
+```bash
+python -m anemll.ane_converter.llama_converter \
+    --part monolithic_prefill \
+    --lut 4 \
+    --context-length 512 \
+    --batch-size 64 \
+    --model "../Meta-Llama-3.2-1B"
+```
+
+### 3. Combine Monolithic Models
+> Creates `{prefix}_monolithic_combined.mlpackage`
+
+```bash
+python ./anemll/utils/combine_models.py \
+    --monolithic \
+    --lut 4 \
+    --prefix llama \
+    --input ./converted_models \
+    --output ./converted_models
+```
+
+### 4. Compile Monolithic Model
+> Converts to MLModelC format
+
+```bash
+python ./anemll/utils/compile_models.py \
+    monolithic \
+    --lut 4 \
+    --prefix llama \
+    --input ./converted_models \
+    --output ./converted_models
+```
+
+### 5. Create meta.yaml for Monolithic Model
+
+```python
+meta = '''model_info:
+  name: anemll-Meta-Llama-3.2-1B-monolithic-ctx512
+  version: 0.3.0
+  parameters:
+    model_type: monolithic
+    context_length: 512
+    batch_size: 64
+    lut_ffn: 4
+    model_prefix: llama
+'''
+
+with open('converted_models/meta.yaml', 'w') as f:
+    f.write(meta)
+```
+
+### 6. Test Monolithic Model
+
+```bash
+python ./tests/chat.py --meta ./converted_models/meta.yaml
+```
+
+> See [Monolithic Model Conversion Guide](convert_monolith.md) for the automated script and more details.

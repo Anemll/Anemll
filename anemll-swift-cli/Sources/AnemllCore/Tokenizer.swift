@@ -12,9 +12,11 @@ public final class Tokenizer: @unchecked Sendable {
     private let debug: Bool = true
     private let debugLevel: Int
     private var chatTemplate: String? // Add chat template property
+    private let templateName: String  // Store template name for fallback formatting
 
     public init(modelPath: String, template: String = "default", debugLevel: Int = 0) async throws {
         self.debugLevel = debugLevel
+        self.templateName = template
         print("\nTokenizer Debug:")
         print("Input modelPath: \(modelPath)")
         print("Using template: \(template)")
@@ -79,13 +81,15 @@ public final class Tokenizer: @unchecked Sendable {
             var bosToken = "<s>"   // Default value
             var padToken = "<pad>"  // Default value
             var eosTokenIdsList: [Int] = []  // To store multiple EOS token IDs
-            
+            var bosTokenIdFromJson: Int? = nil
+            var padTokenIdFromJson: Int? = nil
+
             // First, try to get eos_token_id from config.json
             var configJson: [String: Any]? = nil
             if fileManager.fileExists(atPath: configPath.path) {
                 let configData = try Data(contentsOf: configPath)
                 configJson = try JSONSerialization.jsonObject(with: configData) as? [String: Any]
-                
+
                 // Check for eos_token_id (can be single Int or array of Ints)
                 if let eosId = configJson?["eos_token_id"] {
                     if let singleId = eosId as? Int {
@@ -95,6 +99,61 @@ public final class Tokenizer: @unchecked Sendable {
                         eosTokenIdsList = multipleIds
                         print("Found multiple eos_token_ids in config.json: \(multipleIds)")
                     }
+                }
+
+                // Check for bos_token_id
+                if let bosId = configJson?["bos_token_id"] as? Int {
+                    bosTokenIdFromJson = bosId
+                    print("Found bos_token_id in config.json: \(bosId)")
+                }
+
+                // Check for pad_token_id
+                if let padId = configJson?["pad_token_id"] as? Int {
+                    padTokenIdFromJson = padId
+                    print("Found pad_token_id in config.json: \(padId)")
+                }
+            }
+
+            // Try to read token IDs from tokenizer.json added_tokens array
+            // This is more reliable than encoding token strings for special tokens
+            let tokenizerJsonPath = modelURL.appendingPathComponent("tokenizer.json")
+            if fileManager.fileExists(atPath: tokenizerJsonPath.path) {
+                do {
+                    let tokenizerJsonData = try Data(contentsOf: tokenizerJsonPath)
+                    if let tokenizerJson = try JSONSerialization.jsonObject(with: tokenizerJsonData) as? [String: Any],
+                       let addedTokens = tokenizerJson["added_tokens"] as? [[String: Any]] {
+                        print("Reading special token IDs from tokenizer.json added_tokens...")
+                        for tokenEntry in addedTokens {
+                            if let id = tokenEntry["id"] as? Int,
+                               let content = tokenEntry["content"] as? String {
+                                // Match common EOS token patterns - collect ALL matching tokens
+                                if content == "<eos>" || content == "</s>" || content == "<|endoftext|>" || content == "<end_of_turn>" || content == "<|im_end|>" || content == "<|eot_id|>" {
+                                    if !eosTokenIdsList.contains(id) {
+                                        eosTokenIdsList.append(id)
+                                        print("  Found EOS token in added_tokens: '\(content)' = \(id)")
+                                    }
+                                }
+                                // Match common BOS token patterns
+                                if content == "<bos>" || content == "<s>" || content == "<|startoftext|>" {
+                                    if bosTokenIdFromJson == nil {
+                                        bosTokenIdFromJson = id
+                                        bosToken = content
+                                        print("  Found BOS token in added_tokens: '\(content)' = \(id)")
+                                    }
+                                }
+                                // Match common PAD token patterns
+                                if content == "<pad>" || content == "<|padding|>" {
+                                    if padTokenIdFromJson == nil {
+                                        padTokenIdFromJson = id
+                                        padToken = content
+                                        print("  Found PAD token in added_tokens: '\(content)' = \(id)")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    print("Warning: Could not parse tokenizer.json: \(error)")
                 }
             }
 
@@ -121,7 +180,9 @@ public final class Tokenizer: @unchecked Sendable {
                         "llama": "</s>",
                         "mistral": "</s>",
                         "falcon": "</s>",
-                        "chatglm": "</s>"
+                        "chatglm": "</s>",
+                        "gemma": "<end_of_turn>",
+                        "gemma3": "<end_of_turn>"
                     ]
                     
                     if let templateToken = eosTokenMap[template] {
@@ -153,7 +214,9 @@ public final class Tokenizer: @unchecked Sendable {
                         "llama": "<s>",
                         "mistral": "<s>",
                         "falcon": "<s>",
-                        "chatglm": "<s>"
+                        "chatglm": "<s>",
+                        "gemma": "<bos>",
+                        "gemma3": "<bos>"
                     ]
                     
                     if let templateToken = bosTokenMap[template] {
@@ -185,7 +248,9 @@ public final class Tokenizer: @unchecked Sendable {
                         "llama": "<pad>",
                         "mistral": "<pad>",
                         "falcon": "<pad>",
-                        "chatglm": "<pad>"
+                        "chatglm": "<pad>",
+                        "gemma": "<pad>",
+                        "gemma3": "<pad>"
                     ]
                     
                     if let templateToken = padTokenMap[template] {
@@ -197,37 +262,59 @@ public final class Tokenizer: @unchecked Sendable {
                 }
             }
 
-            // If we didn't get EOS token IDs from config.json, encode the EOS token string
+            // If we didn't get EOS token IDs from config.json or tokenizer.json, encode the EOS token string
             if eosTokenIdsList.isEmpty {
                 let eosTokens = tokenizer.encode(text: eosToken)
                 if let eos = eosTokens.first {
                     eosTokenIdsList = [eos]
-                    print("✓ EOS token ID: \(eos) for token '\(eosToken)'")
+                    print("✓ EOS token ID (from encode): \(eos) for token '\(eosToken)'")
                 } else {
                     throw TokenizerError.initializationFailed("Could not find EOS token ID for '\(eosToken)'")
                 }
             }
-            
+
+            // Explicitly look up critical stop tokens (like Python's build_stop_token_ids)
+            // This ensures we catch <end_of_turn> even if it's not in added_tokens
+            let extraStopTokens = ["<end_of_turn>", "<|eot_id|>", "<|endoftext|>", "<|im_end|>"]
+            for stopToken in extraStopTokens {
+                let encoded = tokenizer.encode(text: stopToken)
+                // Only add if encoding produces a single token (not a sequence)
+                if encoded.count == 1, let tokenId = encoded.first, !eosTokenIdsList.contains(tokenId) {
+                    eosTokenIdsList.append(tokenId)
+                    print("✓ Added stop token (from encode): '\(stopToken)' = \(tokenId)")
+                }
+            }
+
             // Set the EOS token IDs
             self.eosTokenIds = eosTokenIdsList
             print("✓ Using EOS token IDs: \(eosTokenIdsList)")
 
-            // Now encode the correct BOS token
-            let bosTokens = tokenizer.encode(text: bosToken)
-            if let bos = bosTokens.first {
+            // Use BOS token ID from JSON if available, otherwise encode
+            if let bos = bosTokenIdFromJson {
                 self.bosTokenId = bos
-                print("✓ BOS token ID: \(bos) for token '\(bosToken)'")
+                print("✓ BOS token ID (from JSON): \(bos) for token '\(bosToken)'")
             } else {
-                throw TokenizerError.initializationFailed("Could not find BOS token ID for '\(bosToken)'")
+                let bosTokens = tokenizer.encode(text: bosToken)
+                if let bos = bosTokens.first {
+                    self.bosTokenId = bos
+                    print("✓ BOS token ID (from encode): \(bos) for token '\(bosToken)'")
+                } else {
+                    throw TokenizerError.initializationFailed("Could not find BOS token ID for '\(bosToken)'")
+                }
             }
 
-            // Now encode the correct PAD token
-            let padTokens = tokenizer.encode(text: padToken)
-            if let pad = padTokens.first {
+            // Use PAD token ID from JSON if available, otherwise encode
+            if let pad = padTokenIdFromJson {
                 self.padTokenId = pad
-                print("✓ PAD token ID: \(pad) for token '\(padToken)'")
+                print("✓ PAD token ID (from JSON): \(pad) for token '\(padToken)'")
             } else {
-                throw TokenizerError.initializationFailed("Could not find PAD token ID for '\(padToken)'")
+                let padTokens = tokenizer.encode(text: padToken)
+                if let pad = padTokens.first {
+                    self.padTokenId = pad
+                    print("✓ PAD token ID (from encode): \(pad) for token '\(padToken)'")
+                } else {
+                    throw TokenizerError.initializationFailed("Could not find PAD token ID for '\(padToken)'")
+                }
             }
 
             print("✓ Tokenizer loaded successfully!")
@@ -273,10 +360,14 @@ public final class Tokenizer: @unchecked Sendable {
 
     // Consolidated applyChatTemplate method
     public func applyChatTemplate(input: Any, addGenerationPrompt: Bool = true) -> [Int] {
-        // Skip template when addGenerationPrompt is false
+        // When addGenerationPrompt is false, tokenize the raw content without template
         if !addGenerationPrompt {
             if let text = input as? String {
-                return tokenize("" + text)
+                return tokenize(text)
+            } else if let messages = input as? [ChatMessage] {
+                // Concatenate all message contents and tokenize
+                let combinedText = messages.map { $0.content }.joined(separator: " ")
+                return tokenize(combinedText)
             }
             return []
         }
@@ -294,15 +385,83 @@ public final class Tokenizer: @unchecked Sendable {
                 }
                 return tokens
             } catch {
-                print("Error applying chat template: \(error)")
-                // Fallback: use simple prompt formatting for complex templates
-                print("Using fallback prompt formatting...")
-                if let userMessage = messagesArray.first(where: { $0["role"] as? String == "user" }),
-                   let content = userMessage["content"] as? String {
-                    let formattedPrompt = "<|im_start|>user\n\(content)<|im_end|>\n<|im_start|>assistant\n"
-                    return tokenizer.encode(text: formattedPrompt)
+                if debugLevel >= 1 {
+                    print("Error applying chat template: \(error)")
+                    // Fallback: use template-specific prompt formatting for ALL messages (multi-turn)
+                    print("Using fallback prompt formatting for template: \(templateName)")
                 }
-                return []
+
+                let formattedPrompt: String
+                switch templateName.lowercased() {
+                case "gemma", "gemma3":
+                    // Gemma format: <bos><start_of_turn>role\n{content}<end_of_turn>\n...
+                    // Note: Gemma3 doesn't support "system" role - it uses "model" for system messages
+                    var prompt = "<bos>"
+                    for message in messagesArray {
+                        let role = message["role"] as? String ?? "user"
+                        let content = message["content"] as? String ?? ""
+                        // Map both "assistant" and "system" to "model" for Gemma3
+                        let gemmaRole = (role == "assistant" || role == "system") ? "model" : role
+                        prompt += "<start_of_turn>\(gemmaRole)\n\(content)<end_of_turn>\n"
+                    }
+                    prompt += "<start_of_turn>model\n"
+                    formattedPrompt = prompt
+
+                case "llama", "llama3":
+                    // LLaMA 3 format
+                    var prompt = "<|begin_of_text|>"
+                    for message in messagesArray {
+                        let role = message["role"] as? String ?? "user"
+                        let content = message["content"] as? String ?? ""
+                        prompt += "<|start_header_id|>\(role)<|end_header_id|>\n\n\(content)<|eot_id|>"
+                    }
+                    prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+                    formattedPrompt = prompt
+
+                case "deepseek":
+                    // DeepSeek format
+                    var prompt = "<｜begin▁of▁sentence｜>"
+                    for message in messagesArray {
+                        let role = message["role"] as? String ?? "user"
+                        let content = message["content"] as? String ?? ""
+                        if role == "user" {
+                            prompt += "User: \(content)\n\n"
+                        } else if role == "assistant" {
+                            prompt += "Assistant: \(content)\n\n"
+                        } else if role == "system" {
+                            prompt += "\(content)\n\n"
+                        }
+                    }
+                    prompt += "Assistant:"
+                    formattedPrompt = prompt
+
+                case "qwen", "qwen2", "qwen3":
+                    // Qwen/ChatML format
+                    var prompt = ""
+                    for message in messagesArray {
+                        let role = message["role"] as? String ?? "user"
+                        let content = message["content"] as? String ?? ""
+                        prompt += "<|im_start|>\(role)\n\(content)<|im_end|>\n"
+                    }
+                    prompt += "<|im_start|>assistant\n"
+                    formattedPrompt = prompt
+
+                default:
+                    // Default ChatML format
+                    var prompt = ""
+                    for message in messagesArray {
+                        let role = message["role"] as? String ?? "user"
+                        let content = message["content"] as? String ?? ""
+                        prompt += "<|im_start|>\(role)\n\(content)<|im_end|>\n"
+                    }
+                    prompt += "<|im_start|>assistant\n"
+                    formattedPrompt = prompt
+                }
+
+                if debugLevel >= 1 {
+                    print("Fallback formatted prompt (\(messagesArray.count) messages): \(formattedPrompt.prefix(200))...")
+                }
+                return tokenizer.encode(text: formattedPrompt)
             }
         }
 

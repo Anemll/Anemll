@@ -5,7 +5,7 @@ setup(
     version="0.3.3",
     packages=find_packages(),
     install_requires=[
-        "coremltools>=8.2",    # Required for Apple Neural Engine conversion
+        "coremltools>=9.0",    # Required for Apple Neural Engine conversion
         "numpy>=1.24.0",       # Needed for tensor operations
         "tqdm>=4.66.0",        # Progress bars for large conversions
         "transformers>=4.36.0" # HuggingFace Transformers support

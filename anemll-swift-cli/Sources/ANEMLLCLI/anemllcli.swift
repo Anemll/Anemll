@@ -25,13 +25,15 @@ class TokenPrinter: @unchecked Sendable {
     private let showSpecialTokens: Bool
     
     private var currentTokens: [Int] = []  // Add to track tokens
-    
+    private var prevDecodedText: String = ""  // For full-sequence decode diffing
+
     // Add method to reset state for new message
     func startNewMessage() async {
         buffer = ""
         isThinking = false
         isProcessing = false
         currentTokens = []  // Reset tokens
+        prevDecodedText = ""
     }
     
     // Add helper method to detect thinking tokens
@@ -72,10 +74,19 @@ class TokenPrinter: @unchecked Sendable {
         let isThinkEndToken = withSpecial == "</think>" || 
                              (buffer.hasSuffix("</") && withSpecial == "think")
         
-        // Normal decoding for display
-        let decoded = tokenizer.decode(tokens: [token])
-        let cleanedDecoded = decoded.replacingOccurrences(of: "assistant", with: "")
-        
+        // Full-sequence decode + diff to preserve SentencePiece spaces.
+        // Decoding tokens one-at-a-time strips the leading ▁ (space).
+        let fullText = tokenizer.decode(tokens: currentTokens)
+        let newText: String
+        if fullText.count > prevDecodedText.count {
+            newText = String(fullText[fullText.index(fullText.startIndex, offsetBy: prevDecodedText.count)...])
+        } else {
+            newText = tokenizer.decode(tokens: [token])
+        }
+        prevDecodedText = fullText
+
+        let cleanedDecoded = newText.replacingOccurrences(of: "assistant", with: "")
+
         if isThinkStartToken {
             print("\u{001B}[34m", terminator: "")  // Set blue color at start of <think>
             print(cleanedDecoded, terminator: "")
@@ -95,7 +106,7 @@ class TokenPrinter: @unchecked Sendable {
         } else {
             print(cleanedDecoded, terminator: "")
         }
-        
+
         buffer += cleanedDecoded
         fflush(stdout)
         isProcessing = false
@@ -151,8 +162,8 @@ struct AnemllCLI: AsyncParsableCommand {
     @Option(name: .long, help: "Save assistant's response to file")
     var save: String?
     
-    @Option(name: .long, help: "Template style (default, deephermes)")
-    var template: String = "deephermes"
+    @Option(name: .long, help: "Template style (auto, gemma, gemma3, llama, qwen, deephermes)")
+    var template: String = "auto"
     
     @Flag(name: .long, help: "Don't add generation prompt")
     var noGenerationPrompt = false
@@ -292,11 +303,29 @@ struct AnemllCLI: AsyncParsableCommand {
             effectiveMaxTokens = 512  // Default value if context length is unknown
         }
         
+        // Auto-detect template from model prefix if set to "auto"
+        var effectiveTemplate = template
+        if template == "auto" {
+            let prefix = config.modelPrefix.lowercased()
+            if prefix.contains("gemma") {
+                effectiveTemplate = "gemma3"
+            } else if prefix.contains("llama") {
+                effectiveTemplate = "llama"
+            } else if prefix.contains("qwen") {
+                effectiveTemplate = "qwen"
+            } else if prefix.contains("deephermes") || prefix.contains("hermes") {
+                effectiveTemplate = "deephermes"
+            } else {
+                effectiveTemplate = "default"
+            }
+            print("Auto-detected template: \(effectiveTemplate) (from model prefix: \(config.modelPrefix))")
+        }
+
         // Initialize tokenizer with debug level and template
         print("\nInitializing tokenizer...")
         let tokenizer = try await Tokenizer(
             modelPath: config.tokenizerModel,
-            template: template,
+            template: effectiveTemplate,
             debugLevel: debugLevel
         )
         
@@ -334,7 +363,14 @@ struct AnemllCLI: AsyncParsableCommand {
             batchSize: config.batchSize,
             splitLMHead: config.splitLMHead,
             debugLevel: debugLevel,
-            v110: config.configVersion == "0.1.1"  // Set v110 flag based on version
+            v110: config.configVersion == "0.1.1",  // Set v110 flag based on version
+            argmaxInModel: config.argmaxInModel,
+            slidingWindow: config.slidingWindow,  // Gemma3 rotation support
+            updateMaskPrefill: config.updateMaskPrefill,  // Multi-turn KV cache support
+            prefillDynamicSlice: config.prefillDynamicSlice,  // Alternative batch prefill support
+            modelPrefix: config.modelPrefix,
+            vocabSize: config.vocabSize,
+            lmHeadChunkSizes: config.lmHeadChunkSizes
         )
         
         if let prompt = prompt {
@@ -351,7 +387,7 @@ struct AnemllCLI: AsyncParsableCommand {
             
             var messages: [Tokenizer.ChatMessage] = []
             if let system = system {
-                messages.append(Tokenizer.ChatMessage.assistant("I am an AI assistant. \(system)"))
+                messages.append(Tokenizer.ChatMessage.system(system))
             }
             messages.append(Tokenizer.ChatMessage.user(prompt))
             
@@ -403,11 +439,14 @@ struct AnemllCLI: AsyncParsableCommand {
             let inferenceTokensPerSec = Double(generatedTokens.count) / inferenceTime
             let prefillTokensPerSec = Double(tokens.count) / prefillTime
             
+            // Calculate total tokens (prompt + response)
+            let totalTokens = tokens.count + generatedTokens.count
+
             print("\n\u{001B}[34m\(String(format: "%.1f", inferenceTokensPerSec)) t/s, " +
                   "TTFT: \(String(format: "%.1f", prefillMs))ms " +
                   "(\(String(format: "%.1f", prefillTokensPerSec)) t/s), " +
                   "\(generatedTokens.count) tokens" +
-                  " [Stop reason: \(stopReason)]\u{001B}[0m")
+                  " [Stop: \(stopReason)] [Total: \(totalTokens) tokens]\u{001B}[0m")
             
             // Add token ID output for debug level > 0 and prompt mode
             if debugLevel > 0 {
@@ -436,9 +475,9 @@ struct AnemllCLI: AsyncParsableCommand {
             print("Thinking mode is \(thinkingMode ? "ON" : "OFF")")
             
             var conversation: [Tokenizer.ChatMessage] = []
-            
+
             if let system = system {
-                conversation.append(.assistant("I am an AI assistant. \(system)"))
+                conversation.append(.system(system))
             }
             
             // Initialize token printer outside the loop
@@ -476,32 +515,39 @@ struct AnemllCLI: AsyncParsableCommand {
                 }
                 
                 // Before adding new message, check if we need to trim history
-                let maxContextSize = config.contextLength - 200  // Leave more room for response
-                
+                // Use stateLength if available (for split-cache models), otherwise contextLength
+                let stateLength = config.stateLength > 0 ? config.stateLength : config.contextLength
+                let maxContextSize = stateLength - 100  // Leave room for response (match Python)
+
                 // Add new message and check context size
                 if !input.starts(with: "/") {  // Only add non-command inputs to conversation
                     conversation.append(.user(input))
-                    let currentTokens = tokenizer.applyChatTemplate(
+                    var currentTokens = tokenizer.applyChatTemplate(
                         input: conversation,
                         addGenerationPrompt: !noGenerationPrompt
                     )
-                    
-                    // Trim history until we fit in context
-                    while currentTokens.count > maxContextSize && conversation.count > 1 {  // Changed from > 2
-                        if debugLevel >= 1 {
-                            print("Trimming conversation history to fit context...")
-                        }
-                        conversation.removeFirst(1)  // Remove one message at a time
-                        let newTokens = tokenizer.applyChatTemplate(
-                            input: conversation,
-                            addGenerationPrompt: !noGenerationPrompt
-                        )
-                        if newTokens.count <= maxContextSize {
-                            if debugLevel >= 1 {
-                                print("New context size:", newTokens.count)
-                            }
+
+                    // Trim history until we fit in context (match Python: remove pairs)
+                    let originalSize = currentTokens.count
+                    var historyTrimmed = false
+                    while currentTokens.count > maxContextSize {
+                        historyTrimmed = true
+                        // Remove oldest message pair (user + assistant) like Python does
+                        if conversation.count > 2 {
+                            conversation.removeFirst(2)  // Remove oldest pair
+                            currentTokens = tokenizer.applyChatTemplate(
+                                input: conversation,
+                                addGenerationPrompt: !noGenerationPrompt
+                            )
+                        } else {
+                            // Fallback: if only current message remains and still too long,
+                            // keep the tokens as-is (will be truncated during prefill)
                             break
                         }
+                    }
+                    // Report trimming if it occurred
+                    if historyTrimmed {
+                        print("[SYSTEM] History trimmed: \(originalSize) → \(currentTokens.count) tokens, \(conversation.count) msgs remaining")
                     }
                 }
                 
@@ -564,11 +610,14 @@ struct AnemllCLI: AsyncParsableCommand {
                 let inferenceTokensPerSec = Double(generatedTokens.count) / inferenceTime
                 let prefillTokensPerSec = Double(tokens.count) / prefillTime
                 
+                // Calculate total history tokens (prompt + response)
+                let historyTokens = tokens.count + generatedTokens.count
+
                 print("\n\u{001B}[34m\(String(format: "%.1f", inferenceTokensPerSec)) t/s, " +
                       "TTFT: \(String(format: "%.1f", prefillMs))ms " +
                       "(\(String(format: "%.1f", prefillTokensPerSec)) t/s), " +
                       "\(generatedTokens.count) tokens" +
-                      " [Stop reason: \(stopReason)]\u{001B}[0m")
+                      " [Stop: \(stopReason)] [History: \(historyTokens) tokens]\u{001B}[0m")
             }
         }
     }
