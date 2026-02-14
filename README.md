@@ -2,7 +2,7 @@
 
 ANEMLL (pronounced like "animal") is an open-source project focused on accelerating the porting of Large Language Models (LLMs) to tensor processors, starting with the Apple Neural Engine (ANE).
 
-## Version 0.3.5 Alpha Release
+## Version 0.3.5 Beta Release
 
 For complete release notes, see [`docs/RELEASE_NOTES_0.3.5.md`](./docs/RELEASE_NOTES_0.3.5.md).
 
