@@ -99,7 +99,7 @@ class Gemma3Config:
         self.state_length = kwargs.get("state_length", self.context_length)
 
         # FP16 residual clamping (OFF by default - use weight scaling instead)
-        # See GEMMA3_FP16_SCALING.md for details
+        # See docs/GEMMA3_FP16_SCALING.md for details
         self.enable_residual_clamp = kwargs.get("enable_residual_clamp", False)
         self.residual_clamp_value = kwargs.get("residual_clamp_value", 65504.0)
 

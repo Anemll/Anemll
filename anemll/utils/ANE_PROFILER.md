@@ -300,5 +300,5 @@ Run more iterations (`--iterations 50`) for more stable averages.
 ## See Also
 
 - [fp16_compatibility_check.py](./fp16_compatibility_check.py) - FP16 overflow detection
-- [GEMMA3_FP16_SCALING.md](../models/GEMMA3_FP16_SCALING.md) - FP16 scaling for Gemma3
+- [GEMMA3_FP16_SCALING.md](../../docs/GEMMA3_FP16_SCALING.md) - FP16 scaling for Gemma3
 - CoreMLTools documentation: https://coremltools.readme.io/

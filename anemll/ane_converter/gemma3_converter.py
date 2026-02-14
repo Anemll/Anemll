@@ -2195,7 +2195,7 @@ def parse_args() -> argparse.Namespace:
         help="FP16 residual stream scaling factor to prevent overflow. "
              "Use 'auto' to compute based on model, or specify a value (e.g., 0.1875). "
              "Recommended: 0.48 for 270M, 0.82 for 1B, 0.1875 for 4B QAT. "
-             "See anemll/models/GEMMA3_FP16_SCALING.md for details.",
+             "See docs/GEMMA3_FP16_SCALING.md for details.",
     )
     parser.add_argument(
         "--clamp",
@@ -2210,7 +2210,7 @@ def parse_args() -> argparse.Namespace:
 
 
 # Recommended FP16 scaling factors for Gemma3 models
-# Based on residual stream analysis - see anemll/models/GEMMA3_FP16_SCALING.md
+# Based on residual stream analysis - see docs/GEMMA3_FP16_SCALING.md
 GEMMA3_SCALING_FACTORS = {
     # Model identifier patterns -> recommended alpha
     "gemma-3-270m": 0.48,      # Peak 104,162 (1.6x FP16 max)

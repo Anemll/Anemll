@@ -8,6 +8,16 @@ The `convert_model.sh` script automates the conversion of LLAMA models to CoreML
 ./anemll/utils/convert_model.sh --model <path_to_model> --output <output_directory> [options]
 ```
 
+## Recommended Preflight
+
+Before conversion, run an FP16 compatibility sweep:
+
+```bash
+./anemll/utils/fp16_preflight.sh --model <model_id_or_path>
+```
+
+This catches FP16 overflow risks early and saves a JSON report under `tests/dev/logs/`.
+
 ## Parameters
 
 ### Required Parameters
@@ -109,6 +119,9 @@ For the standalone calculator, see [Chunk Split Calculator](calc_chunk_split.md)
 - `--argmax`: Compute argmax inside the LM head model.
 - `--fp16-scale`: FP16 residual scaling for Gemma3 models (e.g., `auto`, `0.1875`).
 - `--split-rotate`: Create separate files for rotate/non-rotate functions per chunk.
+
+Related helper script:
+- `./anemll/utils/fp16_preflight.sh`: one-command FP16 pre-conversion sweep (recommended before `convert_model.sh`)
 
 ## Examples
 

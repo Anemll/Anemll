@@ -42,7 +42,7 @@ This model is converted for CoreML using ANEMLL's open-source conversion pipelin
 ## Requirements
 
 - **macOS 15 (Sequoia)** or later with Apple Neural Engine and 8GB RAM or more
-- **CoreML Tools 8.x+** and **HuggingFace Transformers** libraries
+- **CoreML Tools 9.x+** and **HuggingFace Transformers** libraries
 - **Python 3.9+**
 
 `chat.py` provides a sample inference script.  
@@ -82,7 +82,7 @@ find . -type f -name "*.zip" -exec unzip {} \;
 
 3. Install dependencies:
 ```bash
-pip install coremltools transformers
+pip install "coremltools>=9.0" transformers
 ```
 
 **Coremltools:**

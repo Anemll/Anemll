@@ -198,7 +198,7 @@ fi
 
 # Install CoreML Tools (must be after PyTorch)
 echo "🧠 Installing CoreML Tools..."
-$PIP_CMD install coremltools>=8.2
+$PIP_CMD install coremltools>=9.0
 
 # Install core ANEMLL dependencies
 echo "📚 Installing core dependencies..."

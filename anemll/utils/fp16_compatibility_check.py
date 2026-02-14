@@ -752,7 +752,7 @@ class FP16CompatibilityChecker:
             print(f"  2. For each layer's post_*_layernorm:")
             print(f"     weight_new = {recommended_alpha:.4f} * (1 + weight_old) - 1")
             print(f"\nThis is a WEIGHT-ONLY transformation - no runtime ops needed.")
-            print(f"See: anemll/models/GEMMA3_FP16_SCALING.md for details.")
+            print(f"See: docs/GEMMA3_FP16_SCALING.md for details.")
 
         self.report.scaling_recommendation = scaling_info
         return scaling_info

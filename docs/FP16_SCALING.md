@@ -52,6 +52,19 @@ Gemma3 is the only architecture requiring FP16 scaling:
 
 See [GEMMA3_FP16_SCALING.md](GEMMA3_FP16_SCALING.md) for detailed Gemma3-specific guidance.
 
+## Pre-Conversion Preflight (Recommended)
+
+Before converting any model, run:
+
+```bash
+./anemll/utils/fp16_preflight.sh --model <model_id_or_path>
+```
+
+Behavior:
+- Runs FP16 compatibility checks with clamp sweep by default
+- Saves JSON report to `tests/dev/logs/fp16_preflight_<timestamp>.json`
+- Auto-activates local envs (`env-anemll`, `.venv`, etc.) when possible
+
 ## Using `--fp16-scale`
 
 ### When to Use
@@ -176,3 +189,4 @@ FP16 vs BF16 token match: 100.0%
 - `tests/dev/compute_residual_scaling.py` - Gemma3 scaling computation
 - `tests/dev/compute_residual_scaling_qwen.py` - Generic scaling analysis
 - `anemll/utils/fp16_compatibility_check.py` - FP16 compatibility checker
+- `anemll/utils/fp16_preflight.sh` - one-command FP16 pre-conversion sweep

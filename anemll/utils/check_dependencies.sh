@@ -125,16 +125,16 @@ if [ "$SKIP_CHECK" = false ]; then
 
     if [ -z "$coremltools_version" ]; then
         echo "coremltools is required but not installed. Aborting. (Issue #3)"
-        echo "If using uv: uv pip install coremltools>=8.2"
-        echo "If using pip: pip install coremltools>=8.2"
+        echo "If using uv: uv pip install coremltools>=9.0"
+        echo "If using pip: pip install coremltools>=9.0"
         echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
         exit 1
     fi
 
     # Check coremltools version
     coremltools_major_version=$(echo "$coremltools_version" | cut -d. -f1)
-    if [ "$coremltools_major_version" -lt 8 ]; then
-        echo "coremltools version 8.x or higher is required. Aborting. (Issue #9)"
+    if [ "$coremltools_major_version" -lt 9 ]; then
+        echo "coremltools version 9.x or higher is required. Aborting. (Issue #9)"
         echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
         exit 1
     fi
