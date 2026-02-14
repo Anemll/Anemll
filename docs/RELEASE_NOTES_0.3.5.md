@@ -259,7 +259,14 @@ The demo starts inference with a small context (512 tokens) and automatically tr
 
 Works with both per-context chunked exports (separate directories per context size) and combined multi-context exports (single folder with `infer_ctx{N}` / `prefill_ctx{N}` functions).
 
-See: `tests/dev/STATE_TRANSITION_EXPERIMENTS.md`
+### Try It
+
+A standalone demo script and pre-converted VibeThinker 1.5B model are available:
+- Demo: `examples/variable_context_demo.py` — single-command launcher with sensible defaults.
+- Documentation: [`examples/VARIABLE_CONTEXT.md`](../examples/VARIABLE_CONTEXT.md) — full guide covering advantages, how it works, and all options.
+- Pre-converted model: [anemll/anemll-vibethinker-1.5b-state-transition](https://huggingface.co/anemll/anemll-vibethinker-1.5b-state-transition) on HuggingFace.
+
+See also: `tests/dev/STATE_TRANSITION_EXPERIMENTS.md`
 
 ## Model/Architecture Status in 0.3.5
 
