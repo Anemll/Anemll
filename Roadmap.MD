@@ -8,21 +8,25 @@
 - [x] iOS/SwiftUI Sample Application
 - [x] Qwen Architecture Support
 - [X] Model Quality testing  (/eval)
+- [X] Gemma3 Architecture Support
+- [x] Monolithic model support ( export_coreml)
+- [x] Profiling/Benchmarking scripts
 
 ## In Progress Milestones 🚧
-- [ ] Re-add monolithic model support ( export_coreml)
-- [ ] SpinQuant and other Quantizatio workflows Implementation
+- [ ] Native ANE Quantization
+- [ ] Variable Context Size
+- [ ] Gemma 3N
+- [ ] Improve Quantization Speed
 
 
 ## Upcoming Milestones 🚧
+- [ ] KV-Cache quantization
 - [ ] Add Int4 Linear Quantization
-- [ ] Gemma Architecture Support
 - [ ] Conversion/Quantization Pipeline Re-factoring
 - [ ] Add LoRA Support
 - [ ] Basic ANE Server Implementation w/Third-party API
-- [ ] Profiling/Benchmarking scripts
-- [ ] Re-add monolithic model support (partial in export_coreml)
 - [ ] Add AFM-like Swift API to call models
+- [ ] MoE models support
 
 
 
