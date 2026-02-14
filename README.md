@@ -67,7 +67,7 @@ python tests/test_llama_model.py      # LLaMA
 
 See update [Roadmap.md](./Roadmap.MD) for more details
 
-## Main Components in 0.3.5 Alpha Release
+## Main Components in 0.3.5 Beta Release
 
 ANEMLL provides six main components for Apple Neural Engine inference development:
 
@@ -184,8 +184,8 @@ python3 tests/chat.py --meta /path/to/output/gemma3_270m/meta.yaml --prompt "Hel
 
 Visit our [Hugging Face repository](https://huggingface.co/anemll) for the latest converted models.
 
-### Important Alpha Release Notes
-> This is **Alpha Release 0.3.5** — Gemma 3, monolithic models, in-model argmax, ANEMLL Chat redesign, and ANE stability fixes.
+### Important Beta Release Notes
+> This is **Beta Release 0.3.5** — Gemma 3, monolithic models, in-model argmax, ANEMLL Chat redesign, and ANE stability fixes.
 > - **Breaking Change**: `install_dependencies.sh` moved to project root
 > - **Dependency baseline**: `coremltools>=9.0`
 > - **Stable architectures**: LLaMA 3.1/3.2, DeepSeek R1, DeepHermes, Qwen 3, Qwen 2.5, Gemma 3
