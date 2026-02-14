@@ -52,13 +52,42 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 if [ -d "$ENV_NAME" ]; then
-    echo "Found existing $ENV_NAME environment. Removing it..."
-    rm -rf "$ENV_NAME"
+    echo "Found existing $ENV_NAME environment."
+    echo "  Python: $("$ENV_NAME/bin/python" --version 2>/dev/null || echo 'unknown')"
+    read -r -p "Recreate from scratch? [y/N] " response
+    case "$response" in
+        [yY]|[yY][eE][sS])
+            echo "Removing $ENV_NAME..."
+            rm -rf "$ENV_NAME"
+            ;;
+        *)
+            echo "Resuming existing environment."
+            echo ""
+            # shellcheck disable=SC1090
+            source "$ENV_NAME/bin/activate"
+            echo "Using $(python --version)"
+            echo "Using $(python -m pip --version)"
+            echo ""
+            echo "Environment is ready. To activate in a new terminal:"
+            echo ""
+            echo "  source $ENV_NAME/bin/activate"
+            echo ""
+            echo "Next steps:"
+            echo "  1. ./install_dependencies.sh"
+            echo "  2. python tests/test_gemma3_model.py   # test conversion pipeline"
+            echo ""
+            echo "Alternative direct UV install:"
+            echo "  uv pip install -r requirements.txt"
+            echo "  uv pip install -e ."
+            exit 0
+            ;;
+    esac
 fi
 
 echo "Creating uv environment: $ENV_NAME (Python $PYTHON_VERSION)"
 uv venv --python "$PYTHON_VERSION" --seed "$ENV_NAME"
 
+echo ""
 echo "Activating environment..."
 # shellcheck disable=SC1090
 source "$ENV_NAME/bin/activate"
