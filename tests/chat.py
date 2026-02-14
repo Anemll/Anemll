@@ -63,6 +63,8 @@ class TokenPrinter:
         self.lock = threading.Lock()
         self.thinking = True  # Track if we're still in thinking mode
         self.decoding_buffer = []  # Buffer for token IDs
+        self.all_token_ids = []   # Full history for correct SentencePiece decode
+        self.prev_text = ""       # Previously decoded text (for diffing)
         # Add token counting and timing
         self.start_time = time.time()
         self.token_count = 0
@@ -82,26 +84,38 @@ class TokenPrinter:
             self.token_count += 1
 
     def drain_buffer(self, eval_mode=False):
-        """Decode token IDs from decoding_buffer in the main thread."""
+        """Decode token IDs from decoding_buffer in the main thread.
+
+        Uses full-sequence decode + diff to preserve SentencePiece spaces.
+        Decoding tokens one-at-a-time strips the leading ▁ (space) that
+        SentencePiece encodes into most word-initial tokens.
+        """
         if not self.decoding_buffer:
             return
 
-        # Decode all tokens at once in the main thread
+        # Move new tokens into the full history
+        with self.lock:
+            self.all_token_ids.extend(self.decoding_buffer)
+            self.decoding_buffer.clear()
+
+        # Decode the FULL token sequence and diff against previous decode
         try:
-            token_str = self.tokenizer.decode(self.decoding_buffer)
+            full_text = self.tokenizer.decode(self.all_token_ids)
         except Exception:
-            # Fallback for occasional tokenizer decode failures (e.g. unknown token id -> None)
-            decoded_pieces = []
-            for token_id in self.decoding_buffer:
-                try:
-                    piece = self.tokenizer.decode([token_id])
-                    if piece is not None:
-                        decoded_pieces.append(piece)
-                except Exception:
-                    continue
-            token_str = "".join(decoded_pieces)
-        self.decoding_buffer.clear()
-        
+            # Fallback: decode only the new tokens (may lose spaces, but won't crash)
+            try:
+                full_text = self.prev_text + self.tokenizer.decode(
+                    self.all_token_ids[len(self.all_token_ids) - 1:]
+                )
+            except Exception:
+                return
+
+        token_str = full_text[len(self.prev_text):]
+        self.prev_text = full_text
+
+        if not token_str:
+            return
+
         # Store the text in buffer for later saving to file
         with self.lock:
             self.buffer += token_str

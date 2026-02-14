@@ -25,13 +25,15 @@ class TokenPrinter: @unchecked Sendable {
     private let showSpecialTokens: Bool
     
     private var currentTokens: [Int] = []  // Add to track tokens
-    
+    private var prevDecodedText: String = ""  // For full-sequence decode diffing
+
     // Add method to reset state for new message
     func startNewMessage() async {
         buffer = ""
         isThinking = false
         isProcessing = false
         currentTokens = []  // Reset tokens
+        prevDecodedText = ""
     }
     
     // Add helper method to detect thinking tokens
@@ -72,10 +74,19 @@ class TokenPrinter: @unchecked Sendable {
         let isThinkEndToken = withSpecial == "</think>" || 
                              (buffer.hasSuffix("</") && withSpecial == "think")
         
-        // Normal decoding for display
-        let decoded = tokenizer.decode(tokens: [token])
-        let cleanedDecoded = decoded.replacingOccurrences(of: "assistant", with: "")
-        
+        // Full-sequence decode + diff to preserve SentencePiece spaces.
+        // Decoding tokens one-at-a-time strips the leading ▁ (space).
+        let fullText = tokenizer.decode(tokens: currentTokens)
+        let newText: String
+        if fullText.count > prevDecodedText.count {
+            newText = String(fullText[fullText.index(fullText.startIndex, offsetBy: prevDecodedText.count)...])
+        } else {
+            newText = tokenizer.decode(tokens: [token])
+        }
+        prevDecodedText = fullText
+
+        let cleanedDecoded = newText.replacingOccurrences(of: "assistant", with: "")
+
         if isThinkStartToken {
             print("\u{001B}[34m", terminator: "")  // Set blue color at start of <think>
             print(cleanedDecoded, terminator: "")
@@ -95,7 +106,7 @@ class TokenPrinter: @unchecked Sendable {
         } else {
             print(cleanedDecoded, terminator: "")
         }
-        
+
         buffer += cleanedDecoded
         fflush(stdout)
         isProcessing = false

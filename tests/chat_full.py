@@ -47,6 +47,8 @@ class TokenPrinter:
         self.lock = threading.Lock()
         self.thinking = True  # Track if we're still in thinking mode
         self.decoding_buffer = []  # Buffer for token IDs
+        self.all_token_ids = []   # Full history for correct SentencePiece decode
+        self.prev_text = ""       # Previously decoded text (for diffing)
         # Timing and stats tracking
         self.start_time = time.time()
         self.token_count = 0
@@ -69,15 +71,37 @@ class TokenPrinter:
             self.token_count += 1
 
     def drain_buffer(self):
-        """Decode token IDs from decoding_buffer in the main thread."""
+        """Decode token IDs from decoding_buffer in the main thread.
+
+        Uses full-sequence decode + diff to preserve SentencePiece spaces.
+        Decoding tokens one-at-a-time strips the leading ▁ (space) that
+        SentencePiece encodes into most word-initial tokens.
+        """
         if not self.decoding_buffer:
             return
 
-        # Decode all tokens at once in the main thread
-        # Use skip_special_tokens=True to avoid duplicate special tokens when re-tokenizing
-        # for multi-turn conversations (e.g., <end_of_turn> would be doubled otherwise)
-        token_str = self.tokenizer.decode(self.decoding_buffer, skip_special_tokens=True)
-        self.decoding_buffer.clear()
+        # Move new tokens into the full history
+        with self.lock:
+            self.all_token_ids.extend(self.decoding_buffer)
+            self.decoding_buffer.clear()
+
+        # Decode the FULL token sequence and diff against previous decode
+        try:
+            full_text = self.tokenizer.decode(self.all_token_ids, skip_special_tokens=True)
+        except Exception:
+            try:
+                full_text = self.prev_text + self.tokenizer.decode(
+                    self.all_token_ids[len(self.all_token_ids) - 1:],
+                    skip_special_tokens=True
+                )
+            except Exception:
+                return
+
+        token_str = full_text[len(self.prev_text):]
+        self.prev_text = full_text
+
+        if not token_str:
+            return
 
         # Save to buffer for conversation history
         self.buffer += token_str

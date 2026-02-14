@@ -432,6 +432,9 @@ final class InferenceService: ObservableObject {
                 let minChunkChars = 48
                 var lastTokenLogTime = CFAbsoluteTimeGetCurrent()
                 var lastTokenCount = 0
+                // Full-sequence decode state to preserve SentencePiece spaces
+                var allTokenIds: [Int] = []
+                var prevDecodedText: String = ""
 
                 if capturedDebugLevel >= 2 {
                     logDebug("[Inference] start detached", category: .inference)
@@ -472,7 +475,16 @@ final class InferenceService: ObservableObject {
                         }
 
                         stats.tokenCount += 1
-                        let text = capturedTokenizer.decode(tokens: [token])
+                        // Full-sequence decode + diff to preserve SentencePiece spaces
+                        allTokenIds.append(token)
+                        let fullText = capturedTokenizer.decode(tokens: allTokenIds)
+                        let text: String
+                        if fullText.count > prevDecodedText.count {
+                            text = String(fullText[fullText.index(fullText.startIndex, offsetBy: prevDecodedText.count)...])
+                        } else {
+                            text = capturedTokenizer.decode(tokens: [token])
+                        }
+                        prevDecodedText = fullText
                         stats.generatedText += text
 
                         pendingText += text
