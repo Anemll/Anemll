@@ -67,6 +67,17 @@ DEFAULT_STEP_DURATIONS = {
     "8": 30,        # Test - fast
 }
 
+MONOLITHIC_STEP_DURATIONS = {
+    "1": 900,       # Monolithic infer conversion + optional quantization
+    "2": 900,       # Monolithic prefill conversion + optional quantization
+    "2b": 900,      # Monolithic infer_rotate conversion
+    "2c": 900,      # Monolithic prefill_rotate conversion
+    "3": 30,        # Combine functions
+    "4": 60,        # Compile
+    "5": 10,        # Tokenizer/meta
+    "6": 60,        # Test
+}
+
 # build_ctx_model defaults (scripts/build_ctx_model)
 BUILD_CTX_DEFAULT_CONTEXTS = [512, 1024, 2048, 3072, 4096]
 BUILD_CTX_DEFAULT_MAX_CONTEXT = 4096
@@ -463,6 +474,55 @@ def detect_step(output_dir: Path, num_chunks: int = 2, cutoff_time: float = 0) -
         """Filter to only recent files."""
         return [f for f in files if is_recent(f)]
 
+    # Monolithic conversion detection (convert_monolith.sh)
+    mono_mlpackage = filter_recent(list(output_dir.glob("*_monolithic*.mlpackage")))
+    mono_mlmodelc = filter_recent(list(output_dir.glob("*_monolithic*.mlmodelc")))
+    is_monolithic = bool(mono_mlpackage or mono_mlmodelc)
+
+    if is_monolithic:
+        meta_path = output_dir / "meta.yaml"
+        if meta_path.exists() and is_recent(meta_path):
+            mlmodelc_files = mono_mlmodelc or filter_recent(list(output_dir.glob("*.mlmodelc")))
+            if mlmodelc_files:
+                return ("6", "Testing or Complete", f"{len(mlmodelc_files)} compiled models", mlmodelc_files)
+
+        if mono_mlmodelc:
+            return ("4", "Compiling Monolithic Model", f"{len(mono_mlmodelc)} compiled", mono_mlmodelc)
+
+        mono_full = [f for f in mono_mlpackage if "_monolithic_full" in f.name]
+        if mono_full:
+            return ("3", "Combining Monolithic Models", f"{len(mono_full)} combined", mono_full)
+
+        mono_prefill_rotate = [f for f in mono_mlpackage if "_monolithic_prefill_rotate" in f.name]
+        if mono_prefill_rotate:
+            return ("2c", "Converting Monolithic Prefill Rotate", "complete", mono_prefill_rotate)
+
+        mono_rotate = [
+            f for f in mono_mlpackage
+            if "_monolithic_rotate" in f.name and "_monolithic_prefill_rotate" not in f.name
+        ]
+        if mono_rotate:
+            return ("2b", "Converting Monolithic Inference Rotate", "complete", mono_rotate)
+
+        mono_prefill = [
+            f for f in mono_mlpackage
+            if "_monolithic_prefill" in f.name and "_monolithic_prefill_rotate" not in f.name
+        ]
+        if mono_prefill:
+            return ("2", "Converting Monolithic Prefill", "complete", mono_prefill)
+
+        mono_infer = [
+            f for f in mono_mlpackage
+            if "_monolithic" in f.name
+            and "_monolithic_full" not in f.name
+            and "_monolithic_prefill" not in f.name
+            and "_monolithic_rotate" not in f.name
+        ]
+        if mono_infer:
+            return ("1", "Converting Monolithic Inference", "complete", mono_infer)
+
+        return (0, "Starting", "waiting for first file", [])
+
     # Check for meta.yaml (step 7 complete) - must be recent
     meta_path = output_dir / "meta.yaml"
     if meta_path.exists() and is_recent(meta_path):
@@ -572,7 +632,7 @@ def get_current_output_size(output_dir: Path) -> int:
     return total
 
 
-def estimate_final_size(output_dir: Path, num_chunks: int) -> tuple:
+def estimate_final_size(output_dir: Path, num_chunks: int, is_monolithic: bool = False) -> tuple:
     """
     Estimate final output size based on current files and remaining steps.
     Returns (current_size, estimated_total) in bytes.
@@ -589,9 +649,70 @@ def estimate_final_size(output_dir: Path, num_chunks: int) -> tuple:
             pass
 
     if not mlpackage_sizes:
+        if is_monolithic:
+            # Monolithic runs usually produce 2-4 large mlpackages plus one combined output.
+            return current_size, current_size + 2 * 1024 * 1024 * 1024
         # No files yet, use rough estimate based on typical models
         # 4B model with LUT4: ~8GB total output
         return current_size, current_size + 8 * 1024 * 1024 * 1024
+
+    monolithic_sizes = [(name, size) for name, size in mlpackage_sizes if "_monolithic" in name]
+    if monolithic_sizes:
+        # Estimate remaining for convert_monolith.sh outputs.
+        base_sizes = [
+            size for name, size in monolithic_sizes
+            if "_monolithic_full" not in name
+        ]
+        if base_sizes:
+            avg_base_size = sum(base_sizes) / len(base_sizes)
+        else:
+            avg_base_size = max((size for _, size in monolithic_sizes), default=600 * 1024 * 1024)
+
+        infer_count = len([
+            1 for name, _ in monolithic_sizes
+            if "_monolithic" in name
+            and "_monolithic_full" not in name
+            and "_monolithic_prefill" not in name
+            and "_monolithic_rotate" not in name
+        ])
+        prefill_count = len([
+            1 for name, _ in monolithic_sizes
+            if "_monolithic_prefill" in name and "_monolithic_prefill_rotate" not in name
+        ])
+        infer_rotate_count = len([
+            1 for name, _ in monolithic_sizes
+            if "_monolithic_rotate" in name and "_monolithic_prefill_rotate" not in name
+        ])
+        prefill_rotate_count = len([
+            1 for name, _ in monolithic_sizes
+            if "_monolithic_prefill_rotate" in name
+        ])
+        full_count = len([1 for name, _ in monolithic_sizes if "_monolithic_full" in name])
+
+        estimated_remaining = 0
+        if infer_count < 1:
+            estimated_remaining += avg_base_size
+        if prefill_count < 1:
+            estimated_remaining += avg_base_size
+
+        # If rotate files already appear, assume 4-function export and account for missing rotate files.
+        has_rotate = infer_rotate_count > 0 or prefill_rotate_count > 0
+        if has_rotate:
+            if infer_rotate_count < 1:
+                estimated_remaining += avg_base_size
+            if prefill_rotate_count < 1:
+                estimated_remaining += avg_base_size
+
+        # Combined multi-function monolithic model
+        if full_count < 1:
+            estimated_remaining += avg_base_size * 1.2
+
+        # Compiled modelc is typically similar scale to combined mlpackage
+        mono_mlmodelc_count = len(list(output_dir.glob("*_monolithic*.mlmodelc")))
+        if mono_mlmodelc_count < 1:
+            estimated_remaining += avg_base_size * 1.2
+
+        return current_size, current_size + int(estimated_remaining)
 
     # Calculate average chunk size from FFN chunks
     chunk_sizes = [size for name, size in mlpackage_sizes if 'chunk' in name and '_FFN_' in name]
@@ -637,9 +758,33 @@ def get_file_age(filepath: Path) -> float:
     return 0
 
 
-def estimate_remaining(current_step, num_chunks: int, step_durations: dict, is_gemma3_rotate: bool, current_chunk: int = 1) -> float:
+def estimate_remaining(
+    current_step,
+    num_chunks: int,
+    step_durations: dict,
+    is_gemma3_rotate: bool,
+    current_chunk: int = 1,
+    is_monolithic: bool = False,
+    monolithic_has_rotate: bool = False,
+) -> float:
     """Estimate remaining time based on current step and average durations."""
     remaining = 0
+
+    if is_monolithic:
+        if monolithic_has_rotate:
+            step_order = ["1", "2", "2b", "2c", "3", "4", "5", "6"]
+        else:
+            step_order = ["1", "2", "3", "4", "5", "6"]
+
+        current_str = str(current_step)
+        try:
+            current_idx = step_order.index(current_str)
+        except ValueError:
+            current_idx = 0
+
+        for step in step_order[current_idx + 1:]:
+            remaining += step_durations.get(step, MONOLITHIC_STEP_DURATIONS.get(step, 60))
+        return remaining
 
     if is_gemma3_rotate:
         step_order = ["1", "2", "3", "4", "4a", "4b", "5", "6", "7", "8"]
@@ -682,7 +827,10 @@ def get_running_process(output_dir: Path) -> tuple:
             timeout=5
         )
         for line in result.stdout.split('\n'):
-            if 'converter' in line and str(output_dir) in line and 'grep' not in line:
+            if 'grep' in line:
+                continue
+
+            if 'converter' in line and str(output_dir) in line:
                 # Extract --part value
                 if '--part ' in line:
                     part = line.split('--part ')[1].split()[0]
@@ -693,9 +841,33 @@ def get_running_process(output_dir: Path) -> tuple:
                         '2_prefill': (4, 'Prefill'),
                         '2_rotate': ('4a', 'FFN Rotate'),
                         '2_prefill_rotate': ('4b', 'Prefill Rotate'),
+                        'monolithic': ('1', 'Monolithic Inference'),
+                        'monolithic_prefill': ('2', 'Monolithic Prefill'),
+                        'monolithic_rotate': ('2b', 'Monolithic Inference Rotate'),
+                        'monolithic_prefill_rotate': ('2c', 'Monolithic Prefill Rotate'),
                     }
                     if part in part_map:
                         return part_map[part]
+
+            if (
+                'combine_models.py' in line
+                and '--monolithic' in line
+                and str(output_dir) in line
+            ):
+                return ('3', 'Combining Monolithic Models')
+
+            if (
+                'compile_models.py' in line
+                and ' monolithic ' in line
+                and str(output_dir) in line
+            ):
+                return ('4', 'Compiling Monolithic Model')
+
+            if 'generate_meta_yaml.py' in line and str(output_dir) in line:
+                return ('5', 'Writing Meta/Tokenizer')
+
+            if 'tests/chat.py' in line and str(output_dir) in line:
+                return ('6', 'Testing')
         return None
     except:
         return None
@@ -734,6 +906,8 @@ def monitor(output_dir: Path, num_chunks: int = 2, refresh_interval: float = 2.0
     step_durations = DEFAULT_STEP_DURATIONS.copy()
     last_step = None
     is_gemma3_rotate = False
+    is_monolithic = False
+    is_monolithic_rotate = False
 
     try:
         while True:
@@ -760,29 +934,33 @@ def monitor(output_dir: Path, num_chunks: int = 2, refresh_interval: float = 2.0
             if running:
                 running_step, running_name = running
                 # If running step is ahead of detected step, use running info
-                step_order = ["0", "1", "2", "3", "4", "4a", "4b", "5", "6", "7", "8"]
+                step_order = ["0", "1", "2", "2b", "2c", "3", "4", "4a", "4b", "5", "6", "7", "8"]
                 try:
                     if step_order.index(str(running_step)) > step_order.index(str(step)):
                         step = running_step
                         step_name = f"{running_name} (in progress)"
                         # Determine which chunk we're on based on existing files
                         chunk_num = 1
-                        if running_step == "4a":  # FFN Rotate
+                        running_step_str = str(running_step)
+                        if running_step_str == "4a":  # FFN Rotate
                             existing = len([1 for f in active_output_dir.glob("*_FFN_rotate*chunk*.mlpackage")])
                             chunk_num = existing + 1
-                        elif running_step == "4b":  # Prefill Rotate
+                        elif running_step_str == "4b":  # Prefill Rotate
                             existing = len([1 for pf in active_output_dir.glob("*prefill_rotate*chunk*.mlpackage")
                                           if pf.stat().st_mtime > cutoff_time])
                             chunk_num = existing + 1
-                        elif running_step == 3:  # FFN
+                        elif running_step_str == "3" and "Monolithic" not in running_name:  # FFN
                             existing = len([1 for f in active_output_dir.glob("*_FFN_*chunk*.mlpackage")
                                           if 'rotate' not in f.name and '_PF_' not in f.name])
                             chunk_num = existing + 1
-                        elif running_step == 4:  # Prefill
+                        elif running_step_str == "4" and running_name == "Prefill":
                             existing = len([1 for f in active_output_dir.glob("*prefill*chunk*.mlpackage")
                                           if 'rotate' not in f.name])
                             chunk_num = existing + 1
-                        details = f"chunk {chunk_num}/{num_chunks}"
+                        if running_step_str in {"3", "4", "4a", "4b"} and "Monolithic" not in running_name:
+                            details = f"chunk {chunk_num}/{num_chunks}"
+                        else:
+                            details = "in progress"
                         current_chunk_num = chunk_num
                 except ValueError:
                     pass
@@ -790,6 +968,23 @@ def monitor(output_dir: Path, num_chunks: int = 2, refresh_interval: float = 2.0
             # Detect if this is a Gemma3 rotate conversion
             if str(step) in ["4a", "4b"]:
                 is_gemma3_rotate = True
+            monolithic_files = list(active_output_dir.glob("*_monolithic*.mlpackage")) + list(
+                active_output_dir.glob("*_monolithic*.mlmodelc")
+            )
+            if monolithic_files:
+                is_monolithic = True
+            if any("rotate" in f.name for f in monolithic_files):
+                is_monolithic_rotate = True
+            if str(step) in ["2b", "2c"]:
+                is_monolithic = True
+                is_monolithic_rotate = True
+            if running:
+                running_step, running_name = running
+                if "Monolithic" in running_name:
+                    is_monolithic = True
+                if str(running_step) in ["2b", "2c"]:
+                    is_monolithic = True
+                    is_monolithic_rotate = True
 
             # Track step transitions
             if step != last_step:
@@ -819,7 +1014,15 @@ def monitor(output_dir: Path, num_chunks: int = 2, refresh_interval: float = 2.0
                 step_durations[str(step)] = step_elapsed * 1.1  # Add 10% buffer
 
             # Estimate remaining time
-            remaining = estimate_remaining(step, num_chunks, step_durations, is_gemma3_rotate, current_chunk_num)
+            remaining = estimate_remaining(
+                step,
+                num_chunks,
+                step_durations,
+                is_gemma3_rotate,
+                current_chunk_num,
+                is_monolithic=is_monolithic,
+                monolithic_has_rotate=is_monolithic_rotate,
+            )
 
             # Get most recent file (only from recent files)
             recent_file = None
@@ -867,7 +1070,16 @@ def monitor(output_dir: Path, num_chunks: int = 2, refresh_interval: float = 2.0
                 print()
 
             # Progress bar
-            if is_gemma3_rotate:
+            if is_monolithic:
+                if is_monolithic_rotate:
+                    total_steps = 8
+                    step_map = {
+                        "0": 0, "1": 1, "2": 2, "2b": 3, "2c": 4, "3": 5, "4": 6, "5": 7, "6": 8
+                    }
+                else:
+                    total_steps = 6
+                    step_map = {"0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6}
+            elif is_gemma3_rotate:
                 total_steps = 10
                 step_map = {"0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "4a": 5, "4b": 6, "5": 7, "6": 8, "7": 9, "8": 10}
             else:
@@ -908,7 +1120,9 @@ def monitor(output_dir: Path, num_chunks: int = 2, refresh_interval: float = 2.0
             print()
             output_free, output_total = get_disk_space(active_output_dir)
             sys_free, sys_total = get_system_disk_space()
-            current_size, estimated_total = estimate_final_size(active_output_dir, num_chunks)
+            current_size, estimated_total = estimate_final_size(
+                active_output_dir, num_chunks, is_monolithic=is_monolithic
+            )
 
             print(f"  Current size:    {format_bytes(current_size)}")
             print(f"  Est. final size: {format_bytes(estimated_total)}")
@@ -942,7 +1156,8 @@ def monitor(output_dir: Path, num_chunks: int = 2, refresh_interval: float = 2.0
             else:
                 # Legacy single-output conversion completion (meta.yaml must be recent)
                 meta_path = active_output_dir / "meta.yaml"
-                if step == 8 and meta_path.exists() and meta_path.stat().st_mtime > cutoff_time:
+                completion_step = "6" if is_monolithic else "8"
+                if str(step) == completion_step and meta_path.exists() and meta_path.stat().st_mtime > cutoff_time:
                     print("\n  ✓ CONVERSION COMPLETE!")
                     print(f"    Total time: {format_duration(total_elapsed)}")
                     break
