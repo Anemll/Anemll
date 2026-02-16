@@ -10,10 +10,14 @@
       "Bash(/usr/bin/python3:*)",
       "Bash(xcodebuild:*)",
       "Bash(source:*)",
-      "Bash(./scripts/convert_qwen25_0.5b_instruct.sh:*)"
+      "Bash(./scripts/convert_qwen25_0.5b_instruct.sh:*)",
+      "Bash(python3:*)"
     ],
     "deny": [],
-    "ask": []
+    "ask": [],
+    "additionalDirectories": [
+      "/Volumes/Models/ANE/nanbeige41_3b_lut64_auto/hf_dist/ios"
+    ]
   },
   "sandbox": {
     "network": {}

@@ -337,7 +337,9 @@ class Gemma3RotaryEmbedding(nn.Module):
         #inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(TEST_DEVICE) / self.dim))
 
         self.register_buffer("inv_freq", inv_freq)
-        t = torch.arange(max(config.context_length, config.state_length)*2, device=TEST_DEVICE).type_as(self.inv_freq)
+        # ANE tensors dimension size is limited to 16384
+        max_rope_len = min(max(config.context_length, config.state_length) * 2, 16384)
+        t = torch.arange(max_rope_len, device=TEST_DEVICE).type_as(self.inv_freq)
       
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
