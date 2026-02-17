@@ -270,6 +270,47 @@ class SamplingConfig:
     temperature: float
 
 
+class IncrementalTokenPrinter:
+    """Stream decoded text using full-sequence decode + diff.
+
+    This preserves SentencePiece spaces that are often lost when decoding
+    one token at a time.
+    """
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.all_token_ids: List[int] = []
+        self.prev_text: str = ""
+
+    @staticmethod
+    def _suffix_from_prev(prev: str, full: str) -> str:
+        if full.startswith(prev):
+            return full[len(prev) :]
+        # Fallback for tokenizer normalization quirks.
+        i = 0
+        max_i = min(len(prev), len(full))
+        while i < max_i and prev[i] == full[i]:
+            i += 1
+        return full[i:]
+
+    def add_token(self, token_id: int) -> str:
+        self.all_token_ids.append(int(token_id))
+        try:
+            full_text = self.tokenizer.decode(self.all_token_ids, skip_special_tokens=False)
+        except Exception:
+            try:
+                full_text = self.prev_text + self.tokenizer.decode(
+                    [int(token_id)],
+                    skip_special_tokens=False,
+                )
+            except Exception:
+                return ""
+
+        out = self._suffix_from_prev(self.prev_text, full_text)
+        self.prev_text = full_text
+        return out
+
+
 def _resolve_sampling_config(
     *,
     sampling_mode: str,
@@ -1374,6 +1415,7 @@ def main() -> int:
     decode_stats = {rt.context: {"tokens": 0, "time": 0.0} for rt in runtimes}
     transitions: List[Tuple[int, int, int, float, float]] = []
     compactions: List[Tuple[int, int, int, float, float]] = []
+    token_printer = IncrementalTokenPrinter(tokenizer)
 
     if args.live_events:
         _log_line(log_stream, "\n[decode]", flush=True)
@@ -1561,7 +1603,7 @@ def main() -> int:
 
         generated.append(next_token)
         token_history.append(next_token)
-        piece = tokenizer.decode([next_token], skip_special_tokens=False)
+        piece = token_printer.add_token(next_token)
         print(piece, end="", flush=True)
 
         last_token = next_token
