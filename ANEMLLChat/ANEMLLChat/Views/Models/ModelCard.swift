@@ -186,6 +186,7 @@ struct ModelCard: View {
         .contextMenu {
             contextMenuItems
         }
+        #if !os(tvOS)
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             if model.isDownloaded {
                 Button(role: .destructive) {
@@ -213,6 +214,7 @@ struct ModelCard: View {
                 #endif
             }
         }
+        #endif
         .alert("Delete Model", isPresented: $showingDeleteAlert) {
             Button("Cancel", role: .cancel) {}
             Button("Delete", role: .destructive) {
@@ -313,6 +315,8 @@ struct ModelCard: View {
     private var backgroundCircleColor: Color {
         #if os(macOS)
         return Color(NSColor.windowBackgroundColor)
+        #elseif os(tvOS)
+        return Color.white.opacity(0.12)
         #else
         return Color(uiColor: .systemBackground)
         #endif
@@ -539,6 +543,279 @@ struct ModelCard: View {
     }
 }
 
+// MARK: - tvOS Model Card
+
+#if os(tvOS)
+/// TV-optimized model card with individually focusable action buttons
+struct TVModelCard: View {
+    let model: ModelInfo
+    @Environment(ModelManagerViewModel.self) private var modelManager
+
+    @State private var showingDeleteAlert = false
+    @State private var showingModelDetail = false
+    @State private var showingCancelLoadAlert = false
+    @State private var recommendedSampling: RecommendedSampling?
+    @State private var computedLocalSize: String?
+
+    private var isLoaded: Bool {
+        modelManager.loadedModelId == model.id
+    }
+
+    private var hasCompatibilityWarning: Bool {
+        modelManager.getGlobalAttentionWarning(for: model) != nil
+    }
+
+    private var displaySize: String {
+        computedLocalSize ?? model.size
+    }
+
+    private var architectureIcon: String {
+        switch model.architecture?.lowercased() {
+        case "gemma": return "brain"
+        case "llama": return "hare"
+        case "qwen": return "sparkles"
+        case "deepseek": return "waveform.path.ecg"
+        default: return "cpu"
+        }
+    }
+
+    private var statusColor: Color {
+        switch model.status {
+        case .available: return .orange
+        case .downloading: return .yellow
+        case .downloaded: return .green
+        case .error: return .red
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 20) {
+            // Model icon
+            ZStack {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(statusColor.opacity(0.15))
+                    .frame(width: 70, height: 70)
+
+                Image(systemName: architectureIcon)
+                    .font(.title2)
+                    .foregroundStyle(statusColor)
+            }
+
+            // Model info
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Text(model.name)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    if hasCompatibilityWarning {
+                        Label("Not Compatible", systemImage: "xmark.circle.fill")
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.red)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.red.opacity(0.15), in: Capsule())
+                    }
+                }
+
+                Text(model.description)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                // Metadata row
+                HStack(spacing: 10) {
+                    Text(displaySize)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if let context = model.contextLength {
+                        Text("\(context)ctx")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let arch = model.architecture {
+                        Text(arch)
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.2), in: Capsule())
+                    }
+
+                    if let sampling = recommendedSampling {
+                        HStack(spacing: 3) {
+                            Image(systemName: "dice.fill")
+                                .font(.system(size: 10))
+                            Text(String(format: "%.1f", sampling.temperature))
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                        .background(Color.green.opacity(0.15), in: Capsule())
+                    }
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            // Action buttons — each individually focusable
+            tvActionButtons
+        }
+        .padding(20)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .alert("Delete Model", isPresented: $showingDeleteAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                Task { await modelManager.deleteModel(model) }
+            }
+        } message: {
+            Text("Are you sure you want to delete \(model.name)?")
+        }
+        .sheet(isPresented: $showingModelDetail) {
+            ModelDetailView(model: model)
+        }
+        .alert("Stop Loading?", isPresented: $showingCancelLoadAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Stop", role: .destructive) {
+                Task { await modelManager.cancelModelLoading() }
+            }
+        } message: {
+            Text("The model will be unloaded and loading will stop.")
+        }
+        .task {
+            if model.isDownloaded {
+                modelManager.withLinkedModelAccess(for: model) { modelURL in
+                    let metaPath = modelURL.appendingPathComponent("meta.yaml").path
+                    if let metadata = ModelMetadata.load(from: metaPath) {
+                        recommendedSampling = metadata.recommendedSampling
+                    }
+                }
+            }
+            if model.size == "Local" {
+                computedLocalSize = modelManager.formattedModelSize(for: model)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var tvActionButtons: some View {
+        switch model.status {
+        case .available:
+            if model.sourceKind == .huggingFace {
+                HStack(spacing: 10) {
+                    Button {
+                        showingModelDetail = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        Task { await modelManager.downloadModel(model) }
+                    } label: {
+                        Label("Download", systemImage: "arrow.down.circle")
+                            .fontWeight(.medium)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                }
+            } else {
+                HStack(spacing: 10) {
+                    Button {
+                        showingModelDetail = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Label("Missing", systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+            }
+
+        case .downloading:
+            ProgressView()
+
+        case .downloaded:
+            if modelManager.loadingModelId == model.id {
+                HStack(spacing: 10) {
+                    ModelLoadingIndicator()
+                    Button {
+                        showingCancelLoadAlert = true
+                    } label: {
+                        Image(systemName: "stop.circle.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                }
+            } else {
+                HStack(spacing: 10) {
+                    Button {
+                        showingModelDetail = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        showingDeleteAlert = true
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+
+                    Button {
+                        Task { await modelManager.loadModelForInference(model) }
+                    } label: {
+                        Text(isLoaded ? "Loaded" : "Load")
+                            .fontWeight(.medium)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(isLoaded ? .green : .orange)
+                    .disabled(isLoaded)
+                }
+            }
+
+        case .error(_):
+            HStack(spacing: 10) {
+                if model.sourceKind == .huggingFace {
+                    Button {
+                        showingModelDetail = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        Task { await modelManager.downloadModel(model) }
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.orange)
+                } else {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+    }
+}
+#endif
+
 #Preview {
     List {
         ModelCard(model: ModelInfo(
@@ -749,13 +1026,33 @@ struct ModelDetailView: View {
                     if let path = model.localPath {
                         storageCard(path: path)
                     }
+
+                    #if os(tvOS)
+                    // Close button at bottom for tvOS (focusable)
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label("Close", systemImage: "xmark.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.top, 12)
+                    #endif
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 24)
+                #if os(tvOS)
+                .padding(.horizontal, 28)
+                .padding(.bottom, 40)
+                #endif
             }
         }
+        #if os(tvOS)
+        .scrollClipDisabled()
+        .onExitCommand { dismiss() }
+        #endif
         .background(Color(white: 0.08))
         .overlay(alignment: .topTrailing) {
+            #if !os(tvOS)
             Button {
                 dismiss()
             } label: {
@@ -765,6 +1062,7 @@ struct ModelDetailView: View {
             }
             .buttonStyle(.plain)
             .padding(16)
+            #endif
         }
         .task {
             await loadMetadata()
@@ -1209,6 +1507,10 @@ private struct DetailCard<Content: View>: View {
     let iconColor: Color
     @ViewBuilder let content: Content
 
+    #if os(tvOS)
+    @FocusState private var isFocused: Bool
+    #endif
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             // Header
@@ -1226,7 +1528,22 @@ private struct DetailCard<Content: View>: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
+        #if os(tvOS)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(white: isFocused ? 0.18 : 0.12))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(isFocused ? iconColor.opacity(0.5) : Color.clear, lineWidth: 1.5)
+        )
+        .scaleEffect(isFocused ? 1.02 : 1.0)
+        .animation(.easeOut(duration: 0.15), value: isFocused)
+        .focusable()
+        .focused($isFocused)
+        #else
         .background(Color(white: 0.12), in: RoundedRectangle(cornerRadius: 12))
+        #endif
     }
 }
 

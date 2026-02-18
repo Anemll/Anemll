@@ -78,6 +78,11 @@ actor StorageService {
         fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
 
+    /// Caches directory URL (purgeable by the OS when storage is constrained)
+    private var cachesDirectory: URL {
+        fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+    }
+
     /// App data root directory
     /// - macOS: ~/.cache/anemll
     /// - iOS: app Documents directory
@@ -114,14 +119,24 @@ actor StorageService {
     /// Models directory (for downloaded models)
     /// - macOS: ~/.cache/anemll/Models
     /// - iOS: Documents/Models/ (in app's sandboxed Documents)
+    /// - tvOS: Caches/Models/ (recommended for Apple TV local storage)
     var modelsDirectory: URL {
         #if os(macOS)
         return appDataRootDirectory.appendingPathComponent("Models", isDirectory: true)
+        #elseif os(tvOS)
+        return cachesDirectory.appendingPathComponent("Models", isDirectory: true)
         #else
         // iOS: Store in app's Documents/Models (visible in Files app with UIFileSharingEnabled)
         return documentsDirectory.appendingPathComponent("Models", isDirectory: true)
         #endif
     }
+
+    #if os(tvOS)
+    /// Legacy tvOS location used before switching to Caches/Models.
+    private var legacyTVOSModelsDirectory: URL {
+        documentsDirectory.appendingPathComponent("Models", isDirectory: true)
+    }
+    #endif
 
     /// Ensure directory exists
     private func ensureDirectoryExists(_ url: URL) throws {
@@ -564,11 +579,37 @@ actor StorageService {
 
     // MARK: - Model Files
 
-    /// Get local path for a model
-    func modelPath(for modelId: String) -> URL {
+    private func modelDirectoryName(for modelId: String) -> String {
         // Trim whitespace to prevent path issues from malformed model IDs
         let cleanId = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
-        return modelsDirectory.appendingPathComponent(cleanId.replacingOccurrences(of: "/", with: "_"))
+        return cleanId.replacingOccurrences(of: "/", with: "_")
+    }
+
+    /// Get local path for a model
+    func modelPath(for modelId: String) -> URL {
+        let folderName = modelDirectoryName(for: modelId)
+        let preferred = modelsDirectory.appendingPathComponent(folderName, isDirectory: true)
+
+        #if os(tvOS)
+        // Compatibility path for models already downloaded to Documents/Models by older builds.
+        if fileManager.fileExists(atPath: preferred.path) {
+            return preferred
+        }
+
+        let legacy = legacyTVOSModelsDirectory.appendingPathComponent(folderName, isDirectory: true)
+        if fileManager.fileExists(atPath: legacy.path) {
+            return legacy
+        }
+        #endif
+
+        return preferred
+    }
+
+    /// Get writable destination path for a model import/download.
+    /// On tvOS this always points to Caches/Models to avoid sandbox write restrictions.
+    func writableModelPath(for modelId: String) -> URL {
+        let folderName = modelDirectoryName(for: modelId)
+        return modelsDirectory.appendingPathComponent(folderName, isDirectory: true)
     }
 
     /// Check if a model is downloaded
@@ -583,7 +624,7 @@ actor StorageService {
     func importModelDirectory(from sourceURL: URL, toModelId modelId: String) async throws -> URL {
         try ensureDirectoryExists(modelsDirectory)
 
-        let destinationURL = modelPath(for: modelId)
+        let destinationURL = writableModelPath(for: modelId)
         let stagingURL = modelsDirectory.appendingPathComponent(".import-\(UUID().uuidString)", isDirectory: true)
 
         do {
@@ -610,29 +651,51 @@ actor StorageService {
 
     /// Delete a downloaded model
     func deleteModel(_ modelId: String) async throws {
-        let modelDir = modelPath(for: modelId)
+        let resolvedPath = modelPath(for: modelId)
+        let writablePath = writableModelPath(for: modelId)
+
+        var targets: [URL] = [resolvedPath]
+        if writablePath.path != resolvedPath.path {
+            targets.append(writablePath)
+        }
 
         logDebug("[DELETE] Model ID: '\(modelId)'", category: .storage)
-        logDebug("[DELETE] Computed path: \(modelDir.path)", category: .storage)
-        logDebug("[DELETE] File exists: \(fileManager.fileExists(atPath: modelDir.path))", category: .storage)
 
-        if fileManager.fileExists(atPath: modelDir.path) {
-            do {
-                try fileManager.removeItem(at: modelDir)
+        var firstFailure: Error?
+        for target in targets {
+            logDebug("[DELETE] Computed path: \(target.path)", category: .storage)
+            logDebug("[DELETE] File exists: \(fileManager.fileExists(atPath: target.path))", category: .storage)
 
-                // Verify deletion actually succeeded
-                if fileManager.fileExists(atPath: modelDir.path) {
-                    logError("[DELETE] FAILED - Directory still exists after removeItem!", category: .storage)
-                    throw StorageError.fileWriteFailed(NSError(domain: "StorageService", code: 1, userInfo: [NSLocalizedDescriptionKey: "Directory still exists after deletion"]))
-                }
-
-                logInfo("[DELETE] Successfully deleted model: \(modelId)", category: .storage)
-            } catch {
-                logError("[DELETE] removeItem failed: \(error)", category: .storage)
-                throw StorageError.fileWriteFailed(error)
+            guard fileManager.fileExists(atPath: target.path) else {
+                logWarning("[DELETE] Directory not found at path: \(target.path)", category: .storage)
+                continue
             }
-        } else {
-            logWarning("[DELETE] Directory not found at path: \(modelDir.path)", category: .storage)
+
+            do {
+                try fileManager.removeItem(at: target)
+                if fileManager.fileExists(atPath: target.path) {
+                    let stillExistsError = NSError(
+                        domain: "StorageService",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Directory still exists after deletion"]
+                    )
+                    logError("[DELETE] FAILED - Directory still exists after removeItem: \(target.path)", category: .storage)
+                    if firstFailure == nil {
+                        firstFailure = stillExistsError
+                    }
+                } else {
+                    logInfo("[DELETE] Successfully deleted model path: \(target.path)", category: .storage)
+                }
+            } catch {
+                logError("[DELETE] removeItem failed at \(target.path): \(error)", category: .storage)
+                if firstFailure == nil {
+                    firstFailure = error
+                }
+            }
+        }
+
+        if let firstFailure {
+            throw StorageError.fileWriteFailed(firstFailure)
         }
     }
 
@@ -685,7 +748,18 @@ actor StorageService {
         return false
         #endif
     }()
-    static let defaultShowMicrophoneValue: Bool = true  // Show microphone button by default
+    static let defaultShowMicrophoneValue: Bool = {
+        #if os(tvOS)
+        return false
+        #else
+        return true
+        #endif
+    }()
+    #if os(macOS) || os(tvOS)
+    static let defaultOpenAICompatibleServerEnabledValue: Bool = false
+    static let defaultOpenAICompatibleServerBindModeValue: OpenAICompatibleServerBindMode = .localhost
+    static let defaultOpenAICompatibleServerPortValue: Int = 8080
+    #endif
 
     // Sampling defaults
     static let defaultDoSampleValue: Bool = false  // Default: greedy (temperature=0)
@@ -774,6 +848,47 @@ actor StorageService {
         UserDefaults.standard.set(value, forKey: "showMicrophone")
     }
 
+    #if os(macOS) || os(tvOS)
+    var openAICompatibleServerEnabled: Bool {
+        UserDefaults.standard.object(forKey: "openAICompatibleServerEnabled") as? Bool
+        ?? Self.defaultOpenAICompatibleServerEnabledValue
+    }
+
+    func saveOpenAICompatibleServerEnabled(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "openAICompatibleServerEnabled")
+    }
+
+    var openAICompatibleServerBindMode: OpenAICompatibleServerBindMode {
+        if let raw = UserDefaults.standard.string(forKey: "openAICompatibleServerBindMode"),
+           let mode = OpenAICompatibleServerBindMode(rawValue: raw) {
+            return mode
+        }
+        return Self.defaultOpenAICompatibleServerBindModeValue
+    }
+
+    func saveOpenAICompatibleServerBindMode(_ value: OpenAICompatibleServerBindMode) {
+        UserDefaults.standard.set(value.rawValue, forKey: "openAICompatibleServerBindMode")
+    }
+
+    var openAICompatibleServerPort: Int {
+        let stored = UserDefaults.standard.object(forKey: "openAICompatibleServerPort") as? Int
+        let value = stored ?? Self.defaultOpenAICompatibleServerPortValue
+        return Self.normalizedOpenAICompatibleServerPort(value)
+    }
+
+    func saveOpenAICompatibleServerPort(_ value: Int) {
+        let normalized = Self.normalizedOpenAICompatibleServerPort(value)
+        UserDefaults.standard.set(normalized, forKey: "openAICompatibleServerPort")
+    }
+
+    private static func normalizedOpenAICompatibleServerPort(_ value: Int) -> Int {
+        guard (1...65_535).contains(value) else {
+            return Self.defaultOpenAICompatibleServerPortValue
+        }
+        return value
+    }
+    #endif
+
     // MARK: - Sampling Settings
 
     var doSample: Bool {
@@ -845,6 +960,11 @@ actor StorageService {
         UserDefaults.standard.set(Self.defaultTopPValue, forKey: "topP")
         UserDefaults.standard.set(Self.defaultTopKValue, forKey: "topK")
         UserDefaults.standard.set(Self.defaultUseRecommendedSamplingValue, forKey: "useRecommendedSampling")
+        #if os(macOS) || os(tvOS)
+        UserDefaults.standard.set(Self.defaultOpenAICompatibleServerEnabledValue, forKey: "openAICompatibleServerEnabled")
+        UserDefaults.standard.set(Self.defaultOpenAICompatibleServerBindModeValue.rawValue, forKey: "openAICompatibleServerBindMode")
+        UserDefaults.standard.set(Self.defaultOpenAICompatibleServerPortValue, forKey: "openAICompatibleServerPort")
+        #endif
         logInfo("Settings reset to defaults", category: .storage)
     }
 }

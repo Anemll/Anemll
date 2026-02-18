@@ -14,18 +14,27 @@ struct ContentView: View {
     @Environment(ChatViewModel.self) private var chatVM
     @Environment(ModelManagerViewModel.self) private var modelManager
 
-    // Start with sidebar collapsed (detailOnly) on macOS
-    @State private var columnVisibility: NavigationSplitViewVisibility = .detailOnly
+    // Start with sidebar collapsed on macOS; keep it visible on tvOS
+    @State private var columnVisibility: NavigationSplitViewVisibility = {
+        #if os(macOS)
+        return .detailOnly
+        #else
+        return .all
+        #endif
+    }()
     @State private var showingModelSheet = false
     @State private var showingSettings = false
     @State private var showingConversationSheet = false
     @State private var hasCheckedInitialState = false
     @State private var showingClearAllAlert = false
+    @State private var tvShowsSidebar = true
     @AppStorage("largeControls") private var largeControls = StorageService.defaultLargeControlsValue
 
     var body: some View {
         #if os(iOS)
         iosRoot
+        #elseif os(tvOS)
+        tvRoot
         #else
         macRoot
         #endif
@@ -53,7 +62,7 @@ struct ContentView: View {
                     .environment(chatVM)
             }
         }
-        .onChange(of: modelManager.lastImportedPackageModelId) { importedModelId in
+        .onChange(of: modelManager.lastImportedPackageModelId) { _, importedModelId in
             guard importedModelId != nil else { return }
             showingModelSheet = true
             modelManager.lastImportedPackageModelId = nil
@@ -116,6 +125,346 @@ struct ContentView: View {
             if modelManager.downloadedModels.isEmpty && !modelManager.isLoadingModel {
                 showingModelSheet = true
             }
+        }
+    }
+    #elseif os(tvOS)
+    private var tvRoot: some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(red: 0.04, green: 0.05, blue: 0.06),
+                    Color(red: 0.02, green: 0.02, blue: 0.03)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            HStack(spacing: 0) {
+                if tvShowsSidebar {
+                    tvSidebar
+                        .frame(width: 360)
+                        .focusSection()
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                }
+
+                tvDetail
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .focusSection()
+                    // Intercept Menu/Back button:
+                    // Always toggle sidebar — do NOT cancel inference.
+                    // User can stop generation with the Stop button in InputBar.
+                    .onExitCommand {
+                        if !tvShowsSidebar {
+                            withAnimation(.easeInOut(duration: 0.22)) {
+                                tvShowsSidebar = true
+                            }
+                        }
+                    }
+            }
+            .animation(.easeInOut(duration: 0.22), value: tvShowsSidebar)
+        }
+        .fullScreenCover(isPresented: $showingModelSheet) {
+            TVFullscreenDialog(showsCloseButton: false) {
+                ModelListView()
+                    .environment(modelManager)
+                    .environment(chatVM)
+            }
+        }
+        .fullScreenCover(isPresented: $showingConversationSheet) {
+            TVConversationDialog {
+                showTVDetail()
+            }
+                .environment(chatVM)
+        }
+        .fullScreenCover(isPresented: $showingSettings) {
+            TVFullscreenDialog(showsCloseButton: false) {
+                SettingsView()
+                    .environment(chatVM)
+                    #if os(tvOS)
+                    .environment(modelManager)
+                    #endif
+            }
+        }
+        .onChange(of: modelManager.lastImportedPackageModelId) { _, importedModelId in
+            guard importedModelId != nil else { return }
+            showingModelSheet = true
+            modelManager.lastImportedPackageModelId = nil
+        }
+        .onChange(of: modelManager.requestModelSelection) { _, requested in
+            guard requested else { return }
+            showingModelSheet = true
+            modelManager.requestModelSelection = false
+        }
+        .overlay {
+            if modelManager.isImportingIncomingPackage {
+                ZStack {
+                    Color.black.opacity(0.4)
+                        .ignoresSafeArea()
+                    Rectangle()
+                        .fill(.thickMaterial)
+                        .opacity(0.85)
+                        .ignoresSafeArea()
+                    VStack(spacing: 16) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text(modelManager.incomingTransferStatusMessage ?? "Importing model...")
+                            .font(.headline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(32)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .shadow(color: .black.opacity(0.3), radius: 20, y: 10)
+                    .padding(.horizontal, 40)
+                }
+                .transition(.opacity)
+                .allowsHitTesting(false)
+            }
+        }
+        .toast(Binding(
+            get: {
+                modelManager.isImportingIncomingPackage ? nil : modelManager.incomingTransferStatusMessage
+            },
+            set: { modelManager.incomingTransferStatusMessage = $0 }
+        ), type: .info, duration: 4)
+        .task {
+            guard !hasCheckedInitialState else { return }
+            hasCheckedInitialState = true
+
+            let hasSelectedModelBefore = await StorageService.shared.selectedModelId != nil
+            if hasSelectedModelBefore {
+                return
+            }
+
+            try? await Task.sleep(for: .milliseconds(500))
+
+            if modelManager.downloadedModels.isEmpty && !modelManager.isLoadingModel {
+                showingModelSheet = true
+            }
+        }
+        .onChange(of: chatVM.currentConversation?.id) { _, conversationId in
+            guard conversationId != nil else { return }
+            showTVDetail()
+        }
+    }
+
+    private var tvSidebar: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            // Title with stylish font
+            Text("ANEMLL Chat")
+                .font(.system(size: 32, weight: .bold, design: .rounded))
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [.white, .white.opacity(0.7)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .padding(.bottom, 4)
+
+            // All buttons uniform width
+            VStack(spacing: 14) {
+                Button {
+                    startTVNewChat()
+                } label: {
+                    Label("New Chat", systemImage: "plus.bubble")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                Button {
+                    showingModelSheet = true
+                } label: {
+                    Label(loadedModelName ?? "Select Model", systemImage: "cpu")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+
+                Button {
+                    showingConversationSheet = true
+                } label: {
+                    Label("Chats", systemImage: "text.bubble")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+
+                Button {
+                    showingSettings = true
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+            }
+
+            if !chatVM.conversations.isEmpty {
+                Divider()
+                    .overlay(Color.white.opacity(0.12))
+                    .padding(.vertical, 2)
+                Text("\(chatVM.conversations.count) saved chats")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 0)
+
+            // App icon at bottom
+            Image("AppIcon")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 48, height: 48)
+                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .opacity(0.7)
+                .padding(.bottom, 4)
+        }
+        .padding(.horizontal, 28)
+        .padding(.vertical, 28)
+        .background(
+            ZStack {
+                LinearGradient(
+                    colors: [
+                        Color.black.opacity(0.42),
+                        Color.black.opacity(0.28)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                // Glass-like subtle inner glow
+                RoundedRectangle(cornerRadius: 0)
+                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
+            }
+        )
+    }
+
+    private var tvDetail: some View {
+        VStack(spacing: 0) {
+            tvTopBar
+                .focusSection()
+            tvModelStatusPanel
+            ChatView()
+                .environment(chatVM)
+                .environment(modelManager)
+        }
+    }
+
+    private var tvTopBar: some View {
+        HStack(spacing: 14) {
+            Button {
+                toggleTVSidebar()
+            } label: {
+                Label(tvShowsSidebar ? "Hide Menu" : "Menu", systemImage: "sidebar.leading")
+            }
+            .buttonStyle(.bordered)
+
+            Spacer()
+
+            if let loadedModelName {
+                Label(loadedModelName, systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .font(.subheadline)
+            } else if modelManager.isLoadingModel {
+                // Show a brief loading indicator instead of "No model loaded"
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text(modelManager.loadingModelName ?? "Loading...")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Label("No model loaded", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .font(.subheadline)
+            }
+
+            if modelManager.downloadingModelId != nil {
+                Label("Downloading", systemImage: "arrow.down.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+    }
+
+    private var tvModelStatusPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Model loading progress is shown by the centered gauge in ChatView,
+            // so skip the duplicate top-left panel during loading
+            if modelManager.isLoadingModel {
+                EmptyView()
+            } else if let progress = modelManager.downloadProgress,
+                      modelManager.downloadingModelId != nil {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Label("Downloading model", systemImage: "arrow.down.circle.fill")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Spacer()
+                    Text(progress.progressPercent)
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+
+                ProgressView(value: progress.progress)
+                    .progressViewStyle(.linear)
+
+                Text("\(progress.downloadedString) / \(progress.totalString) • \(progress.speedString)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let error = modelManager.errorMessage,
+                      !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+            } else if modelManager.loadedModelId == nil {
+                HStack(spacing: 10) {
+                    Label("No model loaded", systemImage: "cpu")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Open Models") {
+                        showingModelSheet = true
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(Color.black.opacity(0.22))
+        .overlay(
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1),
+            alignment: .bottom
+        )
+    }
+
+    private func startTVNewChat() {
+        chatVM.newConversation()
+        showTVDetail()
+    }
+
+    private func showTVDetail() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            tvShowsSidebar = false
+        }
+    }
+
+    private func toggleTVSidebar() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            tvShowsSidebar.toggle()
         }
     }
     #else
@@ -201,8 +550,14 @@ struct ContentView: View {
     }
     #endif
 
+    private var loadedModelName: String? {
+        guard let id = modelManager.loadedModelId else { return nil }
+        return modelManager.availableModels.first(where: { $0.id == id })?.name
+    }
+
     // MARK: - Sidebar
 
+    #if !os(tvOS)
     private var sidebar: some View {
         @Bindable var vm = chatVM
 
@@ -280,6 +635,7 @@ struct ContentView: View {
             Text("This will delete all conversations. This action cannot be undone.")
         }
     }
+    #endif
 
     // MARK: - Detail
 
@@ -501,7 +857,11 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
 
             Button {
+                #if os(tvOS)
+                startTVNewChat()
+                #else
                 chatVM.newConversation()
+                #endif
             } label: {
                 Label("New Conversation", systemImage: "plus")
             }
@@ -566,6 +926,135 @@ struct ConversationRow: View {
         .padding(.vertical, 4)
     }
 }
+
+#if os(tvOS)
+private struct TVFullscreenDialog<Content: View>: View {
+    @Environment(\.dismiss) private var dismiss
+    let showsCloseButton: Bool
+    let content: Content
+
+    init(showsCloseButton: Bool = true, @ViewBuilder content: () -> Content) {
+        self.showsCloseButton = showsCloseButton
+        self.content = content()
+    }
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            LinearGradient(
+                colors: [
+                    Color.black.opacity(0.96),
+                    Color(red: 0.06, green: 0.06, blue: 0.08)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if showsCloseButton {
+                Button("Close") {
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .padding(.top, 24)
+                .padding(.trailing, 32)
+            }
+        }
+        // Menu button on remote dismisses fullscreen dialogs
+        .onExitCommand {
+            dismiss()
+        }
+    }
+}
+
+private struct TVConversationDialog: View {
+    @Environment(ChatViewModel.self) private var chatVM
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var showingClearAlert = false
+    let onOpenChat: () -> Void
+
+    var body: some View {
+        TVFullscreenDialog {
+            VStack(spacing: 16) {
+                HStack {
+                    Text("Conversations")
+                        .font(.title2)
+                        .fontWeight(.bold)
+                    Spacer()
+                }
+
+                if chatVM.conversations.isEmpty {
+                    VStack(spacing: 10) {
+                        Image(systemName: "text.bubble")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.secondary)
+                        Text("No conversations yet")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List(chatVM.conversations) { conversation in
+                        Button {
+                            chatVM.selectConversation(conversation)
+                            onOpenChat()
+                            dismiss()
+                        } label: {
+                            ConversationRow(conversation: conversation)
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                chatVM.deleteConversation(conversation)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
+                    }
+                    .listStyle(.plain)
+                }
+
+                HStack(spacing: 12) {
+                    Button {
+                        chatVM.newConversation()
+                        onOpenChat()
+                        dismiss()
+                    } label: {
+                        Label("New Chat", systemImage: "plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+
+                    Button(role: .destructive) {
+                        showingClearAlert = true
+                    } label: {
+                        Label("Clear All", systemImage: "trash")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .disabled(chatVM.conversations.isEmpty)
+
+                    Spacer()
+                }
+            }
+            .padding(.horizontal, 42)
+            .padding(.top, 36)
+            .padding(.bottom, 28)
+        }
+        .alert("Clear All Chats?", isPresented: $showingClearAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Clear All", role: .destructive) {
+                chatVM.clearAllConversations()
+            }
+        } message: {
+            Text("This will delete all conversations. This action cannot be undone.")
+        }
+    }
+}
+#endif
 
 // MARK: - Conversation List Sheet (iOS)
 

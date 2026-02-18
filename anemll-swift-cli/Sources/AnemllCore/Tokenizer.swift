@@ -25,6 +25,14 @@ public final class Tokenizer: @unchecked Sendable {
         print("Using modelURL: \(modelURL.path)")
 
         let fileManager = FileManager.default
+        var tokenizerLoadURL = modelURL
+        var temporaryTokenizerLoadURL: URL?
+        defer {
+            if let temporaryTokenizerLoadURL {
+                try? fileManager.removeItem(at: temporaryTokenizerLoadURL)
+            }
+        }
+
         if let files = try? fileManager.contentsOfDirectory(atPath: modelPath) {
             print("\nFiles in directory:")
             for file in files {
@@ -40,23 +48,39 @@ public final class Tokenizer: @unchecked Sendable {
                 "tokenizer_class": "LlamaTokenizer"
             ]
             let configData = try JSONSerialization.data(withJSONObject: configDict, options: .prettyPrinted)
-            try configData.write(to: configPath)
-            print("Created config.json at: \(configPath.path)")
+            do {
+                try configData.write(to: configPath, options: .atomic)
+                print("Created config.json at: \(configPath.path)")
+            } catch {
+                print("Warning: could not write config.json at model path: \(error.localizedDescription)")
+                do {
+                    let overlayURL = try Self.createTokenizerOverlayDirectory(
+                        sourceModelURL: modelURL,
+                        configData: configData
+                    )
+                    tokenizerLoadURL = overlayURL
+                    temporaryTokenizerLoadURL = overlayURL
+                    print("Using temporary tokenizer overlay: \(overlayURL.path)")
+                } catch {
+                    print("Warning: failed to create tokenizer overlay: \(error.localizedDescription)")
+                }
+            }
         }
 
+        let effectiveConfigPath = tokenizerLoadURL.appendingPathComponent("config.json")
         print("\nChecking specific files:")
-        print("config.json exists: \(fileManager.fileExists(atPath: configPath.path))")
-        print("tokenizer_config.json exists: \(fileManager.fileExists(atPath: modelURL.appendingPathComponent("tokenizer_config.json").path))")
-        print("tokenizer.json exists: \(fileManager.fileExists(atPath: modelURL.appendingPathComponent("tokenizer.json").path))")
+        print("config.json exists: \(fileManager.fileExists(atPath: effectiveConfigPath.path))")
+        print("tokenizer_config.json exists: \(fileManager.fileExists(atPath: tokenizerLoadURL.appendingPathComponent("tokenizer_config.json").path))")
+        print("tokenizer.json exists: \(fileManager.fileExists(atPath: tokenizerLoadURL.appendingPathComponent("tokenizer.json").path))")
 
         print("\nAttempting to load tokenizer...")
         do {
             self.tokenizer = try await AutoTokenizer.from(
-                modelFolder: modelURL
+                modelFolder: tokenizerLoadURL
             )
 
             // Load tokenizer_config.json
-            let tokenizerConfigPath = modelURL.appendingPathComponent("tokenizer_config.json")
+            let tokenizerConfigPath = tokenizerLoadURL.appendingPathComponent("tokenizer_config.json")
             var tokenizerConfig: [String: Any]? = nil  // Declare at this scope level
             
             if fileManager.fileExists(atPath: tokenizerConfigPath.path) {
@@ -86,8 +110,8 @@ public final class Tokenizer: @unchecked Sendable {
 
             // First, try to get eos_token_id from config.json
             var configJson: [String: Any]? = nil
-            if fileManager.fileExists(atPath: configPath.path) {
-                let configData = try Data(contentsOf: configPath)
+            if fileManager.fileExists(atPath: effectiveConfigPath.path) {
+                let configData = try Data(contentsOf: effectiveConfigPath)
                 configJson = try JSONSerialization.jsonObject(with: configData) as? [String: Any]
 
                 // Check for eos_token_id (can be single Int or array of Ints)
@@ -116,7 +140,7 @@ public final class Tokenizer: @unchecked Sendable {
 
             // Try to read token IDs from tokenizer.json added_tokens array
             // This is more reliable than encoding token strings for special tokens
-            let tokenizerJsonPath = modelURL.appendingPathComponent("tokenizer.json")
+            let tokenizerJsonPath = tokenizerLoadURL.appendingPathComponent("tokenizer.json")
             if fileManager.fileExists(atPath: tokenizerJsonPath.path) {
                 do {
                     let tokenizerJsonData = try Data(contentsOf: tokenizerJsonPath)
@@ -322,6 +346,37 @@ public final class Tokenizer: @unchecked Sendable {
             print("✗ Failed to load tokenizer: \(error)")
             throw TokenizerError.initializationFailed("Failed to load tokenizer: \(error)")
         }
+    }
+
+    private static func createTokenizerOverlayDirectory(sourceModelURL: URL, configData: Data) throws -> URL {
+        let fileManager = FileManager.default
+        let overlayURL = fileManager.temporaryDirectory
+            .appendingPathComponent("anemll-tokenizer-overlay-\(UUID().uuidString)", isDirectory: true)
+
+        try fileManager.createDirectory(at: overlayURL, withIntermediateDirectories: true)
+
+        let sourceEntries = try fileManager.contentsOfDirectory(
+            at: sourceModelURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+
+        for entry in sourceEntries {
+            let resourceValues = try entry.resourceValues(forKeys: [.isDirectoryKey])
+            if resourceValues.isDirectory == true {
+                continue
+            }
+
+            let destinationURL = overlayURL.appendingPathComponent(entry.lastPathComponent)
+            try fileManager.copyItem(at: entry, to: destinationURL)
+        }
+
+        let overlayConfigPath = overlayURL.appendingPathComponent("config.json")
+        if !fileManager.fileExists(atPath: overlayConfigPath.path) {
+            try configData.write(to: overlayConfigPath, options: .atomic)
+        }
+
+        return overlayURL
     }
     
     /// Tokenizes the given text into token IDs.

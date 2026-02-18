@@ -23,6 +23,14 @@ struct InputBar: View {
     @AppStorage("largeControls") private var largeControls = StorageService.defaultLargeControlsValue
     @AppStorage("showMicrophone") private var showMicrophone = true
 
+    private var canShowMicrophone: Bool {
+        #if os(tvOS)
+        return false
+        #else
+        return showMicrophone
+        #endif
+    }
+
     private var actionButtonSize: CGFloat {
         #if os(iOS) || os(visionOS)
         return largeControls ? 60 : 30
@@ -75,6 +83,9 @@ struct InputBar: View {
             .padding(.vertical, 12)
             .modifier(InputBarGlassModifier())
             .shadow(color: .black.opacity(0.2), radius: 12, y: 6)
+            #if os(tvOS)
+            .frame(maxHeight: 80)  // Cap total InputBar height on tvOS
+            #endif
 
             // Toast overlay - appears above input bar
             if showLoadingToast {
@@ -154,7 +165,7 @@ struct InputBar: View {
 
     @ViewBuilder
     private var textFieldWithOptionalMic: some View {
-        if showMicrophone {
+        if canShowMicrophone {
             HStack(spacing: 8) {
                 textField
                 microphoneButton
@@ -169,6 +180,27 @@ struct InputBar: View {
     private var textField: some View {
         @Bindable var vm = chatVM
 
+        #if os(tvOS)
+        // tvOS: single-line TextField with fixed height to prevent focus engine scaling
+        return TextField("Message...", text: $vm.inputText)
+            .textFieldStyle(.plain)
+            .focused($isFocused)
+            .disabled(chatVM.isGenerating)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(inputFieldBackground)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(inputFieldBorder, lineWidth: 1)
+            )
+            .frame(maxHeight: 56)
+            .onSubmit {
+                sendMessage()
+            }
+        #else
         return TextField("Message...", text: $vm.inputText, axis: .vertical)
             .textFieldStyle(.plain)
             .lineLimit(1...6)
@@ -195,6 +227,7 @@ struct InputBar: View {
                 sendMessage()
                 return .handled
             }
+        #endif
     }
 
     // MARK: - Microphone Button
@@ -247,9 +280,15 @@ struct InputBar: View {
                     .frame(width: actionButtonSize, height: actionButtonSize)
             }
         }
+        #if os(tvOS)
+        .buttonStyle(.card)
+        #else
         .buttonStyle(.plain)
+        #endif
         .disabled(!canSend && !chatVM.isGenerating)
+        #if !os(tvOS)
         .keyboardShortcut(.return, modifiers: .command)
+        #endif
         .help(chatVM.isGenerating ? "Stop generation" : "Send message (⌘ Return)")
     }
 
@@ -317,15 +356,15 @@ struct InputBar: View {
 
 // MARK: - Platform Colors
 
-#if os(iOS)
-private let inputFieldBackground = Color.white.opacity(0.08)
-private let inputFieldBorder = Color.white.opacity(0.12)
-private let inputBarBorder = Color.white.opacity(0.12)
-#else
+#if os(macOS)
 private let platformTertiaryBackground = NSColor.textBackgroundColor
 private let inputFieldBackground = Color(platformTertiaryBackground)
 private let inputFieldBorder = Color.secondary.opacity(0.3)
 private let inputBarBorder = Color.secondary.opacity(0.2)
+#else
+private let inputFieldBackground = Color.white.opacity(0.08)
+private let inputFieldBorder = Color.white.opacity(0.12)
+private let inputBarBorder = Color.white.opacity(0.12)
 #endif
 
 // actionButtonSize moved to InputBar as computed property for largeControls support

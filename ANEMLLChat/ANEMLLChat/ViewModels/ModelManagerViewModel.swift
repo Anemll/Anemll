@@ -9,7 +9,7 @@ import Foundation
 import SwiftUI
 import Observation
 import CryptoKit
-#if os(iOS)
+#if os(iOS) || os(tvOS)
 import UIKit
 #elseif os(macOS)
 import AppKit
@@ -21,6 +21,7 @@ import AppKit
 enum DeviceType {
     case mac
     case macCatalyst
+    case appleTV
     case iPad
     case iPhone
     case visionPro
@@ -31,6 +32,8 @@ enum DeviceType {
         return .mac
         #elseif targetEnvironment(macCatalyst)
         return .macCatalyst
+        #elseif os(tvOS)
+        return .appleTV
         #elseif os(visionOS)
         return .visionPro
         #else
@@ -106,7 +109,7 @@ enum DeviceType {
             return true
         case .iPad:
             return !hasMSeriesChip
-        case .mac, .macCatalyst, .visionPro:
+        case .mac, .macCatalyst, .visionPro, .appleTV:
             return false
         case .other:
             return true
@@ -200,6 +203,8 @@ enum DeviceType {
         let os = ProcessInfo.processInfo.operatingSystemVersion
         #if os(macOS)
         return "macOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
+        #elseif os(tvOS)
+        return "tvOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
         #elseif os(visionOS)
         return "visionOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
         #else
@@ -323,6 +328,29 @@ enum DeviceType {
                 return "Apple M5"
             default:
                 return parsed.major > 15 ? "Apple M-series (new)" : "Apple M2"
+            }
+        }
+
+        // MARK: Apple TV
+        // AppleTV14,1 = Apple TV 4K 3rd gen (A15), AppleTV11,1 = 4K 2nd gen (A12)
+        // AppleTV6,2 = 4K 1st gen (A10X), AppleTV5,3 = HD (A8)
+        if id.hasPrefix("AppleTV"),
+           let parsed = parseDeviceIdentifier(id, prefix: "AppleTV") {
+            switch parsed.major {
+            case 14:
+                return "Apple A15"
+            case 11:
+                return "Apple A12"
+            case 6:
+                return "Apple A10X Fusion"
+            case 5:
+                return "Apple A8"
+            case 3:
+                return "Apple A5"
+            case 2:
+                return "Apple A4"
+            default:
+                return parsed.major > 14 ? "Apple A-series (new)" : "Apple A-series"
             }
         }
 
@@ -509,7 +537,14 @@ final class ModelManagerViewModel {
     // MARK: - Model Loading
 
     /// HuggingFace collection URL for dynamic model list
-    private static let collectionURL = URL(string: "https://huggingface.co/api/collections/anemll/anemll-chat")!
+    private static let collectionURL: URL = {
+        #if os(tvOS)
+        // Apple TV uses a curated collection of models verified to work on tvOS
+        return URL(string: "https://huggingface.co/api/collections/anemll/appletv")!
+        #else
+        return URL(string: "https://huggingface.co/api/collections/anemll/anemll-chat")!
+        #endif
+    }()
 
     /// Load model list: try HF collection → cache → hardcoded defaults, then merge custom models
     func loadModels() async {

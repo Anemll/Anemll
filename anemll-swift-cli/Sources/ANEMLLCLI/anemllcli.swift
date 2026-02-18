@@ -182,6 +182,15 @@ struct AnemllCLI: AsyncParsableCommand {
     // Add flag for detailed loading progress
     @Flag(name: .long, help: "Show detailed model loading progress")
     var showLoadingProgress = false
+
+    @Flag(name: .long, help: "Run an OpenAI-compatible HTTP server")
+    var serve = false
+
+    @Option(name: .customLong("serve-bind"), help: "Server bind mode: localhost or lan")
+    var serveBind: String = "localhost"
+
+    @Option(name: .customLong("serve-port"), help: "Server port")
+    var servePort: Int = 8080
     
     // Update thinking prompt to use actual tokens
     private static let THINKING_PROMPT = """
@@ -372,6 +381,30 @@ struct AnemllCLI: AsyncParsableCommand {
             vocabSize: config.vocabSize,
             lmHeadChunkSizes: config.lmHeadChunkSizes
         )
+
+        if serve {
+            let bindMode = try CLIServerBindMode(parsing: serveBind)
+            let fallbackModelID = URL(fileURLWithPath: meta)
+                .deletingLastPathComponent()
+                .lastPathComponent
+            let servedModelID = config.modelPrefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? fallbackModelID
+                : config.modelPrefix
+
+            let server = CLIOpenAICompatibleServer(
+                inferenceManager: inferenceManager,
+                tokenizer: tokenizer,
+                defaultTemperature: temperature,
+                defaultMaxTokens: effectiveMaxTokens,
+                modelID: servedModelID,
+                defaultSystemPrompt: system,
+                addGenerationPrompt: !noGenerationPrompt
+            )
+
+            try server.start(bindMode: bindMode, port: servePort)
+            print("Press Ctrl+C to stop.")
+            dispatchMain()
+        }
         
         if let prompt = prompt {
             // Initialize token printer

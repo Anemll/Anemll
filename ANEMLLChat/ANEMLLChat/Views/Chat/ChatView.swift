@@ -6,10 +6,10 @@
 //
 
 import SwiftUI
-#if os(iOS)
-import UIKit
-#elseif os(macOS)
+#if os(macOS)
 import AppKit
+#else
+import UIKit
 #endif
 
 struct ChatView: View {
@@ -42,6 +42,11 @@ struct ChatView: View {
     @State private var generationExtraPad: CGFloat = 0
     @State private var chevronBuffer = ChevronBuffer()
     @State private var cachedVisibleMessages: [ChatMessage] = []  // Cache to prevent repeated filtering
+    #if os(tvOS)
+    @State private var tvScrollTarget: AnyHashable = "bottom"
+    @State private var tvScrollTimer: Timer?
+    @FocusState private var tvFocusedSection: TVFocusZone?
+    #endif
 
     private let autoScrollInterval: TimeInterval = 0.07
     private let bottomVisibilityPadding: CGFloat = 12
@@ -59,15 +64,19 @@ struct ChatView: View {
     }
 
     private var contentBottomPadding: CGFloat {
-        max(24, inputAccessoryHeight + 48)  // Padding to keep content above input box with some clearance
+        #if os(tvOS)
+        return 24  // InputBar is in its own VStack row, not overlaid
+        #else
+        return max(24, inputAccessoryHeight + 48)  // Padding to keep content above input box with some clearance
+        #endif
     }
 
     private var typingPeekHeight: CGFloat {
-        #if os(iOS)
-        UIFont.preferredFont(forTextStyle: .body).lineHeight
-        #else
+        #if os(macOS)
         let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
         return font.ascender - font.descender + font.leading
+        #else
+        return UIFont.preferredFont(forTextStyle: .body).lineHeight
         #endif
     }
 
@@ -76,11 +85,19 @@ struct ChatView: View {
     }
 
     private var scrollButtonBottomPadding: CGFloat {
-        max(24, inputAccessoryHeight + 12)
+        #if os(tvOS)
+        return 24
+        #else
+        return max(24, inputAccessoryHeight + 12)
+        #endif
     }
-    
+
     private var bottomScrimHeight: CGFloat {
-        max(48, inputAccessoryHeight + bottomScrimExtra)
+        #if os(tvOS)
+        return 32
+        #else
+        return max(48, inputAccessoryHeight + bottomScrimExtra)
+        #endif
     }
 
     private var loadingGaugeBottomSpacing: CGFloat {
@@ -100,78 +117,7 @@ struct ChatView: View {
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            // Messages
-            messagesView
-
-            // Centered prompt when no model is loaded and not loading
-            // Wait for initial startup (model list + auto-load) to finish before showing
-            if modelManager.hasCompletedInitialLoad && modelManager.loadedModelId == nil && !modelManager.isLoadingModel {
-                VStack(spacing: 16) {
-                    Image(systemName: modelManager.errorMessage != nil ? "exclamationmark.triangle" : "cpu")
-                        .font(.system(size: 40))
-                        .foregroundStyle(modelManager.errorMessage != nil ? .red : .secondary)
-
-                    if let error = modelManager.errorMessage {
-                        Text("Model loading failed")
-                            .font(.headline)
-                            .foregroundStyle(.primary)
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 32)
-                    }
-
-                    Button {
-                        modelManager.requestModelSelection = true
-                    } label: {
-                        Label("Download or Select Model", systemImage: "arrow.down.circle")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .allowsHitTesting(true)
-            }
-
-            if let progress = modelManager.loadingProgress, modelManager.isLoadingModel {
-                // Full-screen frosted glass overlay to dim text behind
-                ZStack(alignment: .center) {
-                    // Dark tint layer for better contrast
-                    Color.black.opacity(0.5)
-                        .ignoresSafeArea()
-
-                    // Frosted glass effect on top
-                    Rectangle()
-                        .fill(.thickMaterial)
-                        .opacity(0.9)
-                        .ignoresSafeArea()
-
-                    // Centered loading gauge
-                    ModelLoadingGauge(progress: progress, modelName: modelManager.loadingModelName)
-                        .fixedSize()  // Prevent gauge from expanding to fill space
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .transition(.opacity)
-                .allowsHitTesting(false)
-            }
-
-            VStack(spacing: 8) {
-                // Input bar
-                InputBar()
-                    .environment(chatVM)
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 8)
-            .background(
-                GeometryReader { geometry in
-                    Color.clear.preference(key: InputAccessoryHeightPreferenceKey.self, value: geometry.size.height)
-                }
-            )
-
-            scrollToBottomOverlay
-        }
+        chatLayout
         .navigationTitle(chatVM.currentConversation?.title ?? "Chat")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -222,6 +168,9 @@ struct ChatView: View {
                 userInteractedDuringGeneration = false
                 setScrollMode(.manual)
                 generationExtraPad = wasAtBottomBeforeSend ? generationExtraPadMax : 0
+                #if os(tvOS)
+                tvScrollTarget = "bottom"
+                #endif
 
                 // If user was at bottom, keep focus near the latest message.
                 if wasAtBottomBeforeSend {
@@ -248,6 +197,15 @@ struct ChatView: View {
                         }
                     }
                 }
+
+                #if os(tvOS)
+                // When generation stops, move focus to chevrons so user can scroll
+                // (avoids being stuck on the now-changed Send/Stop button)
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(200))
+                    tvFocusedSection = .chevrons
+                }
+                #endif
             }
         }
         // Auto-scroll during streaming when in follow mode (user clicked chevron)
@@ -273,10 +231,141 @@ struct ChatView: View {
         }
     }
 
+    // MARK: - Chat Layout
+
+    @ViewBuilder
+    private var chatLayout: some View {
+        #if os(tvOS)
+        // tvOS: Chat area + chevron row + input bar in vertical stack.
+        // Each focusable area is its own .focusSection() so the Siri Remote
+        // navigates: Menu ↕ Chevrons ↕ Input bar (no skipping).
+        VStack(spacing: 0) {
+            // Chat messages area
+            ZStack(alignment: .bottom) {
+                messagesView
+
+                if modelManager.hasCompletedInitialLoad && modelManager.loadedModelId == nil && !modelManager.isLoadingModel {
+                    noModelPrompt
+                }
+
+                if let progress = modelManager.loadingProgress, modelManager.isLoadingModel {
+                    loadingOverlay(progress: progress)
+                }
+            }
+
+            // Scroll chevron row — Down first (more commonly used), then Up
+            // Tap = ~4 lines scroll, long-press = fast continuous scroll
+            HStack(spacing: 40) {
+                TVScrollChevron(direction: .down, action: {
+                    tvScrollStep(down: true)
+                }, longPressAction: {
+                    tvScrollByOffset(180)
+                })
+                TVScrollChevron(direction: .up, action: {
+                    tvScrollStep(down: false)
+                }, longPressAction: {
+                    tvScrollByOffset(-180)
+                })
+            }
+            .padding(.vertical, 6)
+            .focused($tvFocusedSection, equals: .chevrons)
+            .focusSection()
+
+            // Input bar — own focus section
+            InputBar()
+                .environment(chatVM)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+                .focused($tvFocusedSection, equals: .inputBar)
+                .focusSection()
+        }
+        #else
+        // Default: ZStack overlay layout (InputBar floats over messages)
+        ZStack(alignment: .bottom) {
+            messagesView
+
+            // Centered prompt when no model is loaded and not loading
+            if modelManager.hasCompletedInitialLoad && modelManager.loadedModelId == nil && !modelManager.isLoadingModel {
+                noModelPrompt
+            }
+
+            if let progress = modelManager.loadingProgress, modelManager.isLoadingModel {
+                loadingOverlay(progress: progress)
+            }
+
+            VStack(spacing: 8) {
+                InputBar()
+                    .environment(chatVM)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+            .background(
+                GeometryReader { geometry in
+                    Color.clear.preference(key: InputAccessoryHeightPreferenceKey.self, value: geometry.size.height)
+                }
+            )
+
+            scrollToBottomOverlay
+        }
+        #endif
+    }
+
+    @ViewBuilder
+    private var noModelPrompt: some View {
+        VStack(spacing: 16) {
+            Image(systemName: modelManager.errorMessage != nil ? "exclamationmark.triangle" : "cpu")
+                .font(.system(size: 40))
+                .foregroundStyle(modelManager.errorMessage != nil ? .red : .secondary)
+
+            if let error = modelManager.errorMessage {
+                Text("Model loading failed")
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+            }
+
+            Button {
+                modelManager.requestModelSelection = true
+            } label: {
+                Label("Download or Select Model", systemImage: "arrow.down.circle")
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(true)
+    }
+
+    @ViewBuilder
+    private func loadingOverlay(progress: ModelLoadingProgress) -> some View {
+        // Full-screen frosted glass overlay to dim text behind
+        ZStack(alignment: .center) {
+            Color.black.opacity(0.5)
+                .ignoresSafeArea()
+            Rectangle()
+                .fill(.thickMaterial)
+                .opacity(0.9)
+                .ignoresSafeArea()
+            ModelLoadingGauge(progress: progress, modelName: modelManager.loadingModelName)
+                .fixedSize()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .transition(.opacity)
+        .allowsHitTesting(false)
+    }
+
     // MARK: - Scroll To Bottom Overlay
 
     @ViewBuilder
     private var scrollToBottomOverlay: some View {
+        #if os(tvOS)
+        // tvOS: chevron is handled as a separate focusable row in chatLayout
+        EmptyView()
+        #else
         // Scroll to bottom button (centered horizontally, above input bar)
         // Use opacity + animation instead of if/else for smooth fade
         Button {
@@ -311,6 +400,7 @@ struct ChatView: View {
         .opacity(showScrollToBottom ? 1 : 0)
         .animation(.easeInOut(duration: 0.25), value: showScrollToBottom)
         .allowsHitTesting(showScrollToBottom)  // Only clickable when visible
+        #endif
     }
 
     // MARK: - Messages View
@@ -532,7 +622,7 @@ struct ChatView: View {
         FlameDots(isActive: chatVM.isGenerating, size: 6, spacing: 4)
         .padding(.horizontal)
         .padding(.vertical, 8)
-        .background(Color(platformSecondaryBackground), in: Capsule())
+        .background(platformSecondaryBackground, in: Capsule())
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -843,6 +933,54 @@ struct ChatView: View {
         }
     }
 
+    #if os(tvOS)
+    /// Scroll chat by a fixed pixel offset (~4 lines per tap).
+    /// Finds the UIScrollView backing the SwiftUI ScrollView and adjusts contentOffset.
+    private func tvScrollStep(down: Bool) {
+        let lineHeight: CGFloat = 22  // approximate line height
+        let linesToScroll: CGFloat = 4
+        let offset = lineHeight * linesToScroll * (down ? 1 : -1)
+        tvScrollByOffset(offset)
+    }
+
+    /// Scroll the chat's underlying UIScrollView by a pixel offset.
+    private func tvScrollByOffset(_ dy: CGFloat) {
+        guard let scrollView = tvFindScrollView() else { return }
+        var newOffset = scrollView.contentOffset
+        newOffset.y += dy
+        // Clamp to valid range
+        let maxY = max(0, scrollView.contentSize.height - scrollView.bounds.height + scrollView.contentInset.bottom)
+        newOffset.y = min(max(-scrollView.contentInset.top, newOffset.y), maxY)
+        beginProgrammaticScroll(durationMs: 200)
+        UIView.animate(withDuration: 0.2, delay: 0, options: [.curveEaseOut]) {
+            scrollView.contentOffset = newOffset
+        }
+    }
+
+    /// Walk the view hierarchy to find the UIScrollView used by messagesView.
+    private func tvFindScrollView() -> UIScrollView? {
+        // Find the first UIScrollView in the key window's hierarchy
+        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              let window = windowScene.windows.first else { return nil }
+        return tvFindScrollViewIn(window)
+    }
+
+    private func tvFindScrollViewIn(_ view: UIView) -> UIScrollView? {
+        if let sv = view as? UIScrollView {
+            // Return the first scroll view that has substantial content (the chat)
+            if sv.contentSize.height > sv.bounds.height {
+                return sv
+            }
+        }
+        for sub in view.subviews {
+            if let found = tvFindScrollViewIn(sub) {
+                return found
+            }
+        }
+        return nil
+    }
+    #endif
+
     private func scrollToBottom(animated: Bool, toAbsoluteBottom: Bool = false) {
         // Always scroll to "bottom" spacer when user clicks chevron
         // This ensures we reach the absolute end of content
@@ -1040,6 +1178,8 @@ struct ModelLoadingGauge: View {
     private var barWidth: CGFloat {
         #if os(macOS)
         return 280
+        #elseif os(tvOS)
+        return 400
         #else
         // Use a more adaptive width for iPhone - not too wide
         return 240
@@ -1276,7 +1416,7 @@ private struct DiagonalStripes: View {
 
 // MARK: - Platform Colors & Helpers
 
-#if os(iOS)
+#if !os(macOS)
 private let chatBackground = LinearGradient(
     colors: [
         Color(red: 0.06, green: 0.07, blue: 0.08),
@@ -1285,7 +1425,11 @@ private let chatBackground = LinearGradient(
     startPoint: .topLeading,
     endPoint: .bottomTrailing
 )
-private let platformSecondaryBackground = UIColor.secondarySystemBackground
+#if os(tvOS)
+private let platformSecondaryBackground = Color.white.opacity(0.14)
+#else
+private let platformSecondaryBackground = Color(UIColor.secondarySystemBackground)
+#endif
 private let modelLoadingBackground = Color.white.opacity(0.06)
 private let gaugeAccent = Color(red: 1.0, green: 0.62, blue: 0.2)
 
@@ -1299,8 +1443,8 @@ private enum UIScreen {
 #else
 private let platformBackground = NSColor.windowBackgroundColor
 private let chatBackground = Color(platformBackground)
-private let platformSecondaryBackground = NSColor.controlBackgroundColor
-private let modelLoadingBackground = Color(platformSecondaryBackground)
+private let platformSecondaryBackground = Color(NSColor.controlBackgroundColor)
+private let modelLoadingBackground = platformSecondaryBackground
 private let gaugeAccent = Color(red: 1.0, green: 0.62, blue: 0.2)
 
 private enum UIScreen {
@@ -1348,6 +1492,86 @@ private struct PointingHandCursorModifier: ViewModifier {
 private extension View {
     func pointingHandCursor() -> some View {
         modifier(PointingHandCursorModifier())
+    }
+}
+#endif
+
+#if os(tvOS)
+/// Focus zones for tvOS Siri Remote navigation within ChatView.
+private enum TVFocusZone: Hashable {
+    case chevrons
+    case inputBar
+}
+
+/// Focusable scroll chevron button for tvOS.
+/// Tap = scroll ~4 lines. Hold Select = continuous fast scroll via repeating timer.
+private struct TVScrollChevron: View {
+    enum Direction { case up, down }
+    let direction: Direction
+    /// Called on single tap (scroll by small step)
+    let action: () -> Void
+    /// Called repeatedly during long-press (fast scroll)
+    var longPressAction: (() -> Void)?
+
+    @State private var repeatTimer: Timer?
+    @State private var isHolding = false
+    @State private var tapCount = 0
+
+    var body: some View {
+        Button {
+            // Each tap scrolls one step; rapid tapping accelerates
+            tapCount += 1
+            action()
+            // Start a short repeat timer — if user holds Select, it keeps firing
+            startRepeatIfNeeded()
+        } label: {
+            Image(systemName: direction == .down ? "chevron.down" : "chevron.up")
+                .font(.system(size: 28, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 64, height: 64)
+        }
+        .buttonStyle(.card)
+        .onLongPressGesture(minimumDuration: 0.4, pressing: { pressing in
+            if pressing {
+                // Long press started — begin fast repeat scroll
+                isHolding = true
+                startFastRepeat()
+            } else {
+                // Released
+                stopRepeat()
+            }
+        }, perform: {
+            // Gesture completed (finger lifted after min duration)
+        })
+    }
+
+    private func startRepeatIfNeeded() {
+        // Cancel any existing timer
+        repeatTimer?.invalidate()
+        // After a short delay, if no new tap comes, stop
+        repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { _ in
+            tapCount = 0
+        }
+    }
+
+    private func startFastRepeat() {
+        repeatTimer?.invalidate()
+        // Fire the long-press action immediately, then repeat every 100ms
+        longPressAction?()
+        repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+            if isHolding {
+                longPressAction?()
+            } else {
+                stopRepeat()
+            }
+        }
+    }
+
+    private func stopRepeat() {
+        isHolding = false
+        repeatTimer?.invalidate()
+        repeatTimer = nil
+        tapCount = 0
     }
 }
 #endif

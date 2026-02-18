@@ -7,10 +7,10 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
-#if os(iOS)
-import UIKit
-#else
+#if os(macOS)
 import AppKit
+#else
+import UIKit
 #endif
 
 struct ModelListView: View {
@@ -25,6 +25,407 @@ struct ModelListView: View {
     @State private var refreshResultText = ""
 
     var body: some View {
+        #if os(tvOS)
+        tvBody
+        #else
+        defaultBody
+        #endif
+    }
+
+    @State private var showingActiveModelDetail = false
+
+    // MARK: - tvOS Layout
+
+    #if os(tvOS)
+    private var tvBody: some View {
+        VStack(spacing: 0) {
+            // tvOS Header
+            HStack(alignment: .center) {
+                Button("Done") { dismiss() }
+                    .buttonStyle(.bordered)
+
+                Spacer()
+
+                Text("Models")
+                    .font(.title2)
+                    .fontWeight(.bold)
+
+                Spacer()
+
+                Button { showingAddModel = true } label: {
+                    Label("Add Model", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+            }
+            .padding(.horizontal, 48)
+            .padding(.top, 24)
+            .padding(.bottom, 16)
+            .focusSection()
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(spacing: 24) {
+                        // Active model (if any is loaded)
+                        if let loadedId = modelManager.loadedModelId,
+                           let loadedModel = modelManager.availableModels.first(where: { $0.id == loadedId }) {
+                            tvActiveModelCard(loadedModel)
+                        }
+
+                        // Currently downloading
+                        if let downloadingId = modelManager.downloadingModelId,
+                           let model = modelManager.availableModels.first(where: { $0.id == downloadingId }) {
+                            tvDownloadingCard(model)
+                                .id("downloading")
+                        }
+
+                        // Downloaded models
+                        let downloadedNotLoaded = modelManager.downloadedModels.filter { $0.id != modelManager.loadedModelId }
+                        if !downloadedNotLoaded.isEmpty {
+                            tvSectionHeader("Downloaded", icon: "checkmark.circle.fill", color: .green)
+
+                            ForEach(downloadedNotLoaded) { model in
+                                TVModelCard(model: model)
+                                    .environment(modelManager)
+                                    .id("downloaded-\(model.id)")
+                            }
+                        }
+
+                        // Available for download
+                        if !modelManager.availableForDownload.isEmpty {
+                            HStack {
+                                tvSectionHeader("Available", icon: "cloud.fill", color: .orange)
+                                Spacer()
+                                tvRefreshButton
+                            }
+
+                            ForEach(modelManager.availableForDownload) { model in
+                                TVModelCard(model: model)
+                                    .environment(modelManager)
+                                    .id("available-\(model.id)")
+                            }
+                        }
+
+                        // Error models
+                        if hasErrorModels {
+                            tvSectionHeader("Failed", icon: "exclamationmark.triangle.fill", color: .red)
+
+                            ForEach(errorModels) { model in
+                                tvErrorCard(model)
+                                    .id("error-\(model.id)")
+                            }
+                        }
+
+                        // Storage info
+                        tvStorageInfo
+                    }
+                    .padding(.horizontal, 48)
+                    .padding(.bottom, 40)
+                    .focusSection()
+                }
+                .task {
+                    print("[ModelListView] task: \(modelManager.availableModels.count) models")
+                    logInfo("ModelListView task: \(modelManager.availableModels.count) total", category: .model)
+                    if modelManager.availableModels.isEmpty {
+                        print("[ModelListView] empty, calling loadModels")
+                        await modelManager.loadModels()
+                    }
+                }
+                .onAppear { scrollProxy = proxy }
+                .onChange(of: modelManager.downloadingModelId) { oldValue, newValue in
+                    if newValue != nil && oldValue == nil {
+                        withAnimation(.easeOut(duration: 0.3)) {
+                            proxy.scrollTo("downloading", anchor: .top)
+                        }
+                    }
+                }
+                .onChange(of: modelManager.justAddedModelId) { _, newValue in
+                    guard let modelId = newValue else { return }
+                    withAnimation(.easeOut(duration: 0.3)) {
+                        proxy.scrollTo(modelId, anchor: .center)
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $showingAddModel) {
+            AddModelView()
+                .environment(modelManager)
+        }
+        // Auto-dismiss when a model is loaded
+        .onChange(of: modelManager.loadedModelId) { oldValue, newValue in
+            if newValue != nil && oldValue != newValue {
+                dismiss()
+            }
+        }
+        .errorToast(Binding(
+            get: { modelManager.errorMessage },
+            set: { modelManager.errorMessage = $0 }
+        ))
+        .alert("Large Weight Files", isPresented: Binding(
+            get: { modelManager.showWeightWarningAlert },
+            set: { modelManager.showWeightWarningAlert = $0 }
+        )) {
+            Button("Cancel", role: .cancel) { modelManager.cancelLoadModel() }
+            Button("Load Anyway") { Task { await modelManager.confirmLoadModel() } }
+        } message: {
+            Text(modelManager.weightWarningMessage ?? "This model has weight files that may not load correctly on this device.")
+        }
+        .alert("Device Compatibility", isPresented: Binding(
+            get: { modelManager.showCompatibilityWarningAlert },
+            set: { modelManager.showCompatibilityWarningAlert = $0 }
+        )) {
+            Button("Cancel", role: .cancel) { modelManager.cancelLoadModel() }
+            Button("Load Anyway") { Task { await modelManager.confirmLoadModel() } }
+        } message: {
+            Text(modelManager.compatibilityWarningMessage ?? "This model may not work correctly on this device.")
+        }
+        .alert("Device Compatibility", isPresented: Binding(
+            get: { modelManager.showDownloadCompatibilityWarningAlert },
+            set: { modelManager.showDownloadCompatibilityWarningAlert = $0 }
+        )) {
+            Button("Cancel", role: .cancel) { modelManager.cancelDownloadModel() }
+            Button("Download Anyway") { Task { await modelManager.confirmDownloadModel() } }
+        } message: {
+            Text(modelManager.downloadCompatibilityWarningMessage ?? "This model may not work correctly on this device.")
+        }
+    }
+
+    // MARK: - tvOS Components
+
+    private func tvSectionHeader(_ title: String, icon: String, color: Color) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.title3)
+                .foregroundStyle(color)
+            Text(title)
+                .font(.title3)
+                .fontWeight(.semibold)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 8)
+    }
+
+    private var tvRefreshButton: some View {
+        Button {
+            Task {
+                isRefreshing = true
+                await modelManager.refreshModelStatus()
+                try? await Task.sleep(for: .milliseconds(300))
+                isRefreshing = false
+                refreshResultText = modelManager.lastRefreshDiscoveredCount > 0
+                    ? "+\(modelManager.lastRefreshDiscoveredCount) new"
+                    : "Up to date"
+                showRefreshConfirmation = true
+                try? await Task.sleep(for: .seconds(2.5))
+                showRefreshConfirmation = false
+            }
+        } label: {
+            HStack(spacing: 6) {
+                if isRefreshing {
+                    ProgressView()
+                    Text("Checking...")
+                } else if showRefreshConfirmation {
+                    Image(systemName: modelManager.lastRefreshDiscoveredCount > 0
+                          ? "plus.circle.fill" : "checkmark.circle.fill")
+                    Text(refreshResultText)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                    Text("Refresh")
+                }
+            }
+        }
+        .buttonStyle(.bordered)
+        .disabled(isRefreshing)
+    }
+
+    private func tvActiveModelCard(_ model: ModelInfo) -> some View {
+        HStack(spacing: 20) {
+            ZStack {
+                Circle()
+                    .fill(Color.green.opacity(0.2))
+                    .frame(width: 60, height: 60)
+                Image(systemName: "bolt.fill")
+                    .font(.title2)
+                    .foregroundStyle(.green)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(model.name)
+                    .font(.title3)
+                    .fontWeight(.bold)
+                Text("Loaded & Active")
+                    .font(.body)
+                    .foregroundStyle(.green)
+                Text(model.description)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            Button {
+                showingActiveModelDetail = true
+            } label: {
+                Image(systemName: "info.circle")
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                Task { await modelManager.unloadCurrentModel() }
+            } label: {
+                Text("Unload")
+                    .fontWeight(.medium)
+            }
+            .buttonStyle(.bordered)
+            .tint(.orange)
+        }
+        .padding(24)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.green.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(Color.green.opacity(0.3), lineWidth: 1)
+                )
+        )
+        .sheet(isPresented: $showingActiveModelDetail) {
+            ModelDetailView(model: model)
+        }
+    }
+
+    private func tvDownloadingCard(_ model: ModelInfo) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text(model.name)
+                        .font(.title3)
+                        .fontWeight(.semibold)
+                }
+
+                Spacer()
+
+                Button {
+                    Task { await modelManager.cancelDownload() }
+                } label: {
+                    Text("Cancel")
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.bordered)
+            }
+
+            if let progress = modelManager.downloadProgress {
+                DownloadProgressView(progress: progress)
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Preparing download...")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(24)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.blue.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(Color.blue.opacity(0.3), lineWidth: 1)
+                )
+        )
+    }
+
+    private func tvErrorCard(_ model: ModelInfo) -> some View {
+        HStack(spacing: 16) {
+            ZStack {
+                Circle()
+                    .fill(Color.red.opacity(0.2))
+                    .frame(width: 50, height: 50)
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.title3)
+                    .foregroundStyle(.red)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(model.name)
+                    .font(.headline)
+                if let error = model.downloadError {
+                    Text(error)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                }
+            }
+
+            Spacer()
+
+            if model.sourceKind == .huggingFace {
+                Button {
+                    Task { await modelManager.downloadModel(model) }
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+            } else {
+                Button(role: .destructive) {
+                    Task { await modelManager.deleteModel(model) }
+                } label: {
+                    Label("Remove", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(20)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.red.opacity(0.06))
+        )
+    }
+
+    private var tvStorageInfo: some View {
+        VStack(spacing: 12) {
+            Divider()
+                .padding(.top, 8)
+
+            HStack {
+                Label("Downloaded Models", systemImage: "internaldrive")
+                    .font(.callout)
+                Spacer()
+                Text(modelManager.downloadedModelsSize)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Text(DeviceType.chipName)
+                    .font(.caption)
+                Spacer()
+                Text(DeviceType.physicalMemoryString)
+                    .font(.caption)
+            }
+            .foregroundStyle(.secondary)
+
+            HStack {
+                Text("Total: \(modelManager.availableModels.count)")
+                    .font(.caption)
+                Spacer()
+                Text("Available: \(modelManager.availableForDownload.count)")
+                    .font(.caption)
+                Spacer()
+                Text("Downloaded: \(modelManager.downloadedModels.count)")
+                    .font(.caption)
+            }
+            .foregroundStyle(.secondary)
+        }
+        .padding(.top, 8)
+    }
+    #endif
+
+    // MARK: - Default (non-tvOS) Layout
+
+    private var defaultBody: some View {
         VStack(spacing: 0) {
             // Header
             HStack {
@@ -73,10 +474,10 @@ struct ModelListView: View {
                 // Storage info
                 storageSection
             }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             .listStyle(.insetGrouped)
             .contentMargins(.horizontal, 16, for: .scrollContent)
-            #else
+            #elseif os(macOS)
             .listStyle(.inset)
             #endif
             .refreshable {
@@ -194,8 +595,6 @@ struct ModelListView: View {
     }
 
     // MARK: - Active Model Section
-
-    @State private var showingActiveModelDetail = false
 
     private func activeModelSection(_ model: ModelInfo) -> some View {
         Section {
@@ -420,8 +819,10 @@ struct ModelListView: View {
                                     #if os(macOS)
                                     NSPasteboard.general.clearContents()
                                     NSPasteboard.general.setString(path, forType: .string)
-                                    #else
+                                    #elseif os(iOS) || os(visionOS)
                                     UIPasteboard.general.string = path
+                                    #else
+                                    _ = path
                                     #endif
                                 } label: {
                                     Image(systemName: "doc.on.doc")
@@ -693,7 +1094,7 @@ struct AddModelView: View {
                 }
                 #endif
 
-                #if os(iOS)
+                #if os(iOS) || os(tvOS)
                 // Quick access to ANEMLL models
                 Button {
                     openAnemllHuggingFace()
@@ -793,7 +1194,9 @@ struct AddModelView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                #if !os(tvOS)
                 .keyboardShortcut(.cancelAction)
+                #endif
 
                 Button {
                     addModel()
@@ -808,7 +1211,9 @@ struct AddModelView: View {
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
+                #if !os(tvOS)
                 .keyboardShortcut(.defaultAction)
+                #endif
                 .disabled(addButtonDisabled)
             }
             .padding(.horizontal, 24)
@@ -845,9 +1250,18 @@ struct AddModelView: View {
                     .fontWeight(.medium)
 
                 TextField("anemll/model-name", text: $repoId)
+                    #if os(tvOS)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.white.opacity(0.08))
+                    )
+                    #else
                     .textFieldStyle(.roundedBorder)
+                    #endif
                     .autocorrectionDisabled()
-                    #if os(iOS)
+                    #if os(iOS) || os(tvOS)
                     .textInputAutocapitalization(.never)
                     #endif
                     .onChange(of: repoId) { _, _ in
@@ -872,7 +1286,16 @@ struct AddModelView: View {
                     .fontWeight(.medium)
 
                 TextField(hfSuggestedName.isEmpty ? "Model Name" : hfSuggestedName, text: $hfDisplayName)
+                    #if os(tvOS)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.white.opacity(0.08))
+                    )
+                    #else
                     .textFieldStyle(.roundedBorder)
+                    #endif
 
                 if !hfSuggestedName.isEmpty && hfDisplayName.isEmpty {
                     HStack(spacing: 4) {
@@ -980,7 +1403,7 @@ struct AddModelView: View {
 
     private func openAnemllHuggingFace() {
         if let url = URL(string: "https://huggingface.co/anemll") {
-            #if os(iOS)
+            #if os(iOS) || os(tvOS)
             UIApplication.shared.open(url)
             #else
             NSWorkspace.shared.open(url)

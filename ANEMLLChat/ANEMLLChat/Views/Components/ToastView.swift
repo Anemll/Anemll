@@ -68,7 +68,7 @@ struct ToastView: View {
         .padding(.vertical, 12)
         .background(
             RoundedRectangle(cornerRadius: 12)
-                .fill(Color(platformSecondaryBackground))
+                .fill(platformSecondaryBackground)
                 .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
         )
         .padding(.horizontal)
@@ -137,10 +137,12 @@ extension View {
 
 // MARK: - Platform Colors
 
-#if os(iOS)
-private let platformSecondaryBackground = UIColor.secondarySystemBackground
+#if os(macOS)
+private let platformSecondaryBackground = Color(NSColor.controlBackgroundColor)
+#elseif os(tvOS)
+private let platformSecondaryBackground = Color.white.opacity(0.16)
 #else
-private let platformSecondaryBackground = NSColor.controlBackgroundColor
+private let platformSecondaryBackground = Color(UIColor.secondarySystemBackground)
 #endif
 
 // MARK: - Preview

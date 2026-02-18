@@ -6,6 +6,44 @@
 //
 
 import Foundation
+
+#if os(tvOS)
+
+/// Speech recognition is unavailable on tvOS.
+@MainActor
+@Observable
+final class SpeechRecognitionService {
+    static let shared = SpeechRecognitionService()
+
+    private(set) var isListening = false
+    private(set) var isAuthorized = false
+    private(set) var recognizedText = ""
+    private(set) var errorMessage: String?
+
+    private init() { }
+
+    func requestAuthorization() async -> Bool {
+        isAuthorized = false
+        errorMessage = "Voice input is not available on tvOS"
+        return false
+    }
+
+    func startListening() async {
+        isListening = false
+        errorMessage = "Voice input is not available on tvOS"
+    }
+
+    func stopListening() {
+        isListening = false
+    }
+
+    func toggleListening() async {
+        await startListening()
+    }
+}
+
+#else
+
 import Speech
 import AVFoundation
 #if os(macOS)
@@ -259,3 +297,5 @@ final class SpeechRecognitionService {
         }
     }
 }
+
+#endif

@@ -12,17 +12,18 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		A1000001000000000000000A /* ANEMLLChat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ANEMLLChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1106E7F32F44FC640090FBFA /* ANEMLLChat copy-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = "ANEMLLChat copy-Info.plist"; path = "/Users/anemll/SourceRelease/GITHUB/ML_playground/anemll-0.3.5/ANEMLLChat/ANEMLLChat copy-Info.plist"; sourceTree = "<absolute>"; };
+		A1000001000000000000000A /* Anemll chat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Anemll chat.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		A1000021000000000000000A /* generated-build-number.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = "generated-build-number.xcconfig"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		A1000002000000000000000A /* Exceptions for "ANEMLLChat" folder in "ANEMLLChat" target */ = {
+		A1000002000000000000000A /* Exceptions for "ANEMLLChat" folder in "Anemll chat" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
 			);
-			target = A1000003000000000000000A /* ANEMLLChat */;
+			target = A1000003000000000000000A /* Anemll chat */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -30,7 +31,7 @@
 		A1000004000000000000000A /* ANEMLLChat */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				A1000002000000000000000A /* Exceptions for "ANEMLLChat" folder in "ANEMLLChat" target */,
+				A1000002000000000000000A /* Exceptions for "ANEMLLChat" folder in "Anemll chat" target */,
 			);
 			path = ANEMLLChat;
 			sourceTree = "<group>";
@@ -55,6 +56,7 @@
 			children = (
 				A1000021000000000000000A /* generated-build-number.xcconfig */,
 				A1000004000000000000000A /* ANEMLLChat */,
+				1106E7F32F44FC640090FBFA /* ANEMLLChat copy-Info.plist */,
 				A1000007000000000000000A /* Products */,
 			);
 			sourceTree = "<group>";
@@ -62,7 +64,7 @@
 		A1000007000000000000000A /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				A1000001000000000000000A /* ANEMLLChat.app */,
+				A1000001000000000000000A /* Anemll chat.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -70,9 +72,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		A1000003000000000000000A /* ANEMLLChat */ = {
+		A1000003000000000000000A /* Anemll chat */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = A1000008000000000000000A /* Build configuration list for PBXNativeTarget "ANEMLLChat" */;
+			buildConfigurationList = A1000008000000000000000A /* Build configuration list for PBXNativeTarget "Anemll chat" */;
 			buildPhases = (
 				A1000020000000000000000A /* Set Build Number from Git */,
 				A1000009000000000000000A /* Sources */,
@@ -86,13 +88,13 @@
 			fileSystemSynchronizedGroups = (
 				A1000004000000000000000A /* ANEMLLChat */,
 			);
-			name = ANEMLLChat;
+			name = "Anemll chat";
 			packageProductDependencies = (
 				A100000B000000000000000A /* AnemllCore */,
 				A100000C000000000000000A /* Yams */,
 			);
 			productName = ANEMLLChat;
-			productReference = A1000001000000000000000A /* ANEMLLChat.app */;
+			productReference = A1000001000000000000000A /* Anemll chat.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -128,7 +130,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				A1000003000000000000000A /* ANEMLLChat */,
+				A1000003000000000000000A /* Anemll chat */,
 			);
 		};
 /* End PBXProject section */
@@ -295,11 +297,13 @@
 			baseConfigurationReference = A1000021000000000000000A /* generated-build-number.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=appletvos*]" = "App Icon & Top Shelf Image";
+				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=appletvsimulator*]" = "App Icon & Top Shelf Image";
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ANEMLLChat/ANEMLLChat.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = ARRY5366Y3;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
@@ -307,10 +311,16 @@
 				INFOPLIST_FILE = ANEMLLChat/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "ANEMLL Chat";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSDesktopFolderUsageDescription = "ANEMLL Chat needs access to load local CoreML models.";
+				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "ANEMLL Chat needs access to load local CoreML models.";
+				INFOPLIST_KEY_NSDownloadsFolderUsageDescription = "ANEMLL Chat needs access to load local CoreML models.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "ANEMLL Chat needs microphone access to capture your voice for speech-to-text.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "ANEMLL Chat uses speech recognition to convert your voice to text for chat input.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -319,17 +329,21 @@
 					"@executable_path/Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.3.7;
-				PRODUCT_BUNDLE_IDENTIFIER = com.anemll.chat;
+				MARKETING_VERSION = 0.3.9;
+				PRODUCT_BUNDLE_IDENTIFIER = "anemll.anemll-chat.demo";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator appletvos appletvsimulator macosx";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				"TARGETED_DEVICE_FAMILY[sdk=appletvos*]" = 3;
+				"TARGETED_DEVICE_FAMILY[sdk=appletvsimulator*]" = 3;
+				"TARGETED_DEVICE_FAMILY[sdk=iphoneos*]" = "1,2";
+				"TARGETED_DEVICE_FAMILY[sdk=iphonesimulator*]" = "1,2";
+				TVOS_DEPLOYMENT_TARGET = 18.0;
 			};
 			name = Debug;
 		};
@@ -338,11 +352,13 @@
 			baseConfigurationReference = A1000021000000000000000A /* generated-build-number.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=appletvos*]" = "App Icon & Top Shelf Image";
+				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=appletvsimulator*]" = "App Icon & Top Shelf Image";
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ANEMLLChat/ANEMLLChat.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = ARRY5366Y3;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
@@ -350,10 +366,16 @@
 				INFOPLIST_FILE = ANEMLLChat/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "ANEMLL Chat";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSDesktopFolderUsageDescription = "ANEMLL Chat needs access to load local CoreML models.";
+				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "ANEMLL Chat needs access to load local CoreML models.";
+				INFOPLIST_KEY_NSDownloadsFolderUsageDescription = "ANEMLL Chat needs access to load local CoreML models.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "ANEMLL Chat needs microphone access to capture your voice for speech-to-text.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "ANEMLL Chat uses speech recognition to convert your voice to text for chat input.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -362,24 +384,28 @@
 					"@executable_path/Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.3.7;
-				PRODUCT_BUNDLE_IDENTIFIER = com.anemll.chat;
+				MARKETING_VERSION = 0.3.9;
+				PRODUCT_BUNDLE_IDENTIFIER = "anemll.anemll-chat.demo";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator appletvos appletvsimulator macosx";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				"TARGETED_DEVICE_FAMILY[sdk=appletvos*]" = 3;
+				"TARGETED_DEVICE_FAMILY[sdk=appletvsimulator*]" = 3;
+				"TARGETED_DEVICE_FAMILY[sdk=iphoneos*]" = "1,2";
+				"TARGETED_DEVICE_FAMILY[sdk=iphonesimulator*]" = "1,2";
+				TVOS_DEPLOYMENT_TARGET = 18.0;
 			};
 			name = Release;
 		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		A1000008000000000000000A /* Build configuration list for PBXNativeTarget "ANEMLLChat" */ = {
+		A1000008000000000000000A /* Build configuration list for PBXNativeTarget "Anemll chat" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				A1000013000000000000000A /* Debug */,

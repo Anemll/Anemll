@@ -22,6 +22,12 @@ struct ANEMLLChatApp: App {
         #if DEBUG
         UIFreezeWatchdog.shared.start()
         #endif
+
+        #if os(macOS) || os(tvOS)
+        Task { @MainActor in
+            await OpenAICompatibleServerService.shared.restoreFromStorageAndApply()
+        }
+        #endif
     }
 
     var body: some Scene {
@@ -34,6 +40,13 @@ struct ANEMLLChatApp: App {
                         await modelManager.handleIncomingTransferURL(url)
                     }
                 }
+                #if os(macOS) || os(tvOS)
+                .task {
+                    // Give the OpenAI-compatible server access to the model manager
+                    // so it can list downloaded models and auto-load on request.
+                    OpenAICompatibleServerService.shared.modelManager = modelManager
+                }
+                #endif
                 // Force dark mode to match hardcoded dark backgrounds throughout the app
                 .preferredColorScheme(.dark)
         }

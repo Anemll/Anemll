@@ -7,7 +7,7 @@ A modern, lightweight SwiftUI chat application for on-device LLM inference using
 - **On-Device Inference**: Run LLMs locally using CoreML and Apple Neural Engine
 - **Model Management**: Download and manage models from HuggingFace
 - **Streaming Responses**: Real-time token streaming with performance metrics
-- **Multi-Platform**: iOS 18+ and macOS 15+ support
+- **Multi-Platform**: iOS 18+, tvOS 18+, and macOS 15+ support
 - **Modern SwiftUI**: Built with Swift 6 concurrency and Observation framework
 
 ## Architecture
@@ -38,6 +38,7 @@ ANEMLLChat/
 ## Requirements
 
 - **iOS**: 18.0+
+- **tvOS**: 18.0+
 - **macOS**: 15.0+
 - **Xcode**: 16.0+
 - **Swift**: 6.0+

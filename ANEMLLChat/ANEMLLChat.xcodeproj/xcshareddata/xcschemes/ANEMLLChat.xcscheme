@@ -16,8 +16,8 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A1000003000000000000000A"
-               BuildableName = "ANEMLLChat.app"
-               BlueprintName = "ANEMLLChat"
+               BuildableName = "Anemll chat.app"
+               BlueprintName = "Anemll chat"
                ReferencedContainer = "container:ANEMLLChat.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -45,8 +45,8 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A1000003000000000000000A"
-            BuildableName = "ANEMLLChat.app"
-            BlueprintName = "ANEMLLChat"
+            BuildableName = "Anemll chat.app"
+            BlueprintName = "Anemll chat"
             ReferencedContainer = "container:ANEMLLChat.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -62,8 +62,8 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A1000003000000000000000A"
-            BuildableName = "ANEMLLChat.app"
-            BlueprintName = "ANEMLLChat"
+            BuildableName = "Anemll chat.app"
+            BlueprintName = "Anemll chat"
             ReferencedContainer = "container:ANEMLLChat.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>

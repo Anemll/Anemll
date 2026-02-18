@@ -434,6 +434,10 @@ struct ThinkBlockView: View {
         }
     }
 
+    #if os(tvOS)
+    @FocusState private var headerFocused: Bool
+    #endif
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Header - always visible, tappable
@@ -476,9 +480,23 @@ struct ThinkBlockView: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
+                #if os(tvOS)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(thinkAccent.opacity(headerFocused ? 0.25 : 0.1))
+                )
+                .scaleEffect(headerFocused ? 1.03 : 1.0)
+                .animation(.easeOut(duration: 0.15), value: headerFocused)
+                #else
                 .background(thinkAccent.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                #endif
             }
+            #if os(tvOS)
+            .buttonStyle(.card)
+            .focused($headerFocused)
+            #else
             .buttonStyle(.plain)
+            #endif
 
             // Content - shown when expanded
             if isExpanded {
@@ -506,7 +524,11 @@ struct ThinkBlockView: View {
         }
         .overlay(
             RoundedRectangle(cornerRadius: 8)
+                #if os(tvOS)
+                .stroke(thinkAccent.opacity(headerFocused ? 0.6 : 0.2), lineWidth: headerFocused ? 2 : 1)
+                #else
                 .stroke(thinkAccent.opacity(0.2), lineWidth: 1)
+                #endif
         )
         .onAppear {
             initializeThinkingState()
@@ -612,7 +634,7 @@ private struct CodeBlockView: View {
             // Code content
             Text(code)
                 .font(.system(.body, design: .monospaced))
-                .textSelection(.enabled)
+                .selectable(true)
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.black.opacity(0.3))
@@ -633,8 +655,10 @@ private struct CodeBlockView: View {
         #if os(macOS)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(code, forType: .string)
-        #else
+        #elseif os(iOS) || os(visionOS)
         UIPasteboard.general.string = code
+        #else
+        _ = code
         #endif
 
         // Show "Copied" feedback

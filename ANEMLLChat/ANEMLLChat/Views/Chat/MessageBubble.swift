@@ -85,8 +85,10 @@ struct MessageBubble: View, Equatable {
         #if os(macOS)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        #else
+        #elseif os(iOS) || os(visionOS)
         UIPasteboard.general.string = text
+        #else
+        _ = text
         #endif
     }
 
@@ -144,10 +146,13 @@ struct MessageBubble: View, Equatable {
                 }
 
                 // Copy button inline (appears on hover, no text reflow since it's always in layout)
+                // Hidden on tvOS: no clipboard, and focusable buttons block scroll chevron navigation
+                #if !os(tvOS)
                 if !message.content.isEmpty {
                     copyButton
                         .opacity(shouldShowCopyButton ? 1 : 0)
                 }
+                #endif
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -177,7 +182,9 @@ extension MessageBubble {
     fileprivate var statsView: some View {
         // Always show key stats: copy button, tok/s, prefill speed, context tokens
         HStack(spacing: 8) {
+            #if !os(tvOS)
             // Copy button (always visible in stats row) - excludes thinking
+            // Hidden on tvOS: no clipboard, and the button blocks focus navigation to scroll chevrons
             Button {
                 copyWithoutThinking()
             } label: {
@@ -187,6 +194,7 @@ extension MessageBubble {
             }
             .buttonStyle(.plain)
             .help("Copy message (excludes thinking)")
+            #endif
 
             // Generation speed
             if let tps = message.tokensPerSecond {

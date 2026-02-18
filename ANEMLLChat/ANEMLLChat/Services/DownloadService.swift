@@ -130,7 +130,8 @@ actor DownloadService: NSObject {
             downloadedBytesTotal[modelId] = 0
 
             // Create destination directory
-            let destDir = await StorageService.shared.modelPath(for: modelId)
+            let destDir = await StorageService.shared.writableModelPath(for: modelId)
+            logDebug("Download destination directory: \(destDir.path)", category: .download)
             try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
 
             // Send initial progress update

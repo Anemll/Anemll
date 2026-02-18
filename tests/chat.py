@@ -1349,17 +1349,19 @@ def create_unified_state(ffn_models, context_length, eval_mode=False, metadata=N
 
         return states
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False, no_think=False):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False, no_think=False, single_token_prefill=False):
     """Interactive chat loop."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
     update_mask_prefill = metadata.get('update_mask_prefill', False) if metadata else False
     prefill_dynamic_slice = metadata.get('prefill_dynamic_slice', False) if metadata else False
-    single_token_mode = False
-    if not (update_mask_prefill or prefill_dynamic_slice):
+    single_token_mode = single_token_prefill
+    if not single_token_mode and not (update_mask_prefill or prefill_dynamic_slice):
         single_token_mode = True
         if not warmup and not eval_mode:
             print("No update_mask_prefill or prefill_dynamic_slice; forcing single-token prefill for compatibility.")
+    if single_token_prefill and not warmup and not eval_mode:
+        print("Single-token prefill mode: ENABLED (--single-token-prefill flag)")
     
     if not warmup and not eval_mode:
         print(f"\nUsing context length: {context_length}")
@@ -1618,6 +1620,11 @@ def parse_args():
     parser.add_argument('--no-think', action='store_true',
                        help='Disable thinking mode in chat templates (e.g., Qwen enable_thinking)')
     
+    # Force single-token prefill (process prompt one token at a time through infer)
+    parser.add_argument('--st', '--single-token-prefill', dest='single_token_prefill',
+                       action='store_true',
+                       help='Force single-token prefill (bypass batch prefill)')
+
     # Add eval mode flag
     parser.add_argument('--eval', action='store_true',
                        help='Evaluation mode: suppress all output except model response')
@@ -2229,7 +2236,7 @@ def generate_next_token_monolithic(model, input_ids, pos, context_length, metada
 def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state, causal_mask=None,
                          auto_prompt=None, warmup=False, save_file=None, max_tokens=None,
                          no_template=False, eval_mode=False, infer_rotate_model=None, prefill_rotate_model=None,
-                         no_think=False):
+                         no_think=False, single_token_prefill=False):
     """Chat loop for monolithic models.
 
     Args:
@@ -2250,17 +2257,21 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
         prefill_rotate_model: Optional model for batch prefill with cache rotation
                               (rotation mode, for positions >= sliding_window). If None,
                               uses prefill_model for all positions (legacy behavior).
+        single_token_prefill: If True, force single-token prefill mode.
     """
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
     sliding_window = metadata.get('sliding_window', None)  # For switching between infer modes
     mask_len = max(metadata.get('state_length', context_length), sliding_window or 0)
     update_mask_prefill = metadata.get('update_mask_prefill', False)
-    single_token_mode = False
-    if not update_mask_prefill:
+    prefill_dynamic_slice = metadata.get('prefill_dynamic_slice', False)
+    single_token_mode = single_token_prefill
+    if not single_token_mode and not (update_mask_prefill or prefill_dynamic_slice):
         single_token_mode = True
         if not eval_mode and not warmup:
-            print("update_mask_prefill not set; forcing single-token prefill for compatibility.")
+            print("No update_mask_prefill or prefill_dynamic_slice; forcing single-token prefill for compatibility.")
+    if single_token_prefill and not eval_mode and not warmup:
+        print("Single-token prefill mode: ENABLED (--single-token-prefill flag)")
 
     if not warmup and not eval_mode:
         print(f"\nUsing context length: {context_length}")
@@ -2534,7 +2545,8 @@ def main():
                 max_tokens=args.max_tokens,
                 no_template=args.no_template,
                 eval_mode=args.eval,
-                no_think=args.no_think
+                no_think=args.no_think,
+                single_token_prefill=getattr(args, 'single_token_prefill', False)
             )
 
         else:
@@ -2634,7 +2646,8 @@ def main():
                 max_tokens=args.max_tokens,
                 no_template=args.no_template,
                 eval_mode=args.eval,
-                no_think=args.no_think
+                no_think=args.no_think,
+                single_token_prefill=getattr(args, 'single_token_prefill', False)
             )
         
     except Exception as e:

@@ -7,6 +7,11 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
+#if os(macOS)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 // System prompt options
 enum SystemPromptOption: String, CaseIterable, Identifiable {
@@ -21,8 +26,9 @@ enum SystemPromptOption: String, CaseIterable, Identifiable {
 
 struct SettingsView: View {
     @Environment(ChatViewModel.self) private var chatVM
-    #if os(macOS)
+    #if os(macOS) || os(tvOS)
     @Environment(ModelManagerViewModel.self) private var modelManager
+    @ObservedObject private var openAIServer = OpenAICompatibleServerService.shared
     #endif
     @Environment(\.dismiss) private var dismiss
 
@@ -59,40 +65,58 @@ struct SettingsView: View {
     @State private var storageMigrationProgressValue: Double = 0
     @State private var storageMigrationProgressMessage = ""
     #endif
+    #if os(macOS) || os(tvOS)
+    @State private var openAICompatibleServerEnabled = StorageService.defaultOpenAICompatibleServerEnabledValue
+    @State private var openAICompatibleServerBindMode = StorageService.defaultOpenAICompatibleServerBindModeValue
+    @State private var openAICompatibleServerPort = StorageService.defaultOpenAICompatibleServerPortValue
+    @State private var openAICompatibleServerStatusMessage: String?
+    @State private var hasLoadedOpenAICompatibleServerSettings = false
+    #endif
 
     var body: some View {
-        Form {
-            // Model settings
-            modelSection
+        Group {
+            #if os(tvOS)
+            tvSettingsBody
+            #else
+            Form {
+                // Model settings
+                modelSection
 
-            // Generation settings
-            generationSection
+                // Generation settings
+                generationSection
 
-            // Display settings
-            displaySection
+                // Display settings
+                displaySection
 
-            // System prompt
-            systemPromptSection
+                // System prompt
+                systemPromptSection
 
-            // Logs
-            logsSection
+                #if os(macOS)
+                // Server setup
+                openAICompatibleServerSection
+                #endif
 
-            // About
-            aboutSection
-        }
-        .formStyle(.grouped)
-        .navigationTitle("Settings")
-        #if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .confirmationAction) {
-                Button("Done") {
-                    saveSettings()
-                    dismiss()
+                // Logs
+                logsSection
+
+                // About
+                aboutSection
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Settings")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        saveSettings()
+                        dismiss()
+                    }
                 }
             }
+            #endif
+            #endif
         }
-        #endif
         .onAppear {
             loadSettings()
         }
@@ -149,6 +173,495 @@ struct SettingsView: View {
         }
         #endif
     }
+
+    // MARK: - tvOS Settings
+
+    #if os(tvOS)
+    private var tvSettingsBody: some View {
+        VStack(spacing: 0) {
+            // Header bar
+            HStack(alignment: .center) {
+                Button {
+                    saveSettings()
+                    dismiss()
+                } label: {
+                    Text("Done")
+                }
+                .buttonStyle(.bordered)
+
+                Spacer()
+
+                Text("Settings")
+                    .font(.title2)
+                    .fontWeight(.bold)
+
+                Spacer()
+
+                // Invisible spacer to balance Done button
+                Text("Done").opacity(0)
+            }
+            .padding(.horizontal, 48)
+            .padding(.top, 24)
+            .padding(.bottom, 16)
+            .focusSection()
+
+            ScrollView {
+                VStack(spacing: 24) {
+                    tvModelCard.focusSection()
+                    tvGenerationCard.focusSection()
+                    tvDisplayCard.focusSection()
+                    tvSystemPromptCard.focusSection()
+                    tvServerCard.focusSection()
+                    tvDebugCard.focusSection()
+                    tvAboutCard.focusSection()
+                }
+                .padding(.horizontal, 48)
+                .padding(.top, 8)
+                .padding(.bottom, 40)
+            }
+        }
+    }
+
+    private func tvSectionHeader(_ title: String, icon: String, color: Color) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.title3)
+                .foregroundStyle(color)
+            Text(title)
+                .font(.title3)
+                .fontWeight(.semibold)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func tvCardBackground() -> some View {
+        RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(Color.white.opacity(0.06))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+            )
+    }
+
+    // MARK: - tvOS Model Card
+
+    private var tvModelCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            tvSectionHeader("Model", icon: "cpu", color: .blue)
+
+            Toggle("Auto-load last model", isOn: $autoLoadLastModel)
+            Toggle("Load last chat on startup", isOn: $loadLastChat)
+
+            Button(role: .destructive) {
+                Task {
+                    await StorageService.shared.clearLastModel()
+                }
+            } label: {
+                Label("Clear remembered model", systemImage: "xmark.circle")
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(24)
+        .background(tvCardBackground())
+    }
+
+    // MARK: - tvOS Generation Card
+
+    private var tvGenerationCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            tvSectionHeader("Generation", icon: "slider.horizontal.3", color: .orange)
+
+            // Sampling controls
+            samplingControls
+
+            // Temperature
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Temperature")
+                    Spacer()
+                    Text(String(format: "%.2f", temperature))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
+                tvAdjustmentButtons(
+                    label: "Adjust Temperature",
+                    decrementAction: {
+                        temperature = max(0, temperature - 0.05)
+                    },
+                    incrementAction: {
+                        temperature = min(2, temperature + 0.05)
+                    },
+                    disabled: useRecommendedSampling && hasRecommendedSampling
+                )
+
+                Text("Lower = more focused, Higher = more creative")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            // Top-P and Top-K (only when sampling is enabled)
+            if doSample || (useRecommendedSampling && hasRecommendedSampling) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Top-P")
+                        Spacer()
+                        Text(String(format: "%.2f", topP))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+
+                    tvAdjustmentButtons(
+                        label: "Adjust Top-P",
+                        decrementAction: {
+                            topP = max(0, topP - 0.05)
+                        },
+                        incrementAction: {
+                            topP = min(1, topP + 0.05)
+                        },
+                        disabled: useRecommendedSampling && hasRecommendedSampling
+                    )
+
+                    Text("Nucleus sampling threshold")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Top-K")
+                        Spacer()
+                        Text(topK == 0 ? "Off" : "\(topK)")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+
+                    tvAdjustmentButtons(
+                        label: "Adjust Top-K",
+                        decrementAction: {
+                            topK = max(0, topK - 5)
+                        },
+                        incrementAction: {
+                            topK = min(100, topK + 5)
+                        },
+                        disabled: useRecommendedSampling && hasRecommendedSampling
+                    )
+
+                    Text("Top-K sampling (0 = disabled)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            // Max Tokens
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Max Tokens")
+                    Spacer()
+                    Text("\(maxTokens)")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
+                tvAdjustmentButtons(
+                    label: "Adjust Max Tokens",
+                    decrementAction: {
+                        maxTokens = max(64, maxTokens - 64)
+                    },
+                    incrementAction: {
+                        maxTokens = min(maxTokensLimit, maxTokens + 64)
+                    }
+                )
+
+                Text("Maximum number of tokens to generate (model max: \(maxTokensLimit))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Toggle("Repetition Detection", isOn: $repetitionDetectionEnabled)
+
+            Text(repetitionDetectionEnabled ? "Stops generation if repetitive patterns are detected" : "Generation continues until EOS or max tokens (CLI behavior)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(24)
+        .background(tvCardBackground())
+    }
+
+    // MARK: - tvOS Display Card
+
+    private var tvDisplayCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            tvSectionHeader("Display", icon: "paintbrush", color: .purple)
+
+            Toggle("Enable Markup", isOn: $enableMarkup)
+            Toggle("Send Button on Left", isOn: $sendButtonOnLeft)
+
+            Text("tvOS uses focus-driven controls optimized for Apple TV remote navigation")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(24)
+        .background(tvCardBackground())
+    }
+
+    // MARK: - tvOS System Prompt Card
+
+    private var tvSystemPromptCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            tvSectionHeader("System Prompt", icon: "text.quote", color: .cyan)
+
+            ForEach(SystemPromptOption.allCases) { option in
+                TVPromptOptionButton(
+                    option: option,
+                    isSelected: systemPromptOption == option,
+                    description: tvPromptDescription(for: option)
+                ) {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        systemPromptOption = option
+                    }
+                }
+            }
+
+            if systemPromptOption == .custom {
+                TextField("Custom system prompt", text: $customPrompt)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.white.opacity(0.08))
+                    )
+            }
+        }
+        .padding(24)
+        .background(tvCardBackground())
+    }
+
+    private func tvPromptDescription(for option: SystemPromptOption) -> String {
+        switch option {
+        case .defaultPrompt:
+            return "Standard inference with chat template"
+        case .noTemplate:
+            return "Raw inference without chat template"
+        case .modelThinking:
+            return "Thinking/reasoning mode if supported"
+        case .modelNonThinking:
+            return "Non-thinking mode if supported"
+        case .custom:
+            return "Custom system prompt instructions"
+        }
+    }
+
+    // MARK: - tvOS Server Card
+
+    private var tvServerCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            tvSectionHeader("OpenAI API Server", icon: "network", color: .green)
+
+            Toggle("Enable OpenAI-compatible Server", isOn: $openAICompatibleServerEnabled)
+
+            Picker("Network", selection: $openAICompatibleServerBindMode) {
+                ForEach(OpenAICompatibleServerBindMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(!openAICompatibleServerEnabled)
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Port")
+                    Spacer()
+                    Text("\(openAICompatibleServerPort)")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
+                tvAdjustmentButtons(
+                    label: "Adjust Port",
+                    decrementAction: {
+                        openAICompatibleServerPort = max(1, openAICompatibleServerPort - 1)
+                    },
+                    incrementAction: {
+                        openAICompatibleServerPort = min(65_535, openAICompatibleServerPort + 1)
+                    },
+                    disabled: !openAICompatibleServerEnabled
+                )
+            }
+
+            if openAICompatibleServerEnabled {
+                HStack(spacing: 6) {
+                    Image(systemName: openAIServer.isRunning ? "checkmark.circle.fill" : "clock.arrow.circlepath")
+                        .foregroundStyle(openAIServer.isRunning ? .green : .orange)
+                    Text(openAIServer.isRunning ? "Server is running" : "Starting server...")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let localhostURL = openAIServer.localhostURL {
+                    HStack(spacing: 8) {
+                        Text("Localhost")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 90, alignment: .leading)
+                        Text(localhostURL)
+                            .font(.callout)
+                            .lineLimit(2)
+                    }
+                }
+
+                if openAICompatibleServerBindMode == .lan {
+                    if let lanURL = openAIServer.lanURL {
+                        HStack(spacing: 8) {
+                            Text("LAN/WiFi")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 90, alignment: .leading)
+                            Text(lanURL)
+                                .font(.callout)
+                                .lineLimit(2)
+                        }
+                    } else {
+                        Text("No active LAN/WiFi IPv4 interface found.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if let message = openAICompatibleServerStatusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text("Exposes /v1/models and /v1/chat/completions for the currently loaded model.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(24)
+        .background(tvCardBackground())
+        .onChange(of: openAICompatibleServerEnabled) { _, _ in
+            applyOpenAICompatibleServerSettings()
+        }
+        .onChange(of: openAICompatibleServerBindMode) { _, _ in
+            applyOpenAICompatibleServerSettings()
+        }
+        .onChange(of: openAICompatibleServerPort) { _, newValue in
+            let normalized = min(max(newValue, 1), 65_535)
+            if normalized != newValue {
+                openAICompatibleServerPort = normalized
+                return
+            }
+            applyOpenAICompatibleServerSettings()
+        }
+    }
+
+    // MARK: - tvOS Debug Card
+
+    private var tvDebugCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            tvSectionHeader("Debug", icon: "ladybug", color: .yellow)
+
+            Picker("Debug Level", selection: $debugLevel) {
+                Text("Off").tag(0)
+                Text("Basic").tag(1)
+                Text("Verbose").tag(2)
+            }
+
+            Button {
+                showingLogs = true
+            } label: {
+                HStack {
+                    Label("View Logs", systemImage: "doc.text")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.bordered)
+
+            Text("Debug level affects console output during model loading and inference")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(24)
+        .background(tvCardBackground())
+    }
+
+    // MARK: - tvOS About Card
+
+    private var tvAboutCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            tvSectionHeader("About", icon: "info.circle", color: .gray)
+
+            HStack {
+                Text("Version")
+                Spacer()
+                Text("\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"))")
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Text("Device")
+                Spacer()
+                Text(DeviceType.chipName)
+                    .foregroundStyle(.secondary)
+            }
+
+            Link(destination: URL(string: "https://github.com/anemll/anemll")!) {
+                HStack {
+                    Label("GitHub", systemImage: "link")
+                    Spacer()
+                    Image(systemName: "arrow.up.right")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.bordered)
+
+            Link(destination: URL(string: "https://huggingface.co/anemll")!) {
+                HStack {
+                    Label("HuggingFace Models", systemImage: "link")
+                    Spacer()
+                    Image(systemName: "arrow.up.right")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                showingAcknowledgements = true
+            } label: {
+                HStack {
+                    Label("Acknowledgements", systemImage: "doc.text")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.bordered)
+
+            Button(role: .destructive) {
+                showingResetConfirmation = true
+            } label: {
+                Label("Reset to Defaults", systemImage: "arrow.counterclockwise")
+            }
+            .buttonStyle(.bordered)
+            .confirmationDialog("Reset all settings to defaults?", isPresented: $showingResetConfirmation, titleVisibility: .visible) {
+                Button("Reset", role: .destructive) {
+                    resetToDefaults()
+                }
+                Button("Cancel", role: .cancel) {}
+            }
+
+            Text("ANEMLL Chat - On-device LLM inference powered by Apple Neural Engine")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(24)
+        .background(tvCardBackground())
+    }
+    #endif
 
     // MARK: - Model Section
 
@@ -213,6 +726,143 @@ struct SettingsView: View {
         }
     }
 
+    #if os(macOS) || os(tvOS)
+    private var openAICompatibleServerSection: some View {
+        Section {
+            Toggle("Enable OpenAI-compatible Server", isOn: $openAICompatibleServerEnabled)
+
+            Picker("Network", selection: $openAICompatibleServerBindMode) {
+                ForEach(OpenAICompatibleServerBindMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(!openAICompatibleServerEnabled)
+
+            #if os(tvOS)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Port")
+                    Spacer()
+                    Text("\(openAICompatibleServerPort)")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
+                tvAdjustmentButtons(
+                    label: "Adjust Port",
+                    decrementAction: {
+                        openAICompatibleServerPort = max(1, openAICompatibleServerPort - 1)
+                    },
+                    incrementAction: {
+                        openAICompatibleServerPort = min(65_535, openAICompatibleServerPort + 1)
+                    },
+                    disabled: !openAICompatibleServerEnabled
+                )
+            }
+            #else
+            HStack(spacing: 8) {
+                Text("Port")
+                Spacer()
+                TextField(
+                    "Port",
+                    value: $openAICompatibleServerPort,
+                    format: .number
+                )
+                .frame(width: 90)
+                .multilineTextAlignment(.trailing)
+                .disabled(!openAICompatibleServerEnabled)
+
+                Stepper(
+                    "",
+                    value: $openAICompatibleServerPort,
+                    in: 1...65_535
+                )
+                .labelsHidden()
+                .disabled(!openAICompatibleServerEnabled)
+            }
+            #endif
+
+            if openAICompatibleServerEnabled {
+                HStack(spacing: 6) {
+                    Image(systemName: openAIServer.isRunning ? "checkmark.circle.fill" : "clock.arrow.circlepath")
+                        .foregroundStyle(openAIServer.isRunning ? .green : .orange)
+                    Text(openAIServer.isRunning ? "Server is running" : "Starting server...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let localhostURL = openAIServer.localhostURL {
+                    openAIURLRow(title: "Localhost", url: localhostURL)
+                }
+
+                if openAICompatibleServerBindMode == .lan {
+                    if let lanURL = openAIServer.lanURL {
+                        openAIURLRow(title: "LAN/WiFi", url: lanURL)
+                    } else {
+                        Text("No active LAN/WiFi IPv4 interface found.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if let message = openAICompatibleServerStatusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("OpenAI API Server")
+        } footer: {
+            Text("Exposes `/v1/models` and `/v1/chat/completions` for the currently loaded model.")
+        }
+        .onChange(of: openAICompatibleServerEnabled) { _, _ in
+            applyOpenAICompatibleServerSettings()
+        }
+        .onChange(of: openAICompatibleServerBindMode) { _, _ in
+            applyOpenAICompatibleServerSettings()
+        }
+        .onChange(of: openAICompatibleServerPort) { _, newValue in
+            let normalized = min(max(newValue, 1), 65_535)
+            if normalized != newValue {
+                openAICompatibleServerPort = normalized
+                return
+            }
+            applyOpenAICompatibleServerSettings()
+        }
+    }
+
+    private func openAIURLRow(title: String, url: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 72, alignment: .leading)
+
+            Text(url)
+                .font(.caption)
+                #if !os(tvOS)
+                .textSelection(.enabled)
+                #endif
+                .lineLimit(2)
+
+            Spacer(minLength: 8)
+
+            #if os(macOS)
+            Button("Copy") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(url, forType: .string)
+                openAICompatibleServerStatusMessage = "\(title) URL copied to clipboard."
+            }
+            .buttonStyle(.borderless)
+            #elseif os(tvOS)
+            // tvOS: no clipboard, just display the URL
+            #endif
+        }
+    }
+    #endif
+
     // MARK: - Generation Section
 
     private var generationSection: some View {
@@ -229,8 +879,21 @@ struct SettingsView: View {
                         .monospacedDigit()
                 }
 
+                #if os(tvOS)
+                tvAdjustmentButtons(
+                    label: "Adjust Temperature",
+                    decrementAction: {
+                        temperature = max(0, temperature - 0.05)
+                    },
+                    incrementAction: {
+                        temperature = min(2, temperature + 0.05)
+                    },
+                    disabled: useRecommendedSampling && hasRecommendedSampling
+                )
+                #else
                 Slider(value: $temperature, in: 0...2, step: 0.05)
                     .disabled(useRecommendedSampling && hasRecommendedSampling)
+                #endif
 
                 Text("Lower = more focused, Higher = more creative")
                     .font(.caption)
@@ -248,8 +911,21 @@ struct SettingsView: View {
                             .monospacedDigit()
                     }
 
+                    #if os(tvOS)
+                    tvAdjustmentButtons(
+                        label: "Adjust Top-P",
+                        decrementAction: {
+                            topP = max(0, topP - 0.05)
+                        },
+                        incrementAction: {
+                            topP = min(1, topP + 0.05)
+                        },
+                        disabled: useRecommendedSampling && hasRecommendedSampling
+                    )
+                    #else
                     Slider(value: $topP, in: 0...1, step: 0.05)
                         .disabled(useRecommendedSampling && hasRecommendedSampling)
+                    #endif
 
                     Text("Nucleus sampling threshold")
                         .font(.caption)
@@ -265,6 +941,18 @@ struct SettingsView: View {
                             .monospacedDigit()
                     }
 
+                    #if os(tvOS)
+                    tvAdjustmentButtons(
+                        label: "Adjust Top-K",
+                        decrementAction: {
+                            topK = max(0, topK - 5)
+                        },
+                        incrementAction: {
+                            topK = min(100, topK + 5)
+                        },
+                        disabled: useRecommendedSampling && hasRecommendedSampling
+                    )
+                    #else
                     Slider(
                         value: Binding(
                             get: { Double(topK) },
@@ -274,6 +962,7 @@ struct SettingsView: View {
                         step: 5
                     )
                     .disabled(useRecommendedSampling && hasRecommendedSampling)
+                    #endif
 
                     Text("Top-K sampling (0 = disabled)")
                         .font(.caption)
@@ -290,6 +979,17 @@ struct SettingsView: View {
                         .monospacedDigit()
                 }
 
+                #if os(tvOS)
+                tvAdjustmentButtons(
+                    label: "Adjust Max Tokens",
+                    decrementAction: {
+                        maxTokens = max(64, maxTokens - 64)
+                    },
+                    incrementAction: {
+                        maxTokens = min(maxTokensLimit, maxTokens + 64)
+                    }
+                )
+                #else
                 Slider(
                     value: Binding(
                         get: { Double(maxTokens) },
@@ -298,6 +998,7 @@ struct SettingsView: View {
                     in: 64...Double(maxTokensLimit),
                     step: 64
                 )
+                #endif
 
                 Text("Maximum number of tokens to generate (model max: \(maxTokensLimit))")
                     .font(.caption)
@@ -326,6 +1027,33 @@ struct SettingsView: View {
     private var maxTokensLimit: Int {
         InferenceService.shared.modelMaxContextSize
     }
+
+    #if os(tvOS)
+    private func tvAdjustmentButtons(
+        label: String,
+        decrementAction: @escaping () -> Void,
+        incrementAction: @escaping () -> Void,
+        disabled: Bool = false
+    ) -> some View {
+        HStack(spacing: 12) {
+            Button(action: decrementAction) {
+                Image(systemName: "minus.circle.fill")
+            }
+            .buttonStyle(.bordered)
+            .disabled(disabled)
+
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Button(action: incrementAction) {
+                Image(systemName: "plus.circle.fill")
+            }
+            .buttonStyle(.bordered)
+            .disabled(disabled)
+        }
+    }
+    #endif
 
     @ViewBuilder
     private var samplingControls: some View {
@@ -399,9 +1127,19 @@ struct SettingsView: View {
             }
 
             if systemPromptOption == .custom {
+                #if os(tvOS)
+                TextField("Custom system prompt", text: $customPrompt)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.white.opacity(0.08))
+                    )
+                #else
                 TextEditor(text: $customPrompt)
                     .frame(minHeight: 80)
                     .font(.body)
+                #endif
             }
         } header: {
             Text("System Prompt")
@@ -427,7 +1165,9 @@ struct SettingsView: View {
         Section {
             Toggle("Enable Markup", isOn: $enableMarkup)
             Toggle("Send Button on Left", isOn: $sendButtonOnLeft)
+            #if !os(tvOS)
             Toggle("Show Microphone", isOn: $showMicrophone)
+            #endif
             #if os(iOS) || os(visionOS)
             Toggle("Large Controls", isOn: $largeControls)
             #endif
@@ -436,6 +1176,8 @@ struct SettingsView: View {
         } footer: {
             #if os(iOS) || os(visionOS)
             Text(largeControls ? "Send button and toolbar icons are enlarged for easier touch" : "Standard control sizes")
+            #elseif os(tvOS)
+            Text("tvOS uses focus-driven controls optimized for Apple TV remote navigation")
             #else
             Text(showMicrophone ? "Voice input button is shown next to the text field" : "Voice input button is hidden")
             #endif
@@ -581,6 +1323,12 @@ struct SettingsView: View {
             #if os(macOS)
             macOSStorageFolderPath = await StorageService.shared.currentMacOSStorageFolderURL().path
             #endif
+            #if os(macOS) || os(tvOS)
+            openAICompatibleServerEnabled = await StorageService.shared.openAICompatibleServerEnabled
+            openAICompatibleServerBindMode = await StorageService.shared.openAICompatibleServerBindMode
+            openAICompatibleServerPort = await StorageService.shared.openAICompatibleServerPort
+            hasLoadedOpenAICompatibleServerSettings = true
+            #endif
         }
     }
 
@@ -617,6 +1365,13 @@ struct SettingsView: View {
             await StorageService.shared.saveTopP(topP)
             await StorageService.shared.saveTopK(topK)
             await StorageService.shared.saveUseRecommendedSampling(useRecommendedSampling)
+            #if os(macOS) || os(tvOS)
+            await openAIServer.applySettings(
+                enabled: openAICompatibleServerEnabled,
+                bindMode: openAICompatibleServerBindMode,
+                port: openAICompatibleServerPort
+            )
+            #endif
             // Update InferenceService settings
             await MainActor.run {
                 InferenceService.shared.debugLevel = debugLevel
@@ -647,6 +1402,11 @@ struct SettingsView: View {
         topP = StorageService.defaultTopPValue
         topK = StorageService.defaultTopKValue
         useRecommendedSampling = StorageService.defaultUseRecommendedSamplingValue
+        #if os(macOS) || os(tvOS)
+        openAICompatibleServerEnabled = StorageService.defaultOpenAICompatibleServerEnabledValue
+        openAICompatibleServerBindMode = StorageService.defaultOpenAICompatibleServerBindModeValue
+        openAICompatibleServerPort = StorageService.defaultOpenAICompatibleServerPortValue
+        #endif
 
         // Save to storage
         Task {
@@ -665,8 +1425,47 @@ struct SettingsView: View {
                 InferenceService.shared.topK = topK
                 InferenceService.shared.useRecommendedSampling = useRecommendedSampling
             }
+            #if os(macOS) || os(tvOS)
+            await openAIServer.applySettings(
+                enabled: openAICompatibleServerEnabled,
+                bindMode: openAICompatibleServerBindMode,
+                port: openAICompatibleServerPort
+            )
+            #endif
         }
     }
+
+    #if os(macOS) || os(tvOS)
+    private func applyOpenAICompatibleServerSettings() {
+        guard hasLoadedOpenAICompatibleServerSettings else { return }
+
+        let normalizedPort = min(max(openAICompatibleServerPort, 1), 65_535)
+        if openAICompatibleServerPort != normalizedPort {
+            openAICompatibleServerPort = normalizedPort
+            return
+        }
+
+        Task {
+            await openAIServer.applySettings(
+                enabled: openAICompatibleServerEnabled,
+                bindMode: openAICompatibleServerBindMode,
+                port: normalizedPort
+            )
+
+            await MainActor.run {
+                if let error = openAIServer.lastErrorMessage {
+                    openAICompatibleServerStatusMessage = error
+                } else if openAICompatibleServerEnabled {
+                    openAICompatibleServerStatusMessage = openAIServer.isRunning
+                        ? "Server running on port \(normalizedPort)."
+                        : "Starting server on port \(normalizedPort)..."
+                } else {
+                    openAICompatibleServerStatusMessage = "Server disabled."
+                }
+            }
+        }
+    }
+    #endif
 
     #if os(macOS)
     private func handleStorageFolderSelection(_ selectedURL: URL) {
@@ -750,6 +1549,66 @@ struct SettingsView: View {
     #endif
 }
 
+// MARK: - tvOS Prompt Option Button
+
+#if os(tvOS)
+private struct TVPromptOptionButton: View {
+    let option: SystemPromptOption
+    let isSelected: Bool
+    let description: String
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 14) {
+                // Selection indicator
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(isSelected ? .cyan : .secondary)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(option.rawValue)
+                        .font(.callout)
+                        .fontWeight(isSelected ? .semibold : .regular)
+                        .foregroundStyle(isSelected ? .primary : .secondary)
+
+                    Text(description)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(isSelected
+                          ? Color.cyan.opacity(isFocused ? 0.18 : 0.10)
+                          : Color.white.opacity(isFocused ? 0.10 : 0.04))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(
+                        isFocused
+                            ? Color.cyan.opacity(0.6)
+                            : (isSelected ? Color.cyan.opacity(0.25) : Color.clear),
+                        lineWidth: 1.5
+                    )
+            )
+            .scaleEffect(isFocused ? 1.02 : 1.0)
+            .animation(.easeOut(duration: 0.15), value: isFocused)
+        }
+        .buttonStyle(.plain)
+        .focusable()
+        .focused($isFocused)
+    }
+}
+#endif
+
 // MARK: - Logs View
 
 struct LogsView: View {
@@ -786,7 +1645,7 @@ struct LogsView: View {
 
                         Text(entry.message)
                             .font(.caption)
-                            .textSelection(.enabled)
+                            .selectable(true)
                     }
                 }
                 .listStyle(.plain)
@@ -839,11 +1698,11 @@ struct LogsView: View {
 
     private func copyLogs() {
         let text = AppLogger.shared.exportLogs()
-        #if os(iOS)
-        UIPasteboard.general.string = text
-        #else
+        #if os(macOS)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+        #elseif os(iOS) || os(visionOS)
+        UIPasteboard.general.string = text
         #endif
     }
 
@@ -1139,7 +1998,9 @@ struct AcknowledgementsView: View {
                     Button("Done") {
                         dismiss()
                     }
+                    #if !os(tvOS)
                     .keyboardShortcut(.escape, modifiers: [])
+                    #endif
                 }
             }
             .sheet(item: $selectedLibrary) { library in
@@ -1175,7 +2036,7 @@ struct LicenseDetailView: View {
                     Text(library.license)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
+                        .selectable(true)
                 }
                 .padding()
             }
@@ -1188,7 +2049,9 @@ struct LicenseDetailView: View {
                     Button("Done") {
                         onDismiss()
                     }
+                    #if !os(tvOS)
                     .keyboardShortcut(.escape, modifiers: [])
+                    #endif
                 }
             }
         }
