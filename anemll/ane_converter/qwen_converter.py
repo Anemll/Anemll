@@ -36,6 +36,11 @@ from ..models.qwen_model import (
     TEST_DEVICE,
     CONTEXT_LENGTH,
 )
+from ..models.lazy_weights import (
+    LazySafeTensorLoader,
+    WeightLoadSpec,
+    compute_chunk_layer_range,
+)
 
 
 class QwenConverter(BaseConverter):
@@ -596,7 +601,10 @@ class QwenConverter(BaseConverter):
                 )
                 # Apply final norm only once on the last chunk.
                 # Applying it on every chunk causes severe divergence for chunked exports.
-                if self.end_layer is None or self.end_layer == len(self.model.model.layers):
+                if (
+                    (self.end_layer is None or self.end_layer == self.model.config.num_hidden_layers)
+                    and self.model.model.norm is not None
+                ):
                     out = self.model.model.norm(out)
                 return out
 
@@ -694,7 +702,7 @@ class QwenConverter(BaseConverter):
 
                 # Skip normalization for prefill - data not used, only KV cache is updated!
                 # This follows the LLAMA pattern and avoids unnecessary computation
-                if self.end_layer is None or self.end_layer == len(self.model.model.layers):
+                if self.end_layer is None or self.end_layer == self.model.config.num_hidden_layers:
                     print("Skipping final normalization for prefill, data not used!")
                     # Return only first token to minimize memory usage
                     return out[:, 0:1, :]
@@ -1252,6 +1260,127 @@ def parse_lut_arg(lut_value):
             raise ValueError(f"Invalid LUT bits value: {lut_value}")
 
 
+def _chunk_indices(num_chunks: int, chunk_no: int | None) -> list[int]:
+    if chunk_no is None:
+        return list(range(num_chunks))
+    if chunk_no < 1 or chunk_no > num_chunks:
+        raise ValueError(f"chunk_no must be in [1, {num_chunks}], got {chunk_no}")
+    return [chunk_no - 1]
+
+
+def _build_qwen_base_load_spec(
+    *,
+    part: str,
+    config: QwenConfig,
+    num_chunks: int,
+    chunk_idx: int | None = None,
+) -> WeightLoadSpec | None:
+    if part in ("3",):
+        return None
+
+    if part in ("1", "embeddings"):
+        return WeightLoadSpec(
+            include_prefixes=("model.embed_tokens.", "embed_tokens."),
+            strip_prefix="model.",
+            description="qwen-embeddings-only",
+        )
+
+    if part in ("2", "2_prefill", "prefill"):
+        if chunk_idx is None:
+            layer_range = (0, config.num_hidden_layers)
+            is_last_chunk = True
+        else:
+            layer_range = compute_chunk_layer_range(
+                config.num_hidden_layers, num_chunks, chunk_idx
+            )
+            is_last_chunk = chunk_idx == (num_chunks - 1)
+
+        prefixes = ["model.layers.", "layers."]
+        # Final norm is used only in inference FFN on the last chunk.
+        if part == "2" and is_last_chunk:
+            prefixes.extend(["model.norm.", "norm."])
+
+        return WeightLoadSpec(
+            include_prefixes=tuple(prefixes),
+            layer_range=layer_range,
+            strip_prefix="model.",
+            description=f"qwen-{part}-layers[{layer_range[0]}:{layer_range[1]}]",
+        )
+
+    # full/all/monolithic paths need the whole base model.
+    return WeightLoadSpec(
+        include_prefixes=("model.", "layers.", "embed_tokens.", "norm."),
+        exclude_prefixes=("lm_head.", "model.lm_head."),
+        strip_prefix="model.",
+        description="qwen-base-full",
+    )
+
+
+def _build_qwen_lm_head_load_spec(part: str) -> WeightLoadSpec | None:
+    if part in ("3", "monolithic", "monolithic_prefill", "all", "full", "123"):
+        return QwenForCausalLM.default_lm_head_weight_spec()
+    return None
+
+
+def _build_qwen_model_init_kwargs(
+    *,
+    part: str,
+    config: QwenConfig,
+    num_chunks: int,
+    chunk_no: int | None,
+    lazy_weights: bool,
+) -> dict:
+    # Keep non-lazy path behavior unchanged for baseline comparisons.
+    if not lazy_weights:
+        return {}
+
+    normalized_part = "2_prefill" if part == "prefill" else part
+    kwargs: dict = {}
+
+    if normalized_part in ("1", "embeddings"):
+        kwargs.update(
+            build_embeddings=True,
+            build_layers=False,
+            build_norm=False,
+            build_kv_cache=False,
+            build_lm_head=False,
+        )
+        return kwargs
+
+    if normalized_part == "3":
+        kwargs.update(
+            build_embeddings=False,
+            build_layers=False,
+            build_norm=False,
+            build_kv_cache=False,
+            build_lm_head=True,
+        )
+        return kwargs
+
+    if normalized_part in ("2", "2_prefill"):
+        kwargs.update(
+            build_embeddings=False,
+            build_layers=True,
+            build_norm=(normalized_part == "2"),
+            build_kv_cache=True,
+            build_lm_head=False,
+        )
+        if chunk_no is not None:
+            chunk_idx = chunk_no - 1
+            layer_range = compute_chunk_layer_range(
+                config.num_hidden_layers, num_chunks, chunk_idx
+            )
+            kwargs["layer_range"] = layer_range
+            kwargs["build_norm"] = (
+                normalized_part == "2"
+                and layer_range[1] == config.num_hidden_layers
+            )
+        return kwargs
+
+    # full/all/monolithic use full model topology by default.
+    return kwargs
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments for the converter."""
 
@@ -1291,6 +1420,25 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Split FFN/prefill into N chunks",
+    )
+    parser.add_argument(
+        "--chunk-no",
+        type=int,
+        default=None,
+        help="Convert only this chunk number (1-based) for part 2 / 2_prefill.",
+    )
+    parser.add_argument(
+        "--lazy-weights",
+        dest="lazy_weights",
+        action="store_true",
+        default=True,
+        help="Load only weights required by the current conversion part/chunk (default: on).",
+    )
+    parser.add_argument(
+        "--no-lazy-weights",
+        dest="lazy_weights",
+        action="store_false",
+        help="Disable lazy part/chunk weight loading.",
     )
     parser.add_argument(
         "--dynamic-prefill-slice",
@@ -1348,8 +1496,10 @@ def test_conversion(
     output_dir: str = ".",
     part: str = "full",
     num_chunks: int = 1,
+    chunk_no: int | None = None,
     per_channel: int = 8,
     argmax_in_model: bool = False,
+    lazy_weights: bool = True,
     lut_embeddings_bits=None,
     lut_embeddings_per_channel=8,
     lut_lmhead_bits=None,
@@ -1373,6 +1523,7 @@ def test_conversion(
         f"test_conversion called with model_path={model_path}, prefix={prefix}, part={part}"
     )
 
+    lazy_loader: LazySafeTensorLoader | None = None
     if model is None:
         if model_path is None:
             raise ValueError("model_path must be provided if model is None")
@@ -1397,16 +1548,62 @@ def test_conversion(
             f"Updated config: context_length={config.context_length}, state_length={config.state_length}"
         )
 
+        def _build_model_for_chunk(target_chunk_no: int | None) -> QwenForCausalLM:
+            init_kwargs = _build_qwen_model_init_kwargs(
+                part=part,
+                config=config,
+                num_chunks=num_chunks,
+                chunk_no=target_chunk_no,
+                lazy_weights=lazy_weights,
+            )
+            if init_kwargs:
+                print(f"Model init overrides: {init_kwargs}")
+            built_model = QwenForCausalLM(config, enable_coreml=True, **init_kwargs)
+            built_model.eval()
+            for param in built_model.parameters():
+                param.requires_grad = False
+            return built_model
+
         print("Creating model...")
-        model = QwenForCausalLM(config, enable_coreml=True)
-        print("Loading pretrained weights...")
-        model.load_pretrained_weights(model_path)
-        print("Model loaded successfully!")
-        
-        # Ensure model is in eval mode and gradients are disabled
-        model.eval()
-        for param in model.parameters():
-            param.requires_grad = False
+        initial_chunk_no: int | None = None
+        if lazy_weights and part in ("2", "2_prefill") and num_chunks > 1:
+            # Build only the first active chunk layers up front; remaining chunks
+            # will rebuild a chunk-local model inside the conversion loop.
+            initial_chunk_no = chunk_no if chunk_no is not None else 1
+        model = _build_model_for_chunk(initial_chunk_no)
+        if lazy_weights:
+            lazy_loader = LazySafeTensorLoader(model_path)
+            # For multi-chunk FFN/prefill we lazily reload each chunk right before trace.
+            deferred_chunk_load = part in ("2", "2_prefill") and num_chunks > 1 and chunk_no is None
+            if deferred_chunk_load:
+                print("Lazy chunk mode: deferring weight loads to per-chunk conversion.")
+            else:
+                base_spec = _build_qwen_base_load_spec(
+                    part=part,
+                    config=config,
+                    num_chunks=num_chunks,
+                    chunk_idx=(chunk_no - 1) if chunk_no else None,
+                )
+                lm_spec = _build_qwen_lm_head_load_spec(part)
+                load_base = base_spec is not None
+                load_lm_head = lm_spec is not None
+                allow_partial = part not in ("all", "full", "123", "monolithic", "monolithic_prefill")
+                print("Loading pretrained weights (lazy)...")
+                model.load_pretrained_weights(
+                    model_path,
+                    base_weight_spec=base_spec,
+                    lm_head_weight_spec=lm_spec,
+                    load_base=load_base,
+                    load_lm_head=load_lm_head,
+                    allow_partial=allow_partial,
+                    loader=lazy_loader,
+                )
+                print("Lazy model load completed.")
+        else:
+            print("Loading pretrained weights...")
+            model.load_pretrained_weights(model_path)
+            print("Model loaded successfully!")
+
         print("Model set to eval mode and gradients disabled")
 
     print("Creating converter...")
@@ -1424,8 +1621,67 @@ def test_conversion(
         lut_lmhead_per_channel=lut_lmhead_per_channel,
     )
 
+    if lazy_weights and lazy_loader is None and model_path:
+        lazy_loader = LazySafeTensorLoader(model_path)
+
     print("Starting conversion...")
-    mlmodel = converter.convert(part=part)
+    chunk_numbers: list[int] = []
+    if part in ("2", "2_prefill") and (chunk_no is not None or (lazy_weights and num_chunks > 1)):
+        chunk_ids = _chunk_indices(num_chunks, chunk_no)
+        chunk_models: list[ct.models.MLModel] = []
+        active_chunk_no = chunk_no if chunk_no is not None else (
+            1 if (lazy_weights and num_chunks > 1 and model is not None) else None
+        )
+        for idx in chunk_ids:
+            target_chunk_no = idx + 1
+            if (
+                lazy_weights
+                and model_path
+                and part in ("2", "2_prefill")
+                and num_chunks > 1
+                and active_chunk_no != target_chunk_no
+            ):
+                print(f"Rebuilding chunk-local model for chunk {target_chunk_no}/{num_chunks}...")
+                rebuild_kwargs = _build_qwen_model_init_kwargs(
+                    part=part,
+                    config=model.config,
+                    num_chunks=num_chunks,
+                    chunk_no=target_chunk_no,
+                    lazy_weights=lazy_weights,
+                )
+                if rebuild_kwargs:
+                    print(f"Model init overrides: {rebuild_kwargs}")
+                model = QwenForCausalLM(model.config, enable_coreml=True, **rebuild_kwargs)
+                model.eval()
+                for param in model.parameters():
+                    param.requires_grad = False
+                converter.model = model
+                active_chunk_no = target_chunk_no
+            if lazy_weights and model_path and lazy_loader is not None:
+                base_spec = _build_qwen_base_load_spec(
+                    part=part,
+                    config=model.config,
+                    num_chunks=num_chunks,
+                    chunk_idx=idx,
+                )
+                model.load_pretrained_weights(
+                    model_path,
+                    base_weight_spec=base_spec,
+                    lm_head_weight_spec=None,
+                    load_base=True,
+                    load_lm_head=False,
+                    allow_partial=True,
+                    loader=lazy_loader,
+                )
+            if part == "2":
+                chunk_mlmodel = converter.convert_part_2(model, idx, num_chunks)
+            else:
+                chunk_mlmodel = converter.convert_part_2_prefill(model, idx, num_chunks)
+            chunk_models.append(chunk_mlmodel)
+            chunk_numbers.append(idx + 1)
+        mlmodel = chunk_models if len(chunk_models) > 1 else chunk_models[0]
+    else:
+        mlmodel = converter.convert(part=part)
     print("Conversion completed!")
 
     print(f"Creating output directory: {output_dir}")
@@ -1435,6 +1691,11 @@ def test_conversion(
         models = mlmodel
     else:
         models = [mlmodel]
+    if not chunk_numbers and part in ["2", "2_prefill"]:
+        if chunk_no is not None:
+            chunk_numbers = [chunk_no]
+        else:
+            chunk_numbers = [i + 1 for i in range(len(models))]
 
     vocab_size = int(getattr(model.config, "vocab_size", 0)) if model is not None else None
     lm_head_chunk_sizes = None
@@ -1458,6 +1719,7 @@ def test_conversion(
             lm_head_chunk_sizes = [int(model.lm_head.out_channels)]
 
     for i, m in enumerate(models):
+        chunk_tag = chunk_numbers[i] if (part in ["2", "2_prefill"] and i < len(chunk_numbers)) else None
         AddMetadata(
             m,
             {
@@ -1465,7 +1727,7 @@ def test_conversion(
                 "batch_size": batch_size if part in ["2_prefill", "prefill", "monolithic_prefill"] else None,
                 "lut_bits": lut_bits,
                 "num_chunks": num_chunks if part in ["2", "2_prefill"] else None,
-                "chunk_no": i + 1 if part in ["2", "2_prefill"] else None,
+                "chunk_no": chunk_tag if part in ["2", "2_prefill"] else None,
                 "split_part": (
                     ModelPart.FULL.value if part in ["full", "all", "123"] else part
                 ),
@@ -1488,7 +1750,8 @@ def test_conversion(
             fname += f"_{base}"
             if lut_bits is not None:
                 fname += f"_lut{lut_bits}"
-            fname += f"_chunk_{i+1:02d}of{num_chunks:02d}"
+            chunk_id = chunk_tag if chunk_tag is not None else (i + 1)
+            fname += f"_chunk_{chunk_id:02d}of{num_chunks:02d}"
         if part in ["full", "all", "123"]:
             fname += ""
         if part not in ["2", "2_prefill"]:
@@ -1530,8 +1793,11 @@ def main() -> None:
         print(f"LUT lm_head override: {lut_lmhead_bits} bits, per_channel={lut_lmhead_per_channel}")
     if args.chunk:
         print(f"Splitting into {args.chunk} chunks")
+    if args.chunk_no is not None:
+        print(f"Converting chunk number: {args.chunk_no}")
     if args.argmax:
         print("Argmax in model: enabled")
+    print(f"Lazy weights: {'enabled' if args.lazy_weights else 'disabled'}")
     print(f"Converting part(s): {args.part}")
 
     # Map legacy part names to numeric equivalents
@@ -1549,8 +1815,10 @@ def main() -> None:
             output_dir=args.output,
             part=part,
             num_chunks=args.chunk or 1,
+            chunk_no=args.chunk_no,
             per_channel=per_channel,
             argmax_in_model=args.argmax,
+            lazy_weights=args.lazy_weights,
             lut_embeddings_bits=lut_embeddings_bits,
             lut_embeddings_per_channel=lut_embeddings_per_channel,
             lut_lmhead_bits=lut_lmhead_bits,

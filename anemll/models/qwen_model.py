@@ -12,12 +12,13 @@ from __future__ import annotations
 import os
 import json
 import math
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
-import safetensors.torch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .lazy_weights import LazySafeTensorLoader, WeightLoadSpec
 
 # ---------------------------------------------------------------------------
 # Qwen 3 model implementation adapted from llama_model.py
@@ -578,27 +579,62 @@ class QwenDecoderLayer(nn.Module):
 
 
 class QwenModel(nn.Module):
-    def __init__(self, config: QwenConfig) -> None:
+    def __init__(
+        self,
+        config: QwenConfig,
+        *,
+        build_embeddings: bool = True,
+        build_layers: bool = True,
+        build_norm: bool = True,
+        layer_range: Optional[Tuple[int, int]] = None,
+        build_kv_cache: bool = True,
+    ) -> None:
         super().__init__()
         self.config = config
         self.disable_kv_cache = False  # Will be set by parent model
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size).to(
-            TEST_DEVICE
-        )
-        self.layers = nn.ModuleList(
-            [QwenDecoderLayer(config) for _ in range(config.num_hidden_layers)]
-        )
-        self.norm = QwenRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.total_num_hidden_layers = int(config.num_hidden_layers)
+
+        if layer_range is None:
+            start_layer, end_layer = 0, self.total_num_hidden_layers
+        else:
+            start_layer, end_layer = layer_range
+            if start_layer < 0 or end_layer < start_layer or end_layer > self.total_num_hidden_layers:
+                raise ValueError(
+                    f"Invalid layer_range={layer_range} for total layers={self.total_num_hidden_layers}"
+                )
+
+        self.active_layer_start = int(start_layer)
+        self.active_layer_end = int(end_layer)
+        active_layer_count = max(0, self.active_layer_end - self.active_layer_start)
+
+        if build_embeddings:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size).to(
+                TEST_DEVICE
+            )
+        else:
+            self.embed_tokens = None
+
+        if build_layers and active_layer_count > 0:
+            self.layers = nn.ModuleList(
+                [QwenDecoderLayer(config) for _ in range(active_layer_count)]
+            )
+        else:
+            self.layers = nn.ModuleList([])
+
+        if build_norm:
+            self.norm = QwenRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = None
 
         # Initialize KV cache with MODEL_DTYPE (following llama_model.py pattern)  
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         if not hasattr(QwenModel, '_config_printed'):
             print(f"QwenModel using head_dim={self.head_dim} for KV cache (config has: {getattr(config, 'head_dim', 'not set')})")
             QwenModel._config_printed = True
-        
-        if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
+
+        if build_kv_cache and len(self.layers) > 0 and (FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE):
             cache_size = (
-                2 * config.num_hidden_layers,
+                2 * self.total_num_hidden_layers,
                 config.num_key_value_heads,
                 config.state_length,
                 self.head_dim
@@ -607,8 +643,8 @@ class QwenModel(nn.Module):
             if not hasattr(QwenModel, '_cache_init_printed'):
                 print(f"Initialized unified KV kv_cache_0 with shape: {self.kv_cache_0.shape}")
                 QwenModel._cache_init_printed = True
-        else:
-            layers_per_group = config.num_hidden_layers
+        elif build_kv_cache and len(self.layers) > 0:
+            layers_per_group = self.total_num_hidden_layers
             for i in range(config.num_hidden_layers):
                 cache_size = (
                     2 * layers_per_group,
@@ -621,8 +657,33 @@ class QwenModel(nn.Module):
                     torch.zeros(cache_size, dtype=MODEL_DTYPE, device=TEST_DEVICE)
                 )
 
+    def _local_layer_index(self, layer_idx: int) -> int:
+        local_idx = int(layer_idx) - self.active_layer_start
+        if local_idx < 0 or local_idx >= len(self.layers):
+            raise IndexError(
+                f"Layer index {layer_idx} is outside active range "
+                f"[{self.active_layer_start}, {self.active_layer_end})"
+            )
+        return local_idx
+
+    def _resolve_layer_range(
+        self,
+        start_layer: Optional[int],
+        end_layer: Optional[int],
+    ) -> Tuple[int, int]:
+        start = self.active_layer_start if start_layer is None else int(start_layer)
+        end = self.active_layer_end if end_layer is None else int(end_layer)
+        if start < self.active_layer_start or end > self.active_layer_end or end < start:
+            raise ValueError(
+                f"Requested layer range [{start}, {end}) is outside active range "
+                f"[{self.active_layer_start}, {self.active_layer_end})"
+            )
+        return start, end
+
     def get_rotary_embeddings_s(self, current_pos):
         """Get rotary embeddings for the current position"""
+        if len(self.layers) == 0:
+            raise RuntimeError("No transformer layers are initialized; rotary embeddings unavailable.")
         sin = self.layers[0].self_attn.rotary_emb.sin_cached[:, current_pos].view(1, 1, 1, -1)
         cos = self.layers[0].self_attn.rotary_emb.cos_cached[:, current_pos].view(1, 1, 1, -1)
         return cos.to(MODEL_DTYPE), sin.to(MODEL_DTYPE)
@@ -634,6 +695,8 @@ class QwenModel(nn.Module):
         Returns:
             Tuple of (cos, sin) tensors with shape [1, seq_len, 1, head_dim]
         """
+        if len(self.layers) == 0:
+            raise RuntimeError("No transformer layers are initialized; rotary embeddings unavailable.")
         # Get rotary embeddings from the first attention layer
         rotary_emb = self.layers[0].self_attn.rotary_emb
         
@@ -646,7 +709,7 @@ class QwenModel(nn.Module):
 
     def process_layer_prefill(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset):
         """Process a single transformer layer in prefill mode"""
-        layer = self.layers[layer_idx]
+        layer = self.layers[self._local_layer_index(layer_idx)]
 
         normalized_states = layer.input_layernorm(hidden_states)
         
@@ -658,7 +721,9 @@ class QwenModel(nn.Module):
         )
 
         # Get group indices
-        group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
+        group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(
+            layer_idx, self.total_num_hidden_layers
+        )
 
         # Get the combined KV cache for this group
         if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
@@ -697,7 +762,7 @@ class QwenModel(nn.Module):
 
     def process_layer_regular(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset):
         """Process a single transformer layer in regular (non-prefill) mode"""
-        layer = self.layers[layer_idx]
+        layer = self.layers[self._local_layer_index(layer_idx)]
         batch_size = position_ids.shape[0]
         seq_len = hidden_states.shape[1]
 
@@ -722,7 +787,9 @@ class QwenModel(nn.Module):
         if not self.disable_kv_cache:
             # Standard KV cache path
             # Get group indices
-            group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
+            group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(
+                layer_idx, self.total_num_hidden_layers
+            )
 
             # Get the combined KV cache for this group
             if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
@@ -845,10 +912,22 @@ class QwenModel(nn.Module):
         else:
             return self.process_layer_regular(layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset)
 
-    def process_layers(self, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, start_layer=0, end_layer=None, IN_PREFILL=False):
+    def process_layers(
+        self,
+        hidden_states,
+        position_ids,
+        causal_mask,
+        current_pos,
+        rotary_emb,
+        start_layer=None,
+        end_layer=None,
+        IN_PREFILL=False,
+    ):
         """Process a range of transformer layers"""
-        if end_layer is None:
-            end_layer = len(self.layers)
+        if len(self.layers) == 0:
+            return hidden_states
+
+        start_layer, end_layer = self._resolve_layer_range(start_layer, end_layer)
 
         layer_offset = 0
         if not ENABLE_UNIFIED_CACHE:
@@ -870,6 +949,8 @@ class QwenModel(nn.Module):
         IN_PREFILL: bool = False,
     ) -> torch.Tensor:
         """Forward pass through the transformer layers with KV cache support."""
+        if self.embed_tokens is None:
+            raise RuntimeError("embed_tokens is not initialized for this model instance.")
         hidden_states = self.embed_tokens(input_ids)
         
         # Get rotary embeddings
@@ -881,10 +962,12 @@ class QwenModel(nn.Module):
         # Process layers
         hidden_states = self.process_layers(
             hidden_states, position_ids, causal_mask,
-            current_pos, rotary_emb, start_layer=0, end_layer=None, IN_PREFILL=IN_PREFILL,
+            current_pos, rotary_emb, start_layer=self.active_layer_start, end_layer=self.active_layer_end, IN_PREFILL=IN_PREFILL,
         )
 
         # Always apply final normalization - critical for correct model output
+        if self.norm is None:
+            raise RuntimeError("norm is not initialized for this model instance.")
         hidden_states = self.norm(hidden_states)
 
         return hidden_states
@@ -898,31 +981,20 @@ class QwenModel(nn.Module):
         # Get rotary embeddings
         rotary_emb = self.get_rotary_embedding_prefill(position_ids)
         
-        # Process layers within the specified range if provided
-        if start_layer is not None and end_layer is not None:
-            hidden_states = self.process_layers(
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                causal_mask=causal_mask,
-                current_pos=current_pos,
-                rotary_emb=rotary_emb,
-                start_layer=start_layer,
-                end_layer=end_layer,
-                IN_PREFILL=True
-            )
-        else:
-            # Process all layers for non-split mode
-            hidden_states = self.process_layers(
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                causal_mask=causal_mask,
-                current_pos=current_pos,
-                rotary_emb=rotary_emb,
-                IN_PREFILL=True
-            )
+        resolved_start, resolved_end = self._resolve_layer_range(start_layer, end_layer)
+        hidden_states = self.process_layers(
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            causal_mask=causal_mask,
+            current_pos=current_pos,
+            rotary_emb=rotary_emb,
+            start_layer=resolved_start,
+            end_layer=resolved_end,
+            IN_PREFILL=True
+        )
         
         # Apply final normalization if this is the last block
-        if end_layer is None or end_layer == len(self.layers):
+        if self.norm is not None and resolved_end == self.total_num_hidden_layers:
             hidden_states = self.norm(hidden_states)
 
         return hidden_states
@@ -930,44 +1002,59 @@ class QwenModel(nn.Module):
     # ------------------------------------------------------------------
     # Weight loading
     # ------------------------------------------------------------------
-    def load_pretrained_weights(self, model_path: str) -> bool:
-        if not os.path.isdir(model_path):
-            raise FileNotFoundError(model_path)
-        state_dict: Dict[str, torch.Tensor] = {}
-        for file in os.listdir(model_path):
-            if file.endswith(".safetensors"):
-                state_dict.update(
-                    safetensors.torch.load_file(os.path.join(model_path, file))
-                )
+    @staticmethod
+    def default_base_weight_spec() -> WeightLoadSpec:
+        return WeightLoadSpec(
+            include_prefixes=("model.", "layers.", "embed_tokens.", "norm."),
+            exclude_prefixes=("lm_head.", "model.lm_head."),
+            strip_prefix="model.",
+            description="qwen-base",
+        )
 
+    @staticmethod
+    def _projection_like(name: str) -> bool:
+        return any(
+            proj in name
+            for proj in (
+                "q_proj.weight",
+                "k_proj.weight",
+                "v_proj.weight",
+                "o_proj.weight",
+                "gate_proj.weight",
+                "up_proj.weight",
+                "down_proj.weight",
+            )
+        )
+
+    @staticmethod
+    def _filter_missing_keys(missing: list[str]) -> list[str]:
+        filtered = [m for m in missing if "rotary_emb.inv_freq" not in m]
+        return [m for m in filtered if m != "kv_cache_0"]
+
+    def _apply_base_state_dict(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        allow_partial: bool = False,
+    ) -> bool:
         conv_state = {}
         for k, v in state_dict.items():
             new_k = k.replace("model.", "") if k.startswith("model.") else k
             if "lm_head.weight" in new_k:
                 continue
-            if any(
-                proj in new_k
-                for proj in [
-                    "q_proj.weight",
-                    "k_proj.weight",
-                    "v_proj.weight",
-                    "o_proj.weight",
-                    "gate_proj.weight",
-                    "up_proj.weight",
-                    "down_proj.weight",
-                ]
-            ):
+            if self._projection_like(new_k):
                 conv_state[new_k] = v.view(v.shape[0], v.shape[1], 1, 1)
             else:
                 conv_state[new_k] = v
 
         missing, unexpected = self.load_state_dict(conv_state, strict=False)
-        missing = [m for m in missing if "rotary_emb.inv_freq" not in m]
-        # Filter out expected missing keys including KV cache buffer
-        expected_missing = ['kv_cache_0']  # KV cache buffer is initialized separately
-        missing = [m for m in missing if m not in expected_missing]
+        missing = self._filter_missing_keys(missing)
         allow_missing = os.environ.get("ANEMLL_ALLOW_MISSING_WEIGHTS", "").lower() in ("1", "true", "yes")
         if missing:
+            if allow_partial:
+                print(f"Partial base weight load: {len(missing)} keys left unchanged.")
+                if unexpected:
+                    print("Unexpected keys", unexpected)
+                return True
             print("Missing keys", missing)
             if unexpected:
                 print("Unexpected keys", unexpected)
@@ -982,11 +1069,40 @@ class QwenModel(nn.Module):
             print("Unexpected keys", unexpected)
         return True
 
+    def load_pretrained_weights(
+        self,
+        model_path: str,
+        weight_spec: WeightLoadSpec | None = None,
+        allow_partial: bool = False,
+        loader: LazySafeTensorLoader | None = None,
+    ) -> bool:
+        if not os.path.isdir(model_path):
+            raise FileNotFoundError(model_path)
+
+        load_spec = weight_spec or self.default_base_weight_spec()
+        lazy_loader = loader or LazySafeTensorLoader(model_path)
+        state_dict, stats = lazy_loader.load_state_dict(load_spec)
+        print(f"Lazy load base: {stats.summary()}")
+        return self._apply_base_state_dict(state_dict, allow_partial=allow_partial)
+
 
 class QwenForCausalLM(nn.Module):
     config_class = QwenConfig
 
-    def __init__(self, config: QwenConfig, enable_coreml=False, disable_kv_cache=False, **kwargs) -> None:
+    def __init__(
+        self,
+        config: QwenConfig,
+        enable_coreml=False,
+        disable_kv_cache=False,
+        *,
+        build_embeddings: bool = True,
+        build_layers: bool = True,
+        build_norm: bool = True,
+        layer_range: Optional[Tuple[int, int]] = None,
+        build_kv_cache: bool = True,
+        build_lm_head: bool = True,
+        **kwargs,
+    ) -> None:
         super().__init__()
         self.config = config
         self.enable_coreml = enable_coreml
@@ -998,12 +1114,21 @@ class QwenForCausalLM(nn.Module):
             ENABLE_COREML = True
             print(f"Set global ENABLE_COREML = {ENABLE_COREML} for CoreML conversion")
         
-        self.model = QwenModel(config)
+        self.model = QwenModel(
+            config,
+            build_embeddings=build_embeddings,
+            build_layers=build_layers,
+            build_norm=build_norm,
+            layer_range=layer_range,
+            build_kv_cache=build_kv_cache,
+        )
         # Set the disable_kv_cache flag on the model
         self.model.disable_kv_cache = self.disable_kv_cache
         
         # Initialize lm_head as Conv2d for ANE optimization following llama_model.py pattern
-        if ENABLE_CONV2D:
+        if not build_lm_head:
+            print("Skipping LM head module initialization (build_lm_head=False)")
+        elif ENABLE_CONV2D:
             if ENABLE_VACAB_SPLIT16:
                 vocab_split = config.vocab_size // 16
                 vocab_remainder = config.vocab_size % 16
@@ -1175,6 +1300,8 @@ class QwenForCausalLM(nn.Module):
         batch_size, seq_length = input_ids.shape
         
         # Get embeddings and run through model
+        if self.model.embed_tokens is None:
+            raise RuntimeError("embed_tokens is not initialized for this model instance.")
         hidden_states = self.model.embed_tokens(input_ids)
         hidden_states = hidden_states.to(MODEL_DTYPE)
 
@@ -1195,43 +1322,68 @@ class QwenForCausalLM(nn.Module):
                 current_pos=start_pos
             )
 
-    def load_pretrained_weights(self, model_path: str) -> bool:
-        if not self.model.load_pretrained_weights(model_path):
+    @staticmethod
+    def default_lm_head_weight_spec() -> WeightLoadSpec:
+        # Include embed_tokens for tie fallback when lm_head.weight is absent.
+        return WeightLoadSpec(
+            include_exact=frozenset(
+                {
+                    "lm_head.weight",
+                    "model.lm_head.weight",
+                    "embed_tokens.weight",
+                    "model.embed_tokens.weight",
+                }
+            ),
+            description="qwen-lm-head",
+        )
+
+    def _apply_lm_head_state_dict(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        allow_partial: bool = False,
+    ) -> bool:
+        has_lm_head_module = any(
+            hasattr(self, name)
+            for name in (
+                "lm_head16_1",
+                "lm_head8_1",
+                "lm_head2_1",
+                "lm_head1",
+                "lm_head",
+            )
+        )
+        if not has_lm_head_module:
+            msg = "LM head modules are not initialized; cannot apply lm_head weights."
+            if allow_partial:
+                print(f"{msg} Continuing due to allow_partial=True.")
+                return True
+            print(msg)
             return False
-        
-        # Load lm_head weights with splitting support
-        state_dict: Dict[str, torch.Tensor] = {}
-        for file in os.listdir(model_path):
-            if file.endswith(".safetensors"):
-                state_dict.update(
-                    safetensors.torch.load_file(os.path.join(model_path, file))
-                )
-        
+
         # Handle lm_head weight (following llama_model.py pattern)
-        lm_head_present = False
+        lm_head_key = None
         embed_tokens_key = None
-        for k, v in state_dict.items():
-            if k == "lm_head.weight":
-                lm_head_present = True
-            if "embed_tokens.weight" in k:
+        for k in state_dict:
+            if k in ("lm_head.weight", "model.lm_head.weight"):
+                lm_head_key = k
+            if k.endswith("embed_tokens.weight"):
                 embed_tokens_key = k
 
-        if not lm_head_present:
+        if lm_head_key is None:
             print("lm_head.weight not found in the model file dictionary")
             if embed_tokens_key:
                 print(f"Using {embed_tokens_key} for lm_head.weight")
-                state_dict['lm_head.weight'] = state_dict[embed_tokens_key].clone()
+                lm_head_weight = state_dict[embed_tokens_key].clone()
             else:
                 print("embed_tokens.weight not found. Unable to set lm_head.weight")
+                if allow_partial:
+                    print("Continuing without lm_head due to allow_partial=True.")
+                    return True
                 return False
-        
+        else:
+            lm_head_weight = state_dict[lm_head_key]
+
         # Handle lm_head weight loading and splitting
-        lm_head_weight = None
-        for k, v in state_dict.items():
-            if k == "lm_head.weight":
-                lm_head_weight = v
-                break
-        
         if lm_head_weight is not None:
             if ENABLE_CONV2D:
                 reshaped_weight = lm_head_weight.view(lm_head_weight.shape[0], lm_head_weight.shape[1], 1, 1)
@@ -1266,6 +1418,41 @@ class QwenForCausalLM(nn.Module):
                 self.lm_head.weight.data.copy_(lm_head_weight.view(lm_head_weight.shape[0], lm_head_weight.shape[1], 1, 1))
         else:
             print("Warning: lm_head.weight not found in model weights")
+            if allow_partial:
+                print("Continuing without lm_head due to allow_partial=True.")
+                return True
             return False
-        
+
+        return True
+
+    def load_pretrained_weights(
+        self,
+        model_path: str,
+        base_weight_spec: WeightLoadSpec | None = None,
+        lm_head_weight_spec: WeightLoadSpec | None = None,
+        load_base: bool = True,
+        load_lm_head: bool = True,
+        allow_partial: bool = False,
+        loader: LazySafeTensorLoader | None = None,
+    ) -> bool:
+        lazy_loader = loader or LazySafeTensorLoader(model_path)
+
+        if load_base:
+            if self.model is None:
+                raise RuntimeError("Base model is not initialized; cannot load base weights.")
+            if not self.model.load_pretrained_weights(
+                model_path,
+                weight_spec=base_weight_spec,
+                allow_partial=allow_partial,
+                loader=lazy_loader,
+            ):
+                return False
+
+        if load_lm_head:
+            spec = lm_head_weight_spec or self.default_lm_head_weight_spec()
+            state_dict, stats = lazy_loader.load_state_dict(spec)
+            print(f"Lazy load lm_head: {stats.summary()}")
+            if not self._apply_lm_head_state_dict(state_dict, allow_partial=allow_partial):
+                return False
+
         return True
