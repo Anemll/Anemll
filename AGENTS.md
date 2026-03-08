@@ -7,17 +7,12 @@ A skill is a set of local instructions stored in a `SKILL.md` file.
 - `ane-divergence-analysis`
   - Compare PyTorch vs CoreML/ANE and HuggingFace Transformers vs CoreML for decoder-only LLMs in this repo.
   - Use for token/logit divergence, instability, ANE lowering issues, and parity metrics (KL, correlation, entropy, repetition).
-  - File: `/Users/anemll/.codex/skills/custom/ane-divergence-analysis/SKILL.md`
+  - File: `agents/skills/ane-divergence-analysis/SKILL.md`
 
 - `ane-lowering-plan`
   - Create an ANE-legal CoreML/MIL lowering plan for decoder-only Transformers from HF or JAX/Flax.
   - Use for conversion/debugging on ANE, KV-cache/state contract issues, sliding-window/global attention, and chunked FFN.
-  - File: `/Users/anemll/.codex/skills/custom/ane-lowering-plan/SKILL.md`
-
-- `anemll-macos-agent`
-  - Control macOS UI via AnemllAgentHost HTTP API for screenshots, clicks, typing, and window/screen automation.
-  - Use only when GUI interaction is required.
-  - File: `/Users/anemll/.codex/skills/custom/anemll-macos-agent/SKILL.md`
+  - File: `agents/skills/ane-lowering-plan/SKILL.md`
 
 ### Trigger rules
 
