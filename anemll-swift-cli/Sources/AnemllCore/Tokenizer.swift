@@ -359,7 +359,29 @@ public final class Tokenizer: @unchecked Sendable {
     }
 
     // Consolidated applyChatTemplate method
-    public func applyChatTemplate(input: Any, addGenerationPrompt: Bool = true) -> [Int] {
+    //
+    // `enableThinking` controls thinking-mode on model templates that
+    // support it (Qwen3 today — its HF chat template reads
+    // `enable_thinking` in its Jinja context and emits a pre-closed
+    // `<think>\n\n</think>\n\n` block before the assistant's first
+    // output when the flag is false). When false, we forward
+    // `enable_thinking: false` to swift-transformers via the template
+    // `additionalContext` parameter, and the HF Jinja renderer does
+    // the rest — no per-family hardcoding needed. Default is `true`
+    // to preserve existing caller behavior; templates whose Jinja
+    // doesn't read `enable_thinking` simply ignore the extra context.
+    //
+    // Small Qwen3 models (0.6B, 1.7B) can get stuck in repetitive
+    // loops inside an unclosed `<think>` block at these scales and
+    // never produce a real response within reasonable token budgets
+    // (see issue #36). Passing `enableThinking: false` avoids that
+    // by steering the template to emit the pre-closed block so the
+    // model skips thinking-mode and goes straight to response.
+    public func applyChatTemplate(
+        input: Any,
+        addGenerationPrompt: Bool = true,
+        enableThinking: Bool = true
+    ) -> [Int] {
         // When addGenerationPrompt is false, tokenize the raw content without template
         if !addGenerationPrompt {
             if let text = input as? String {
@@ -377,11 +399,25 @@ public final class Tokenizer: @unchecked Sendable {
             let messagesArray = messages.map { message in
                 return ["role": message.role, "content": message.content]
             }
+            // Forward enable_thinking to the HF chat template via
+            // additionalContext. When enableThinking is true (default),
+            // pass nil so no additional context is added — zero change
+            // in output for existing callers. When false, pass the
+            // kwarg and let the Jinja template do the work.
+            let additionalContext: [String: any Sendable]? =
+                enableThinking ? nil : ["enable_thinking": false]
             do {
-                let tokens = try tokenizer.applyChatTemplate(messages: messagesArray)
+                let tokens = try tokenizer.applyChatTemplate(
+                    messages: messagesArray,
+                    tools: nil,
+                    additionalContext: additionalContext
+                )
                 if debugLevel >= 1 {
                     print("\nTokens:", tokens)
                     print("Decoded:", tokenizer.decode(tokens: tokens))
+                    if !enableThinking {
+                        print("Forwarded enable_thinking=false via additionalContext")
+                    }
                 }
                 return tokens
             } catch {
@@ -436,7 +472,10 @@ public final class Tokenizer: @unchecked Sendable {
                     formattedPrompt = prompt
 
                 case "qwen", "qwen2", "qwen3":
-                    // Qwen/ChatML format
+                    // Qwen/ChatML format. When enableThinking is false,
+                    // pre-close the <think> block inline so small Qwen3
+                    // models skip thinking-mode and go straight to
+                    // response (see main-path comment above).
                     var prompt = ""
                     for message in messagesArray {
                         let role = message["role"] as? String ?? "user"
@@ -444,6 +483,9 @@ public final class Tokenizer: @unchecked Sendable {
                         prompt += "<|im_start|>\(role)\n\(content)<|im_end|>\n"
                     }
                     prompt += "<|im_start|>assistant\n"
+                    if !enableThinking {
+                        prompt += "<think>\n\n</think>\n\n"
+                    }
                     formattedPrompt = prompt
 
                 default:
