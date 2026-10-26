@@ -13,7 +13,7 @@ The `prepare_hf.sh` script automates the preparation of converted ANEMLL models 
      export HUGGING_FACE_HUB_TOKEN=your_token_here
      
      # Option 2: Login via CLI
-     hf login
+     hf auth login
      ```
 
 2. **Hugging Face CLI**
@@ -121,7 +121,7 @@ After running the script, you can upload the model using:
 
 ```bash
 # First, ensure you're logged in
-hf login
+hf auth login
 
 # For standard distribution:
 hf upload <org>/<model-name>_<version> <output_directory>/standard
@@ -156,7 +156,7 @@ If this is your first time uploading this model:
    echo $HUGGING_FACE_HUB_TOKEN
 
    # Re-login if needed
-   hf login
+   hf auth login
    ```
 
 2. **Permission Issues**
