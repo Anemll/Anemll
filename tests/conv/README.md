@@ -63,7 +63,7 @@ Python wrapper that uses test_hf_model.sh to test Qwen models:
 - Python virtual environment with ANEMLL dependencies (env-anemll or anemll-env)
 - Run `./install_dependencies.sh` to set up environment
 - Internet connection for model downloads (first run only)
-- HuggingFace CLI login for gated models: `huggingface-cli login`
+- HuggingFace CLI login for gated models: `hf auth login`
 
 ## Recommended Testing Workflow
 

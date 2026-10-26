@@ -295,13 +295,13 @@ fi
 echo
 echo "To upload to Hugging Face, use:"
 if [ "$PREPARE_IOS" = true ]; then
-    echo "huggingface-cli upload $HF_ORG/$FULL_MODEL_NAME $OUTPUT_DIR/ios"
+    echo "hf upload $HF_ORG/$FULL_MODEL_NAME $OUTPUT_DIR/ios"
     echo
     echo "Example:"
-    echo "huggingface-cli upload $HF_ORG/$FULL_MODEL_NAME $(realpath "$OUTPUT_DIR/ios")"
+    echo "hf upload $HF_ORG/$FULL_MODEL_NAME $(realpath "$OUTPUT_DIR/ios")"
 else
-    echo "huggingface-cli upload $HF_ORG/$FULL_MODEL_NAME $OUTPUT_DIR/standard"
+    echo "hf upload $HF_ORG/$FULL_MODEL_NAME $OUTPUT_DIR/standard"
     echo
     echo "Example:"
-    echo "huggingface-cli upload $HF_ORG/$FULL_MODEL_NAME $(realpath "$OUTPUT_DIR/standard")"
+    echo "hf upload $HF_ORG/$FULL_MODEL_NAME $(realpath "$OUTPUT_DIR/standard")"
 fi 
