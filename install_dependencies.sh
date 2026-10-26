@@ -127,10 +127,12 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     fi
     
     # Check for coremlcompiler
-    if command -v xcrun coremlcompiler &> /dev/null; then
+    if xcrun --find coremlcompiler &> /dev/null; then
         echo "✅ CoreML compiler found"
     else
         echo "⚠️  CoreML compiler not found - some features may not work"
+        echo "   coremlcompiler ships with full Xcode (not the Command Line Tools alone)."
+        echo "   See docs/troubleshooting.md (CoreML Compiler Not Found)."
     fi
 else
     echo "⚠️  Non-macOS system detected - some Apple-specific features will not be available"
