@@ -24,6 +24,7 @@ import coremltools.optimize as cto
 from .environment import require_coreml
 
 from .base_converter import BaseConverter
+from .argmax import chunked_argmax
 from .metadata import AddMetadata, ModelPart
 from ..models.gemma3_model import (
     Gemma3ForCausalLM,
@@ -1050,23 +1051,7 @@ class Gemma3Converter(BaseConverter):
                     # NOTE: Using int16 for ANE compatibility - ANE doesn't support int32 for argmax.
                     # Local indices (0 to 16383) fit in int16 (max 32767).
                     if self.argmax_in_model:
-                        all_idx = []
-                        all_val = []
-                        for i, logits in enumerate(logits_list):
-                            # logits shape: [1, 1, chunk_size] for inference mode
-                            # Get argmax index within chunk (0 to chunk_size-1)
-                            chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)  # [1, 1, 1], int64
-                            # Cast to int32 for CoreML compatibility (int16 not supported for outputs)
-                            # Local indices 0-16383 fit easily in int32
-                            local_idx = chunk_argmax.to(torch.int32)  # [1, 1, 1]
-                            # Get max value
-                            max_val = torch.max(logits, dim=-1, keepdim=True).values  # [1, 1, 1]
-                            all_idx.append(local_idx)
-                            all_val.append(max_val)
-                        # Concatenate along last dim: [1, 1, num_chunks], then squeeze to [num_chunks]
-                        argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], int32 (LOCAL indices)
-                        argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], fp16
-                        return (argmax_idx, argmax_val)
+                        return chunked_argmax(logits_list)
                     else:
                         return tuple(logits_list)
 
@@ -1321,21 +1306,7 @@ class Gemma3Converter(BaseConverter):
                 # The Swift/Python inference code must add (chunk_idx * chunk_size) to get global index.
                 # NOTE: Using int32 for ANE compatibility - ANE doesn't support int64 for argmax.
                 if self.argmax_mode:
-                    all_idx = []
-                    all_val = []
-                    for logits in logits_list:
-                        # logits: [1, 1, chunk_size]
-                        # Get argmax index within chunk (0 to chunk_size-1)
-                        chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)  # [1, 1, 1], int64
-                        chunk_max_val = torch.gather(logits, -1, chunk_argmax)  # [1, 1, 1], fp16
-                        # Convert to int32 for ANE compatibility
-                        local_idx = chunk_argmax.to(torch.int32)  # [1, 1, 1]
-                        all_idx.append(local_idx)
-                        all_val.append(chunk_max_val)
-                    # Stack into single tensors
-                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], int32 (LOCAL indices)
-                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)  # [num_chunks], fp16
-                    return (argmax_idx, argmax_val)
+                    return chunked_argmax(logits_list)
                 else:
                     # Return logits as tuple
                     return tuple(logits_list)

@@ -4,6 +4,7 @@
 #  found in the LICENSE.txt file or at https://opensource.org/license/mit
 
 from .base_converter import BaseConverter
+from .argmax import chunked_argmax
 import coremltools as ct
 import coremltools.optimize as cto
 from coremltools.converters.mil import Builder as mb
@@ -659,16 +660,7 @@ class LlamaConverter(BaseConverter):
                     logits = [self.head(hidden_states)]
 
                 if self.argmax_mode:
-                    all_idx = []
-                    all_val = []
-                    for chunk_logits in logits:
-                        chunk_argmax = torch.argmax(chunk_logits, dim=-1, keepdim=True)
-                        chunk_max_val = torch.gather(chunk_logits, -1, chunk_argmax)
-                        all_idx.append(chunk_argmax.to(torch.int32))
-                        all_val.append(chunk_max_val)
-                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)
-                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)
-                    return (argmax_idx, argmax_val)
+                    return chunked_argmax(logits)
 
                 if self.split_mode == '8way':
                     return tuple(logits)
@@ -1059,16 +1051,7 @@ class LlamaConverter(BaseConverter):
                     logits_list = [self.lm_head(hidden_states)]
 
                 if self.argmax_in_model and not self.is_prefill:
-                    all_idx = []
-                    all_val = []
-                    for logits in logits_list:
-                        chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)
-                        chunk_max_val = torch.gather(logits, -1, chunk_argmax)
-                        all_idx.append(chunk_argmax.to(torch.int32))
-                        all_val.append(chunk_max_val)
-                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)
-                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)
-                    return (argmax_idx, argmax_val)
+                    return chunked_argmax(logits_list)
 
                 return tuple(logits_list)
 
