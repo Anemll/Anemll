@@ -28,6 +28,7 @@ import coremltools.optimize as cto
 from .environment import require_coreml
 
 from .base_converter import BaseConverter
+from .argmax import chunked_argmax
 from .metadata import AddMetadata, ModelPart
 from ..models.qwen_model import (
     QwenForCausalLM,
@@ -482,16 +483,7 @@ class QwenConverter(BaseConverter):
                     logits_list = [self.head(hidden_states)]
 
                 if self.argmax_mode:
-                    all_idx = []
-                    all_val = []
-                    for logits in logits_list:
-                        chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)
-                        chunk_max_val = torch.gather(logits, -1, chunk_argmax)
-                        all_idx.append(chunk_argmax.to(torch.int32))
-                        all_val.append(chunk_max_val)
-                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)
-                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)
-                    return (argmax_idx, argmax_val)
+                    return chunked_argmax(logits_list)
 
                 if self.mode == "16":
                     return tuple(logits_list)
@@ -1063,16 +1055,7 @@ class QwenConverter(BaseConverter):
                     logits_list = [self.lm_head(hidden_states)]
 
                 if self.argmax_in_model and not self.is_prefill:
-                    all_idx = []
-                    all_val = []
-                    for logits in logits_list:
-                        chunk_argmax = torch.argmax(logits, dim=-1, keepdim=True)
-                        chunk_max_val = torch.gather(logits, -1, chunk_argmax)
-                        all_idx.append(chunk_argmax.to(torch.int32))
-                        all_val.append(chunk_max_val)
-                    argmax_idx = torch.cat(all_idx, dim=-1).squeeze(0).squeeze(0)
-                    argmax_val = torch.cat(all_val, dim=-1).squeeze(0).squeeze(0)
-                    return (argmax_idx, argmax_val)
+                    return chunked_argmax(logits_list)
 
                 return tuple(logits_list)
 
