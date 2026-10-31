@@ -6,14 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ANEMLL (pronounced "animal") is an open-source project for accelerating Large Language Models (LLMs) on Apple Neural Engine (ANE). The project converts Hugging Face models to CoreML format for on-device inference on Apple devices.
 
+## Repo Agent Resources
+
+Repo-contained agent workflows live under `agents/skills/` so Codex and Claude can use the same instructions without relying on machine-local paths.
+
+- `agents/skills/ane-divergence-analysis/SKILL.md`: PyTorch vs CoreML/ANE divergence, parity, and instability workflows
+- `agents/skills/ane-lowering-plan/SKILL.md`: ANE-safe lowering plans, shape/state contracts, and legality checks
+
+When a task clearly matches one of these workflows, read only the relevant skill file instead of loading unrelated guidance.
+
 ## Command Allowlist (Claude Code)
 
 Approved commands for Claude Code in this repo:
 ```bash
 osascript -e 'tell application "System Events" to key code 121'  # page down
 sleep 0.5
-export ANEMLL_HOST="http://127.0.0.1:8765"
-curl ...
 ```
 
 ## Development Commands
