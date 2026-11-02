@@ -287,7 +287,7 @@ cd anemll-swift-cli && swift run anemllcli --meta <output>/meta.yaml
    pip install huggingface_hub
    
    # Login (choose one method)
-   huggingface-cli login
+   hf auth login
    # OR set environment variable
    export HUGGING_FACE_HUB_TOKEN=your_token_here
    ```
@@ -331,12 +331,12 @@ cd anemll-swift-cli && swift run anemllcli --meta <output>/meta.yaml
 
 **Upload Standard Distribution:**
 ```bash
-huggingface-cli upload <org>/<model-name>_<version> <hf_dist_directory>/standard
+hf upload <org>/<model-name>_<version> <hf_dist_directory>/standard
 ```
 
 **Upload iOS Distribution:**
 ```bash
-huggingface-cli upload <org>/<model-name>_<version> <hf_dist_directory>/ios
+hf upload <org>/<model-name>_<version> <hf_dist_directory>/ios
 ```
 
 **Example Commands:**
@@ -349,10 +349,10 @@ huggingface-cli upload <org>/<model-name>_<version> <hf_dist_directory>/ios
     --ios
 
 # Upload standard version
-huggingface-cli upload anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.3 ./qwen3-0.6b-hf-dist/standard
+hf upload anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.3 ./qwen3-0.6b-hf-dist/standard
 
 # Upload iOS version
-huggingface-cli upload anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.3 ./qwen3-0.6b-hf-dist/ios
+hf upload anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.3 ./qwen3-0.6b-hf-dist/ios
 ```
 
 ### Distribution Structure
@@ -392,7 +392,7 @@ hf_dist_directory/ios/
 1. **Token Issues:**
    ```bash
    echo $HUGGING_FACE_HUB_TOKEN
-   huggingface-cli login
+   hf auth login
    ```
 
 2. **Permission Issues:**

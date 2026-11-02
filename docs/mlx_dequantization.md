@@ -27,7 +27,7 @@ MLX (Apple's ML framework) provides quantized versions of popular models to redu
 
 ```bash
 # Using Hugging Face CLI (recommended)
-huggingface-cli download mlx-community/Qwen3-0.6B-MLX-4bit --local-dir ~/Models/MLX/Qwen3-0.6B-MLX-4bit
+hf download mlx-community/Qwen3-0.6B-MLX-4bit --local-dir ~/Models/MLX/Qwen3-0.6B-MLX-4bit
 
 # Or using git (alternative)
 git clone https://huggingface.co/mlx-community/Qwen3-0.6B-MLX-4bit ~/Models/MLX/Qwen3-0.6B-MLX-4bit

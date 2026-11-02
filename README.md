@@ -169,7 +169,7 @@ python3 tests/chat.py --meta /path/to/output/gemma3_270m/meta.yaml --prompt "Hel
 - Recommended: `--chunk 1` for all Gemma 3 models (1B fits in single chunk)
 - Supports context lengths up to 4096 (512-2048 recommended for optimal ANE performance)
 - Large vocabulary (262K tokens) uses 16-way LM head splitting
-- Requires HuggingFace login for gated models: `hf login`
+- Requires HuggingFace login for gated models: `hf auth login`
 
 > **⚠️ FP16 Overflow Warning**: Gemma 3 models can produce activations exceeding FP16 range (65,504). See [FP16 Compatibility](#fp16-compatibility-for-ane) below.
 

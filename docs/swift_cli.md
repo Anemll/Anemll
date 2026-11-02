@@ -34,7 +34,7 @@ mkdir -p ~/Documents/anemll-models
 cd ~/Documents/anemll-models
 
 # Using Hugging Face CLI to download model
-huggingface-cli download anemll/anemll-llama-3.2-1B-iOSv2.0 --local-dir .
+hf download anemll/anemll-llama-3.2-1B-iOSv2.0 --local-dir .
 ```
 
 > [!Note]

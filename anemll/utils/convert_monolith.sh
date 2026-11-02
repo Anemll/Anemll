@@ -190,6 +190,19 @@ if [ "$ALLOW_MISSING_WEIGHTS" = true ]; then
     echo "Warning: ANEMLL_ALLOW_MISSING_WEIGHTS=1 (missing weights will be ignored)"
 fi
 
+# Download a HuggingFace model into the local cache.
+# Prefers the `hf` CLI (huggingface_hub >= 0.34) and falls back to the legacy `huggingface-cli`.
+hf_download() {
+    if command -v hf >/dev/null 2>&1; then
+        hf download "$1"
+    elif command -v huggingface-cli >/dev/null 2>&1; then
+        huggingface-cli download "$1"
+    else
+        echo "Error: HuggingFace CLI not found. Install it with: pip install -U huggingface_hub"
+        return 1
+    fi
+}
+
 # Check if MODEL_PATH looks like a HuggingFace model name (e.g., "google/gemma-3-270m-it")
 # HuggingFace names contain "/" but don't start with "/" or "~" or "."
 if [[ "$MODEL_PATH" == *"/"* ]] && [[ ! "$MODEL_PATH" =~ ^[/~.] ]]; then
@@ -207,16 +220,16 @@ if [[ "$MODEL_PATH" == *"/"* ]] && [[ ! "$MODEL_PATH" =~ ^[/~.] ]]; then
             MODEL_PATH="$SNAPSHOT_DIR"
         else
             echo "Cache directory exists but no snapshots found. Downloading model..."
-            huggingface-cli download "$MODEL_PATH"
+            hf_download "$MODEL_PATH"
             SNAPSHOT_DIR=$(find "$HF_CACHE_DIR/snapshots" -maxdepth 1 -type d | tail -1)
             MODEL_PATH="$SNAPSHOT_DIR"
         fi
     else
         echo "Model not in cache. Downloading from HuggingFace..."
-        huggingface-cli download "$MODEL_PATH"
+        hf_download "$MODEL_PATH"
         if [ $? -ne 0 ]; then
             echo "Error: Failed to download model from HuggingFace"
-            echo "Make sure you're logged in: huggingface-cli login"
+            echo "Make sure you're logged in: hf auth login"
             exit 1
         fi
         SNAPSHOT_DIR=$(find "$HF_CACHE_DIR/snapshots" -maxdepth 1 -type d | tail -1)
