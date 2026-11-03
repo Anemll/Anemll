@@ -51,8 +51,7 @@ If you confident it's incorrectly reporting an issue, you can skip the check by 
 - Error message: "coremlcompiler is required but not found. Aborting. (Issue #4)"
 
 **Solution:**
-- Ensure that Xcode Command Line Tools are installed, as they include `coremlcompiler`.
-- You can install them by running `xcode-select --install`.
+- `coremlcompiler` ships with full Xcode. The Xcode Command Line Tools alone (`xcode-select --install`) do not include it.
 - Verify that the `xcrun` command is available and correctly configured in your PATH.
 - Download Xcode from the App Store.
 - Run `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer/` to set the path.
