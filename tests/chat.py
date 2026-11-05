@@ -478,6 +478,7 @@ def load_metadata(model,args):
         # Extract key parameters with defaults
         metadata['context_length'] = int(meta.get('com.anemll.context_length', 512))
         metadata['state_length'] = int(meta.get('com.anemll.state_length', metadata['context_length']))  # Added state_length
+        metadata['position_mask_prefill'] = meta.get('com.anemll.position_mask_prefill') == 'true'
         metadata['batch_size'] = int(meta.get('com.anemll.batch_size', 64))
         metadata['lut_bits'] = int(meta.get('com.anemll.lut_bits', 0))
         metadata['num_chunks'] = int(meta.get('com.anemll.num_chunks', 1))
@@ -582,6 +583,9 @@ def load_metadata(model,args):
     if getattr(args, 'prefill_dynamic_slice', None) is not None:
         metadata['prefill_dynamic_slice'] = bool(args.prefill_dynamic_slice)
     
+    if getattr(args, 'position_mask_prefill', None) is not None:
+        metadata['position_mask_prefill'] = args.position_mask_prefill
+
     return metadata
 
 def detect_cache_type(ffn_model, eval_mode=False):
@@ -1349,17 +1353,25 @@ def create_unified_state(ffn_models, context_length, eval_mode=False, metadata=N
 
         return states
 
+def _prefill_options(metadata, allow_dynamic_slice=False):
+    """Resolve batching and visible masks independently of KV storage padding."""
+    position_mask = metadata.get('position_mask_prefill', False)
+    use_update_mask = metadata.get('update_mask_prefill', False)
+    dynamic_slice = allow_dynamic_slice and metadata.get('prefill_dynamic_slice', False)
+    single_token_mode = not (position_mask or use_update_mask or dynamic_slice)
+    context_length = metadata['context_length']
+    mask_length = context_length if position_mask else metadata.get('state_length', context_length)
+    mask_length = max(mask_length, metadata.get('sliding_window') or 0)
+    return single_token_mode, use_update_mask, mask_length
+
+
 def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False, no_think=False):
     """Interactive chat loop."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
-    update_mask_prefill = metadata.get('update_mask_prefill', False) if metadata else False
-    prefill_dynamic_slice = metadata.get('prefill_dynamic_slice', False) if metadata else False
-    single_token_mode = False
-    if not (update_mask_prefill or prefill_dynamic_slice):
-        single_token_mode = True
-        if not warmup and not eval_mode:
-            print("No update_mask_prefill or prefill_dynamic_slice; forcing single-token prefill for compatibility.")
+    single_token_mode, update_mask_prefill, _ = _prefill_options(metadata, allow_dynamic_slice=True)
+    if single_token_mode and not warmup and not eval_mode:
+        print("No batched prefill capability; forcing single-token prefill for compatibility.")
     
     if not warmup and not eval_mode:
         print(f"\nUsing context length: {context_length}")
@@ -1698,6 +1710,7 @@ def parse_args():
                 args.vocab_size = params.get('vocab_size', None)
                 args.lm_head_chunk_sizes = params.get('lm_head_chunk_sizes', None)
                 # Prefill behavior flags
+                args.position_mask_prefill = params.get('position_mask_prefill', False)
                 args.update_mask_prefill = params.get('update_mask_prefill', False)
                 args.prefill_dynamic_slice = params.get('prefill_dynamic_slice', False)
                 # Sliding window (cache rotation) is optional; keep None when model does not use SWA.
@@ -1812,6 +1825,7 @@ def parse_args():
                 args.vocab_size = params.get('vocab_size', None)
                 args.lm_head_chunk_sizes = params.get('lm_head_chunk_sizes', None)
                 # Prefill behavior flags
+                args.position_mask_prefill = params.get('position_mask_prefill', False)
                 args.update_mask_prefill = params.get('update_mask_prefill', False)
                 args.prefill_dynamic_slice = params.get('prefill_dynamic_slice', False)
 
@@ -2254,13 +2268,9 @@ def chat_loop_monolithic(infer_model, prefill_model, tokenizer, metadata, state,
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
     sliding_window = metadata.get('sliding_window', None)  # For switching between infer modes
-    mask_len = max(metadata.get('state_length', context_length), sliding_window or 0)
-    update_mask_prefill = metadata.get('update_mask_prefill', False)
-    single_token_mode = False
-    if not update_mask_prefill:
-        single_token_mode = True
-        if not eval_mode and not warmup:
-            print("update_mask_prefill not set; forcing single-token prefill for compatibility.")
+    single_token_mode, update_mask_prefill, mask_len = _prefill_options(metadata)
+    if single_token_mode and not eval_mode and not warmup:
+        print("No batched prefill capability; forcing single-token prefill for compatibility.")
 
     if not warmup and not eval_mode:
         print(f"\nUsing context length: {context_length}")
@@ -2496,8 +2506,12 @@ def main():
                 print("\nCreated unified transformer state for monolithic model")
             _maybe_report_mem("after monolithic make_state", getattr(args, "mem_report", False))
 
-            # Initialize causal mask - use state_length for split cache models
-            causal_mask = initialize_causal_mask(metadata['state_length'], args.eval)
+            # Position-masked models keep visible masks independent of KV storage padding.
+            if metadata.get("position_mask_prefill", False):
+                _, _, mask_len = _prefill_options(metadata)
+            else:
+                mask_len = metadata["state_length"]
+            causal_mask = initialize_causal_mask(mask_len, args.eval)
 
             # Warmup runs
             if not args.nw and not args.eval:

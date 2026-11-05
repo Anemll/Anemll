@@ -38,6 +38,7 @@ fi
 
 # Default values
 CONTEXT_LENGTH=512
+STATE_PAD=0
 BATCH_SIZE=64
 LUT_PART1=""  # No LUT for embeddings
 LUT_PART2=4   # FFN and prefill
@@ -79,6 +80,7 @@ print_usage() {
     echo "  --model         Path to the model directory (required)"
     echo "  --output        Output directory for converted models (required)"
     echo "  --context       Context length (default: 512)"
+    echo "  --state-pad     Extra KV-state row: 0 or 1 (Hunyuan only; default: 0)"
     echo "  --batch         Batch size (default: 64)"
     echo "  --lut1          LUT bits for embeddings (default: none)"
     echo "                  Format: 'bits' or 'bits,per_channel' (e.g., '6' or '6,4')"
@@ -138,6 +140,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --output)
             OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --state-pad)
+            if [ "$#" -lt 2 ] || [[ "$2" != "0" && "$2" != "1" ]]; then
+                echo "Error: --state-pad must be 0 or 1"
+                exit 1
+            fi
+            STATE_PAD="$2"
             shift 2
             ;;
         --context)
@@ -323,6 +333,12 @@ if [ -f "$CONFIG_FILE" ]; then
         if [ "$PREFIX" = "llama" ]; then
             PREFIX="qwen"
         fi
+    elif [[ "$ARCH" == "hunyuan_v1_dense" ]] || [[ "$ARCH" == "hunyuandensev1forcausallm" ]]; then
+        ARCH="hunyuan_v1_dense"
+        CONVERTER="python3 -m anemll.ane_converter.hunyuan_converter"
+        if [ "$PREFIX" = "llama" ]; then
+            PREFIX="hunyuan"
+        fi
     elif [[ "$ARCH" == "gemma3_text"* ]] || [[ "$ARCH" == "gemma3"* ]]; then
         CONVERTER="python3 -m anemll.ane_converter.gemma3_converter"
         # Use "gemma3" as default prefix for Gemma3 models unless explicitly set
@@ -355,11 +371,20 @@ if [ -f "$CONFIG_FILE" ]; then
     fi
 fi
 
+# Keep state padding explicit: it changes storage, not the visible context length.
+STATE_PAD_PARAM=""
+if [[ "$ARCH" == "hunyuan_v1_dense" ]]; then
+    STATE_PAD_PARAM="--state-pad $STATE_PAD"
+elif [ "$STATE_PAD" != "0" ]; then
+    echo "Error: --state-pad is only supported for Hunyuan"
+    exit 1
+fi
+
 # Optional argmax layout metadata for runtimes that need exact local->global mapping.
 VOCAB_SIZE_JSON="null"
 LM_HEAD_CHUNK_SIZES_JSON="null"
 SPLIT_LM_HEAD=8
-if [[ "$ARCH" == qwen* ]] || [[ "$ARCH" == gemma* ]]; then
+if [[ "$ARCH" == qwen* ]] || [[ "$ARCH" == gemma* ]] || [[ "$ARCH" == "hunyuan_v1_dense" ]]; then
     SPLIT_LM_HEAD=16
 fi
 if [ -f "$CONFIG_FILE" ]; then
@@ -533,6 +558,7 @@ fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "1" ]; then
     run_step 1 "Converting Embeddings" "$CONVERTER \
+        $STATE_PAD_PARAM \
         --part 1 \
         $LUT1_PARAM \
         $FP16_SCALE_PARAM $CLAMP_PARAM \
@@ -582,6 +608,7 @@ fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
     run_step 2 "Converting LM Head" "$CONVERTER \
+        $STATE_PAD_PARAM \
         --part 3 \
         $LUT3_PARAM \
         $ARGMAX_PARAM \
@@ -604,6 +631,7 @@ fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "3" ]; then
     run_step 3 "Converting FFN" "$CONVERTER \
+        $STATE_PAD_PARAM \
         --part 2 \
         $LUT2_PARAM \
         $FP16_SCALE_PARAM $CLAMP_PARAM \
@@ -621,6 +649,7 @@ fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "4" ]; then
     run_step 4 "Converting Prefill" "$CONVERTER \
+        $STATE_PAD_PARAM \
         --part 2_prefill \
         $LUT2_PARAM \
         $DYNAMIC_PREFILL_SLICE_PARAM \
@@ -771,6 +800,8 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
         --arg clamp "${CLAMP:-}" \
         --arg command_line "$CONVERSION_COMMAND" \
         --argjson context_length "$CONTEXT_LENGTH" \
+        --argjson state_pad "$STATE_PAD" \
+        --argjson state_length "$((CONTEXT_LENGTH + STATE_PAD))" \
         --argjson batch_size "$BATCH_SIZE" \
         --argjson num_chunks "$NUM_CHUNKS" \
         --argjson argmax_in_model "$ARGMAX_JSON" \
@@ -784,6 +815,8 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
             model_path: $model_path,
             output_dir: $output_dir,
             context_length: $context_length,
+            state_pad: $state_pad,
+            state_length: $state_length,
             batch_size: $batch_size,
             num_chunks: $num_chunks,
             lut_part1: $lut_part1,
@@ -837,6 +870,13 @@ EOF_CONFIG
 {
   \"tokenizer_class\": \"Qwen2Tokenizer\",
   \"model_type\": \"qwen3\"
+}
+EOF_CONFIG
+            elif [[ \"$ARCH\" == \"hunyuan_v1_dense\" ]]; then
+                cat > \"$OUTPUT_DIR/config.json\" <<'EOF_CONFIG'
+{
+  \"tokenizer_class\": \"PreTrainedTokenizerFast\",
+  \"model_type\": \"hunyuan_v1_dense\"
 }
 EOF_CONFIG
             else
