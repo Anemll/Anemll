@@ -360,6 +360,11 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 - **Qwen 2.5** (0.5B, 1.5B, 3B, 7B) — chunked and monolithic
 - **Context lengths**: Up to 4K (512-2048 recommended for ANE)
 
+**Hunyuan Dense V1**
+- **HY-MT2-1.8B** (`tencent/Hy-MT2-1.8B`) — chunked and monolithic conversion
+- **Model type**: `hunyuan_v1_dense`; alpha-NTK RoPE and post-RoPE Q/K normalization
+- See [HY-MT2 conversion and runtime contract](./docs/hunyuan.md).
+
 **Gemma 3 Family (Stable)**
 - **Gemma 3** (270M, 1B, 4B QAT) — split KV cache with sliding-window + global attention
 - **Context lengths**: Up to 4096 tokens (512-2048 recommended for ANE)
@@ -376,6 +381,7 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 | Qwen 3 | 0.6B, 1.7B, 8B | 512-4096 | Yes | Yes | Stable |
 | Qwen 2.5 | 0.5B, 1.5B, 3B, 7B | 512-2048 | Yes | Yes | Stable |
 | Gemma 3 | 270M, 1B, 4B QAT | 512-4096 | Yes | Yes | Stable |
+| HY-MT2 | 1.8B | Fixed at conversion | Yes | Yes | Initial support |
 
 ### 🎯 **ANE Performance Notes**
 - **Recommended context**: 512-1024 tokens for best performance

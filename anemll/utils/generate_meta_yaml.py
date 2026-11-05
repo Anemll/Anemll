@@ -125,6 +125,7 @@ def generate_monolithic_meta(
     single_cache=False,
     vocab_size=None,
     lm_head_chunk_sizes=None,
+    state_pad=0,
 ):
     """Generate meta.yaml for monolithic model format.
 
@@ -154,8 +155,11 @@ def generate_monolithic_meta(
     if not os.path.exists(model_path):
         print(f"Warning: Monolithic model not found: {model_path}")
 
+    state_geometry_line = (f"\n    position_mask_prefill: true\n    state_pad: {state_pad}\n    state_length: {int(context) + state_pad}"
+                           if arch == "hunyuan_v1_dense" else "")
+
     # Set split_lm_head based on architecture
-    if arch.startswith('qwen') or arch.startswith('gemma'):
+    if arch.startswith('qwen') or arch.startswith('gemma') or arch == 'hunyuan_v1_dense':
         split_lm_head = 16
     else:
         split_lm_head = 8
@@ -200,7 +204,7 @@ def generate_monolithic_meta(
     chunk_sizes_line = f'\n    lm_head_chunk_sizes: [{", ".join(str(x) for x in lm_head_chunk_sizes)}]' if lm_head_chunk_sizes else ''
     sliding_window_line = f'\n    sliding_window: {sliding_window}' if sliding_window is not None else ''
     update_mask_line = '\n    update_mask_prefill: true' if update_mask_prefill else ''
-    prefill_dynamic_slice_line = '\n    prefill_dynamic_slice: true' if prefill_dynamic_slice else ''
+    prefill_dynamic_slice_line = '\n    prefill_dynamic_slice: true' if prefill_dynamic_slice and arch != 'hunyuan_v1_dense' else ''
     single_cache_line = '\n    single_cache: true' if single_cache else ''
 
     # Build functions list based on rotate flag
@@ -217,7 +221,7 @@ def generate_monolithic_meta(
 
     meta_parts.append(f'''    model_prefix: {prefix}
     monolithic_model: {model_name_file}
-    split_lm_head: {split_lm_head}{argmax_line}{vocab_line}{chunk_sizes_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}
+    split_lm_head: {split_lm_head}{state_geometry_line}{argmax_line}{vocab_line}{chunk_sizes_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}
 {functions_yaml}
 ''')
 
@@ -382,6 +386,7 @@ def main():
             # Optional metadata from conversion info (if provided)
             vocab_size=conversion_info_dict.get('vocab_size') if conversion_info_dict else None,
             lm_head_chunk_sizes=conversion_info_dict.get('lm_head_chunk_sizes') if conversion_info_dict else None,
+            state_pad=conversion_info_dict.get('state_pad', 0) if conversion_info_dict else 0,
             argmax_in_model=argmax_in_model,
             rotate=rotate,
             sliding_window=sliding_window,
@@ -439,8 +444,12 @@ def main():
     if split_rotate:
         pf_path = f'{pf_name}.mlmodelc'
     
+    state_pad = conversion_info_dict.get("state_pad", 0) if conversion_info_dict else 0
+    state_geometry_line = (f"\n    position_mask_prefill: true\n    state_pad: {state_pad}\n    state_length: {int(CONTEXT) + state_pad}"
+                           if ARCH == "hunyuan_v1_dense" else "")
+
     # Set split_lm_head based on architecture
-    if ARCH.startswith('qwen') or ARCH.startswith('gemma'):
+    if ARCH.startswith('qwen') or ARCH.startswith('gemma') or ARCH == 'hunyuan_v1_dense':
         split_lm_head = 16
     else:
         split_lm_head = 8
@@ -497,7 +506,7 @@ def main():
     # Add sliding_window for Gemma3 models
     sliding_window_line = f'\n    sliding_window: {sliding_window}' if sliding_window is not None else ''
     update_mask_line = '\n    update_mask_prefill: true' if update_mask_prefill else ''
-    prefill_dynamic_slice_line = '\n    prefill_dynamic_slice: true' if prefill_dynamic_slice else ''
+    prefill_dynamic_slice_line = '\n    prefill_dynamic_slice: true' if prefill_dynamic_slice and ARCH != 'hunyuan_v1_dense' else ''
     single_cache_line = '\n    single_cache: true' if single_cache else ''
 
     meta_parts.append(f'''    num_chunks: {NUM_CHUNKS}
@@ -505,7 +514,7 @@ def main():
     embeddings: {embeddings_path}
     lm_head: {lmhead_path}
     ffn: {ffn_path}{pf_line}
-    split_lm_head: {split_lm_head}{argmax_line}{vocab_line}{chunk_sizes_line}{split_rotate_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}
+    split_lm_head: {split_lm_head}{state_geometry_line}{argmax_line}{vocab_line}{chunk_sizes_line}{split_rotate_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}
 ''')
 
     meta = '\n'.join(meta_parts)
